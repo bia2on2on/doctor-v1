@@ -7241,3 +7241,16 @@ Branch `arena/6bbaeeb2-doctor-v1`, base `c9771403`. Patched `docs/architecture/p
 - **H10** 100 unique `file:line` citations re-checked, 0 problems (`uninstall.php` at plugin root read directly); `git diff --check` clean; diff vs `main` = the design doc and this log; ff push; PR #2 body PATCHed via REST and read back.
 
 Docs only: no code, no schema, no migration, no CI rerun, one approved new table (`cpms_patient_logins`), cap 2 unchanged.
+
+## 2026-11-17 — patient identity design, revision 18 (S1-S5, scope cut, docs only)
+
+Branch `arena/6bbaeeb2-doctor-v1`, base `c9771403`. Owner decision applied: in 1.0 staff and doctors log in **only** with the WordPress username/email + password an administrator creates. Document 478 → 477 lines (net cut held at or below the revision-17 size).
+
+- **S1** everything that exists only for staff identifier login moved into one new section **§22 "Deferred — not in release 1.0"**, with its requirements written compactly so a later release can restore it: the staff usermeta digest and verified mobile (§2.11), the separate versioned staff digest key and re-proof rotation (§2.11, §9.1), the shared per-digest `GET_LOCK` (§2.11), and tests **T-L43, T-L52, T-L54, T-L55** (removed from §15, recorded in §22). §2.11 is now one bullet, §9.1 keeps only the counter-key statement, §11.2's staff row is marked deferred, §12.1's staff cells say "not in 1.0", and T-L44 no longer claims both methods for staff.
+- **S2** kept unchanged and cited: staff search by identifier in the body only (§6.12), separate staff and patient accounts with the mixed-account guard (`PortalLogin.php:153-174`, §2.9), the legacy-login statements (§6.11) and the existing `LoginRateLimiter` (`src/Infrastructure/Security/LoginRateLimiter.php:33-42`, now cited in §6.11).
+- **S3** stated in §2.9 and §22: the administrator creates passwords only for staff accounts. Checked in code: the only two `wp_insert_user()` call sites are staff paths — `StaffManagementPage.php:623` (roles gated to `MANAGEABLE_ROLES` `:50`, `:580-582`) and `ManagementPortalService.php:1551` inside `enroll_staff()` `:900` (`subscriber` only); no code creates a `cpms_patient_logins` row (0 hits in `src`), so the patient credential path stays a build-time rule, not a claim.
+- **S4** recorded as later optional, not designed: forced password change at a staff member's first login, and per-account closure of the legacy path (§6.11).
+- **S5** reconciliation row rewritten, §19 owner question (4) added (should staff identifier login return, and would each staff member need a mobile), and §20 states the deferred work is out of the estimate.
+- **S6/S7** adversarial self-read: fixed three leftovers (T-L44 wording, the §2.11 heading, the revision-17 paragraph pointer) and the §13 "c" note that still said two working assumptions.
+
+Docs only: no code, schema or migration; one approved new table; cap 2 unchanged; patient-side protections, tests and accepted limitations untouched. 105 unique `file:line` citations re-checked, 0 problems.
