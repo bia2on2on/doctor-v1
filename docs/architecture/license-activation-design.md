@@ -1,7 +1,5 @@
 # License & Activation Design — CPMS 1.0 (Draft, docs-only)
 
-Status: **DRAFT for owner approval. No code, key, migration, settings, workflow or header change is included.**
-
 ## خلاصهٔ فارسی
 
 - این سند طراحیِ نظامِ مجوز و فعال‌سازیِ «Clinic Practice Management» (CPMS) نسخهٔ ۱٫۰ است؛ فقط سند است و هیچ کدی تغییر نمی‌کند.
@@ -15,6 +13,8 @@ Status: **DRAFT for owner approval. No code, key, migration, settings, workflow 
 - تصمیم‌های مالک پیش از هر پیاده‌سازی لازم است (بخش ۱۲).
 
 ---
+
+Status: **DRAFT for owner approval. No code, key, migration, settings, workflow or header change is included.**
 
 ## 1. Goals, non-goals, honest threat model
 
@@ -170,12 +170,12 @@ Design target (T) vs current code (C). "Existing appointment" = created before t
 | State | New patient/booking | Existing appt read/cancel | Check-in existing appt | Complete visit | Payment existing invoice | Reads/export | Backup/restore | OTP login |
 |---|---|---|---|---|---|---|---|---|
 | `ACTIVE`/`EXPIRING`/`GRACE` | allow | allow | allow | allow | allow | allow | allow | allow |
-| `RESTRICTED` ordinary expiry, ≥T0 | deny | allow | T: allow; C: owner 1/6-month windows then deny | allow | allow | allow | allow | allow |
+| `RESTRICTED` ordinary expiry, ≥T0 | T: owner reception/returning windows; C: same | allow | T: allow; C: owner 1/6-month windows then deny | allow | allow | allow | allow | allow |
 | `RESTRICTED` activation/binding | deny | allow | T: allow; C: deny | allow | allow | allow | allow | allow |
 | `ACTIVATION_PENDING`/`ACTIVATION_GRACE` (in window) | allow (notice) | allow | allow | allow | allow | allow | allow | allow |
 | `SUSPENDED`/`REVOKED`/`INVALID`/`UNREACHABLE` | deny | allow | T: allow; C: deny | allow | allow | allow | allow | allow |
 
-The only divergence from the safety target is check-in of an existing appointment under non-expiry restrictions; that is D8. Everything else in the target already matches the current code.
+The only divergence from the safety target is check-in of an existing appointment under non-expiry restrictions; that is D8. The new-patient cell for ordinary expiry follows the owner post-expiration policy (ADR-0023 §0), not a blanket denial. Everything else in the target already matches the current code.
 
 ## 8. Admin UX (Persian, words only)
 
