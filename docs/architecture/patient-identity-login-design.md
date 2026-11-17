@@ -1,338 +1,223 @@
-# Patient Identity, SMS Login and Self-Registration — DESIGN ONLY (revision 9)
+# Patient Identity, SMS Login and Self-Registration — DESIGN ONLY (revision 10)
 
 > # ⛔ DESIGN ONLY — MERGE IS NOT PERMISSION TO BUILD
->
-> Merging does **not** authorise a build; it starts only after this PR is merged and two independent readers
-> pass. `cpms_patient_logins` is **owner-approved**; **any other new table or column needs separate owner
-> approval — stop and ask.** No code, migration, test or workflow here.
+> Merging does **not** authorise a build; it starts only after this PR is merged and two independent readers pass. `cpms_patient_logins` is **owner-approved**; **any other new table or column needs separate owner approval — stop and ask.** No code, migration, test or workflow here.
 
 | | |
 |---|---|
 | **Base** | `origin/main` = `c97714034e62b001a313ee6636b25d7bece9d374` |
-| **Prior head** | `9a1fb5b5249548623dc7af9a8a06f90ba93a11a7` (revision 8) |
+| **Prior head** | `e04d318eb6f1580ccd9f2194c5ab1654391b5147` (revision 9) |
 | **Labels** | **OBSERVED** read in code at this commit, not executed · **INFERENCE** · **UNKNOWN** · **LIMITATION** · **DECIDED** · **DEBT** |
 | **Not executed** | No PHP/MySQL/WordPress/browser run; PHP gates NOT APPLICABLE (docs-only). |
 
-## Revision 9 changes
+## Revision 10 changes
 
 | # | Change |
 |---|---|
-| **R1** | **Root cause of the revision-8 blockers fixed:** the "verified binding" is now a row **inside `cpms_patient_logins`** (`clinic_id`, `patient_id`, `verified_at`, `verification_method`), settable **only** by link-record two-factor success or reception approval. Registration, first booking, reschedule and identity reuse never set it; existing edges are **NON-PROOF** (§2.3, §6.3). |
-| **R2-R7** | One-clinic search with the OTP-time stamp mechanism (§6.2); notifications gated before `lastId`/ETag/304 and binding-filtered (§6.7); one live account per record per clinic by row lock, since no unique key can express it (§6.3); consume at depth 0 (§6.5); audit inventory by search term (§6.6). |
-| **R8-R11** | Reschedule **inserts** a replacement row (`BookingService.php:1720-1741`) — contrary claims removed, cap restated (§8); no collision flag is stored (§6.2); restore paragraph (§7.3); rollout and cross-references repaired (§11, §16). |
-
----
+| **R1** | **One setter (F1).** Reception approval is **removed** as a binding setter: reception may sever, close and correct, never grant; `verification_method` has one value, `two_factor`. The "record without a national ID" case is an owner decision (OQ-D9), not designed. |
+| **R2** | **Account ≠ binding (F2, F4).** One table, two row kinds (`kind`): one **account** row, many **binding** rows; `state` is `pending`/`active` for accounts, `active`/`closed` for bindings. Four keys let one account hold its own record, dependents up to the cap and proofs in several clinics (§1). Sever and restore **close** bindings and never delete accounts or password hashes (§6.9, §7.3). |
+| **R3** | **Bootstrap and both edges (F3).** The stamp cannot precede the proof: `/patient/link-record` takes its clinic in the body, sets a per-request scope, and the stamp is written at the *next* OTP issue from the account's bindings (§6.2). The link route writes **both** the clinical edge and the user edge, naming each writer (§2.4). |
+| **R4** | **Audit census corrected (F5).** All 108 sites re-censused; free-text/NID carriers now include `VisitPricingService` charge descriptions/notes, the `SEARCH_EXECUTED` search string, patient-profile diffs (raw NID), visit rows and file names (§6.6). |
+| **R5** | **No existence oracle (F6).** Patient-side creation of clinical records is **removed from the first release**, so there is no collision branch to distinguish; records come from reception (existing route). The product cost is owner decision OQ-D8 (§5, §16). |
+| **R6** | **NULL claim withdrawn (F7).** A plain `UNIQUE (clinic_id, patient_id)` *does* block two non-NULL pairs; the cross-account rule must be *conditional*, hence the generated-NULL key (§1, §6.3). |
+| **R7** | **Booking predicates aligned (F8).** No route serves an appointment list without a binding: `active unbound` reaches no booking route either (§2.5, §12). |
+| **R8** | **Citations corrected (F9); every file:line re-opened.** `PatientRepository::user_has_clinical_access_to_patient()` `:140-157` is a boolean access check, not a selector; the raw NID is in `publicView()` `:779-795` (`:787`), not `staffView()`; `BackupSqlDumper`, `0019` mobile lines and `link_user` ranges fixed (§13(b)). |
 
 ## 1. Data model (D1)
 
-One table, `{wp_prefix}cpms_patient_logins`:
+One table, `{wp_prefix}cpms_patient_logins`, with **two row kinds**: an *account* row is the login/identity of one WP user; a *binding* row is one permission of that account over one record in one clinic.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `BIGINT UNSIGNED AUTO_INCREMENT` PK | |
-| `wp_user_id` | `BIGINT UNSIGNED NOT NULL` | no FK (none to `wp_users` exists) |
-| `mobile` | `CHAR(11) NOT NULL` | normalised `09xxxxxxxxx` |
-| `state` | `ENUM('pending','active') NOT NULL DEFAULT 'pending'` | **not** an access level (§2.4) |
-| `clinic_id`, `patient_id` | `BIGINT UNSIGNED NULL` | **the binding** (§6.3); NULL = unbound |
-| `verified_at`, `verification_method` | `DATETIME(3) NULL` / `ENUM('two_factor','reception') NULL` | set only by §6.3's two setters |
-| `given_name`, `family_name`, `national_id` | `VARCHAR(120)` / `VARCHAR(120)` / `VARCHAR(10)` NULL | pre-verification only; scrubbed at decision or 14 d |
-| `hold_reason`, `verified_by_wp_user_id` | `ENUM(...) NULL` / `BIGINT NULL` | reception approval only |
+| `kind` | `ENUM('account','binding') NOT NULL` | row role; every predicate says which kind it reads |
+| `wp_user_id` | `BIGINT UNSIGNED NOT NULL` | the owning account (its own id for `kind='account'`) |
+| `mobile` | `CHAR(11) NULL` | account rows only, normalised `09xxxxxxxxx`; **NULL** on binding rows |
+| `state` | `ENUM('pending','active','closed') NOT NULL` | account `pending`/`active`/`closed`; binding `active`/`closed` |
+| `clinic_id`, `patient_id` | `BIGINT UNSIGNED NULL` | binding rows only; **NULL** on account rows |
+| `verified_at`, `verification_method` | `DATETIME(3) NULL` / `ENUM('two_factor') NULL` | binding rows only; the proof; set only by §6.3 |
+| `given_name`, `family_name` | `VARCHAR(120) NULL` | pending account rows only; scrubbed (§7.5) |
 | `created_at`, `updated_at` | `DATETIME(3) NOT NULL` | UTC |
 
-`UNIQUE u_pl_mobile (mobile)`, `UNIQUE u_pl_user (wp_user_id)`, `KEY (state, created_at)`, `KEY (national_id)`, `KEY (clinic_id, patient_id)`. Revocation = DELETE + one audit row in one transaction; history lives in `cpms_audit_logs` (`0001:676-701`). **UNKNOWN:** not executed on MariaDB 11.4.13.
+**No `national_id` column** (M4: the NID lives only in the request body; revision 9's pending copy is deleted because nothing needs it once reception approval is gone). No OTP, hash, token or free text is stored.
+
+| Key | Definition | Invariant |
+|---|---|---|
+| `u_pl_mobile` | `UNIQUE (mobile)` | exactly **one account row per mobile**; binding rows are NULL and MySQL keeps NULLs distinct, so bindings are unlimited. A shared number cannot mint a second account ⇒ **no identity merge is possible** (§6.8). |
+| `u_pl_bind` | `UNIQUE (wp_user_id, clinic_id, patient_id)` | exactly **one binding row per account + clinic + record**, closed rows included ⇒ re-proof **reactivates** instead of inserting; account rows are (NULL, NULL) and never collide. |
+| `u_pl_live` | `UNIQUE (live_pair)`, `live_pair` = `GENERATED ALWAYS AS (IF(kind='binding' AND state='active', CONCAT(clinic_id,':',patient_id), NULL)) VIRTUAL` | **at most one ACTIVE binding per (clinic, patient) across all accounts** — the DB half of "one live account per record"; closed rows are NULL and unlimited. |
+| `u_pl_account` | `UNIQUE (account_user)`, `account_user` = `GENERATED ALWAYS AS (IF(kind='account', wp_user_id, NULL)) VIRTUAL` | exactly **one account row per account**, any number of bindings. |
+
+Plus `KEY (kind, state, wp_user_id)` for the gate read. **F7 correction (R6):** revision 9 claimed a plain `UNIQUE (clinic_id, patient_id)` would not stop a second bound row because MySQL treats NULLs as distinct — **wrong**: that applies only to keys containing a NULL (`dev.mysql.com/doc/refman/8.4/en/create-index.html`), and a bound row has neither column NULL. A plain pair key would be *too* strict here (it would also forbid a closed row next to a live one), so the cross-account rule must be *conditional* — the generated NULL above; `u_pl_live` turns §6.3's lock into a second line of defence. **"One patient per mobile per clinic" is not enforced here and needs no key**: it is `u_pat_mobile (clinic_id, mobile)` on the record (`0001:82`). **Fallback** if the engine rejects generated columns: drop `u_pl_account`/`u_pl_live` and enforce both by the §6.4 lock + recheck (INFERENCE). **TRADE-OFF:** `u_pl_mobile` fixes one mobile to one account for ever; a recycled number needs reception to correct the old account's phone first (LIMITATION, §14). **UNKNOWN:** not executed on MariaDB 11.4.13.
 
 ## 2. Access model
 
 ### 2.1 One gate
-`PatientAccess::level(int $wp_user_id, ?int $patient_id = null, ?int $clinic_id = null)` → `none` | `booking` | `full`, re-read per request (never a cookie).
-`full` needs **all** of: a live login row; `verified_at` non-NULL for that `(clinic_id, patient_id)`; the clinic link; the Organization identity edge.
-Anything less is `booking`.
+`PatientAccess::level(int $wp_user_id, ?int $patient_id = null, ?int $clinic_id = null)` → `none` | `booking` | `full`, re-read per request (never a cookie). `full` needs **all** of: an account row with `state='active'`; one **binding** row with `state='active'` and non-NULL `verified_at` for that `(wp_user_id, clinic_id, patient_id)`; the clinical identity edge; the user-identity edge (§2.4). `booking` = the same binding **without** the two edges (anomaly: appointments only, and it is reported). Anything else is `none`. **No predicate reads `mobile`**: a mobile is an attribute of an account row, never a key to any grant, so possession of a number alone opens nothing.
 
 ### 2.2 Recount (revision 5 method, unchanged)
-137 `register_rest_route` sites / 18 controllers, every `permission_callback` callee resolved ⇒ 153 runtime routes; **18 patient-reachable sites / 20 runtime
-routes** (loop expansion: `DoctorPortalController.php:82-91`, `QueueController.php:217-225`, `PatientController.php:64-93`, `FilesController.php:72-95`). A
-staff-role user is never patient-only (`Admin/PatientPortalPage.php:92-111`, `:116-124`) nor eligible for SMS login.
+137 `register_rest_route` sites / 18 controllers, every `permission_callback` callee resolved ⇒ 153 runtime routes; **18 patient-reachable sites / 20 runtime routes** (loop expansion: `DoctorPortalController.php:82-91`, `QueueController.php:217-225`, `PatientController.php:64-93`, `FilesController.php:72-95`). A staff-role user is never patient-only (`Admin/PatientPortalPage.php:92-111`, `:116-124`) nor eligible for SMS login.
 
-### 2.3 Existing edges are NON-PROOF (R1)
-`cpms_patient_user_links` (booking/staff-created), `cpms_patients.identity_id` and `cpms_patient_identity_links` (set on **every** create,
-`PatientIdentityActivator.php:93-104`, and Organization-wide), and `cpms_patient_identities` (**no** national ID, `0018:27-36`) grant no record access and are
-never upgraded by registration, first booking, reschedule or identity reuse. `PatientRepository::clinical_access_identity_predicate()` `:261-269` is the hole
-— it admits `p.identity_id IS NULL` **or** a matching identity link — used by `active_linked_records_for_user` `:85-99`, the single-patient selector
-`:145-156`, `active_linked_patients_for_user` `:164-177`, `find_active_linked_patient_by_link` `:182-195` (call sites `:95`, `:151`, `:173`, `:191`). The
-build replaces that disjunct with an `EXISTS` on a `cpms_patient_logins` binding for **account + patient + clinic**, so a legacy NULL-identity row is readable
-only after proof too.
+### 2.3 Existing edges are NON-PROOF
+`cpms_patient_user_links` (booking/staff-created), `cpms_patients.identity_id` and `cpms_patient_identity_links` (set on **every** create, `PatientIdentityActivator.php:93-104`, and Organization-wide), and `cpms_patient_identities` (**no** NID, `0018:27-36`) grant no record access and are never upgraded by registration, booking, reschedule or identity reuse. `PatientRepository::clinical_access_identity_predicate()` `:261-269` is the hole — it admits `p.identity_id IS NULL` **or** a matching identity link — used by `active_linked_records_for_user` `:85-99`, `user_has_clinical_access_to_patient` `:140-157` (**a boolean access check, not a selector** — F9), `active_linked_patients_for_user` `:164-177`, `find_active_linked_patient_by_link` `:182-195` (call sites `:95`, `:151`, `:173`, `:191`). The build replaces that disjunct with an `EXISTS` on an **active binding** for account + patient + clinic, so a legacy NULL-identity row is readable only after proof too.
 
-### 2.4 Levels
-Three levels, enumerated route-by-route once in §12: **`booking`** (hold, confirm, resume, `/appointments/mine`, reschedule-options, the patient branches of
-reschedule/cancel, the minimal `GET /patient/me`, portal appointments); **`full`** (visits, prescriptions, files + stream, `/patient/enroll`,
-`/patient/my-records`, `POST /patient/link-record`, full `GET` and `PATCH /patient/me`); **refused writes** (`PATCH /patient/me` for `booking`). Staff
-branches and staff routes are unchanged. Enforcement is duplicated at the service layer so a direct service call is covered too: `PatientService::me()`
-`:128`, `updateMe()` `:139`, `linked_records()` `:99-112`, `PatientController.php:52-62`, `NotificationService::inbox()` `:155-184`,
-`Admin\PatientPortalPage::render()`.
+### 2.4 The two edges, and who writes each (R3, F3)
+`full` needs two different edges; revision 9 named one and implied the other. **(1) Clinical edge** — `cpms_patients.identity_id`, the record → Organization identity pointer, written by `PatientIdentityService::link_clinical_record()`, called from `PatientIdentityActivator::activate_for_new_patient()` `:77-107` (`:101`), which creates or reuses the identity at `:93-94` and asserts the persisted pointer at `:104`; that class writes **only** this edge, never a user link. **(2) User edge** — `cpms_patient_identity_links` (identity ↔ WP user), written by `PatientIdentityService::link_user()` `:248-280` → `insert_user_link()` `:268-277` (`clear_primary_user_links()` `:267`; duplicate pair rejected `:259-261`; `u_pil_pair` `0019:65`); this is the edge `clinical_access_identity_predicate()` `:266-268` matches on. **Build rule:** `/patient/link-record` writes the binding **and** both edges in one transaction — for a legacy `identity_id IS NULL` record it creates or reuses the identity and calls `link_clinical_record`, then `link_user` unless `user_link_exists`, then inserts or reactivates the binding. Without the user edge the binding is useless (existing selectors still refuse), which is why a binding alone is only `booking`. **Only the link route writes bindings**; the record-creation paths (`PatientService::create` `:370-378` → `create_record` `:379-496`, creation `:437-455`; `activate_identity` `:561-576`; `createByStaff`; reschedule `:1720-1750`) write the clinical edge and **no** binding.
 
-### 2.5 Non-REST surfaces
-`admin_post_*`: 51 occurrences / 46 distinct (`git grep -o "admin_post_[a-z_]*"` over `src`); `wp_ajax_*`: 0; `add_shortcode`: 1
-(`PublicBookingShortcode.php:219`); `template_redirect`: 9 hits — `RuntimeSchemaGate.php:42`, `DoctorPortalShell.php:30,31`,
-`Frontend/ManagementPortalController.php:80`, `ManagementPortalShell.php:64`, `PatientPortalShell.php:50`, `StaffPortalShell.php:194` + 2 comments — **NOT
-PROVEN COMPLETE**. The runtime self-check must enumerate `rest_get_server()->get_routes()` and fail on any route with no level.
+### 2.5 Levels
+Three levels, enumerated route-by-route once in §12. **`booking`** — only for patients with an **active binding** in the request's clinic: hold, confirm, resume, `/appointments/mine`, reschedule-options, the patient branches of reschedule/cancel, the minimal `GET /patient/me`, portal appointments; **no list is ever served without a binding (R7, F8)**. **`full`** adds the two edges: visits, prescriptions, files + stream, `/patient/enroll`, `/patient/my-records`, `POST /patient/link-record`, full `GET` and `PATCH /patient/me`. **Refused writes:** `PATCH /patient/me` for `booking`. Staff branches and staff routes are unchanged. Enforcement is duplicated at the service layer so a direct service call is covered too: `PatientService::me()` `:128`, `updateMe()` `:139`, `linked_records()` `:99-112`, `PatientController.php:52-62`, `NotificationService::inbox()` `:155-184`, `Admin\PatientPortalPage::render()`.
+
+### 2.6 Non-REST surfaces
+`admin_post_*`: 51 occurrences / 46 distinct (`git grep -o "admin_post_[a-z_]*"` over `src`); `wp_ajax_*`: 0; `add_shortcode`: 1 (`PublicBookingShortcode.php:219`); `template_redirect`: 9 hits — `RuntimeSchemaGate.php:42`, `DoctorPortalShell.php:30,31`, `Frontend/ManagementPortalController.php:80`, `ManagementPortalShell.php:64`, `PatientPortalShell.php:50`, `StaffPortalShell.php:194` + 2 comments — **NOT PROVEN COMPLETE**. The runtime self-check must enumerate `rest_get_server()->get_routes()` and fail on any route with no level.
 
 ## 3. Login, transaction depth, cookie
-
-Normalise → limits → verify + atomic consume (`OtpService.php:527-534`), candidate read inside that transaction (`:449` → `:575`). 0 live rows + valid code ⇒
-`202 register_required`, no cookie. **Cookie:** nested `transactional` calls become savepoints (`:279-304`), so issuance needs depth 0 or fails closed
-(neutral 503). **That accessor does not exist** — `tx_depth` is private (`:31`, `:286`, `:316`); P1 adds a read-only one. `remember=false` (today `true`,
-`:595`); 8 h via `auth_cookie_expiration` for patient-only users. **Fresh `verify_mobile` code:** state is keyed by (mobile, **purpose**) (`:232`, `:658-672`)
-with `OtpPolicy::canSend` (`:234`), so no `login` cooldown is inherited; the bound is the per-mobile charge (`:274-275`). INFERENCE: concurrency governed by
-the guard row `:200-211`.
+Normalise → limits → verify + atomic consume (`OtpService.php:527-534`), candidate read inside that transaction (`:449` → `:575`). 0 live rows + valid code ⇒ `202 register_required`, no cookie. **Cookie:** nested `transactional` calls become savepoints (`CpmsDb.php:272-320`: `SAVEPOINT` `:284`, `START TRANSACTION` `:282`, commit/release `:298-304`), so issuance needs depth 0 or fails closed (neutral 503). **That accessor does not exist** — `tx_depth` is private (`CpmsDb.php:31`, `:286`, `:316`); P1 adds a read-only one. `remember=false` (today `true`, `OtpService.php:595`); 8 h via `auth_cookie_expiration` for patient-only users. **Fresh `verify_mobile` code:** state is keyed by (mobile, **purpose**) (`:232`, `:658-672`) with `OtpPolicy::canSend` (`:234`), so no `login` cooldown is inherited; the bound is the per-mobile charge (`:274-275`). INFERENCE: concurrency governed by the guard row `:200-211`.
 
 ## 4. Registration
+`POST /patient/register` — registered only in P7 (§11). Consume a `verify_mobile` OTP (`:39`); create exactly two rows (WP user, random login + unusable password, pattern `ManagementPortalService.php:1551-1558`; one **account** row with `state='pending'`, no binding). **No patient row, no link, no `clinic_id`** — the clinic is unknown (`cpms_appointments.patient_id NOT NULL` `0001:226`). A second registration on a used mobile creates nothing (`u_pl_mobile`, §1) and returns the identical `202`. The queue is this table, **not** `cpms_notifications` (`clinic_id NOT NULL` `0001:634`, purged by `NotifDispatchHandler.php:39-41` → `NotificationRepository::purgeArchived` `:232-242`).
 
-`POST /patient/register` — registered only in P7 (§11). Consume a `verify_mobile` OTP (`:39`); create exactly two rows (WP user, random login + unusable
-password, pattern `ManagementPortalService.php:1551-1558`; one `pending` row with **no binding**). **No patient row, no link, no `clinic_id`** — clinic
-unknown (`cpms_appointments.patient_id NOT NULL` `0001:226`). Collision ⇒ nothing created; identical `202` on every branch. The queue is the login table,
-**not** `cpms_notifications` (`clinic_id NOT NULL` `0001:634`, purged by `NotifDispatchHandler.php:39-41` → `NotificationRepository::purgeArchived`
-`:232-242`).
-
-## 5. First booking (R2, B1-B2)
-
-Zero-link failure chain (OBSERVED `BookingService.php:556-557`, `:3097-3122`, `:3014-3038`, `:567-569`). **(a) Clinic** only from the persisted slot:
-`requireClinician` `:2898-2909` → `clinic_for_persisted_slot` `:2848-2882` at `:519-522`; a body `clinic_id` is never read (`:515-518`). **(b) Names** from
-the **validated request body** (`PatientService::CREATE_FIELDS` `:52-57`, `validate_for_update(..., true)` `:420`); login-row names are never trusted. **(c)
-Edges** — `create` wraps the row and its identity edge in one transaction (`:431-455`); `activate_identity()` `:561-576` →
-`PatientIdentityActivator::activate_for_new_patient()` `:77-107`, which **reuses** a resolvable Organization identity (`:93-94`) via `link_clinical_record`
-(`:101`). **NON-PROOF (§2.3): no `verified_at` row is written, so a first booking yields `booking`, never `full`.** **(d) Collision** — `u_pat_mobile` UNIQUE
-(`0001:82`): create nothing and return the **same generic refusal** as the link route (§6.2). **Disclosure (owner-visible risk):** whoever controls the mobile
-learns this clinic holds a record for it; no timing claim. **(e)** A second hold creates nothing; the login-row lock is taken first (§8); the cap covers
-patient-initiated creation including dependents.
+## 5. Record access is proved, never created by the patient (R5, F6)
+**DECIDED, first release:** patient-side routes **never create a clinical record**. Records are created by reception (`ReceptionPortalController.php:183-188` → `PatientService::create` `:370-400`) and by staff booking (`createByStaff`); every patient-side capability is a *proof over an existing record*. There is therefore **no "new patient" branch and no collision branch**, so a mobile holder cannot learn whether a clinic holds a record for their number: with mobile + OTP and any non-matching NID, every attempt returns one identical envelope whether the record is missing, unprovable, bound to another account, or closed. **Why the branch had to go:** revision 9 refused on a `u_pat_mobile` collision (`0001:82`) but created on a free number, so refusal-vs-success answered "does this clinic know me?" — no refusal can be byte-identical to a successful creation, and creation cannot succeed when a record exists, so the oracle is structural; the only uniform answer is a path that never creates. **Cost, stated:** a person with no record cannot self-serve until reception creates one — **OQ-D8** (§16), not a silent decision. Booking still needs a record (`0001:226`), and `u_pat_mobile` still means one patient per mobile per clinic (§6.8).
 
 ## 6. The two-factor proof and binding
 
 ### 6.1 Owner policy (final, first release)
-All capabilities ship in the **first release**: self-registration, record creation at first booking, pending state with cap 2 per account including
-dependents, dependents/guardian accounts (each extra patient needs its own proof), and link-record two-factor. A patient is authenticated by **both** a mobile
-receiving a valid SMS OTP and a national ID matching the record; in-person approval is **not** a precondition. **M1-M7 (owner-approved):** **M1** the record's
-mobile must equal the OTP mobile; **M2** a record with no national ID is never auto-linked; **M3** linking only in the clinic whose record matches both;
-**M4** limits per account/mobile/IP, **never** on the national ID, which appears only in a request body (never URL, log, audit, rate-limit key, notification,
-exception); **M5** every failure returns the identical status/body/message (no oracle, **no timing claim**); **M6** on success an SMS to that mobile plus one
-audit row with ids/closed codes; **M7** every additional patient needs its own proof. **Six safeguards:** the five threats (§14) plus the squat rule.
+A patient is authenticated by **both** a mobile receiving a valid SMS OTP and a national ID matching the record; in-person approval is **not** a precondition and **not** an alternative (R1). **M1** the record's mobile must equal the OTP mobile; **M2** a record with no NID is never auto-linked; **M3** linking only in the clinic whose record matches both; **M4** limits per account/mobile/IP, **never** on the NID, which appears only in a request body (never URL, log, audit, rate-limit key, notification, exception); **M5** every failure returns the identical status/body/message (no oracle, **no timing claim**); **M6** on success an SMS to that mobile plus one audit row with ids/closed codes; **M7** every additional patient needs its own proof. Pending cap 2 per account including dependents; a parent/guardian account may hold a child's appointments.
 
-### 6.2 Link-record: one clinic per proof (R2, R3)
-`POST /patient/link-record {mobile, code, national_id}` — level `booking`, registered only in the PR that ships the gate. The search runs **only inside the
-single clinic of the current request's scope**: resolve that clinic, consume the OTP and charge the attempt (§6.5), then `SELECT … FROM cpms_patients WHERE
-clinic_id = %d AND mobile = %s AND national_id = %s AND status='active' FOR UPDATE` (§6.4). `u_pat_mobile` (`0001:82`) makes that **at most one row**; no row
-⇒ generic failure. Those three values are the only inputs, so **a match in another clinic is not visible here and cannot produce an "exactly one across
-clinics" failure** — it is a separate proof there, reached by switching scope. One row ⇒ write the binding (§6.3); for a legacy `identity_id IS NULL` row,
-create/reuse the Organization identity and edge in the same transaction (`PatientIdentityActivator.php:77-107`), verified before commit. **Scope transition
-(R3):** `App::replaceExplicitScope()` sets a per-request static only (`ScopeContext.php:19-41`, `App.php:2285-2293`), not `PatientSessionScope`. The marker is
-stamped at OTP cookie issue — `begin_otp_cookie_issue()` `:132-142` arms it and `set_logged_in_cookie` writes `cpms_clinic_id` + the link snapshot
-(`:534-584`) — then read back at `:238-252`, with `require_clinic_matching` `:347-358` throwing on mismatch. **DECIDED:** the OTP login following a proof
-stamps the clinic it proved; an unstamped session with no link resolves `null` (`:261-277`) and **fails closed**. A stamp is only a snapshot and grants
-nothing — the §6.3 binding row is still required.
+### 6.2 Link-record: one clinic per proof, and the bootstrap (R3)
+`POST /patient/link-record {mobile, code, clinic_id, national_id}` — reachable with no binding, registered only in the PR that ships the gate. The search runs **only inside the one clinic resolved for this request**: `SELECT … FROM cpms_patients WHERE clinic_id = %d AND mobile = %s AND national_id = %s AND status='active' FOR UPDATE` (§6.4); `u_pat_mobile` (`0001:82`) makes that **at most one row**, and no row ⇒ generic failure. Those three values are the only inputs, so **a match in another clinic is not visible here** — it is a separate proof there. **Bootstrap, exactly (F3):** a zero-link account has no clinic, so (i) `clinic_id` comes **in the body**, is validated server-side as a live clinic of a live Organization, and is applied as a per-request explicit scope only — `App::replaceExplicitScope()` (`App.php:2285-2293`, `ScopeContext.php:19-41`), never written to the session; (ii) the stamp is written only at the **next** OTP cookie issue (`begin_otp_cookie_issue()` `:132-142` arms it; `record_and_maybe_stamp_cookie_token()` `:534-584` writes `cpms_clinic_id` + the link snapshot) from the account's **active bindings**: exactly one clinic ⇒ that clinic; several ⇒ a supplied `clinic_id` is used **only** if the account is bound there, else nothing is stamped; (iii) with no stamp the resolver falls back to "one distinct linked clinic" and otherwise `null` (`resolve_clinic_id()` `:261-277`), and every clinic-scoped route fails closed. A stamp is a snapshot and grants nothing; a resolved clinic is **not** a binding. `require_clinic_matching()` `:347-358` throws the clinic-name-free error on mismatch.
 
-### 6.3 Verified binding — the only two setters (R1, R5)
-A binding is **one `cpms_patient_logins` row with `verified_at IS NOT NULL`** for a `(wp_user_id, clinic_id, patient_id)` triple, created **only** by (i) §6.2
-two-factor success (`two_factor`) or (ii) reception in-person approval (`reception`: staff capability + explicit patient pick + its own audit row). Every
-record, booking-list, notification and prescription predicate requires that row **in addition to** existing checks (§2.3). Because the row is keyed by
-`clinic_id`, reuse of an Organization identity gives **no** access in a second clinic without that clinic's own proof. **One live account per record per
-clinic (R5):** not enforced today — `u_link_pair (patient_id, wp_user_id)` (`0001:97`) and `u_pil_pair (identity_id, wp_user_id)` (`0019:65`) both include
-`wp_user_id`, so a second account can link the same patient. Enforcement: `SELECT … FOR UPDATE` on `cpms_patients`, a live-binding re-read for `(clinic_id,
-patient_id)`, **generic** refusal if another account holds one. **A unique key inside `cpms_patient_logins` cannot express it:** many unbound rows per patient
-must coexist, and a plain `UNIQUE (clinic_id, patient_id)` would not block a second *bound* row either because MySQL treats NULLs as distinct
-(dev.mysql.com/doc/refman/8.4/en/create-index.html). So lock + recheck, **INFERENCE, not executed**.
+### 6.3 The only setter: verified binding (R1, R2, R6)
+A binding is **one `cpms_patient_logins` row with `kind='binding'`, `state='active'` and non-NULL `verified_at`** for a `(wp_user_id, clinic_id, patient_id)` triple. It is created — and after a sever re-activated — by **exactly one** writer: §6.2 two-factor success. There is **no staff-granted path** (F1), so `verification_method` has one value; reception may **close** a binding, **close** an account and correct record data (§6.9), and no staff action sets `verified_at`. **One live binding per record:** `u_pl_live` (§1) enforces it across accounts at the DB level; the §6.4 patient-row lock plus a live-binding re-read produce the friendly generic failure and remain the fallback if generated columns are unavailable (INFERENCE). A second account cannot bind a record that is already bound — it gets §6.2's generic failure, not a hint. **Account-level facts need their own key**, and `u_pl_account` (§1) provides it; revision 9's "no unique key can express it" is withdrawn for that part. **`booking` vs `full`:** a binding alone is `booking`; `full` additionally needs the two edges of §2.4.
 
 ### 6.4 Concurrency
-`FOR UPDATE` on the candidate patient row, then re-check tenant, `status='active'`, `mobile`, `national_id`; only then write the binding. **Sever** and
-**reception approval** take the **same** row lock, so link, sever and approval serialise on one row. Tests: concurrent NID edit, concurrent sever, competing
-accounts (§15).
+`FOR UPDATE` on the candidate patient row, then re-check tenant, `status='active'`, `mobile`, `national_id`; only then write the binding (`u_pl_live` is the backstop). **Sever** and **restore closure** take the **same** row lock, so proof, sever and restore serialise on one row. Tests: concurrent NID edit, concurrent sever, competing accounts (§15).
 
 ### 6.5 Consume runs at depth zero (R6)
-The OTP consume lives **inside** `verify()`'s transaction (`OtpService.php:449`…`:527-534`) and would roll back with a failed link. The link route therefore
-runs **consume + attempt charge + decision** in a unit that must execute at **transaction depth 0**, checked before it runs; a nested caller **fails closed**
-(neutral 503, no consume). Depth 0 means `CpmsDb::transactional` issues `START TRANSACTION` and a real `COMMIT` (`:279-304`), so **the consume commits before
-any binding row can exist**. Limits: per account, per mobile **across all accounts**, per IP; keys hashed; the NID is never a key; `cpms_rate_limits` already
-exists. Tests T-L8, T-L15. **No schema change** beyond the accessor (§3, P1).
+The OTP consume lives **inside** `verify()`'s transaction (`OtpService.php:449`…`:527-534`) and would roll back with a failed link. The link route therefore runs **consume + attempt charge + decision** in a unit that must execute at **transaction depth 0**, checked before it runs; a nested caller **fails closed** (neutral 503, no consume). Depth 0 means `CpmsDb::transactional` issues `START TRANSACTION` and a real `COMMIT` (`CpmsDb.php:282`, `:298-304`), so **the consume commits before any binding row can exist**. Limits: per account, per mobile **across all accounts**, per IP; keys hashed; the NID is never a key; `cpms_rate_limits` already exists. Tests T-L8, T-L15. No schema change beyond the accessor (§3, P1).
 
-### 6.6 Audit free text — inventory by search term (R7)
-Term `git grep -o "audit->log(\|audit()->log("` over `src`: **108 call sites in 37 files**. Free-text carriers, each re-opened in current `main`:
-`BookingService.php:1057-1070` (patient-typed `reason` via `appointmentView` `:3367-3383`), reschedule `:1732-1755`, no-show `:2058-2069` (`['reason' =>
-$trimmed]` `:2067`), `ClinicalService.php:972-982` (`:980`), `FinanceService.php:647-666` (`:665`) and `:770`, `PatientService.php:472-482` `PATIENT_CREATED`
-via `staffView()` raw names/NID (`:779-795`), plus `MedicalFileService.php:1166`, `HandwritingService.php:731,748,774,810`, `LocationService.php:461`,
-`StaffMessagingService.php:143`, `ClinicalService.php:2070`. `AuditLogger::sanitize()` **does** recurse into arrays (`:253-255`), so a nested `national_id`
-key **is** masked; but masking is exact-key and **case-sensitive** (`MASK_KEYS` `:26`, applied `:249`) while `FORBIDDEN_KEYS` is case-insensitive (`:246`),
-and a `reason` string holding an NID passes through. **P2 rule (owner):** replace these payloads with closed codes, booleans and bounded lengths (the existing
-≤255 `mb_substr` is **not** sanitising); **no regex sanitising of free text**. Historical rows are immutable and **not** rewritten; their contents are
-**UNKNOWN**.
+### 6.6 Audit free text — full census (R4, F5)
+`git grep -o "audit->log(\|audit()->log("` over `src`: **108 call sites in 37 files** (OBSERVED); every site was re-opened. **Carriers of user free text or a NID:** `PatientService.php:472-482` `PATIENT_CREATED` (inside `create_record` `:379-496`) via `staffView()` `:801-813` over `publicView()` `:779-795` — raw `national_id` at **`:787`**; `PatientService.php:161-171` `PATIENT_PROFILE_UPDATED` (patient self-service) and `:521-531` `PATIENT_UPDATED` (staff), both via `diffView()` `:864-875` → the same raw fields incl. the NID when edited; `ClinicalService.php:1597-1610` `SEARCH_EXECUTED` — `q` is the **typed search string** (`:1606`), which can contain an NID; `:435-444` `NOTE_UPDATED` `change_reason`; `:681-689` `PRESCRIPTION_VOIDED` and `:972-981` `CONSULTATION_REOPENED` `reason`; `BookingService.php:1057-1070`, `:1755`, `:1962` via `appointmentView()` `:3367-3383` (patient-typed `reason` `:3382`, patient name `:3394-3396`); `:2058-2069`, `:2209-2216` no-show/cancel `reason`; `VisitService.php:384-387` `after` = the raw visit row incl. free-text `cancel_reason`/`skip_reason` (written `:1296-1309`, projected `:2041-2042`); `FinanceService.php:647-665`, `:754-770` `PAYMENT_VOID`/`PAYMENT_REFUND` `reason`; **`VisitPricingService.php:276-290` `INVOICE_ITEM_CREATE` charge `description` (missing from revision 9), `:330-349` `INVOICE_ITEM_UPDATE` `description` and `note` (before + after), `:379-392` `INVOICE_ITEM_REMOVE` persisted `description`**; `MedicalFileService.php:348-357` `original_filename`; `HandwritingService.php:117-125` document `title`; `LocationService.php:144-157`, `:284-293` name/address/phone; `ClinicProfileService.php:203-219`; `FirstPracticeSetupService.php:269`, `:501` and `OrganizationClinicProvisioningService.php:730` org/clinic name/address; `ClinicianAdminPage.php:682` `full_name`; `CustomRoleManagementService.php:166`, `:219` `display_name`; `Settings.php:374` setting `value`. **Closed-code-only (verified, no free text):** the `FORBIDDEN_ACCESS_ATTEMPT` family (`BookingController.php:490,525,558`, `RestBase.php:85,100`, `ClinicalController.php:308`, `PatientController.php:234`, `RestClinicContext.php:626`, `DoctorPortalController.php:528`, `ClinicalService.php:2062`, `MedicalFileService.php:1158`, `HandwritingService.php:723,739,766,802`), `ClinicalService.php:316` (lengths), `MedicalFileService.php:283-292`, `LocationService.php:461`, `StaffMessagingService.php:143` and `:290-300` (**`body_length` only**, never the body), `PatientIdentityService.php:78`, `:198` (ids), `ReceptionRecoveryService.php:165`, `ExportService.php:156`, `ReportService.php:236`, `BackupService.php:143,239,263,369`. **Pass-through helpers are NOT covered by this list** and stay a residual: `BookingService.php:3466-3483`, `VisitService.php:2151-2166`, `ScheduleService.php:1104-1114`, `ManagementPortalService.php:1462-1479`, `SmsService.php:1248-1259` (`$meta` provenance UNKNOWN), `OtpService.php:701` (masked mobile + `$meta`). **Masking facts:** `AuditLogger::sanitize()` **does** recurse into arrays (`:253-255`), so a nested `national_id` key **is** masked; but masking is exact-key and **case-sensitive** (`MASK_KEYS` `:26`, applied `:249`) while `FORBIDDEN_KEYS` is case-insensitive (`:24`, applied `:246`), and a `reason`/`q`/`description` **string** holding an NID passes straight through. **P2 rule (owner):** replace these payloads with closed codes, booleans and bounded lengths (the ≤255 `mb_substr` is **not** sanitising); **no regex sanitising of free text**; the search term is logged as a boolean/count, never as text. Historical rows are immutable and **not** rewritten; their contents are **UNKNOWN**.
 
 ### 6.7 Notifications, per verified binding (R4)
-For `pending`, no-row, revoked and **unbound** `active` accounts every notification read **and** write endpoint returns one fixed empty envelope with a
-**constant ETag**, computed **before** any `lastId`/ETag/304 work: `GET /notifications` `NotificationsController.php:34-49` (guard `:42-43`); `POST
-/notifications/read` `:51-71` (`:64-65`); `GET /rt/notifications` `:74-85` (`:78-79`) — gated **before** `lastId` `:104`, the 304 branch `:106-111` and
-`since()` `:113`. When the account **is** bound, the payload is filtered to patients with a binding for the request's clinic:
-`NotificationService::active_linked_patient_ids_in_clinic()` `:465-477` collects every booking-linked patient in the clinic (`:470-477`) and must intersect
-the binding set for **inbox, cursor, counts and writes**. §12 states the same. Test: `If-None-Match` + real ETag ⇒ fixed envelope.
+For `pending`, no-row, closed and **unbound** `active` accounts every notification read **and** write endpoint returns one fixed empty envelope with a **constant ETag**, computed **before** any `lastId`/ETag/304 work: `GET /notifications` `NotificationsController.php:34-49` (guard `:42-43`); `POST /notifications/read` `:51-71` (`:64-65`); `GET /rt/notifications` `:74-85` (`:78-79`) — gated **before** `lastId` `:104`, the 304 branch `:106-111` and `since()` `:113`. When the account **is** bound, the payload is filtered to patients with a binding for the request's clinic: `NotificationService::active_linked_patient_ids_in_clinic()` `:465-477` must intersect the binding set for **inbox, cursor, counts and writes**. §12 states the same. Test: `If-None-Match` + real ETag ⇒ fixed envelope.
 
 ### 6.8 Shared mobile — DECIDED: one patient per mobile per clinic
-`u_pat_mobile` UNIQUE (`0001:82`) and `mobile NOT NULL` (`0001:60`): a shared number serves **one patient per clinic** in the first release, **no schema
-change**; the others use reception. Identities carry a non-unique `normalized_mobile` (`0019:44-53`) and no NID (`0018:27-36`), so the matcher cannot run at
-Organization level. Several patients per mobile in one clinic is a **next-version** item (§18).
+`u_pat_mobile` UNIQUE (`0001:82`) and `mobile NOT NULL` (`0001:60`): a shared number serves **one patient per clinic** in the first release, **no schema change**. One account per mobile (`u_pl_mobile`, §1) means a second person on that number cannot register; the others use reception, and **no code path can merge two people because a mobile is shared**. Identities carry a non-unique `normalized_mobile` (`0019:36-51`, deliberately not UNIQUE `:10`) and no NID (`0018:27-36`), so the matcher cannot run at Organization level. Several patients per mobile in one clinic is a **next-version** item (§18).
 
-### 6.9 Staff fallback and sever
-Reception creates via `ReceptionPortalController.php:183-188` → `PatientService::create` `:370-400`, can set a checked national ID, and can **approve a
-binding** — the second and last setter (§6.3) — under the §6.3/§6.4 patient-row lock. **Sever** deletes the binding row (optionally the login row) + audit,
-takes the same lock, and destroys patient sessions (`WP_Session_Tokens::destroy_all`). Reception views use `searchView` `:245-257`, `:831-844` →
-`to_search_view` `:823-825`; add `login_state`; no NID beyond the existing mask. **"Pending registrants must first visit reception" is removed** — a `pending`
-account proves itself through §6.2.
+### 6.9 Staff actions: sever, close, correct — never grant (R1, F2)
+Reception creates records via `ReceptionPortalController.php:183-188` → `PatientService::create` `:370-400`, can set a checked NID, and can **correct** record data. It can **sever**: `UPDATE … SET state='closed'` on the binding row + one audit row + patient sessions destroyed (`WP_Session_Tokens::destroy_all`) — **a state change, never a DELETE, and never a change to the account row or to `wp_users`**. It can **close** an account (account row `state='closed'`, sessions destroyed); the WP user and its password hash stay. **Closing never deletes an account** (F4). Reception search returns `searchView()` `:831-844` — masked NID (`:839`) — via `search()` `:245-257` and `to_search_view()` `:823-825`; add `login_state`. **OBSERVED:** `get()` `:264-273` returns `staffView()` with the **raw** NID to authenticated staff of the same clinic; that is existing, staff-authorised behaviour and this design does not widen or narrow it. **"Pending registrants must first visit reception" is removed** — a `pending` account proves itself through §6.2.
 
 ## 7. Lifecycle
 
 ### 7.1 Table existence
-`App::is_runtime_blocked_by_pending_schema()` `App.php:622-639` returns `false` for a supported engine (`:626-628`) and for unreadable evidence (`:630-634`) —
-it reports **pending migrations**, not a missing table. The gate does its own cached-per-request existence check and fails closed (`none` + neutral refusal).
+`App::is_runtime_blocked_by_pending_schema()` `App.php:622-639` returns `false` for a supported engine (`:626-628`) and for unreadable evidence (`:630-634`) — it reports **pending migrations**, not a missing table. The gate does its own cached-per-request existence check and fails closed (`none` + neutral refusal).
 
 ### 7.2 Restore barrier
-The dump set is `SHOW TABLES LIKE '{prefix}cpms_%'` (`BackupSqlDumper.php:113-126`, `dbPrefix()` `:85-88`), so the **option** `cpms_restore_barrier` is
-outside it and survives a restore. Set before the restore; while set every patient level is `none`. **UNKNOWN:** `restoreApply` `:324-390` has **no** pre-drop
-hook — the build PR must add one with a kill-between-drop-and-recreate test.
+The dump set is `SHOW TABLES LIKE '{prefix}cpms_%'` (`BackupSqlDumper.php:113-126`, pattern `:118`, `dbPrefix()` `:116`), so an **option** (proposed `cpms_restore_barrier`) is outside it and survives a restore. **OBSERVED: no such option exists in this tree today** — it is a P1 deliverable. Set before the restore; while set every patient level is `none`. **UNKNOWN:** `restoreApply` `:324-390` has **no** pre-drop hook — the build PR must add one with a kill-between-drop-and-recreate test.
 
-### 7.3 Restore closes every binding (R10)
-Clearing the barrier is one manager action that destroys patient-only sessions, writes one audit row, and **deletes every restored binding row** — no restored
-binding is trusted, so every account returns to `booking` and needs a fresh §6.2 proof or individual reception approval. A restored revoked account cannot
-silently regain access. This is the PR #358 decision D-B coordinate; that PR and `docs/architecture/backup-restore-design.md` **do not exist in this tree at
-`c9771403`**, so the requirement is recorded here and not claimed as met.
+### 7.3 Restore closes every binding (R2, F4)
+Clearing the barrier is one manager action that destroys patient-only sessions, writes one audit row, and sets **`state='closed'` on every binding row of the restored data** — no restored binding is trusted, so every account falls back to `none` on record routes and needs a fresh §6.2 proof. **Accounts, account rows and password hashes are kept; nothing is deleted.** This matches the restore rule, taken read-only from `docs/architecture/backup-restore-design.md` in branch `arena/f52cec7c-doctor` at `efa0e214495b198a3a60243126212b4625e296c6`: after a restore EVERY restored binding is closed and grants nothing, user accounts and password hashes are kept, and the patient must prove **both** factors again; closing never deletes an account, and a restored closed binding cannot silently regain access. **Note:** that branch's file does **not** exist in this tree at `c9771403`, so the requirement is recorded here and not claimed as met.
 
 ### 7.4 Backups and uninstall
-Backups already contain every patient NID from `cpms_patients.national_id`; **encrypting the backup is a requirement of the backup work (PR #358 D-B), not a
-fact of this tree** (UNKNOWN/LIMITATION, §7.3). The 14-day scrub limits the live window only. **Uninstall (`uninstall.php:8-20`):** unset ⇒ `return` at
-`:9-11`, nothing deleted, login rows and bindings survive a reinstall; set ⇒ every `{prefix}cpms_%` table dropped (`:15-18`) plus two options (`:19-20`), so
-login rows, bindings and identities are destroyed, **patient sessions are not explicitly destroyed** (LIMITATION — the build must add it), and patient
-`wp_users` are **not** deleted.
+Backups already contain every patient NID from `cpms_patients.national_id`; **encrypting the backup is a requirement of the backup work, not a fact of this tree** (UNKNOWN/LIMITATION). The 14-day scrub limits the live window only. **Uninstall (`uninstall.php:8-20`):** unset ⇒ `return` at `:9-11`, nothing deleted, account and binding rows survive a reinstall; set ⇒ every `{prefix}cpms_%` table dropped (`:15-18`) plus two options (`:19-20`), so login rows, bindings and identities are destroyed, **patient sessions are not explicitly destroyed** (LIMITATION — the build must add it), and patient `wp_users` are **not** deleted.
 
 ### 7.5 Retention
-Live rows are deleted only by revocation. At decision: names and NID → NULL. At 14 days a still-unbound row is scrubbed and deleted, its WP user only when it
-has no link and no appointment. Sweep host: a **new** `cleanup.patient_logins` job (`App::RECURRING_JOBS` `:2616-2635`; existing `cleanup.*` `:2625-2628` each
-own another table, `OtpCleanupHandler.php:22-25` only `cpms_otp_tokens`). A stalled sweep is a residual (§16).
+Revoking a **binding** is a state change, so no proved row is deleted in the first release; names → NULL at closure. A `pending` account row that never proved anything is different: at 14 days it is scrubbed (names → NULL) and **deleted** — retention of an unverified registration, explicitly **not** the closure of an account (§7.3) — together with its WP user only when that user has no link and no appointment, so the mobile is freed and the person may register again. A **closed** account row is terminal for access (§12) and is not deleted. Sweep host: a **new** `cleanup.patient_logins` job (`App::RECURRING_JOBS` `:2616-2635`; existing `cleanup.*` `:2625-2628` each own another table, `OtpCleanupHandler.php:22-25` only `cpms_otp_tokens`). A stalled sweep is a residual (§16).
 
-## 8. Cap and lock order (R8)
-
-Cap = 2 active appointments per account (DECIDED), counted across all patients linked to the account by joining `cpms_patient_user_links` (never
-`cpms_appointments.wp_user_id`, `0001:230`, which `createByStaff` `:1935-1954` does not populate). The locking read runs in the **outermost** transaction:
-login row `FOR UPDATE` → `COUNT(*)` of future non-cancelled appointments. Depth guard: fail closed if nested (§6.5). **Staff bookings are exempt.**
-**Reschedule inserts a row (R8, correcting revision 8):** `reschedule()` calls `appointments->create()` `BookingService.php:1720-1741` — replacement,
-`status='confirmed'`, `rescheduled_from` set (`:1735`) — and only then `updateStatus()` on the source (`:1743-1750`). The source leaves the active set and the
-**replacement enters it**, so (i) a pending account's reschedule **consumes cap capacity**, counted as **one** by excluding rows with a non-NULL
-`rescheduled_to` (`:1747`); (ii) reschedule **does** take the login lock — revision 8 said otherwise and was wrong. **Lock order:** patient hold/confirm login
-→ Organization → Clinic → Slot → Location (`:1881-1886`, `:2750-2790`); reschedule appointment-first (`:1568-1574`); `createByStaff` tenant→Slot→Location
-(`:1805-1935`). The only new edge is "login before tenant prefix" ⇒ no cycle (INFERENCE).
+## 8. Cap and lock order
+Cap = 2 active appointments per account (DECIDED), counted across all patients with an **active binding** on the account (never `cpms_appointments.wp_user_id` `0001:230`, which `createByStaff` `:1935-1954` does not populate). The locking read runs in the **outermost** transaction: account row `FOR UPDATE` → `COUNT(*)` of future non-cancelled appointments. Depth guard: fail closed if nested (§6.5). **Staff bookings are exempt. Reschedule replaces the row:** `reschedule()` calls `appointments->create()` `BookingService.php:1720-1741` — replacement, `status='confirmed'`, `rescheduled_from` set (`:1735`) — and only then `updateStatus()` on the source (`:1743-1750`). The source leaves the active set and the **replacement enters it**, so a reschedule **consumes cap capacity**, counted as **one** by excluding rows with a non-NULL `rescheduled_to` (`:1747`); reschedule **does** take the account lock. **Lock order:** account row → Organization → Clinic → Slot → Location (`:1881-1886`, `:2750-2790`); reschedule appointment-first (`:1568-1574`); `createByStaff` tenant→Slot→Location (`:1805-1935`). The only new edge is "account row before tenant prefix" ⇒ no cycle (INFERENCE).
 
 ## 9. Abuse limits
-
-`Settings::DEFAULTS` (`Settings.php:28-40`) are configurable defaults (`get()` `:207`), not ceilings. Per mobile 3/day, 10/hour, 60 s cooldown, 900 s lockout
-after 5 bad codes; `/otp/request` per IP 10/hour; `/otp/verify` per IP 20/3600 hard-coded (`OtpService.php:392`). `/patient/register` needs a consumed OTP
-plus hashed buckets. `/patient/link-record`: per account, per mobile across all accounts, per IP (§6.5). Existing debt not copied: `OtpService` keys
-`otp-day:`/`otp-hour:` on the **raw** mobile (`:274-275`, `:622-629`).
+`Settings::DEFAULTS` (`Settings.php:28-40`) are configurable defaults (`get()` `:207`), not ceilings. Per mobile 3/day, 10/hour, 60 s cooldown, 900 s lockout after 5 bad codes; `/otp/request` per IP 10/hour; `/otp/verify` per IP 20/3600 hard-coded (`OtpService.php:392`). `/patient/register` needs a consumed OTP plus hashed buckets. `/patient/link-record`: per account, per mobile across all accounts, per IP (§6.5). The NID is never a key (M4). Existing debt not copied: `OtpService` keys `otp-day:`/`otp-hour:` on the **raw** mobile (`:274-275`, `:622-629`).
 
 ## 10. Dependents
-
-Several patients per account already work (`linkedActivePatientsForClinic` `BookingService.php:3057-3063`); `>1` link makes the hold refuse to guess (`:3121`) with an optional `patient_id` (`BookingController.php:90`) validated by `assert_requested_patient_owned_by_caller` `:3131-3153`. Dependents are **in** the first release. **OQ-D1** — a dependent sharing the guardian's mobile in the same clinic — stays a **LIMITATION**: one patient per mobile per clinic (§6.8). A guardian's proof never inherits; each dependent needs its own (M7). `pending` accounts create no dependents; the cap counts parent + dependents; per-link access; no age limit; never merged with a walk-in. Negative test §15 T-L13.
+Several patients per account work because bindings are many (§1): `linkedActivePatientsForClinic` `BookingService.php:3057-3063`; `>1` link makes the hold refuse to guess (`:3121`) with an optional `patient_id` (`BookingController.php:90`) validated by `assert_requested_patient_owned_by_caller` `:3131-3153`. Dependents are **in** the first release: the dependent's record is created by reception (§5) and proved with **the dependent's own mobile + NID** (M7) — a guardian's proof never inherits. **OQ-D1** — a dependent sharing the guardian's mobile in the same clinic — stays a **LIMITATION** (§6.8, §1). `pending` accounts hold no binding; the cap counts the account's bound patients; per-binding access; no age limit; never merged with a walk-in. Negative test §15 T-L13.
 
 ## 11. Rollout
 
 | PR | Contents | Binding settable? | Record access |
 |---|---|---|---|
-| **P1** | table `cpms_patient_logins` (+ binding columns), existence check, restore barrier + hook, **public tx-depth accessor**, uninstall session destruction | no | no |
+| **P1** | table `cpms_patient_logins`, existence check, restore barrier + pre-drop hook, **public tx-depth accessor**, uninstall session destruction | no | no |
 | **P2** | audit redaction (§6.6) | no | no |
 | **P3** | gate on **all** routes by actor branch + service-layer checks + runtime-registry test + `:261-269` predicate replacement (§2.3) | no | **no** |
-| **P4** | SMS login issuance (cookie at depth 0) + clinic stamping (§6.2) | no | no |
-| **P5** | cap + first-booking **creation only** (§5) | no | no |
-| **P6** | **binding**: `/patient/link-record` + reception approval + sever (§6.2-6.5, §6.9) | **yes** | **yes**, per binding |
-| **P7** | public `/patient/register` | yes | per binding |
+| **P4** | SMS login issuance (cookie at depth 0) + clinic stamping and its bootstrap (§6.2) | no | no |
+| **P5** | cap enforcement (§8) and lock order; **no record creation** (records exist via reception, §5) | no | no |
+| **P6** | **binding**: `/patient/link-record` (both edges, §2.4) + sever/close (§6.2-6.5, §6.9) | **yes** | **yes**, per binding |
+| **P7** | public `/patient/register` + pending queue | yes | per binding |
 | **P8-P10** | UI journeys (incl. dependents, M7), browser lanes, acceptance evidence | yes | per binding |
 
-**Invariants:** sessions (`P4`) and registration (`P7`) both come **after** the gate (`P3`); no binding before `P6`; no `pending` row before `P7`. "Attach SMS
-login" ships inside the gate PR. Minutes (INFERENCE incl. review): P1 110 · P2 60 · P3 260 · P4 100 · P5 180 · P6 260 · P7 150 · P8 200 · P9 120 ⇒ **≈1 440
-implementation + 800–950 review ≈ 2 250–2 400**.
+**Invariants:** sessions (`P4`) and registration (`P7`) both come **after** the gate (`P3`); no binding before `P6`; no `pending` row before `P7`; only `P6` writes `verified_at`. "Attach SMS login" ships inside the gate PR. Minutes (INFERENCE incl. review): P1 110 · P2 60 · P3 260 · P4 100 · P5 120 · P6 280 · P7 150 · P8 200 · P9 120 ⇒ **≈1 400 implementation + 800–950 review ≈ 2 200–2 350**.
 
 ## 12. State matrix
+`✗` refused · `—` not routed · `✓` allowed; `booking` = active binding **without** the two edges of §2.4. This is the route enumeration §2.5 refers to.
 
-`✗` refused · `—` not routed · `✓` allowed; `booking` = live row, **no binding**. This is the route enumeration §2.4 refers to.
-
-| Route / branch | no row | pending | active unbound | active bound | deleted | password-only | staff | anon |
+| Route / branch | no row | pending | active unbound | active bound | closed | password-only | staff | anon |
 |---|---|---|---|---|---|---|---|---|
-| `/booking/hold` | ✗ | ✓ + create | ✓ | ✓ | ✗ | ✗ | — | ✗ |
-| `/booking/confirm` | ✗ | ✓ cap | ✓ cap | ✓ cap | ✗ | ✗ | — | ✗ |
-| `/booking/resume`, `/appointments/mine`, `…/reschedule-options` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | — | ✗ |
-| `…/reschedule`, `…/cancel` | ✗ | ✓ cap | ✓ cap | ✓ cap | ✗ | ✗ | staff branch | ✗ |
+| `/booking/hold`, `/booking/confirm`, `/booking/resume` | ✗ | ✗ proof | ✗ proof | ✓ bound patient | ✗ | ✗ | — | ✗ |
+| `/appointments/mine`, `…/reschedule-options` | ✗ | ✗ proof | ✗ proof | ✓ bound patient | ✗ | ✗ | — | ✗ |
+| `…/reschedule`, `…/cancel` | ✗ | ✗ proof | ✗ proof | ✓ bound patient | ✗ | ✗ | staff branch | ✗ |
 | `GET /patient/me` | ✗ | minimal | minimal | full | ✗ | ✗ | — | ✗ |
-| `PATCH /patient/me` | ✗ | ✗ | ✗ 403 | ✓ | ✗ | ✗ | — | ✗ |
-| `POST /patient/link-record` | ✗ | ✓ own proof | ✓ own proof | ✓ idempotent | ✗ | ✗ | ✗ | ✗ |
-| `/patient/enroll`, `/patient/my-records`, `/visits*`, `/prescriptions` | ✗ | ✗ 403 | ✗ 403 | ✓ | ✗ | ✗ | staff path | ✗ |
-| `/patients/{id}/files`, `/files/{id}/stream` | ✗ | ✗ 403 | ✗ 403 | ✓ own | ✗ | ✗ | `MedicalFileService:219-250` | ✗ |
-| `/notifications`, `/notifications/read`, `/rt/notifications` | ✗ | fixed empty | fixed empty | ✓ bound only | ✗ | ✗ | staff branch | ✗ |
-| portal render | ✗ | appointments | appointments | full | ✗ | ✗ | — | ✗ 403 |
-| `/patient/register` (P7+) | ✓ 202 | ✓ 202 | ✓ 202 | ✓ 202 | ✓ 202 | ✓ 202 | ✗ | ✓ 202 |
+| `PATCH /patient/me` | ✗ | ✗ | ✗ | ✓ `full` only | ✗ | ✗ | — | ✗ |
+| `POST /patient/link-record` | ✗ | ✓ own proof | ✓ own proof | ✓ idempotent | ✗ closed | ✗ | ✗ | ✗ |
+| `/patient/enroll`, `/patient/my-records`, `/visits*`, `/prescriptions` | ✗ | ✗ 403 | ✗ 403 | ✓ `full` | ✗ | ✗ | staff path | ✗ |
+| `/patients/{id}/files`, `/files/{id}/stream` | ✗ | ✗ 403 | ✗ 403 | ✓ own `full` | ✗ | ✗ | `MedicalFileService::stream()` `:206-262` | ✗ |
+| `/notifications`, `/notifications/read`, `/rt/notifications` | ✗ | fixed empty | fixed empty | ✓ bound only | fixed empty | ✗ | staff branch | ✗ |
+| portal render | ✗ | nothing | nothing | appointments / full | ✗ | ✗ | — | ✗ 403 |
+| `/patient/register` (P7+) | ✓ 202 | ✓ 202 | ✓ 202 | ✓ 202 | ✓ 202 (same `202`, nothing created) | ✓ 202 | ✗ | ✓ 202 |
 
-**The only cell that matters: `active unbound` reaches no record route and no notification endpoint** — a fixed empty envelope, never a 304. **Login oracle**
-(`/otp/request` always sends, 200): unknown mobile + valid code ⇒ `202 register_required`, no cookie; live row ⇒ 200 + cookie, still only `booking` unless
-bound; staff/ineligible or wrong code ⇒ the generic invalid-code envelope. `register_required` is distinguishable only to a caller who has proved possession
-of that mobile (owner-permitted); record access is never signalled at login — the point of R1.
+**The cells that matter: `active unbound` reaches no booking route, no record route and no notification endpoint** (one fixed empty envelope, never a 304) — R7/F8. **Login oracle** (`/otp/request` always sends, 200): unknown mobile + valid code ⇒ `202 register_required`, no cookie; live row ⇒ 200 + cookie, still only what the binding allows; staff or wrong code ⇒ the generic invalid-code envelope. `register_required` is distinguishable only to a caller who has proved possession of that mobile (owner-permitted); record access **and record existence** are never signalled (§5).
 
-## 13. Self-audit (Phase 2 of revision 9)
-
-- **(a) Leak paths.** The revision-8 blocker — first booking creating the rows that *were* the binding — is
-closed: the binding is a `cpms_patient_logins` row with `verified_at`, written only by §6.3's two setters. Checked every writer that can touch a patient row:
-`PatientService::create` `:431-455`, `activate_identity` `:561-576`, `PatientIdentityActivator` `:77-107` (reuse at `:93`),
-`PatientIdentityService::link_user` `:248-280`, `link_clinical_record` (`:101`), reschedule `:1720-1750`, `createByStaff` `:1935-1954` — **none** writes
-`cpms_patient_logins`. Wrong clinic: the query is `WHERE clinic_id = <scope>` (§6.2). Wrong patient: `u_pat_mobile` makes it one row. Notifications: gated
-pre-ETag, intersected with the binding set (§6.7).
-- **(b) False file:line.** All re-opened with `git show origin/main:` at `c9771403`; corrections this revision:
-§2.3 predicates, §6.5 depth facts, §6.6 inventory, §8 reschedule, `AuditLogger` recursion and case.
-- **(c)-(e) Ordering, buildability, claim words.** Gate P3 < sessions P4 < binding P6 < registration P7 (§11);
-no STOP item, the binding fits the approved table and P1 adds the accessor; `only`/`never`/`cannot` are traced to the cited line, `template_redirect` stays
-**NOT PROVEN COMPLETE**, and the one-clinic search is a property of the query, not of the data.
+## 13. Self-audit (Phase 2 of revision 10)
+- **(a) Leak paths (F1-F6).** Bindings have one writer: `PatientService::create_record` `:379-496` (creation `:437-455`), `activate_identity` `:561-576`, `PatientIdentityActivator` `:77-107` (reuse `:93-94`), `PatientIdentityService::link_user` `:248-280`, `link_clinical_record` (`:101`), reschedule `:1720-1750`, `createByStaff` `:1935-1954` — **none** writes `cpms_patient_logins`; only §6.2 two-factor success sets a binding, and only sever/restore change its `state` to `closed`. Wrong clinic: the query is `WHERE clinic_id = <request clinic>` (§6.2) and the stamp grants nothing. Wrong patient: `u_pat_mobile` makes it one row. Cross-account: `u_pl_live` (§1). Existence: no patient-side creation, no collision branch (§5). Notifications: gated pre-ETag, intersected with the binding set (§6.7). Sever/restore close rows; no path deletes an account (§6.9, §7.3).
+- **(b) False file:line (F9).** All re-opened with `git show origin/main:` at `c9771403`. Corrected: `PatientRepository` `:140-157` (boolean check, not a selector); `PatientService::publicView` `:779-795` (raw NID `:787`) vs `staffView` `:801-813`; `PatientIdentityService::link_user` `:248-280`; `0019` mobile column/index `:36-51`; `BackupSqlDumper` `:113-126`/`:116`/`:118`; `CpmsDb` savepoint and commit `:272-320`; `ReceptionPortalController` path (`src/Rest/`); `PatientService::search()` `:245-257` and `get()` `:264-273` (raw NID to staff) instead of a single `:245-272`; `create()` `:370-378` vs `create_record()` `:379-496`; `ScheduleService::audit()` `:1104-1114`; `ManagementPortalService::audit_change()` `:1462-1479`. **Withdrawn:** the claim that `UNIQUE (clinic_id, patient_id)` cannot block two bound rows, and the claim that reception approval may set a binding.
+- **(c)-(e) Ordering, buildability, claim words.** Gate P3 < sessions P4 < binding P6 < registration P7 (§11 table order and invariants line); the binding fits the approved table; P1 adds the depth accessor; `only`/`never`/`cannot` are traced to the cited line; `template_redirect` stays **NOT PROVEN COMPLETE**; the one-clinic search is a property of the query, not of the data. Two owner decisions are open (OQ-D8, OQ-D9) and one schema question is a STOP (§16) — none is silently assumed above.
 
 ## 14. Security: threats
 
 | Threat | Mitigation | Residual (accepted) |
 |---|---|---|
-| **Recycled number** | NID must also match (M1/M3) | New subscriber who also knows the old owner's NID can link; reception severs |
-| **SIM swap/theft** | NID still required; mismatch links nothing | M6's SMS goes to the attacker's number — a weak warning only |
+| **Recycled number** | NID must also match (M1/M3); one account per mobile (§1) | New subscriber who also knows the old owner's NID can link; reception severs, and the old account keeps the mobile until reception corrects it (LIMITATION) |
+| **SIM swap/theft** | NID still required; mismatch links nothing; no creation branch to probe | M6's SMS goes to the attacker's number — a weak warning only |
 | **NID known to relatives/documents** | Mobile possession still required | A relative with both can link — the authority documents already give |
 | **NID brute force after SIM compromise** | Limits per account/mobile/IP, never the NID (M4); identical failures (M5) | Bounded only by configurable `Settings` (§9); windows UNKNOWN |
+| **Record-existence probing** | No patient-side creation, no collision branch, one envelope for every non-matching attempt (§5) | An account holding a valid binding already knows its own record exists |
 | **Squatting a national ID** | `u_pat_nid (clinic_id, national_id)` UNIQUE (`0001:83`) + `assert_unique_national_id` (`PatientService.php:850-857`) | A squat **can** block the real patient in that clinic and M2 refuses auto-link; resolution is manual and audited |
 
 ## 15. Tests
 
 | # | Case | Expected |
 |---|---|---|
-| T-L1 | matching mobile + NID in the scoped clinic | binding written, `full` next request, M6 SMS without NID, audit ids only |
-| T-L2 | wrong NID | no binding, identical envelope to T-L3/T-L4 |
+| T-L1 | matching mobile + NID in the scoped clinic | binding `active` + both edges (§2.4), `full` next request, M6 SMS without NID, audit ids only |
+| T-L2 | wrong NID | no binding, envelope byte-identical to T-L3/T-L4/T-L17 |
 | T-L3/T-L4 | NID right but record mobile ≠ OTP mobile (M1); record has no NID (M2) | no binding, identical envelope |
-| T-L5 | same mobile, two clinics | each proof binds only in its clinic; **no cross-clinic "exactly one" failure** |
-| T-L6 | `active unbound` hits every record route + 3 notification endpoints | 403 / fixed empty; `If-None-Match` with a real ETag ⇒ fixed envelope, no 304 |
+| T-L5 | same mobile, two clinics | each proof binds only in its clinic; two binding rows on one account; **no cross-clinic "exactly one" failure** |
+| T-L6 | `active unbound` hits every record **and booking** route + 3 notification endpoints | 403 / fixed empty; `If-None-Match` with a real ETag ⇒ fixed envelope, no 304 |
 | T-L7 | limits: per account, per mobile across accounts, per IP | identical envelope; keys hashed; no NID in `cpms_rate_limits` |
 | T-L8 | failed link | OTP **not** restored, counters **not** reset (§6.5) |
-| T-L9 | concurrent NID edit; concurrent sever; competing accounts | one outcome, no orphan binding, generic refusal |
+| T-L9 | concurrent NID edit; concurrent sever; two accounts racing one record | one outcome, `u_pl_live` holds, generic refusal, no orphan binding |
 | T-L10 | audit payloads after success/failure | no NID, no mobile, no name, no free text |
-| T-L11 | reception sever | access drops to `booking`, sessions destroyed, audit row |
+| T-L11 | reception sever | bindings `closed`, account row intact, `wp_users` intact, sessions destroyed, audit row |
 | T-L12 | pending account self-proves | succeeds without visiting reception (§6.9) |
 | T-L13 | dependent with a distinct mobile; guardian proof | own proof required (M7); guardian's proof never inherits |
-| T-L14 | restore then re-establish (§7.3) | before proof `booking`; after proof `full`; restored bindings deleted |
+| T-L14 | restore then re-establish (§7.3) | every binding `closed` and grantless; accounts + password hashes kept; `full` again only after proof |
 | T-L15 | link called from inside a transaction (§6.5) | fails closed, no consume, no binding |
-| T-L16 | first booking / registration / identity reuse | **no** `verified_at` row appears (§2.3) |
+| T-L16 | reception/booking/registration/reschedule/identity reuse | **no** `verified_at` row appears anywhere (§6.3) |
+| T-L17 | a mobile with an unprovable existing record, then a mobile with none | **identical** envelope, **no** record created (§5) |
+| T-L18 | cap with dependents: 3 bound patients, 2 future appointments | third appointment refused, counted across patients (§8) |
+| T-L19 | password-only and closed accounts | password login grants no binding; a closed account cannot re-bind without a new proof |
 
 ## 16. Weakest points, open decisions, STOP items
+**Weakest:** `u_pl_mobile` fixes one account per mobile for ever (recycled numbers need reception, §1/§14); the generated-column keys are **INFERENCE** (unexecuted engine behaviour) with the §6.4 lock as fallback; the NID is not a secret and a squat blocks a real patient's NID while M2 refuses auto-link; `restoreApply` has no pre-drop hook, `uninstall.php` does not destroy sessions, the sweep has no host, and `identity_id IS NULL` rows stay readable by legacy predicates until P3 lands (DEBT).
 
-**Weakest:** no unique key can enforce one live account per patient, so lock + recheck is INFERENCE (§6.3); the depth-0 rule needs a `CpmsDb` accessor that does not exist yet (§3); NID is not a secret and a squat blocks a real patient's NID while M2 refuses auto-link; plaintext pending NID is live **and in backups**, whose encryption is only a requirement of absent work (§7.3/§7.4); `restoreApply` has no pre-drop hook, `uninstall.php` does not destroy sessions, the 14-day sweep has no host, and `identity_id IS NULL` rows stay readable by legacy predicates until P3 lands (DEBT).
+**OQ-D8 — how does a clinical record come into existence in the first release?** (from F6; **no schema change**) **(A) reception-only creation [RECOMMENDED]**: no oracle at all, because a non-matching attempt is identical whether a record exists or not; cost: a person without a record cannot self-serve booking. **(B) patient-side creation at first booking**: keeps self-service, but a mobile holder can distinguish "record exists" from "no record" — a record-existence disclosure no uniform error can remove; needs written owner acceptance plus rate limits and an SMS notice on every creation. **(C) in-person issued creation code**: closes the oracle and keeps self-service, but needs the OTP `purpose` ENUM to gain a value (`0001:119`) = schema change ⇒ **S1**. Recommendation: **(A)** now.
 
-**Open:** **OQ-D1** dependent sharing the guardian's mobile (LIMITATION, §10) · **OQ-D2** stalled-sweep warning · **OQ-D3** per-account vs per-link cap (per link assumed) · **OQ-D4** "attach login" mandatory forever · **OQ-D5 closed** · **OQ-D6 DECIDED** (§6.8) · **OQ-D7 closed by deletion** (§6.2).
+**OQ-D9 — a record with no national ID can never be auto-linked (M2).** **(A) accept [RECOMMENDED]**: that patient keeps in-person service and gets no digital record access; reception may correct the record's data, never grant. **(B) a staff-granted binding**: it fits the approved table (`verification_method` value only, no new column) but **breaks the owner rule that every access-granting setter needs both proofs**, and needs a consent artefact plus an audit trail; risk: a staff member becomes an access authority. Recommendation: **(A)** now; (B) only as a separate owner decision with a signed-consent design.
 
-**STOP / UNKNOWN:** **none blocking the first release.** No schema beyond `cpms_patient_logins` is required; a binding column on `cpms_patient_user_links` later would be **"STOP - needs owner decision: schema"**, not to be designed around.
+**STOP items:** **S1 — "STOPPED - OWNER DECISION NEEDED: schema".** Question: may `cpms_otp_tokens.purpose` (`0001:119`, `ENUM('login','verify_mobile')`) gain a third value `record_create` for OQ-D8 option (C)? Options: add the value, or keep two values. Recommendation: **do not add now** — the first release is OQ-D8 (A). Pros of adding: closes the oracle and keeps self-service. Cons: a schema change beyond the approved table, one more enum value to maintain, stale codes must expire. Risk: a new issuer path for codes that create records. **No other schema is required**: a binding column on `cpms_patient_user_links` later would be **"STOP - needs owner decision: schema"**, not to be designed around.
 
-## 17. What revision 9 changed
-
-The binding moved into the approved table with two setters only (R1); one-clinic search and the scope/stamp mechanism (R2/R3); gating before ETag with binding-filtered payloads (R4); one-live-account by lock and recheck, with the unique-key impossibility stated (R5); depth-zero consume (R6); the audit inventory by search term (R7); the reschedule insert corrected and the cap restated (R8); the collision flag is deleted rather than stored (R9); restore, rollout and cross-references repaired (R10/R11).
+## 17. What revision 10 changed
+One setter and no staff grant (R1); account and binding split into two row kinds with four keys, `u_pl_live` making "one live binding per record" a DB rule (R2/R6); the clinic bootstrap and both identity edges specified with their writers (R3); the audit census completed with charge descriptions, the search string and profile diffs (R4); patient-side record creation removed so no refusal can disclose existence, with the cost raised as OQ-D8 (R5); booking predicates aligned with the state matrix (R7); citations corrected and the NULL claim withdrawn (R8).
 
 ## 18. Next version (not this release)
-
-Several patients per mobile in one clinic — blocked by `u_pat_mobile` (`0001:82`) and `mobile NOT NULL` (`0001:60`); needs its own design and owner approval
-before any schema change. Dependent self-service beyond §10 follows the same design. No column or table is proposed here.
+Several patients per mobile in one clinic — blocked by `u_pat_mobile` (`0001:82`) and `mobile NOT NULL` (`0001:60`); needs its own design and owner approval before any schema change. Dependent self-service beyond §10 follows the same design. No column or table is proposed here.
