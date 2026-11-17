@@ -7266,3 +7266,17 @@ Branch `arena/6bbaeeb2-doctor-v1`, base `c9771403`. Reader-defect patch on revis
 - **K5** T-L50 now has three distinct fixtures (fresh registration, existing mobile, never registered) with real state-change assertions and identical responses. **K6** T-L34 asserts both the proof-less staff denial on the patient surface and the working scoped staff search. **K7** the `:283`/`:355` descriptions corrected everywhere; the §19 uniqueness correction is kept. **K8** adversarial self-read fixed two more spots (§10 dependent record source, §14 SIM-swap row) and named the `OtpService.php:39` citation.
 
 Docs only: no code, schema or migration; one approved new table; cap 2 unchanged; no patient-side protection, test or accepted limitation removed. 107 unique `file:line` citations re-checked, 0 problems.
+
+## 2026-11-17 — patient identity design, revision 20 (L1-L7, final blocker patch, docs only)
+
+Fresh clone (the previous workspace sat on main with an untracked doc); branch `arena/6bbaeeb2-doctor-v1` created from `origin/arena/6bbaeeb2-doctor-v1` at `67f85409`, base `c9771403`. Document 482 → 499 lines (cap 530).
+
+- **L1** OBSERVED `u_pat_mobile` is `UNIQUE (clinic_id, mobile)` and ignores `status` (`0001:60`, `:75`, `:82`): a status change never frees a number. Corrected §4 (new LIMITATION paragraph), §6.8, §7.5, §14, §16 (weakest and OQ-D2) and T-L28, whose "re-registration succeeds after archiving" sequence was false; "release of a mobile" is written as owner-pending **STOP** and no mechanism, column or table is invented.
+- **L2** T-L50 rewritten for the account-only D-9 shape: one WP user and one `kind='account'` row, **no** record, link, binding or names, with the three fixtures and byte-identical responses where the spec says so.
+- **L3** corrected the false "staff-only" claims (revision-18 history line, §2.9, T-L56): `ASSIGNABLE_BUILT_IN_ROLES` (`ManagementPortalService.php:91-95`, `may_assign_role` `:1422`) includes `ROLE_PATIENT`, and `enroll_staff()` (`:900-905`) provisions a subscriber with a generated password (`:1551-1558`) plus a clinic membership (`:942-948`). The rule now denies patient-role **and** patient-membership provisioning; still a build-time requirement with separate owner approval, no migration, existing users UNKNOWN.
+- **L4** every rollback/collision branch of registration and the child path must call `UserCacheRollback::invalidate()` (`UserCacheRollback.php:8-32`, `:38`; precedent `StaffManagementPage.php:659-675`), regression test T-L58 with a persistent object cache.
+- **L5** corrected the claim that only the search puts the identifier into SQL: the registration writes insert it too (`CpmsDb.php:100-106` inlines parameters), so the no-SQL-logging rule covers the writes (§2, §6.2, T-L53) and no control over operator/DB-server logs is claimed.
+- **L6** new §4.1: the guardian's own bound-and-proved session creates a child's **record only** — record, identity edge and one link row to the guardian's user, **no WP user and no account row for the child**; access still comes from the ordinary binding path (§6.2, single writer §5); tested by T-L57; §21.1, §21.2, §11 P7 and the §12A matrix updated.
+- **L7** `T-L32a` → `T-L32(a)`, test IDs unique (T-L1…T-L58 plus the four deferred in §22), cross-references swept.
+
+Docs only: no code, schema or migration; one approved new table; cap 2 unchanged; no patient-side protection, test or accepted limitation removed. 108 unique `file:line` citations re-checked, 0 problems.
