@@ -882,167 +882,27 @@ final class VisitService
      * limit 100. Actual eligibility computed in PHP with explicit DateTimeZone + per-Clinic grace.
      * This is safe: never excludes overdue, may include future which will be filtered (no premature).
      *
-     * T2 starvation fix: uses durable cursor via cpms_jobs payload for continuation.
-     * Root starts at null, continuation advances strictly, bounded per tick.
+     * R4 (1.0, owner decision): MANUAL-ONLY no-show. Retained for signature and
+     * return-shape compatibility, but inert: no scan, no status mutation, no audit
+     * write, no continuation. Manual no-show is BookingService::markNoShowByStaff().
+     * The private sweep helpers and markAppointmentNoShow() stay (unused) so the
+     * full line can re-enable the sweep deliberately.
      *
      * @param array{slot_date:string, slot_time:string, id:int}|null $incomingCursor
      * @return array{processed:int, next_cursor:?array, has_more:bool, depth:int, scanned:int}
      */
     public function processNoShows(?array $incomingCursor = null, int $depth = 0): array
     {
-        $nowUtc = new DateTimeImmutable('now', new DateTimeZone('UTC'));
-        $count = 0;
-        $cursor = $incomingCursor;
-        $maxScan = 500; // bounded scan per tick to avoid full table
-        $scanned = 0;
-        $batchSize = 100;
-        $maxToProcess = 100; // bounded per tick
-        $hasMore = false;
-        $nextCursor = null;
-
-        // Depth is observability only — no arbitrary product ceiling.
-        // Only negative depth is invalid (fail-closed). Upper bound is PHP_INT_MAX implicitly.
-        if ( $depth < 0 ) {
-            $this->opLog?->warning('visit.no_show_depth_invalid', ['depth' => $depth]);
-            return [
-                'processed' => 0,
-                'next_cursor' => null,
-                'has_more' => false,
-                'depth' => $depth,
-                'scanned' => 0,
-            ];
-        }
-
-        while ( $scanned < $maxScan && $count < $maxToProcess ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy PSR-style, established contract
-            $candidates = $this->visits->appointmentsPastGraceCandidates($batchSize, $nowUtc, $cursor);
-            if ( empty($candidates )) { // phpcs:ignore PEAR.Functions.FunctionCallSignature.SpaceAfterOpenBracket,WordPress.WhiteSpace.ControlStructureSpacing.NoSpaceBeforeCloseParenthesis -- WPCS
-                $hasMore = false;
-                break;
-            }
-
-            $hasMore = count($candidates) === $batchSize;
-
-            foreach ( $candidates as $appt ) {
-                $scanned++;
-                // Advance cursor to current row for next batch (progress even if invalid)
-                $cursor = [
-                    'slot_date' => (string) ($appt['slot_date'] ?? ''),
-                    'slot_time' => (string) ($appt['slot_time'] ?? ''),
-                    'id' => (int) ($appt['id'] ?? 0),
-                ];
-                $nextCursor = $cursor;
-
-                $clinicId = (int) ($appt['clinic_id'] ?? 0);
-                $locationId = (int) ($appt['location_id'] ?? 0);
-
-                if ( $clinicId <= 0 || $locationId <= 0 ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy PSR-style, established contract
-                    $this->opLog?->warning('visit.location_missing', ['appointment_id' => $appt['id'] ?? 0, 'clinic_id' => $clinicId, 'location_id' => $locationId]);
-                    continue; // fail-closed
-                }
-
-                // Location validation from JOIN data if available
-                $locClinicId = $appt['loc_clinic_id'] ?? null;
-                $locTimezone = $appt['loc_timezone'] ?? null;
-
-                if ( $locClinicId === null ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy PSR-style, established contract
-                    // LEFT JOIN returned null => location missing
-                    $this->opLog?->warning('visit.location_missing', ['location_id' => $locationId, 'clinic_id' => $clinicId]);
-                    continue;
-                }
-
-                if ( (int) $locClinicId !== $clinicId) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase,WordPress.WhiteSpace.ControlStructureSpacing.NoSpaceBeforeCloseParenthesis -- legacy PSR-style, established contract
-                    $this->opLog?->warning('visit.location_clinic_mismatch', [
-                        'location_id' => $locationId,
-                        'expected_clinic' => $clinicId,
-                        'actual_clinic' => (int) $locClinicId,
-                    ]);
-                    continue;
-                }
-
-                $tzName = trim((string) ($locTimezone ?? ''));
-                if ( $tzName === '' ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy PSR-style, established contract
-                    $this->opLog?->warning('visit.location_timezone_missing', ['location_id' => $locationId]);
-                    continue;
-                }
-
-                try {
-                    $tz = new DateTimeZone($tzName);
-                } catch ( Throwable $e ) {
-                    $this->opLog?->warning('visit.location_timezone_invalid', [
-                        'location_id' => $locationId,
-                        'timezone' => $tzName,
-                        'error' => $e->getMessage(),
-                    ]);
-                    continue;
-                }
-
-                $apptUtc = $this->appointmentUtcInstant($appt, $tz);
-                if ( $apptUtc === null ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy PSR-style, established contract
-                    continue;
-                }
-
-                $grace = $this->graceForClinic($clinicId);
-                if ( $grace === null ) {
-                    continue; // fail-closed
-                }
-
-                $eligible = $apptUtc->add(new DateInterval('PT' . $grace . 'M'));
-
-                if ( $nowUtc < $eligible ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy PSR-style, established contract
-                    continue; // not yet past grace
-                }
-
-                // Each appointment owns its own boundary: a failed mandatory
-                // audit rolls that single item back (the mark stays undurable)
-                // and the tick continues with the next candidate instead of
-                // aborting the whole cron run. The unchanged item is retried on
-                // a later tick; cron resilience is preserved (D7).
-                // phpcs:disable Squiz.Functions.FunctionDeclarationArgumentSpacing.SpacingAfterOpen,Squiz.Functions.FunctionDeclarationArgumentSpacing.SpacingBeforeClose,PEAR.Functions.FunctionCallSignature.SpaceAfterOpenBracket,PEAR.Functions.FunctionCallSignature.SpaceBeforeCloseBracket,PEAR.Functions.FunctionCallSignature.ContentAfterOpenBracket,PEAR.Functions.FunctionCallSignature.MultipleArguments,PEAR.Functions.FunctionCallSignature.CloseBracketLine,WordPress.WhiteSpace.CastStructureSpacing.NoSpaceBeforeOpenParenthesis,WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase,WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- established PSR-style in this file: compact closures/calls and camelCase locals/properties; security, SQL, i18n and escaping sniffs stay active.
-                try {
-                    $count += $this->db->transactional(function () use ($appt): int {
-                        $fresh = $this->appointments->findForUpdate((int) $appt['id']);
-                        if ( $fresh === null || (string) $fresh['status'] !== 'confirmed') { // phpcs:ignore WordPress.WhiteSpace.ControlStructureSpacing.NoSpaceBeforeCloseParenthesis -- WPCS
-                            return 0;
-                        }
-                        if ( $this->activeVisitForAppointment((int) $fresh['id']) !== null) { // phpcs:ignore PEAR.Functions.FunctionCallSignature.SpaceAfterOpenBracket,PEAR.Functions.FunctionCallSignature.SpaceBeforeCloseBracket,WordPress.WhiteSpace.CastStructureSpacing.NoSpaceBeforeOpenParenthesis,WordPress.WhiteSpace.ControlStructureSpacing.NoSpaceBeforeCloseParenthesis -- WPCS
-                            return 0;
-                        }
-                        $this->markAppointmentNoShow($fresh, $this->db->nowUtc(), null);
-                        return 1;
-                    });
-                } catch ( Throwable $e ) {
-                    $this->opLog?->warning('visit.no_show_item_failed', [
-                        'appointment_id' => (int) $appt['id'],
-                        'clinic_id'      => $clinicId,
-                        'error'          => $e->getMessage(),
-                    ]);
-                    continue;
-                }
-                // phpcs:enable
-
-                if ( $count >= $maxToProcess ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy PSR-style, established contract
-                    break 2;
-                }
-            }
-
-            if ( count($candidates ) < $batchSize) { // phpcs:ignore PEAR.Functions.FunctionCallSignature.SpaceAfterOpenBracket,WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase,WordPress.WhiteSpace.ControlStructureSpacing.NoSpaceBeforeCloseParenthesis -- legacy PSR-style, established contract
-                $hasMore = false;
-                break;
-            }
-        }
-
-        // If hasMore true, nextCursor is already set to last scanned row
-        // If no more candidates, nextCursor should be null to stop chain
-        if ( !$hasMore ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase,WordPress.WhiteSpace.OperatorSpacing.NoSpaceAfter -- legacy PSR-style, established contract
-            $nextCursor = null;
-        }
+        // R4 (1.0): MANUAL-ONLY — this sweep never mutates an appointment, never
+        // writes audit rows and never asks for a continuation. No op-log entry is
+        // written here; the queued-job path is traced by VisitsNoShowHandler.
 
         return [
-            'processed' => $count,
-            'next_cursor' => $nextCursor,
-            'has_more' => $hasMore,
-            'depth' => $depth,
-            'scanned' => $scanned,
+            'processed'   => 0,
+            'next_cursor' => null,
+            'has_more'    => false,
+            'depth'       => $depth,
+            'scanned'     => 0,
         ];
     }
 

@@ -2616,7 +2616,9 @@ final class App
     public const RECURRING_JOBS = [
         'holds.expire' => 8,
         'slots.generate' => 3,
-        'visits.no_show' => 5, // FR-5.5 — no-show خودکار نوبت‌ها
+        // R4 (1.0): no-show is MANUAL-ONLY. The recurring visits.no_show sweep is
+        // intentionally NOT scheduled; queued jobs no-op (VisitsNoShowHandler) and
+        // the sweep is inert (VisitService::processNoShows). Re-enable here.
         'handwriting.gc' => 2, // ADR-0009 — سیاست نگهداری نسخه‌ها (idempotent هر Tick)
         'notif.dispatch' => 6, // F8 N-2/N-3 — queued→sent + Retention (idempotent هر Tick)
         'appt.reminder' => 4, // F8 FR-20.6 — یادآوری نوبت (Dedupe دو-لایه)
