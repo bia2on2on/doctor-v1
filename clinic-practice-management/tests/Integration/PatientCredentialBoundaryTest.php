@@ -100,7 +100,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
     private function membershipRow( int $membershipId ): array
     {
         return (array) App::db()->fetchRow(
-            'SELECT id, role_key, status FROM ' . App::db()->table( 'cpms_clinic_memberships' )
+            'SELECT id, role_key, status, scope_mode FROM ' . App::db()->table( 'cpms_clinic_memberships' )
             . ' WHERE id = %d LIMIT 1',
             [ $membershipId ]
         );
