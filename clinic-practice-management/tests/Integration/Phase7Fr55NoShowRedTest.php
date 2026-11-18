@@ -1375,12 +1375,16 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         $slotLocal = new DateTimeImmutable('today 14:00:00', new DateTimeZone(self::TZ));
         $spec      = ['date' => $slotLocal->format('Y-m-d'), 'time' => $slotLocal->format('H:i:s')];
 
-        $inside = $this->seedConfirmedAppointment($this->clinicB, $this->locationB, $this->clinicianB, $this->patientB, $spec, 'grace-fault-in');
-        $past   = $this->seedConfirmedAppointment($this->clinicB, $this->locationB, $this->clinicianB, $secondPatient, $spec, 'grace-fault-out');
+        // A distinct slot minute for the second appointment: (location, clinician, date,
+        // time) is unique, so reusing 14:00:00 would fail the seed insert instead of
+        // exercising the grace path.
+        $pastSpec = ['date' => $spec['date'], 'time' => '14:01:00'];
 
-        $start   = $this->persistedSlotStart($inside['slot_id']);
-        $nowIn   = $start->modify('+10 minutes');
-        $nowPast = $start->modify('+40 minutes');
+        $inside = $this->seedConfirmedAppointment($this->clinicB, $this->locationB, $this->clinicianB, $this->patientB, $spec, 'grace-fault-in');
+        $past   = $this->seedConfirmedAppointment($this->clinicB, $this->locationB, $this->clinicianB, $secondPatient, $pastSpec, 'grace-fault-out');
+
+        $nowIn   = $this->persistedSlotStart($inside['slot_id'])->modify('+10 minutes');
+        $nowPast = $this->persistedSlotStart($past['slot_id'])->modify('+40 minutes');
 
         global $wpdb;
         $settingsTable = App::db()->table('cpms_settings');
