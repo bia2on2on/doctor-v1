@@ -882,29 +882,20 @@ final class VisitService
      * limit 100. Actual eligibility computed in PHP with explicit DateTimeZone + per-Clinic grace.
      * This is safe: never excludes overdue, may include future which will be filtered (no premature).
      *
-     * R4 (1.0, owner decision): MANUAL-ONLY no-show. This method is retained for
-     * signature/return-shape compatibility but is inert — it performs no scan, no
-     * status mutation, no audit write and no continuation, so every historical
-     * automatic entry point (queued `visits.no_show` job, `processNoShowsLegacy()`,
-     * a direct call) is harmless. Manual no-show lives in
-     * `BookingService::markNoShowByStaff()` (reason + actor + audit, unchanged).
-     * The private sweep helpers and `markAppointmentNoShow()` are intentionally
-     * retained (unused) so the full line can re-enable the sweep deliberately.
+     * R4 (1.0, owner decision): MANUAL-ONLY no-show. Retained for signature and
+     * return-shape compatibility, but inert: no scan, no status mutation, no audit
+     * write, no continuation. Manual no-show is BookingService::markNoShowByStaff().
+     * The private sweep helpers and markAppointmentNoShow() stay (unused) so the
+     * full line can re-enable the sweep deliberately.
      *
      * @param array{slot_date:string, slot_time:string, id:int}|null $incomingCursor
      * @return array{processed:int, next_cursor:?array, has_more:bool, depth:int, scanned:int}
      */
     public function processNoShows(?array $incomingCursor = null, int $depth = 0): array
     {
-        // R4 (1.0, owner decision): no-show is MANUAL-ONLY. This sweep is inert —
-        // it never mutates an appointment, never writes audit rows and never asks
-        // for a continuation, so a queued job, a legacy wrapper or a direct call
-        // is harmless. The manual path (`BookingService::markNoShowByStaff`) is
-        // untouched. The returned shape is kept stable for existing callers.
-        $this->opLog?->info('visit.no_show_manual_only_skip', [
-            'depth' => $depth,
-            'has_cursor' => $incomingCursor !== null,
-        ]);
+        // R4 (1.0): MANUAL-ONLY — this sweep never mutates an appointment, never
+        // writes audit rows and never asks for a continuation. No op-log entry is
+        // written here; the queued-job path is traced by VisitsNoShowHandler.
 
         return [
             'processed' => 0,

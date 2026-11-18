@@ -69,8 +69,11 @@ final class VisitNoShowStarvationRedTest extends WP_UnitTestCase
     private function seedPastAppointment(string $time, int $locationId = self::FX_T_LOC_A_ID): int
     {
         $date = $this->pastDate();
-        $this->fxTInsertSlot($locationId, $date, $time);
+        // The slot must be the appointment's own slot: `fxTInsertSlot()` enforces the
+        // (location, clinician, date, time) unique key, so a second implicit slot at the
+        // same wall-clock would fail and leave the appointment unlinked.
+        $slotId = $this->fxTInsertSlot($locationId, $date, $time);
 
-        return $this->fxTInsertAppointment($locationId, $date, $time, 'confirmed');
+        return $this->fxTInsertAppointment($locationId, $date, $time, 'confirmed', $slotId);
     }
 }

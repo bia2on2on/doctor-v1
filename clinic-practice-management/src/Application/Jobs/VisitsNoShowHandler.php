@@ -12,21 +12,17 @@ use DateTimeImmutable;
 use DateTimeZone;
 
 /**
- * No-show — **MANUAL-ONLY in 1.0 (owner decision R4)**.
+ * No-show — MANUAL-ONLY in 1.0 (owner decision R4).
  *
- * The automatic sweep is retired for 1.0: `App::RECURRING_JOBS` no longer schedules
- * `visits.no_show`, and this handler is an inert no-op so that any *already queued*
- * job (or a direct invocation) completes successfully with zero appointment
- * mutations, zero audit rows, zero continuation jobs and no retry storm.
- * The manual path is untouched (`BookingService::markNoShowByStaff` +
- * `POST /appointments/{id}/no-show`, reason required, actor recorded, audited).
- * The private payload/continuation helpers below are intentionally retained
- * (unused) so the full line can re-enable the sweep without rewriting them.
+ * The automatic sweep is retired: RECURRING_JOBS no longer schedules visits.no_show
+ * and this handler is an inert no-op, so an already-queued job or a direct invocation
+ * completes with zero mutations, zero audit rows, zero continuation jobs and no retry
+ * storm. The manual path is untouched. The payload/continuation helpers below are
+ * retained (unused) so the full line can re-enable the sweep without rewriting them.
  *
- * Historical behaviour (pre-R4, retained for context) — FR-5.5 job `visits.no_show`:
- *
+ * Historical behaviour (pre-R4, retained for context) — FR-5.5 job visits.no_show:
  * T2 starvation fix: از payload در cpms_jobs برای cursor پایدار استفاده می‌کند.
- * - pre-R4 payload shapes (root `[]` and cursor continuations) are no longer validated
+ * - pre-R4 payload shapes (root [] and cursor continuations) are no longer validated
  *   or acted on: the handler returns 0 immediately for every payload
  */
 final class VisitsNoShowHandler
@@ -42,17 +38,14 @@ final class VisitsNoShowHandler
     }
 
     /**
-     * R4 (1.0): inert. Completes without retry, without continuation and without
-     * mutating any appointment, so queued legacy jobs drain harmlessly.
+     * R4 (1.0): inert. Completes without retry, continuation or mutation.
      *
-     * @param array<string,mixed> $payload Ignored (legacy payload shapes are not validated).
-     * @return int Always 0 (no appointment was marked no-show automatically).
+     * @param array<string,mixed> $payload Ignored; legacy payload shapes are not validated.
+     * @return int Always 0 — nothing is marked no-show automatically.
      */
     public function __invoke(array $payload): int
     {
-        $this->op?->info('visit.no_show_manual_only_skip', [
-            'payload_keys' => array_keys($payload),
-        ]);
+        $this->op?->info('visit.no_show_manual_only_skip', ['payload_keys' => array_keys($payload)]);
 
         return 0;
     }

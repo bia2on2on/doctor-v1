@@ -68,8 +68,8 @@ final class NoShowManualOnlyTest extends WP_UnitTestCase
         $pastDate = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
             ->modify('-3 days')
             ->format('Y-m-d');
-        $this->fxTInsertSlot(self::FX_T_LOC_A_ID, $pastDate, '09:00:00');
-        $appointmentId = $this->fxTInsertAppointment(self::FX_T_LOC_A_ID, $pastDate, '09:00:00', 'confirmed');
+        $slotId = $this->fxTInsertSlot(self::FX_T_LOC_A_ID, $pastDate, '09:00:00');
+        $appointmentId = $this->fxTInsertAppointment(self::FX_T_LOC_A_ID, $pastDate, '09:00:00', 'confirmed', $slotId);
 
         $before = $this->appointmentRow($appointmentId);
         self::assertSame('confirmed', (string) $before['status']);
@@ -103,8 +103,8 @@ final class NoShowManualOnlyTest extends WP_UnitTestCase
         $pastDate = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
             ->modify('-3 days')
             ->format('Y-m-d');
-        $this->fxTInsertSlot(self::FX_T_LOC_A_ID, $pastDate, '10:00:00');
-        $appointmentId = $this->fxTInsertAppointment(self::FX_T_LOC_A_ID, $pastDate, '10:00:00', 'confirmed');
+        $slotId = $this->fxTInsertSlot(self::FX_T_LOC_A_ID, $pastDate, '10:00:00');
+        $appointmentId = $this->fxTInsertAppointment(self::FX_T_LOC_A_ID, $pastDate, '10:00:00', 'confirmed', $slotId);
 
         $nowUtc = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
         $jobId = App::jobs()->enqueue('visits.no_show', [], $nowUtc, 5, 3);
@@ -139,8 +139,8 @@ final class NoShowManualOnlyTest extends WP_UnitTestCase
         $pastDate = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
             ->modify('-3 days')
             ->format('Y-m-d');
-        $this->fxTInsertSlot(self::FX_T_LOC_A_ID, $pastDate, '11:00:00');
-        $appointmentId = $this->fxTInsertAppointment(self::FX_T_LOC_A_ID, $pastDate, '11:00:00', 'confirmed');
+        $slotId = $this->fxTInsertSlot(self::FX_T_LOC_A_ID, $pastDate, '11:00:00');
+        $appointmentId = $this->fxTInsertAppointment(self::FX_T_LOC_A_ID, $pastDate, '11:00:00', 'confirmed', $slotId);
 
         $handler = new VisitsNoShowHandler(App::visitService(), App::jobs(), App::db(), App::op());
 
@@ -159,8 +159,8 @@ final class NoShowManualOnlyTest extends WP_UnitTestCase
     public function testManualNoShowStillWorksWithReasonActorAndAudit(): void
     {
         $today = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d');
-        $this->fxTInsertSlot(self::FX_T_LOC_A_ID, $today, '12:00:00');
-        $appointmentId = $this->fxTInsertAppointment(self::FX_T_LOC_A_ID, $today, '12:00:00', 'confirmed');
+        $slotId = $this->fxTInsertSlot(self::FX_T_LOC_A_ID, $today, '12:00:00');
+        $appointmentId = $this->fxTInsertAppointment(self::FX_T_LOC_A_ID, $today, '12:00:00', 'confirmed', $slotId);
 
         $secretaryId = $this->makeUser('r4_sec');
         $membership  = cpms_test_seed_membership($secretaryId, self::FX_T_CLINIC_ID, 'cpms_secretary');
@@ -189,8 +189,8 @@ final class NoShowManualOnlyTest extends WP_UnitTestCase
     public function testManualNoShowStaysDeniedWithoutAMembershipOrCapability(): void
     {
         $today = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d');
-        $this->fxTInsertSlot(self::FX_T_LOC_A_ID, $today, '13:00:00');
-        $appointmentId = $this->fxTInsertAppointment(self::FX_T_LOC_A_ID, $today, '13:00:00', 'confirmed');
+        $slotId = $this->fxTInsertSlot(self::FX_T_LOC_A_ID, $today, '13:00:00');
+        $appointmentId = $this->fxTInsertAppointment(self::FX_T_LOC_A_ID, $today, '13:00:00', 'confirmed', $slotId);
 
         // A WP administrator is NOT automatically clinic staff: no membership, no scope.
         foreach (['administrator', 'subscriber'] as $wpRole) {
@@ -227,7 +227,9 @@ final class NoShowManualOnlyTest extends WP_UnitTestCase
             [$appointmentId]
         );
 
-        return is_array($row) ? $row : [];
+        self::assertIsArray($row, 'fixture: appointment ' . $appointmentId . ' must exist');
+
+        return $row;
     }
 
     private function auditCount(string $action, int $resourceId): int
