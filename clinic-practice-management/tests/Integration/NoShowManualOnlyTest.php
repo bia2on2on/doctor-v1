@@ -158,8 +158,9 @@ final class NoShowManualOnlyTest extends WP_UnitTestCase
 
     public function testManualNoShowStillWorksWithReasonActorAndAudit(): void
     {
-        // Q5: the appointment day is a CLINIC-LOCAL day (IranV1 uses Asia/Tehran); a UTC
-        // date would seed "yesterday" for any run after 20:30 local time.
+        // Q5: the appointment day is a CLINIC-LOCAL day (IranV1 uses Asia/Tehran, UTC+03:30);
+        // a UTC-derived date lags Tehran by one day between 00:00 and 03:30 local time, so
+        // such a run would seed "yesterday".
         $today = (new \DateTimeImmutable('now', new \DateTimeZone(self::FX_T_TZ_A)))->format('Y-m-d');
         $slotId = $this->fxTInsertSlot(self::FX_T_LOC_A_ID, $today, '12:00:00');
         $appointmentId = $this->fxTInsertAppointment(self::FX_T_LOC_A_ID, $today, '12:00:00', 'confirmed', $slotId);
@@ -190,8 +191,9 @@ final class NoShowManualOnlyTest extends WP_UnitTestCase
 
     public function testManualNoShowStaysDeniedWithoutAMembershipOrCapability(): void
     {
-        // Q5: the appointment day is a CLINIC-LOCAL day (IranV1 uses Asia/Tehran); a UTC
-        // date would seed "yesterday" for any run after 20:30 local time.
+        // Q5: the appointment day is a CLINIC-LOCAL day (IranV1 uses Asia/Tehran, UTC+03:30);
+        // a UTC-derived date lags Tehran by one day between 00:00 and 03:30 local time, so
+        // such a run would seed "yesterday".
         $today = (new \DateTimeImmutable('now', new \DateTimeZone(self::FX_T_TZ_A)))->format('Y-m-d');
         $slotId = $this->fxTInsertSlot(self::FX_T_LOC_A_ID, $today, '13:00:00');
         $appointmentId = $this->fxTInsertAppointment(self::FX_T_LOC_A_ID, $today, '13:00:00', 'confirmed', $slotId);
