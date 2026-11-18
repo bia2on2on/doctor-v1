@@ -133,12 +133,14 @@ final class VisitAuditAtomicityTest extends WP_UnitTestCase
         self::assertSame(0, $this->auditCount('APPOINTMENT_NO_SHOW'));
         self::assertSame($depthBefore, $this->savepointDepth(), 'SAVEPOINT depth must be restored after the item rollback');
 
-        // Next tick (fault removed) durably marks the unchanged item.
+        // R4 (1.0): no-show is MANUAL-ONLY. The next tick (fault removed) must also
+        // stay inert — the row stays confirmed and NO audit row appears, so an audit
+        // outage can never turn into an automatic terminal state.
         $retry = App::visitService()->processNoShows();
-        self::assertSame(1, (int) ($retry['processed'] ?? 0));
-        self::assertSame('no_show', (string) App::db()->fetchValue('SELECT status FROM ' . App::db()->table('cpms_appointments') . ' WHERE id = %d', [$late]));
-        self::assertSame(1, $this->auditCount('APPOINTMENT_NO_SHOW'));
-        self::assertSame(1, $this->latestAuditClinicId('APPOINTMENT_NO_SHOW'), 'the no-show audit must name the trusted Clinic explicitly');
+        self::assertSame(0, (int) ($retry['processed'] ?? -1), 'R4: the retry tick must process nothing');
+        self::assertSame('confirmed', (string) App::db()->fetchValue('SELECT status FROM ' . App::db()->table('cpms_appointments') . ' WHERE id = %d', [$late]));
+        self::assertSame(0, $this->auditCount('APPOINTMENT_NO_SHOW'), 'no automatic no-show audit may exist');
+        self::assertSame($depthBefore, $this->savepointDepth(), 'no savepoint may be opened by an inert sweep');
     }
 
     public function testDenialAuditFailureDoesNotReplaceTheDomainRefusal(): void

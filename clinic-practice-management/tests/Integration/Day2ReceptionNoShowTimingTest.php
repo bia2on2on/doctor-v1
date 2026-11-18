@@ -5,51 +5,27 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
-use ClinicCore\Domain\Booking\BookingWindow;
 use ClinicCore\Infrastructure\Repository\AppointmentRepository;
-use ClinicCore\Settings\Settings;
-use ClinicCore\Tests\Support\Day2ReceptionFixtureClockPolicy;
-use DateInterval;
-use DateTimeImmutable;
-use DateTimeZone;
+use ClinicCore\Tests\Integration\Fixtures\Phase2MultiLocationTemporalFixture;
 use WP_UnitTestCase;
 
-require_once __DIR__ . '/Fixtures/Phase2MultiLocationTemporalFixture.php';
-
-use ClinicCore\Tests\Integration\Fixtures\Phase2MultiLocationTemporalFixture;
-
 /**
- * Day-2 Journey B clock-safety regression (real background job + real board).
+ * R4 (1.0) — no-show is MANUAL-ONLY (replaces the pre-R4 automatic-sweep timing suite).
  *
- * Journey B reads the reception board for the CURRENT operational day, and the
- * real `visits.no_show` job (`VisitsNoShowHandler` →
- * `VisitService::processNoShows()`) marks a `confirmed` appointment `no_show`
- * once `slot + queue.no_show_grace_minutes` has passed;
- * `AppointmentRepository::list_for_reception_operational_day()` then stops
- * listing it. That is exactly the retired fixed-row failure
- * (`journey-B-reception … Locator.wait_for` timeout on 74a6dab).
- *
- * Every test here runs unconditionally, at any wall-clock time — there is no
- * conditional skip and no assumption that "today" is young or old. The real
- * service, the real repository query, real persistence and the real audit are
- * exercised in both directions: rows inside grace survive the sweep, rows past
- * grace are swept and leave the board.
+ * The pre-R4 suite protected WHEN the sweep marked a row (grace boundary, wall-clock
+ * independence, board eviction). That timing no longer exists; the equal-or-stronger
+ * contract is that NO wall-clock position, past the old grace window included, ever
+ * marks or evicts a row: the reception board keeps showing the appointment until a
+ * human decides.
  */
 final class Day2ReceptionNoShowTimingTest extends WP_UnitTestCase
 {
     use Phase2MultiLocationTemporalFixture;
 
-    private const GRACE_MINUTES = 30;
-    private const TZ = 'Asia/Tehran';
-    private const SLOT_DURATION_MIN = 20;
-
     protected function setUp(): void
     {
         parent::setUp();
-        App::migrations()->migrate();
         $this->buildMultiLocationTemporalFixture();
-        App::settingsFactory()->forClinic(self::FX_T_CLINIC_ID)->set('queue.no_show_grace_minutes', self::GRACE_MINUTES);
-        Settings::flushCache();
     }
 
     protected function tearDown(): void
@@ -58,132 +34,28 @@ final class Day2ReceptionNoShowTimingTest extends WP_UnitTestCase
         parent::tearDown();
     }
 
-    /**
-     * The production rule the fixture must never fight: the real sweep marks a
-     * `confirmed` row `no_show` exactly once its grace window has expired.
-     */
-    public function testRealSweepMarksOnlyRowsPastSlotPlusGrace(): void
+    public function testRealSweepMarksNothingEvenPastSlotPlusGrace(): void
     {
-        $timezone = new DateTimeZone(self::TZ);
-        $nowUtc = new DateTimeImmutable('now', new DateTimeZone('UTC'));
-        $nowLocal = $nowUtc->setTimezone($timezone);
-        $localDate = $nowLocal->format('Y-m-d');
+        $appointmentId = $this->seedPastAppointment('09:00:00', self::FX_T_LOC_A_ID);
 
-        // Inside grace: 60 s less than the full window has elapsed.
-        $insideSlot = $nowLocal->sub(new DateInterval('PT' . (self::GRACE_MINUTES * 60 - 60) . 'S'));
-        // Past grace: 60 s more than the full window has elapsed.
-        $pastSlot = $nowLocal->sub(new DateInterval('PT' . (self::GRACE_MINUTES * 60 + 60) . 'S'));
+        $res = App::visitService()->processNoShows(null, 0);
+        self::assertSame(0, (int) $res['processed'], 'R4: nothing may be marked automatically');
+        self::assertNull($res['next_cursor'], 'R4: no continuation');
 
-        $insideId = $this->seedReceptionRow($insideSlot, 'inside');
-        $pastId = $this->seedReceptionRow($pastSlot, 'past');
-
-        App::visitService()->processNoShows(null, 0);
-
-        self::assertSame('confirmed', $this->statusOf($insideId), 'A row inside slot + grace must never be swept');
-        self::assertSame('no_show', $this->statusOf($pastId), 'A row past slot + grace must be swept by the real job');
-
-        $boardToday = $this->boardIds($localDate);
-        $boardPastDay = $this->boardIds($pastSlot->format('Y-m-d'));
-
-        if ($insideSlot->format('Y-m-d') === $localDate) {
-            self::assertContains($insideId, $boardToday, 'The inside-grace row stays on its operational-day board');
-        }
-        self::assertNotContains($pastId, $boardPastDay, 'A swept row leaves the board — the Journey B timeout cause');
+        $row = $this->appointmentRow($appointmentId);
+        self::assertSame('confirmed', (string) $row['status']);
+        self::assertNull($row['no_show_at'], 'no_show_at stays NULL without a manual decision');
     }
 
     /**
-     * The anchored rows the fixture/harness produce must survive the real sweep
-     * and stay on the operational-day board — at ANY wall-clock time.
+     * The real reception-board query, not a status check standing in for it:
+     * `list_for_reception_operational_day()` only returns pending/confirmed rows,
+     * so this is exactly what the reception screen renders.
+     *
+     * @return int[]
      */
-    public function testAnchoredReceptionRowsSurviveTheRealSweepAndStayOnTheBoard(): void
-    {
-        $timezone = new DateTimeZone(self::TZ);
-        $nowUtc = new DateTimeImmutable('now', new DateTimeZone('UTC'));
-        $nowLocal = $nowUtc->setTimezone($timezone);
-        $localDate = $nowLocal->format('Y-m-d');
-
-        $times = Day2ReceptionFixtureClockPolicy::slotTimes($nowLocal, $localDate, self::GRACE_MINUTES);
-        self::assertIsArray($times, 'The policy is total: no wall-clock minute may be unusable');
-
-        $appointments = [];
-        foreach ($times as $key => $slot) {
-            self::assertSame($localDate, $slot->format('Y-m-d'), $key . ' must stay on the operational date');
-            $appointments[$key] = $this->seedReceptionRow($slot, 'anchored-' . $key);
-        }
-
-        // Real handler the production cron tick runs.
-        App::visitService()->processNoShows(null, 0);
-
-        $boardIds = $this->boardIds($localDate);
-        foreach ($appointments as $key => $appointmentId) {
-            self::assertSame(
-                'confirmed',
-                $this->statusOf($appointmentId),
-                $key . ' must NOT be swept: it is inside queue.no_show_grace_minutes'
-            );
-            self::assertContains(
-                $appointmentId,
-                $boardIds,
-                $key . ' must stay on the operational-day board Journey B drives'
-            );
-        }
-    }
-
-    /**
-     * Deterministic direction check that never depends on the real clock:
-     * a row whose slot has not started yet is never swept, at any hour.
-     */
-    public function testFutureRowsAreNeverSweptBeforeTheirSlotStarts(): void
-    {
-        $timezone = new DateTimeZone(self::TZ);
-        $nowLocal = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->setTimezone($timezone);
-
-        $future = $nowLocal->add(new DateInterval('PT90M'));
-        $appointmentId = $this->seedReceptionRow($future, 'future');
-
-        App::visitService()->processNoShows(null, 0);
-
-        self::assertSame(
-            'confirmed',
-            $this->statusOf($appointmentId),
-            'A future appointment must never be marked no_show before its slot starts'
-        );
-        self::assertContains(
-            $appointmentId,
-            $this->boardIds($future->format('Y-m-d')),
-            'A future same-day appointment stays visible on that operational day board'
-        );
-    }
-
-    private function seedReceptionRow(DateTimeImmutable $slotLocal, string $tag): int
-    {
-        $slotTime = $slotLocal->format('H:i:s');
-        $slotId = $this->fxTInsertSlot(
-            self::FX_T_LOC_A_ID,
-            $slotLocal->format('Y-m-d'),
-            $slotTime
-        );
-        self::assertGreaterThan(0, $slotId, $tag . ' slot must be persisted');
-
-        $appointmentId = $this->fxTInsertAppointment(
-            self::FX_T_LOC_A_ID,
-            $slotLocal->format('Y-m-d'),
-            $slotTime,
-            'confirmed',
-            $slotId
-        );
-        self::assertGreaterThan(0, $appointmentId, $tag . ' appointment must be persisted');
-
-        return $appointmentId;
-    }
-
-    /** @return list<int> */
     private function boardIds(string $date): array
     {
-        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $date) !== 1) {
-            return [];
-        }
-
         return array_map(
             static fn (array $row): int => (int) $row['id'],
             (new AppointmentRepository(App::db()))->list_for_reception_operational_day(
@@ -194,13 +66,116 @@ final class Day2ReceptionNoShowTimingTest extends WP_UnitTestCase
         );
     }
 
-    private function statusOf(int $appointmentId): string
+    public function testAnchoredReceptionRowsSurviveTheRealSweepAndStayOnTheBoard(): void
+    {
+        $appointmentId = $this->seedPastAppointment('10:00:00', self::FX_T_LOC_A_ID);
+
+        $result = App::visitService()->processNoShows(null, 0);
+        self::assertSame(0, (int) $result['processed'], 'R4: the sweep processes nothing');
+
+        $row = $this->appointmentRow($appointmentId);
+        self::assertSame('confirmed', (string) $row['status'], 'the row must stay confirmed without a manual decision');
+        self::assertNull($row['no_show_at']);
+        self::assertContains(
+            $appointmentId,
+            $this->boardIds($this->pastDate()),
+            'the real reception-board query must still return the row (only pending/confirmed reach the board)'
+        );
+    }
+
+    public function testFutureAndPastRowsAreBothUntouchedAndStayOnTheirBoard(): void
+    {
+        $pastId = $this->seedPastAppointment('11:00:00', self::FX_T_LOC_A_ID);
+        $future = $this->seedFutureAppointment(90, self::FX_T_LOC_A_ID);
+
+        $result = App::visitService()->processNoShows(null, 0);
+        self::assertSame(0, (int) $result['processed'], 'R4: the sweep processes nothing');
+
+        foreach (['past' => $pastId, 'future' => $future['id']] as $label => $id) {
+            $row = $this->appointmentRow($id);
+            self::assertSame(
+                'confirmed',
+                (string) $row['status'],
+                $label . ' row must never be touched by an automatic path'
+            );
+            self::assertNull($row['no_show_at'], $label . ' row keeps no_show_at NULL');
+        }
+
+        self::assertContains($pastId, $this->boardIds($this->pastDate()), 'the past row stays on its operational-day board');
+        self::assertContains(
+            $future['id'],
+            $this->boardIds($future['date']),
+            'a genuinely future appointment stays on its operational-day board'
+        );
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function appointmentRow(int $appointmentId): array
     {
         $row = App::db()->fetchRow(
-            'SELECT status FROM ' . App::db()->table('cpms_appointments') . ' WHERE id = %d',
+            'SELECT status, no_show_at FROM ' . App::db()->table('cpms_appointments') . ' WHERE id = %d',
             [$appointmentId]
         );
 
-        return is_array($row) ? (string) $row['status'] : '';
+        self::assertIsArray($row, 'the appointment row must exist');
+        self::assertArrayHasKey('status', $row);
+
+        return $row;
+    }
+
+    /**
+     * A genuinely future slot (real wall clock + `$minutesAhead`), so the
+     * "future row" case cannot silently degrade into another past row.
+     *
+     * @return array{id: int, date: string, time: string}
+     */
+    private function seedFutureAppointment(int $minutesAhead = 90, int $locationId = self::FX_T_LOC_A_ID): array
+    {
+        // P1: the slot columns are CLINIC-LOCAL (Location timezone Asia/Tehran), so the
+        // value must be built in that timezone. Formatting a UTC instant here produced a
+        // slot ~3.5 h EARLIER in local time — i.e. a "future" row that was already past.
+        $clinicTz = new \DateTimeZone(self::FX_T_TZ_A);
+        $slot = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+            ->setTimezone($clinicTz)
+            ->modify('+' . $minutesAhead . ' minutes');
+        $date = $slot->format('Y-m-d');
+        $time = $slot->format('H:i:s');
+
+        // Fixture invariant, asserted here so a wrong timezone fails loudly instead of
+        // silently producing a past row.
+        self::assertGreaterThan(
+            new \DateTimeImmutable('now', new \DateTimeZone('UTC')),
+            new \DateTimeImmutable($date . ' ' . $time, $clinicTz),
+            'fixture invariant: the "future" slot must be strictly in the future in the clinic timezone '
+            . self::FX_T_TZ_A . ' — slot ' . $date . ' ' . $time . ' local'
+        );
+
+        $slotId = $this->fxTInsertSlot($locationId, $date, $time);
+
+        return [
+            'id'   => $this->fxTInsertAppointment($locationId, $date, $time, 'confirmed', $slotId),
+            'date' => $date,
+            'time' => $time,
+        ];
+    }
+
+    private function pastDate(int $days = 3): string
+    {
+        return (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+            ->modify('-' . $days . ' days')
+            ->format('Y-m-d');
+    }
+
+    private function seedPastAppointment(string $time, int $locationId = self::FX_T_LOC_A_ID): int
+    {
+        $date = $this->pastDate();
+        // The slot must be the appointment's own slot: `fxTInsertSlot()` enforces the
+        // (location, clinician, date, time) unique key, so a second implicit slot at the
+        // same wall-clock would fail and leave the appointment unlinked.
+        $slotId = $this->fxTInsertSlot($locationId, $date, $time);
+
+        return $this->fxTInsertAppointment($locationId, $date, $time, 'confirmed', $slotId);
     }
 }

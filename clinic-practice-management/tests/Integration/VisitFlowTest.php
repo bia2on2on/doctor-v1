@@ -415,7 +415,7 @@ final class VisitFlowTest extends WP_UnitTestCase
         $this->assertSame((int) $normal['id'], (int) $queue[1]['id']);
     }
 
-    // ================= FR-5.5 — Sweep خودکار =================
+    // ================= FR-5.5 — no-show (R4: manual-only, sweep inert) =================
 
     public function testNoShowSweepMarksOnlyUnvisitedLateAppointments(): void
     {
@@ -463,12 +463,13 @@ final class VisitFlowTest extends WP_UnitTestCase
         $res = App::visitService()->processNoShows();
         $count = is_array($res) ? ($res['processed'] ?? 0) : (int) $res;
 
-        $this->assertSame(1, $count); // فقط نوبت دیرهنگام بدون ویزیت
+        // R4 (1.0): no-show is MANUAL-ONLY — the sweep must mark nothing, ever.
+        $this->assertSame(0, $count, 'R4: the automatic sweep must not mark the late row');
         $status = static fn (int $id): string => (string) App::db()->fetchValue(
             'SELECT status FROM ' . App::db()->table('cpms_appointments') . ' WHERE id = %d',
             [$id]
         );
-        $this->assertSame('no_show', $status($late));
+        $this->assertSame('confirmed', $status($late), 'R4: only a manual action may set no_show');
         $this->assertSame('confirmed', $status($upcoming));
         $this->assertSame('confirmed', $status($visitedLate)); // checked in before grace; active Visit prevents sweep
 

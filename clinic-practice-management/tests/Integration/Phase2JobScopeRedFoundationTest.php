@@ -565,10 +565,18 @@ final class Phase2JobScopeRedFoundationTest extends WP_UnitTestCase
             $registered,
             'canonical design §A-3 plus Classic V1 cancellation outbox records exactly 16 registered job types; actual: ' . implode(', ', $registered)
         );
+        // R4 (1.0, owner decision): no-show is MANUAL-ONLY, so `visits.no_show` is
+        // still REGISTERED (16 above) but no longer SCHEDULED — 13 → 12. This is a
+        // deliberate product change, not registry drift.
         self::assertCount(
-            13,
+            12,
             $recurring,
-            'canonical design §A-3 records exactly 13 scheduled (recurring) job types; actual: ' . implode(', ', $recurring)
+            'canonical design §A-3 minus the R4 retired sweep records exactly 12 scheduled (recurring) job types; actual: ' . implode(', ', $recurring)
+        );
+        self::assertNotContains(
+            'visits.no_show',
+            $recurring,
+            'R4: the automatic no-show sweep must stay unscheduled in 1.0'
         );
         self::assertSame(
             [],
@@ -579,9 +587,9 @@ final class Phase2JobScopeRedFoundationTest extends WP_UnitTestCase
         $eventDriven = array_values(array_diff($registered, $recurring));
         sort($eventDriven);
         self::assertSame(
-            ['appointment.cancel_notify', 'report.export', 'sms.send'],
+            ['appointment.cancel_notify', 'report.export', 'sms.send', 'visits.no_show'],
             $eventDriven,
-            'the three event-driven (non-recurring) registered types per canonical design §A-3 plus Classic V1 cancellation outbox'
+            'event-driven (non-recurring) registered types: the canonical three plus the R4-registered-but-unscheduled no-show sweep'
         );
     }
 
