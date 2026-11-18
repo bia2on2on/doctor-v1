@@ -7004,3 +7004,8 @@ Integration assertion counts differ between pushes (76873/76877/76874) with no t
 - OBSERVED: On the fresh clone at `ff076bedb0c180dea926ce991a8848ff944abc46`, restored the dashboard follow-up interval assertion, supplied Jalali past-visit date fixture, exact rendered rows, and made the Day2 Node wrapper fail when Node is absent. Three source mutations were applied, each made the JS spec fail, then reverted: interval digits removed; supplied `jalali_date` ignored; Gregorian-to-Jalali day incremented. The fallback fixture uses a distinct exact row.
 - OBSERVED: Workflow contract tests 178 passed; YAML check 17 files passed; companion isolation passed; tenant tripwire returned the 3 existing suspects; both JS specs and `node --check` passed; `git diff --check` passed; changed-lines WPCS collection completed using baseline `2263ed673a8fdf4ab91e6a7fffae6d82252e4324`.
 - LIMITATION: Native PHP is absent; PHP syntax validation is UNKNOWN. CI status is reported after the single round-6 push; no merge authorized.
+
+### [2026-11-18 UTC] — doctor-v1 Phase 2 origin and Release 1.0 decisions
+- OBSERVED: The imported main snapshot matched the expected baseline. The live workflow inventory contained only CI and Closure Gate active; the other 15 workflows were manually disabled.
+- OBSERVED: Added `docs/ORIGIN.md` and appended the Release 1.0 owner decisions, migration rule, and License decision A to `docs/status/ledger.md`. Recorded the older technical design separately from the 1.0 target. This change is documentation only; no build, implementation, or merge is authorized here.
+- LIMITATION: Both Actions permissions reads returned HTTP 403 (UNKNOWN). Release acceptance is NOT verified; the exact-head CI census is separate from this entry.
