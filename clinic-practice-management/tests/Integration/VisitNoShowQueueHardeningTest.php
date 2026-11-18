@@ -47,6 +47,54 @@ final class VisitNoShowQueueHardeningTest extends WP_UnitTestCase
         self::assertArrayNotHasKey('visits.no_show', App::RECURRING_JOBS);
     }
 
+    /**
+     * A4 — the GENERIC queue-hardening rule ("an existing PROCESSING recurring job
+     * suppresses a duplicate root") lost its home when the no-show schedule entry
+     * was removed. It is re-homed here on an ACTIVE recurring lane
+     * (`notif.dispatch`), so the protection stays asserted somewhere real.
+     */
+    public function testSchedulerSuppressesDuplicateRootWhileProcessingOnAnActiveLane(): void
+    {
+        global $wpdb;
+        $db      = App::db();
+        $nowSql  = $db->nowUtcSql();
+        $lockExp = gmdate('Y-m-d H:i:s', time() + 600) . '.000';
+
+        $wpdb->query($wpdb->prepare('DELETE FROM ' . $db->table('cpms_jobs') . ' WHERE type = %s', 'notif.dispatch'));
+
+        $ok = $wpdb->insert(
+            $db->table('cpms_jobs'),
+            [
+                'type'            => 'notif.dispatch',
+                'payload_json'    => '[]',
+                'status'          => 'processing',
+                'priority'        => 6,
+                'attempts'        => 1,
+                'max_attempts'    => 3,
+                'run_after'       => $nowSql,
+                'locked_by'       => 'test-worker',
+                'lock_expires_at' => $lockExp,
+                'created_at'      => $nowSql,
+            ]
+        );
+        self::assertTrue((bool) $ok, 'fixture: PROCESSING notif.dispatch job inserted — ' . $wpdb->last_error);
+        self::assertGreaterThan(0, (int) $wpdb->insert_id, 'fixture: PROCESSING job id');
+
+        App::scheduleRecurringJobs();
+
+        $queued = (int) $wpdb->get_var(
+            'SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . " WHERE type = 'notif.dispatch' AND status = 'queued'"
+        );
+        $total = (int) $wpdb->get_var(
+            'SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . " WHERE type = 'notif.dispatch' AND status IN ('queued','processing')"
+        );
+
+        self::assertSame(0, $queued, 'a PROCESSING job must suppress a duplicate root on an active lane — queued=' . $queued);
+        self::assertSame(1, $total, 'only the original PROCESSING job may remain — total=' . $total);
+
+        $wpdb->query($wpdb->prepare('DELETE FROM ' . $db->table('cpms_jobs') . ' WHERE type = %s', 'notif.dispatch'));
+    }
+
     public function testContinuationDedupPreventsDuplicateSameCursor(): void
     {
         $appointmentId = $this->seedPastAppointment('10:00:00', self::FX_T_LOC_A_ID);

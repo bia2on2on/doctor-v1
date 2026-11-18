@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Infrastructure\Repository\AppointmentRepository;
 use ClinicCore\Tests\Integration\Fixtures\Phase2MultiLocationTemporalFixture;
 use WP_UnitTestCase;
 
@@ -46,31 +47,66 @@ final class Day2ReceptionNoShowTimingTest extends WP_UnitTestCase
         self::assertNull($row['no_show_at'], 'no_show_at stays NULL without a manual decision');
     }
 
+    /**
+     * The real reception-board query, not a status check standing in for it:
+     * `list_for_reception_operational_day()` only returns pending/confirmed rows,
+     * so this is exactly what the reception screen renders.
+     *
+     * @return int[]
+     */
+    private function boardIds(string $date): array
+    {
+        return array_map(
+            static fn (array $row): int => (int) $row['id'],
+            (new AppointmentRepository(App::db()))->list_for_reception_operational_day(
+                self::FX_T_CLINIC_ID,
+                self::FX_T_LOC_A_ID,
+                $date
+            )
+        );
+    }
+
     public function testAnchoredReceptionRowsSurviveTheRealSweepAndStayOnTheBoard(): void
     {
         $appointmentId = $this->seedPastAppointment('10:00:00', self::FX_T_LOC_A_ID);
 
-        App::visitService()->processNoShows(null, 0);
+        $result = App::visitService()->processNoShows(null, 0);
+        self::assertSame(0, (int) $result['processed'], 'R4: the sweep processes nothing');
 
         $row = $this->appointmentRow($appointmentId);
-        self::assertSame('confirmed', (string) $row['status'], 'the row must stay on the operational-day board');
+        self::assertSame('confirmed', (string) $row['status'], 'the row must stay confirmed without a manual decision');
         self::assertNull($row['no_show_at']);
+        self::assertContains(
+            $appointmentId,
+            $this->boardIds($this->pastDate()),
+            'the real reception-board query must still return the row (only pending/confirmed reach the board)'
+        );
     }
 
-    public function testFutureAndPastRowsAreBothUntouched(): void
+    public function testFutureAndPastRowsAreBothUntouchedAndStayOnTheirBoard(): void
     {
-        $pastId   = $this->seedPastAppointment('11:00:00', self::FX_T_LOC_A_ID);
-        $futureId = $this->seedPastAppointment('23:30:00', self::FX_T_LOC_B_ID);
+        $pastId = $this->seedPastAppointment('11:00:00', self::FX_T_LOC_A_ID);
+        $future = $this->seedFutureAppointment(90, self::FX_T_LOC_A_ID);
 
-        App::visitService()->processNoShows(null, 0);
+        $result = App::visitService()->processNoShows(null, 0);
+        self::assertSame(0, (int) $result['processed'], 'R4: the sweep processes nothing');
 
-        foreach (['past' => $pastId, 'future' => $futureId] as $label => $id) {
+        foreach (['past' => $pastId, 'future' => $future['id']] as $label => $id) {
+            $row = $this->appointmentRow($id);
             self::assertSame(
                 'confirmed',
-                (string) $this->appointmentRow($id)['status'],
+                (string) $row['status'],
                 $label . ' row must never be touched by an automatic path'
             );
+            self::assertNull($row['no_show_at'], $label . ' row keeps no_show_at NULL');
         }
+
+        self::assertContains($pastId, $this->boardIds($this->pastDate()), 'the past row stays on its operational-day board');
+        self::assertContains(
+            $future['id'],
+            $this->boardIds($future['date']),
+            'a genuinely future appointment stays on its operational-day board'
+        );
     }
 
     /**
@@ -83,7 +119,32 @@ final class Day2ReceptionNoShowTimingTest extends WP_UnitTestCase
             [$appointmentId]
         );
 
-        return is_array($row) ? $row : [];
+        self::assertIsArray($row, 'the appointment row must exist');
+        self::assertArrayHasKey('status', $row);
+
+        return $row;
+    }
+
+    /**
+     * A genuinely future slot (real wall clock + `$minutesAhead`), so the
+     * "future row" case cannot silently degrade into another past row.
+     *
+     * @return array{id: int, date: string, time: string}
+     */
+    private function seedFutureAppointment(int $minutesAhead = 90, int $locationId = self::FX_T_LOC_A_ID): array
+    {
+        $slot = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+            ->modify('+' . $minutesAhead . ' minutes');
+        $date = $slot->format('Y-m-d');
+        $time = $slot->format('H:i:s');
+
+        $slotId = $this->fxTInsertSlot($locationId, $date, $time);
+
+        return [
+            'id'   => $this->fxTInsertAppointment($locationId, $date, $time, 'confirmed', $slotId),
+            'date' => $date,
+            'time' => $time,
+        ];
     }
 
     private function pastDate(int $days = 3): string

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Jobs\VisitsNoShowHandler;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Tests\Integration\Fixtures\Phase2MultiLocationTemporalFixture;
 use WP_UnitTestCase;
@@ -30,6 +31,52 @@ final class VisitNoShowContinuationTest extends WP_UnitTestCase
     {
         $this->purgeMultiLocationTemporalFixture();
         parent::tearDown();
+    }
+
+    /**
+     * A5(i) — the pre-R4 suite asserted that a malformed continuation payload
+     * raised an exception. The handler is now inert and validates nothing, so the
+     * equal-or-stronger statement is: EVERY malformed shape is accepted and
+     * produces no work, no cursor and no new job (never a retry storm). The
+     * retained `validateContinuationPayload()` helper is unreachable from
+     * `__invoke()`, which is exactly what this test pins.
+     */
+    public function testMalformedPayloadsAreInertAtTheHandler(): void
+    {
+        $appointmentId = $this->seedPastAppointment('09:10:00', self::FX_T_LOC_A_ID);
+        $handler = new VisitsNoShowHandler(App::visitService(), App::jobs(), App::db(), App::op());
+
+        $payloads = [
+            'cursor-only'        => ['cursor' => ['appointment_id' => 5]],
+            'continuation-shape' => ['continuation' => true, 'cursor' => ['not' => 'a cursor'], 'depth' => 3],
+            'string-types'       => ['continuation' => 'yes', 'cursor' => 'abc', 'depth' => 'deep'],
+            'numeric-junk'       => ['continuation' => 1, 'cursor' => 999999, 'depth' => -5],
+            'unknown-keys'       => ['whatever' => ['nested' => true], 'payload' => null],
+        ];
+
+        $jobsBefore = $this->noShowJobIds();
+        foreach ($payloads as $label => $payload) {
+            self::assertSame(0, $handler($payload), $label . ': the inert handler must return 0');
+            self::assertSame(
+                'confirmed',
+                (string) $this->appointmentRow($appointmentId)['status'],
+                $label . ': no appointment may be mutated by a malformed payload'
+            );
+        }
+
+        self::assertSame($jobsBefore, $this->noShowJobIds(), 'a malformed payload must never enqueue another job');
+    }
+
+    /**
+     * @return int[]
+     */
+    private function noShowJobIds(): array
+    {
+        $rows = App::db()->fetchAll(
+            'SELECT id FROM ' . App::db()->table('cpms_jobs') . " WHERE type = 'visits.no_show' ORDER BY id ASC"
+        );
+
+        return array_map(static fn (array $row): int => (int) $row['id'], is_array($rows) ? $rows : []);
     }
 
     public function testEmptyPayloadIsValidRoot(): void

@@ -679,13 +679,15 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             global $wpdb;
             $wpdb->query('COMMIT'); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
 
-            // Past-grace confirmed appointment: a genuine sweep candidate.
+            // CHECK-IN ELIGIBLE confirmed appointment (same trusted local day,
+            // inside grace), so the check-in worker can legitimately win this
+            // race; the manual no-show has no time guard and stays legal too.
             $seed = $this->seedConfirmedAppointment(
                 $this->clinicA,
                 $this->locationA,
                 $this->clinicianA,
                 $patientId,
-                $this->pastSlotSpec(180 + 60 * ($attempt - 1)),
+                $this->eligibleRaceSlotSpec($attempt),
                 'rc' . $attempt
             );
 
@@ -712,6 +714,117 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         }
 
         self::assertSame(self::RACE_ATTEMPTS, count($observations), 'race evidence must exist for every attempt');
+    }
+
+    // ============ T12b — both serialization orders, deterministically (no fork) ============
+
+    /**
+     * Order 1 — the check-in commits first, so the manual no-show must be refused
+     * by the active-Visit guard (HAS_ACTIVE_VISIT) and nothing may mutate.
+     *
+     * The appointment is CHECK-IN ELIGIBLE (pinned clock on its own trusted local
+     * day, before slot + grace). That is what the forked race cannot provide: it
+     * seeds past-grace rows, where the check-in is refused by the ER-06 guard and
+     * the "check-in wins" branch is unreachable.
+     */
+    public function testCheckInFirstThenManualNoShowIsRefusedWithHasActiveVisit(): void
+    {
+        $patientId = $this->insertPatient($this->clinicA, 'MR-FR55-O1-' . $this->fileTag, $this->nowUtcSql());
+        $seed = $this->seedConfirmedAppointment(
+            $this->clinicA,
+            $this->locationA,
+            $this->clinicianA,
+            $patientId,
+            $this->futureSlotSpec(4, '10:00:00'),
+            'o1'
+        );
+        $slotBefore = $this->slotRow($seed['slot_id']);
+
+        $visit = $this->checkInWithPinnedClock($patientId, $seed['id']);
+        self::assertGreaterThan(0, (int) ($visit['id'] ?? 0), 'precondition: the eligible check-in commits');
+        self::assertCount(1, $this->liveVisitsForAppointment($seed['id']), 'precondition: exactly one live Visit');
+
+        $refusal = null;
+        try {
+            App::bookingService()->markNoShowByStaff($this->secretaryA, $seed['id'], 'تلاش دستی پس از پذیرش');
+        } catch (BookingException $e) {
+            $refusal = $e;
+        }
+        self::assertInstanceOf(BookingException::class, $refusal, 'the manual no-show must be refused after a winning check-in');
+        self::assertSame('HAS_ACTIVE_VISIT', $refusal->errorCode, 'refusal via the active-Visit guard');
+        self::assertSame(409, $refusal->httpStatus, 'the active-Visit guard maps to HTTP 409');
+
+        $appt = $this->appointmentRow($seed['id']);
+        self::assertSame('confirmed', (string) $appt['status'], 'the appointment stays confirmed');
+        self::assertNull($appt['no_show_at'], 'no_show_at stays NULL when the check-in won');
+        self::assertSame((int) $visit['id'], (int) $appt['active_visit_id'], 'the pointer keeps the live Visit');
+        self::assertCount(1, $this->liveVisitsForAppointment($seed['id']), 'exactly one live Visit remains');
+        self::assertSame(0, $this->noShowAuditCount($seed['id']), 'no APPOINTMENT_NO_SHOW audit');
+        $slotAfter = $this->slotRow($seed['slot_id']);
+        self::assertSame((int) $slotBefore['booked_count'], (int) $slotAfter['booked_count'], 'slot booked counter unchanged');
+        self::assertSame((int) $slotBefore['held_count'], (int) $slotAfter['held_count'], 'slot held counter unchanged');
+    }
+
+    /**
+     * Order 2 — the manual no-show commits first, so the check-in must be refused
+     * by the appointment-state guard, with zero live Visits and no pointer.
+     */
+    public function testManualNoShowFirstThenCheckInIsRefusedWithInvalidAppointmentState(): void
+    {
+        $patientId = $this->insertPatient($this->clinicA, 'MR-FR55-O2-' . $this->fileTag, $this->nowUtcSql());
+        $seed = $this->seedConfirmedAppointment(
+            $this->clinicA,
+            $this->locationA,
+            $this->clinicianA,
+            $patientId,
+            $this->futureSlotSpec(5, '11:00:00'),
+            'o2'
+        );
+        $slotBefore = $this->slotRow($seed['slot_id']);
+
+        $result = App::bookingService()->markNoShowByStaff($this->secretaryA, $seed['id'], 'عدم حضور به تصمیم پذیرش');
+        self::assertSame('no_show', (string) $result['status'], 'precondition: the manual no-show commits first');
+
+        $refusal = null;
+        try {
+            $this->checkInWithPinnedClock($patientId, $seed['id']);
+        } catch (VisitException $e) {
+            $refusal = $e;
+        }
+        self::assertInstanceOf(VisitException::class, $refusal, 'the losing check-in must be refused');
+        self::assertSame('CLINIC_INVALID_APPOINTMENT_STATE', $refusal->errorCode, 'terminal refusal code');
+        self::assertSame(409, $refusal->httpStatus, 'the state guard maps to HTTP 409');
+
+        $appt = $this->appointmentRow($seed['id']);
+        self::assertSame('no_show', (string) $appt['status'], 'the appointment stays no_show');
+        self::assertNotNull($appt['no_show_at'], 'the committed no-show stamps no_show_at');
+        self::assertNull($appt['active_visit_id'], 'a no_show appointment holds no Visit pointer');
+        self::assertCount(0, $this->liveVisitsForAppointment($seed['id']), 'zero live Visits exist');
+        self::assertSame(1, $this->noShowAuditCount($seed['id']), 'exactly one APPOINTMENT_NO_SHOW audit');
+        $slotAfter = $this->slotRow($seed['slot_id']);
+        self::assertSame((int) $slotBefore['booked_count'], (int) $slotAfter['booked_count'], 'slot booked counter unchanged');
+        self::assertSame((int) $slotBefore['held_count'], (int) $slotAfter['held_count'], 'slot held counter unchanged');
+    }
+
+    /**
+     * Check-in of an explicitly chosen patient with the clock pinned to the
+     * appointment's own local day at 00:00 — the same clock technique the REST
+     * level T5 test uses through `checkInOnAppointmentDay()`.
+     *
+     * @return array<string, mixed>
+     */
+    private function checkInWithPinnedClock(int $patientId, int $appointmentId): array
+    {
+        $date = (string) App::db()->fetchValue(
+            'SELECT slot_date FROM ' . App::db()->table('cpms_appointments') . ' WHERE id = %d',
+            [$appointmentId]
+        );
+        VisitService::setTestNowUtc(new DateTimeImmutable($date . ' 00:00:00', new DateTimeZone(self::TZ)));
+        try {
+            return App::visitService()->checkIn($this->secretaryA, $patientId, $appointmentId);
+        } finally {
+            VisitService::setTestNowUtc(null);
+        }
     }
 
     /** Fixture check-in uses the existing deterministic clock on its trusted Location day. */
@@ -933,6 +1046,35 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             new MembershipRepository($cpms)
         );
 
+        // Constructed BEFORE the barrier: the measured window must contain only
+        // the product call, so reported overlap cannot be an artefact of building
+        // dependencies inside the window (reader finding A1).
+        $providers = new SmsProviderRegistry();
+        $providers->register(new LogSmsProvider($op));
+        $booking = new BookingService(
+            $cpms,
+            new SlotRepository($cpms),
+            new AppointmentRepository($cpms),
+            new PatientRepository($cpms),
+            $factory,
+            new Phase7Fr55AllowAllLicenseGate(),
+            $audit,
+            $op,
+            new Idempotency($cpms),
+            new SmsService(
+                $cpms,
+                $factory,
+                $providers,
+                new CredentialVault(),
+                $audit,
+                $op,
+                new JobQueue($cpms, $op, new JobWake()),
+                fn (): int => $this->clinicA
+            ),
+            null,
+            new MembershipRepository($cpms)
+        );
+
         $target = $fireAt + $offset;
         while (true) {
             if (@is_file($this->fileTag . '-barrier-' . $attempt) && microtime(true) >= $target) {
@@ -949,31 +1091,6 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                 // (BookingService::markNoShowByStaff — the same call chain the
                 // reception route uses). The retired automatic sweep is not a
                 // product path any more and cannot be raced.
-                $providers = new SmsProviderRegistry();
-                $providers->register(new LogSmsProvider($op));
-                $booking = new BookingService(
-                    $cpms,
-                    new SlotRepository($cpms),
-                    new AppointmentRepository($cpms),
-                    new PatientRepository($cpms),
-                    $factory,
-                    new Phase7Fr55AllowAllLicenseGate(),
-                    $audit,
-                    $op,
-                    new Idempotency($cpms),
-                    new SmsService(
-                        $cpms,
-                        $factory,
-                        $providers,
-                        new CredentialVault(),
-                        $audit,
-                        $op,
-                        new JobQueue($cpms, $op, new JobWake()),
-                        fn (): int => $this->clinicA
-                    ),
-                    null,
-                    new MembershipRepository($cpms)
-                );
                 $booking->markNoShowByStaff($this->secretaryA, $appointmentId, 'race: manual no-show');
                 $outcome = [
                     'role' => $role,
@@ -1404,6 +1521,25 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
      *
      * @return array{date: string, time: string}
      */
+    /**
+     * Slot the check-in guard accepts: same trusted local day and inside the
+     * grace window (+5 min, or -5 min when +5 would cross local midnight), with
+     * a per-attempt second skew so `fx` slot uniqueness never collides.
+     *
+     * @return array{date: string, time: string}
+     */
+    private function eligibleRaceSlotSpec(int $attempt): array
+    {
+        $now = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->setTimezone(new DateTimeZone(self::TZ));
+        $candidate = $now->add(new DateInterval('PT5M'));
+        if ($candidate->format('Y-m-d') !== $now->format('Y-m-d')) {
+            $candidate = $now->sub(new DateInterval('PT5M'));
+        }
+        $candidate = $candidate->sub(new DateInterval('PT' . (int) $attempt . 'S'));
+
+        return ['date' => $candidate->format('Y-m-d'), 'time' => $candidate->format('H:i:s')];
+    }
+
     private function pastSlotSpec(int $minutesAgo, string $tz = self::TZ): array {
         $d = (new DateTimeImmutable('now', new DateTimeZone('UTC')))
             ->setTimezone(new DateTimeZone($tz))
