@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ClinicCore\Application\Roles;
 
 use ClinicCore\Application\Authorization\AuthorizationService;
+use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Application\Scope\TrustedClinicEstablisher;
 use ClinicCore\Auth\CustomRolePolicy;
@@ -12,6 +13,7 @@ use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Repository\CustomRoleRepository;
+use ClinicCore\Infrastructure\Repository\MembershipRepository;
 
 /**
  * Custom Role & Permission Management — Slice 2: the authorized, Clinic-scoped
@@ -271,6 +273,19 @@ final class CustomRoleManagementService {
         return $this->db->transactional(
             function () use ( $actor_wp_user_id, $clinic_id, $role_key, $clean_capabilities, $expected_version ): array {
                 $existing = $this->require_mutable_definition_for_update( $actor_wp_user_id, $clinic_id, $role_key, $expected_version );
+                // B0-PR2-G9 (closed here) — widening a role DEFINITION is refused
+                // while any ACTIVE holder of that custom role is a patient/mixed/
+                // unknown account: the definition applies to those members at once.
+                // Reductions stay allowed; the member list is a strict read.
+                $added_caps = array_values( array_diff( $clean_capabilities, array_map( 'strval', (array) ( $existing['capabilities'] ?? [] ) ) ) );
+                if ( [] !== $added_caps ) {
+                    $holders = new MembershipRepository( $this->db );
+                    foreach ( $holders->member_user_ids_for_role( $role_key ) as $holder_user_id ) {
+                        if ( PatientAccountPolicy::is_patient_account( $holder_user_id ) ) {
+                            throw CustomRoleManagementException::membership_references();
+                        }
+                    }
+                }
                 $this->require_delegable_capabilities( $actor_wp_user_id, $clinic_id, $clean_capabilities, true );
                 $replaced = $this->roles->replace_capabilities( $clinic_id, $role_key, $clean_capabilities );
                 if ( ! $replaced ) {

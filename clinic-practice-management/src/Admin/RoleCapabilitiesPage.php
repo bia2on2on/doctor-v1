@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace ClinicCore\Admin;
 
 use ClinicCore\Auth\RolesAndCapabilities;
+use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Time\PersianDigits;
+use ClinicCore\Infrastructure\Repository\MembershipRepository;
 
 /**
  * صفحه «CPMS (دسترسی‌ها)» — مدیریت Capabilities نقش‌های CPMS (ADR-0030 / Part 1).
@@ -461,6 +463,10 @@ final class RoleCapabilitiesPage
                     foreach ( self::ROLE_PRESETS as $role ) {
                         $requested = isset( $input[ $role ] ) && is_array( $input[ $role ] ) ? $input[ $role ] : [];
                         $before    = array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
+                        // B0-PR2-H2 — widening a BUILT-IN preset is refused while any
+                        // active holder of that role is a patient/mixed/unknown account,
+                        // because the preset applies to those members immediately.
+                        self::assert_widening_has_no_patient_holder( $role, $requested, $before );
                         if ( ! RolesAndCapabilities::setRoleCaps( $role, $requested ) ) {
                             continue;
                         }
@@ -496,6 +502,45 @@ final class RoleCapabilitiesPage
     }
 
     /**
+     * Template capability list of one built-in preset.
+     *
+     * @return list<string>
+     */
+    private static function template_caps( string $role ): array {
+        return match ( $role ) {
+            RolesAndCapabilities::ROLE_DOCTOR => RolesAndCapabilities::DOCTOR_CAPS,
+            RolesAndCapabilities::ROLE_ACCOUNTANT => RolesAndCapabilities::ACCOUNTANT_CAPS,
+            RolesAndCapabilities::ROLE_MANAGER => RolesAndCapabilities::MANAGER_CAPS,
+            default => RolesAndCapabilities::SECRETARY_CAPS,
+        };
+    }
+
+    /**
+     * Refuse a widening of one built-in preset while any ACTIVE holder of that role
+     * is a patient / mixed / unknown account (B0-PR2-H2).
+     *
+     * A widening is any capability present in the requested set but absent from the
+     * current preset. Reductions are always allowed. The check runs before the write
+     * and throws, so the caller's transaction writes nothing.
+     *
+     * @param array<int|string, mixed> $requested
+     * @param list<string>             $before
+     */
+    private static function assert_widening_has_no_patient_holder( string $role, array $requested, array $before ): void {
+        $added = array_values( array_diff( RolesAndCapabilities::sanitizeCapList( $requested ), $before ) );
+        if ( [] === $added ) {
+            return;
+        }
+
+        $repository = new MembershipRepository( App::db() );
+        foreach ( $repository->member_user_ids_for_role( $role ) as $user_id ) {
+            if ( PatientAccountPolicy::is_patient_account( $user_id ) ) {
+                throw new \RuntimeException( 'widening a role preset held by a patient account is refused' );
+            }
+        }
+    }
+
+    /**
      * Pure single-role template-reset boundary (no redirect/exit). Throws on audit
      * failure after the option/role changes have rolled back.
      */
@@ -506,16 +551,12 @@ final class RoleCapabilitiesPage
         try {
             App::db()->transactional(
                 function () use ( $role ) {
-                    $before = array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
-                    RolesAndCapabilities::setRoleCaps(
-                        $role,
-                        match ( $role ) {
-                            RolesAndCapabilities::ROLE_DOCTOR => RolesAndCapabilities::DOCTOR_CAPS,
-                            RolesAndCapabilities::ROLE_ACCOUNTANT => RolesAndCapabilities::ACCOUNTANT_CAPS,
-                            RolesAndCapabilities::ROLE_MANAGER => RolesAndCapabilities::MANAGER_CAPS,
-                            default => RolesAndCapabilities::SECRETARY_CAPS,
-                        }
-                    );
+                    $before   = array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
+                    $template = self::template_caps( $role );
+                    // B0-PR2-H2 — a reset restores the template, which can WIDEN a
+                    // currently narrowed preset; refused under the same condition.
+                    self::assert_widening_has_no_patient_holder( $role, $template, $before );
+                    RolesAndCapabilities::setRoleCaps( $role, $template );
                     App::audit()->log(
                         'ROLE_PERMISSION_RESET',
                         [ 'wp_user_id' => (int) get_current_user_id(), 'role' => 'administrator' ],

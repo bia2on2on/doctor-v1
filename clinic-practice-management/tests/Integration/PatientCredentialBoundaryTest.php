@@ -8,6 +8,7 @@ use ClinicCore\Admin\StaffManagementPage;
 use ClinicCore\Frontend\ManagementPortalController;
 use ClinicCore\Application\Finance\FinanceException;
 use ClinicCore\Application\Onboarding\FirstPracticeSetupException;
+use ClinicCore\Admin\RoleCapabilitiesPage;
 use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
@@ -59,20 +60,26 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
      *
      * @param callable|null $onlyWhen Additional condition: break the read only
      *                               while it returns true.
+     * @param bool          $is_regex Match $needle as a REGEX instead of a
+     *                                substring, so ONE query shape can be broken
+     *                                (H4(c): the manager-authorization read uses the
+     *                                same table, so a table-wide break masks the
+     *                                guard under test).
      */
-    private function failReadsMatching( string $needle, ?callable $onlyWhen = null ): void
+    private function failReadsMatching( string $needle, ?callable $onlyWhen = null, bool $is_regex = false ): void
     {
         global $wpdb;
 
         self::assertNull( $this->queryFault, 'the read fault must not be installed twice' );
 
-        $fault = static function ( $query ) use ( $needle, $onlyWhen ) {
+        $fault = static function ( $query ) use ( $needle, $onlyWhen, $is_regex ) {
             $sql = (string) $query;
             if ( $onlyWhen !== null && true !== $onlyWhen() ) {
                 return $query;
             }
-            if ( 1 === preg_match( '/\A\s*SELECT/i', $sql ) && false !== strpos( $sql, $needle ) ) {
-                return 'SELECT cpms_fault_injection_no_such_column FROM ' . $needle;
+            $hit = $is_regex ? 1 === preg_match( $needle, $sql ) : false !== strpos( $sql, $needle );
+            if ( 1 === preg_match( '/\A\s*SELECT/i', $sql ) && $hit ) {
+                return 'SELECT cpms_fault_injection_no_such_column FROM cpms_fault_injection';
             }
 
             return $query;
@@ -1174,7 +1181,12 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         );
         self::assertSame( 0, $this->membershipCount( $this->clinicId, $target ) );
 
-        // (b) credential path.
+        // (b) credential path. H4(b): the target needs a durable membership in this
+        // Clinic, otherwise StaffManagementPage refuses it as "not manageable"
+        // (StaffManagementPage.php:1271-1275) and the arm proves nothing about the
+        // patient guard. The identity link stays the ONLY patient evidence.
+        cpms_test_seed_membership( $target, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+        self::assertSame( 1, $this->membershipCount( $this->clinicId, $target ) );
         $admin  = $this->makeAdmin();
         $update = StaffManagementPage::upsertUser(
             [
@@ -1283,7 +1295,13 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         );
 
         // The prior override read failing must refuse too (unknown != "no DENY").
-        $this->failReadsMatching( 'cpms_membership_capabilities' );
+        // MUTATION THAT TURNS THIS RED: removing capability_effect_strict() (or
+        // falling back to the soft reader) makes the CLEAR succeed and this
+        // assertion fail. H4(c): the fault targets ONLY the portal's strict read
+        // (`WHERE membership_id = %d` with no ORDER BY); a table-wide fault would
+        // break the manager-authorization read (AuthorizationService.php:97) first
+        // and the arm would pass for the wrong reason.
+        $this->failReadsMatching( '/SELECT capability, effect FROM \S+ WHERE membership_id = \d+\z/', null, true );
         $faulted = ManagementPortalController::dispatch(
             $manager,
             'clinic_staff_capability',
@@ -1394,7 +1412,15 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
 
     /**
      * G8: a patient account never claims first-practice manager authority even
-     * holding manage_options. Fails if the actor guard in claim() is removed.
+     * holding manage_options.
+     *
+     * H4(a) — the fixture must be ELIGIBLE for claim(): exactly ONE Clinic, no
+     * membership in it, no first-setup marker. The earlier version created an extra
+     * Clinic, so `not_available` was thrown even with the actor guard removed.
+     *
+     * MUTATION THAT TURNS THIS RED: removing the `is_patient_account()` guard in
+     * FirstPracticeSetupService::claim() — the patient actor then CLAIMS the
+     * membership, so `reason_code()` and the "nothing written" assertions fail.
      */
     public function test_patient_actor_cannot_claim_first_practice_manager_membership(): void
     {
@@ -1403,8 +1429,58 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         $this->insertPatientLink( $actor );
         wp_set_current_user( $actor );
 
-        $this->expectException( FirstPracticeSetupException::class );
-        App::first_practice_setup_service()->claim( $actor, $this->clinicId, 'کلینیک بیمار' );
+        // Single-Clinic, unclaimed installation: the ONLY reason claim() can refuse
+        // below is the patient-actor guard.
+        App::db()->execute(
+            'DELETE FROM ' . App::db()->table( 'cpms_clinics' ) . ' WHERE id <> %d',
+            [ $this->clinicId ]
+        );
+        self::assertSame( 1, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_clinics' ) ) );
+        self::assertSame(
+            0,
+            (int) App::db()->fetchValue(
+                'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_clinic_memberships' ) . ' WHERE clinic_id = %d',
+                [ $this->clinicId ]
+            )
+        );
+        self::assertNull(
+            App::db()->fetchValue(
+                'SELECT first_setup_claimed_at FROM ' . App::db()->table( 'cpms_clinics' ) . ' WHERE id = %d',
+                [ $this->clinicId ]
+            )
+        );
+
+        try {
+            App::first_practice_setup_service()->claim( $actor, $this->clinicId, 'کلینیک بیمار' );
+            self::fail( 'a patient actor must not claim first-practice authority' );
+        } catch ( FirstPracticeSetupException $e ) {
+            self::assertSame( FirstPracticeSetupException::CODE_NOT_ADMINISTRATOR, $e->reason_code() );
+        }
+
+        self::assertSame(
+            0,
+            (int) App::db()->fetchValue(
+                'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_clinic_memberships' ) . ' WHERE wp_user_id = %d',
+                [ $actor ]
+            ),
+            'nothing may be written for a refused actor'
+        );
+        self::assertNull(
+            App::db()->fetchValue(
+                'SELECT first_setup_claimed_at FROM ' . App::db()->table( 'cpms_clinics' ) . ' WHERE id = %d',
+                [ $this->clinicId ]
+            ),
+            'the first-setup marker must stay unset'
+        );
+
+        // Staff control on the SAME fixture: a non-patient administrator really
+        // receives the manager membership, so the refusal above is the guard.
+        $staffAdmin = (int) self::factory()->user->create( [ 'role' => 'administrator' ] );
+        $this->userIds[] = $staffAdmin;
+        wp_set_current_user( $staffAdmin );
+        $claimed = App::first_practice_setup_service()->claim( $staffAdmin, $this->clinicId, 'کلینیک کارکنان' );
+        self::assertGreaterThan( 0, (int) ( $claimed['membership_id'] ?? 0 ) );
+        self::assertSame( 1, $this->membershipCount( $this->clinicId, $staffAdmin ) );
     }
 
     /** @return list<string> */
@@ -1465,5 +1541,220 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         );
 
         return (int) $wpdb->insert_id;
+    }
+
+    // ==================================================================
+    // 11. H1/H2 — parking must PERSIST, and presets must not widen members
+    // ==================================================================
+
+    /**
+     * H1: the suspension must prove the parked evidence is PERSISTED before it
+     * downgrades the WordPress role, and it must not write anything when that
+     * evidence cannot be read.
+     *
+     * MUTATION THAT TURNS THIS RED: dropping require_parked_evidence_persisted()
+     * from the suspend transaction — the role is then downgraded to `subscriber`
+     * while nothing was parked, and the account loses its only patient evidence.
+     */
+    public function test_suspension_refuses_when_the_parked_evidence_is_not_persisted(): void
+    {
+        $admin  = $this->makeAdmin();
+        $target = $this->makeUser( RolesAndCapabilities::ROLE_PATIENT, 'pb_h1_persist' );
+        $user   = get_userdata( $target );
+        $user->add_role( RolesAndCapabilities::ROLE_SECRETARY );
+        cpms_test_seed_membership( $target, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        // The parked-roles write is short-circuited: update_user_meta() returns
+        // false and NOTHING is persisted, exactly like a failed write.
+        $shortCircuit = static function ( $check, $object_id, $meta_key ) {
+            if ( 'cpms_parked_roles' === (string) $meta_key ) {
+                return false;
+            }
+
+            return $check;
+        };
+        add_filter( 'update_user_metadata', $shortCircuit, 10, 3 );
+
+        $result = StaffManagementPage::toggleUser( $target, 'deactivate', $admin, $this->clinicId );
+
+        remove_filter( 'update_user_metadata', $shortCircuit, 10 );
+
+        self::assertNotSame( '', $result['error'], 'a suspension whose evidence did not persist must refuse' );
+        self::assertSame(
+            'active',
+            (string) App::membership_service()->membership_for( $this->clinicId, $target )['status'],
+            'the membership must not be suspended'
+        );
+        self::assertContains(
+            RolesAndCapabilities::ROLE_PATIENT,
+            array_values( (array) get_userdata( $target )->roles ),
+            'the live patient role must survive a refused suspension'
+        );
+        self::assertTrue( PatientAccountPolicy::is_patient_account( $target ) );
+        self::assertSame(
+            PatientAccountPolicy::DENIAL_MESSAGE,
+            StaffManagementPage::toggleUser( $target, 'activate', $admin, $this->clinicId )['error']
+        );
+    }
+
+    /**
+     * H1: a failed READ of the parked evidence refuses the suspension with nothing
+     * written (the merged list cannot be computed without it).
+     *
+     * MUTATION THAT TURNS THIS RED: restoring get_user_meta() as the merge source —
+     * the soft read returns "" on the broken query and the suspension proceeds.
+     */
+    public function test_suspension_refuses_when_the_parked_evidence_cannot_be_read(): void
+    {
+        $admin  = $this->makeAdmin();
+        $target = $this->makeUser( RolesAndCapabilities::ROLE_PATIENT, 'pb_h1_read' );
+        cpms_test_seed_membership( $target, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $this->failReadsMatching( 'cpms_parked_roles' );
+        $result = StaffManagementPage::toggleUser( $target, 'deactivate', $admin, $this->clinicId );
+        $this->restoreReads();
+
+        self::assertNotSame( '', $result['error'], 'an unreadable evidence row must refuse the suspension' );
+        self::assertSame(
+            'active',
+            (string) App::membership_service()->membership_for( $this->clinicId, $target )['status']
+        );
+        self::assertSame(
+            [ RolesAndCapabilities::ROLE_PATIENT ],
+            array_values( (array) get_userdata( $target )->roles )
+        );
+    }
+
+    /**
+     * H2: widening a BUILT-IN preset is refused while an active holder of that role
+     * is a patient/mixed account; a role with no such holder is unaffected.
+     *
+     * MUTATION THAT TURNS THIS RED: removing assert_widening_has_no_patient_holder()
+     * from apply_capability_matrix() — the patient member then gains the new
+     * capability through the preset.
+     */
+    public function test_matrix_edit_refuses_widening_a_preset_held_by_a_patient(): void
+    {
+        $admin   = $this->makeAdmin();
+        $patient = $this->makeUser( 'subscriber', 'pb_h2_matrix' );
+        $this->insertPatientLink( $patient );
+        cpms_test_seed_membership( $patient, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        // A capability the secretary preset does NOT already hold (dynamic, so the
+        // arm cannot go vacuous if a template changes).
+        $widening = $this->capabilityOutside( RolesAndCapabilities::ROLE_SECRETARY );
+        $matrix   = $this->matrixWithCurrentCaps();
+        $matrix[ RolesAndCapabilities::ROLE_SECRETARY ][] = $widening;
+
+        $before = RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY );
+
+        try {
+            RolesCapabilitiesPage::apply_capability_matrix( $matrix, $admin );
+            self::fail( 'widening a preset held by a patient must be refused' );
+        } catch ( \RuntimeException $e ) {
+            self::assertNotSame( '', $e->getMessage() );
+        }
+
+        self::assertSame(
+            $before,
+            RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY ),
+            'the preset must be unchanged after the refusal'
+        );
+
+        // Control: the same widening on a role with no patient holder applies.
+        $controlWidening = $this->capabilityOutside( RolesAndCapabilities::ROLE_ACCOUNTANT );
+        $control         = $this->matrixWithCurrentCaps();
+        $control[ RolesAndCapabilities::ROLE_ACCOUNTANT ][] = $controlWidening;
+        RolesCapabilitiesPage::apply_capability_matrix( $control, $admin );
+        self::assertTrue(
+            true === ( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_ACCOUNTANT )[ $controlWidening ] ?? null ),
+            'a preset without a patient holder may still be widened'
+        );
+    }
+
+    /**
+     * H2: a template RESET that would widen a currently narrowed preset is refused
+     * while a patient/mixed holder exists.
+     *
+     * MUTATION THAT TURNS THIS RED: removing assert_widening_has_no_patient_holder()
+     * from reset_role_to_template().
+     */
+    public function test_template_reset_refuses_widening_a_preset_held_by_a_patient(): void
+    {
+        $admin   = $this->makeAdmin();
+        $patient = $this->makeUser( 'subscriber', 'pb_h2_reset' );
+        $this->insertPatientLink( $patient );
+        cpms_test_seed_membership( $patient, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        // Narrow the preset first: the reset would restore (widen) it.
+        $narrowed = array_values(
+            array_diff(
+                array_keys( array_filter( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY ) ) ),
+                [ RolesAndCapabilities::PAYMENT_CREATE ]
+            )
+        );
+        self::assertTrue( RolesAndCapabilities::setRoleCaps( RolesAndCapabilities::ROLE_SECRETARY, $narrowed ) );
+        $before = RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY );
+        self::assertFalse( true === ( $before[ RolesAndCapabilities::PAYMENT_CREATE ] ?? null ) );
+
+        try {
+            RolesCapabilitiesPage::reset_role_to_template( RolesAndCapabilities::ROLE_SECRETARY );
+            self::fail( 'a reset that widens a preset held by a patient must be refused' );
+        } catch ( \RuntimeException $e ) {
+            self::assertNotSame( '', $e->getMessage() );
+        }
+
+        self::assertSame( $before, RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY ) );
+
+        // Control: the same reset on a role with no patient holder is allowed and
+        // really restores the template (mirror image of the refusal above).
+        $accountantCaps = array_keys( array_filter( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_ACCOUNTANT ) ) );
+        self::assertNotSame( [], $accountantCaps );
+        $droppedCap = (string) $accountantCaps[0];
+        RolesAndCapabilities::setRoleCaps(
+            RolesAndCapabilities::ROLE_ACCOUNTANT,
+            array_values( array_diff( $accountantCaps, [ $droppedCap ] ) )
+        );
+        self::assertFalse( true === ( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_ACCOUNTANT )[ $droppedCap ] ?? null ) );
+
+        RolesCapabilitiesPage::reset_role_to_template( RolesAndCapabilities::ROLE_ACCOUNTANT );
+        self::assertTrue(
+            true === ( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_ACCOUNTANT )[ $droppedCap ] ?? null ),
+            'a preset without a patient holder resets to its template'
+        );
+    }
+
+    /**
+     * The full role_caps payload the admin form submits, with every preset at its
+     * CURRENT capability set (so only the explicit change under test happens).
+     *
+     * @return array<string, list<string>>
+     */
+    /**
+     * A capability that the given built-in preset does NOT currently grant.
+     */
+    private function capabilityOutside( string $role ): string {
+        $current    = array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
+        $candidates = array_values( array_diff( RolesAndCapabilities::ALL_CAPS, $current ) );
+
+        self::assertNotSame( [], $candidates, 'the preset must not already hold every capability' );
+
+        return (string) $candidates[0];
+    }
+
+    private function matrixWithCurrentCaps(): array {
+        $matrix = [];
+        $roles  = [
+            RolesAndCapabilities::ROLE_SECRETARY,
+            RolesAndCapabilities::ROLE_DOCTOR,
+            RolesAndCapabilities::ROLE_ACCOUNTANT,
+            RolesAndCapabilities::ROLE_MANAGER,
+        ];
+
+        foreach ( $roles as $role ) {
+            $matrix[ $role ] = array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
+        }
+
+        return $matrix;
     }
 }

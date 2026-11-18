@@ -21,6 +21,12 @@ use SplFileInfo;
  * Matching is FILE-level (never line numbers), so moving code cannot break it.
  * This is a completeness guard, not a behaviour test: the behaviour is asserted
  * by the integration suites that call these writers.
+ *
+ * LIMITATION (stated plainly): a NEW writer call added INSIDE an already
+ * allowlisted file is NOT detected — the file is classified once, at file level.
+ * The guard only catches a writer appearing in a file that is not classified yet.
+ * Comments are stripped before matching, so prose about a writer cannot create a
+ * false positive (and comment-only mentions are not evidence of a call).
  */
 final class PatientBoundaryWriterInventoryTest extends TestCase
 {
@@ -33,7 +39,9 @@ final class PatientBoundaryWriterInventoryTest extends TestCase
         'password'       => '/wp_set_password\s*\(/',
         'user-write'     => '/wp_update_user\s*\(|wp_insert_user\s*\(|wp_create_user\s*\(/',
         'reset'          => '/(?<!->)\breset_password\s*\(/',
+        'reset-key'      => '/\bget_password_reset_key\s*\(/',
         'wp-role'        => '/->add_role\s*\(|->set_role\s*\(|->remove_role\s*\(/',
+        'wp-cap'         => '/->add_cap\s*\(|->remove_cap\s*\(/',
         'membership'     => '/\bcreate_membership\s*\(|reactivate_membership\s*\(|suspend_membership\s*\(|memberships->insert\s*\(|insert\(\s*\'cpms_clinic_memberships\'/',
         'capability'     => '/->set_capability\s*\(|->remove_capability\s*\(|replace_capabilities\s*\(/',
         'scope'          => '/set_scope_mode\s*\(/',
@@ -55,6 +63,7 @@ final class PatientBoundaryWriterInventoryTest extends TestCase
         'src/Admin/ClinicianAdminPage.php'                                  => 'GUARDED: G7 guard on create/update/activation clinician links.',
         'src/Admin/CustomRoleDefinitionsPage.php'                            => 'GUARDED: delegates to CustomRoleManagementService, which requires clinic-manager authority.',
         'src/Admin/FinanceDelegationPage.php'                               => 'GUARDED: delegates to FinanceDelegationService (G5 guard + revocation rules).',
+        'src/Auth/RolesAndCapabilities.php'                                 => 'NOT NEEDED at this level: the role/capability registry; every widening decision lives in RoleCapabilitiesPage (H2 guards) and CustomRoleManagementService (G9 guard).',
         'src/Admin/StaffManagementPage.php'                                 => 'GUARDED: PatientAccountPolicy::guard()/is_patient_account() on every credential, role and status path.',
         'src/Application/Finance/FinanceDelegationService.php'              => 'GUARDED: G5 delegate()/revoke() patient checks plus strict prior-effect read.',
         'src/Application/Management/ManagementPortalService.php'            => 'GUARDED: patient checks on enroll, role, status, capability, scope and clinician link.',
@@ -67,6 +76,16 @@ final class PatientBoundaryWriterInventoryTest extends TestCase
         'src/Infrastructure/Repository/MembershipRepository.php'            => 'NOT NEEDED: storage layer; no authorization decision lives here.',
         'src/Infrastructure/UserCacheRollback.php'                          => 'NOT NEEDED: only evicts WordPress caches for an account the caller just rolled back.',
     );
+
+    /**
+     * Remove PHP comments so only executable code is matched.
+     */
+    private static function stripComments( string $source ): string {
+        $stripped = preg_replace( '#/\*.*?\*/#s', '', $source );
+        $stripped = preg_replace( '#(^|[^:])//[^\n]*#', '$1', (string) $stripped );
+
+        return (string) $stripped;
+    }
 
     public function test_every_writer_file_is_classified(): void
     {
@@ -85,7 +104,9 @@ final class PatientBoundaryWriterInventoryTest extends TestCase
             }
 
             $relative = 'src/' . str_replace( '\\', '/', substr( $file->getPathname(), strlen( $root ) + 1 ) );
-            $contents = (string) file_get_contents( $file->getPathname() );
+            // H5 — comments are stripped before matching, so prose that mentions a
+            // writer function cannot create a false positive.
+            $contents = self::stripComments( (string) file_get_contents( $file->getPathname() ) );
 
             foreach ( self::WRITERS as $label => $pattern ) {
                 if ( 1 === preg_match( $pattern, $contents ) ) {

@@ -146,6 +146,26 @@ final class MembershipRepository {
      *
      * @return list<int>
      */
+    /**
+     * شناسهٔ کاربرانِ دارای عضویتِ **فعال** با این role_key در همهٔ Clinicها — مبنای
+     * بررسیِ «گسترشِ» یک نقشِ دارای عضوِ بیمار/مختلط (B0-PR2-H2/G9).
+     *
+     * خواندنِ strict است: خطای دیتابیس throw می‌شود تا «نامعلوم» هرگز «بدون عضو»
+     * تلقی نشود (`require_successful_read()`).
+     *
+     * @return list<int>
+     */
+    public function member_user_ids_for_role( string $role_key ): array {
+        $rows = $this->db->fetch_all_strict(
+            'SELECT DISTINCT wp_user_id FROM ' . $this->db->table( 'cpms_clinic_memberships' )
+                . ' WHERE role_key = %s AND status = %s ORDER BY wp_user_id ASC LIMIT 5000',
+            [ $role_key, 'active' ]
+        );
+        $this->require_successful_read();
+
+        return array_map( 'intval', array_column( $rows, 'wp_user_id' ) );
+    }
+
     public function active_clinic_ids_for_user( int $wp_user_id ): array {
         $rows = $this->db->fetchAll(
             'SELECT clinic_id FROM ' . $this->db->table( 'cpms_clinic_memberships' ) .

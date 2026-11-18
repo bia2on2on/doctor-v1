@@ -976,11 +976,17 @@ final class StaffManagementPage
                 return ['error' => 'عضویت هدف از قبل غیرفعال است.'];
             }
 
-            // B0-PR2-G4 — durable evidence for EVERY parked role, merged with any
+            // B0-PR2-G4/H1 — durable evidence for EVERY parked role, merged with any
             // value an earlier suspension (another Clinic) wrote. `$user->roles[0]`
             // alone is not durable: the patient role may sit at any position, and a
             // second suspension sees only `subscriber` after the first downgrade.
-            $parked_roles = self::merge_parked_roles( $user_id, (array) $user->roles );
+            // The merged list is built from a STRICT read: if the persisted evidence
+            // cannot be read, nothing is written (a suspension must never erase it).
+            try {
+                $parked_roles = self::merge_parked_roles( $user_id, (array) $user->roles );
+            } catch ( \RuntimeException $e ) {
+                return ['error' => 'وضعیت نقش‌های این کاربر خوانده نشد؛ هیچ تغییری اعمال نشد.'];
+            }
             // D6 audit atomicity: suspension, role parking/meta and the
             // mandatory audit event share one transaction boundary. The old
             // manual reactivation compensation on a wp_update_user() failure is
@@ -993,6 +999,12 @@ final class StaffManagementPage
                         App::membership_service()->suspend_membership( (int) $target_membership['id'] );
                         update_user_meta( $user_id, self::META_PREV_ROLE, $prev_role );
                         update_user_meta( $user_id, self::META_PARKED_ROLES, (string) wp_json_encode( $parked_roles ) );
+                        // H1 — `update_user_meta()` returns false both on failure and
+                        // on an unchanged value, so the return value proves nothing.
+                        // READ BACK the persisted rows (strict); a mismatch throws and
+                        // rolls back BEFORE the WordPress role is downgraded, so a
+                        // failed parking can never strip the live patient role.
+                        self::require_parked_evidence_persisted( $user_id, $prev_role, $parked_roles );
                         if ( $park_wp_role ) {
                             $updated = wp_update_user( [ 'ID' => $user_id, 'role' => 'subscriber' ] );
                             if ( is_wp_error( $updated ) ) {
@@ -1389,7 +1401,17 @@ final class StaffManagementPage
      * @return list<string>
      */
     private static function merge_parked_roles( int $user_id, array $roles ): array {
-        $existing = get_user_meta( $user_id, self::META_PARKED_ROLES, true );
+        global $wpdb;
+
+        // STRICT read (H1): `get_user_meta()` is cached and silent, so a failed read
+        // would look like "nothing parked yet" and the next write would drop the
+        // evidence an earlier suspension persisted. A failure throws, and the caller
+        // refuses without writing.
+        $rows     = App::db()->fetch_all_strict(
+            'SELECT meta_value FROM ' . $wpdb->usermeta . ' WHERE user_id = %d AND meta_key = %s LIMIT 1',
+            [ $user_id, self::META_PARKED_ROLES ]
+        );
+        $existing = [] === $rows ? '' : (string) ( $rows[0]['meta_value'] ?? '' );
         $parked   = [];
 
         if ( is_string( $existing ) && '' !== $existing ) {
@@ -1414,6 +1436,45 @@ final class StaffManagementPage
         sort( $parked );
 
         return $parked;
+    }
+
+    /**
+     * Read the parked evidence back from the database and throw unless the two
+     * rows really persist what the suspension decided (H1).
+     *
+     * Runs inside the suspension transaction, after the meta writes and BEFORE the
+     * WordPress role downgrade, so a silently failed write rolls the whole
+     * suspension back with the account's roles untouched.
+     *
+     * @param list<string> $parked_roles
+     */
+    private static function require_parked_evidence_persisted( int $user_id, string $prev_role, array $parked_roles ): void {
+        global $wpdb;
+
+        $rows = App::db()->fetch_all_strict(
+            'SELECT meta_key, meta_value FROM ' . $wpdb->usermeta
+            . ' WHERE user_id = %d AND meta_key IN (%s, %s)',
+            [ $user_id, self::META_PREV_ROLE, self::META_PARKED_ROLES ]
+        );
+
+        $persisted = [];
+        foreach ( $rows as $row ) {
+            $persisted[ (string) ( $row['meta_key'] ?? '' ) ] = (string) ( $row['meta_value'] ?? '' );
+        }
+
+        $stored_prev   = (string) ( $persisted[ self::META_PREV_ROLE ] ?? '' );
+        $stored_parked = json_decode( (string) ( $persisted[ self::META_PARKED_ROLES ] ?? '' ), true );
+
+        if ( $stored_prev !== $prev_role || ! is_array( $stored_parked ) ) {
+            throw new \RuntimeException( 'parked role evidence was not persisted' );
+        }
+
+        $stored = array_map( 'strval', $stored_parked );
+        foreach ( $parked_roles as $role ) {
+            if ( ! in_array( $role, $stored, true ) ) {
+                throw new \RuntimeException( 'parked role evidence lost a role' );
+            }
+        }
     }
 
     private static function has_any_membership( int $user_id ): bool {
