@@ -148,7 +148,10 @@ final class VisitNoShowContinuationTest extends WP_UnitTestCase
             [$appointmentId]
         );
 
-        return is_array($row) ? $row : [];
+        self::assertIsArray($row, 'the appointment row must exist: id=' . $appointmentId);
+        self::assertArrayHasKey('status', $row);
+
+        return $row;
     }
 
     private function pastDate(int $days = 3): string

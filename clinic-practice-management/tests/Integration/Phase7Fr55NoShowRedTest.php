@@ -1319,7 +1319,9 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         $row = $res->fetch_assoc();
         $res->free();
 
-        return is_array($row) ? (array) $row : [];
+        self::assertIsArray($row, 'fresh-connection read must return a row: ' . $sql);
+
+        return (array) $row;
     }
 
     private function mysqliAll(\mysqli $conn, string $sql): array {
