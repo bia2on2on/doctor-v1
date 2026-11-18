@@ -663,57 +663,343 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     }
 
     // ================= T12 — concurrency: check-in vs no-show (real-DB race) =================
+    //
+    // The race runs ONCE per class and its observations are asserted by ONE test per
+    // invariant, so a red run names the invariant instead of hiding several behind a
+    // single aggregate name. The harness has its own test: a fork / bootstrap /
+    // child-exit problem can never be mistaken for product evidence.
 
-    public function testConcurrentCheckInAndNoShowNeverLeaveLiveVisitOnNoShowAppointment(): void {
+    /** @var array<int, array{attempt: int, outcomes: array<string, array<string, mixed>>, state: array<string, mixed>}>|null */
+    private static ?array $race_observations = null;
+
+    /** @var string|null Harness-level fatal (fork, child exit, outcome file); null means the harness completed. */
+    private static ?string $race_harness_error = null;
+
+    /**
+     * Run the real-DB race once per class and keep the observations.
+     *
+     * @return array<int, array{attempt: int, outcomes: array<string, array<string, mixed>>, state: array<string, mixed>}>
+     */
+    private function raceObservations(): array
+    {
+        if (self::$race_observations !== null || self::$race_harness_error !== null) {
+            return self::$race_observations ?? [];
+        }
+
         if (!function_exists('pcntl_fork')) {
             $this->markTestSkipped('pcntl is not available in this CI environment.');
         }
 
         $observations = [];
-        for ($attempt = 1; $attempt <= self::RACE_ATTEMPTS; $attempt++) {
-            $patientId = $this->insertPatient(
-                $this->clinicA,
-                'MR-FR55-R' . $attempt . '-' . $this->fileTag,
-                $this->nowUtcSql()
-            );
-            global $wpdb;
-            $wpdb->query('COMMIT'); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+        try {
+            for ($attempt = 1; $attempt <= self::RACE_ATTEMPTS; $attempt++) {
+                $patientId = $this->insertPatient(
+                    $this->clinicA,
+                    'MR-FR55-R' . $attempt . '-' . $this->fileTag,
+                    $this->nowUtcSql()
+                );
+                global $wpdb;
+                $wpdb->query('COMMIT'); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
 
-            // CHECK-IN ELIGIBLE confirmed appointment (same trusted local day,
-            // inside grace), so the check-in worker can legitimately win this
-            // race; the manual no-show has no time guard and stays legal too.
-            $seed = $this->seedConfirmedAppointment(
-                $this->clinicA,
-                $this->locationA,
-                $this->clinicianA,
-                $patientId,
-                $this->eligibleRaceSlotSpec($attempt),
-                'rc' . $attempt
-            );
+                // CHECK-IN ELIGIBLE confirmed appointment (same trusted local day,
+                // inside grace), so the check-in worker can legitimately win this
+                // race; the manual no-show has no time guard and stays legal too.
+                $seed = $this->seedConfirmedAppointment(
+                    $this->clinicA,
+                    $this->locationA,
+                    $this->clinicianA,
+                    $patientId,
+                    $this->eligibleRaceSlotSpec($attempt),
+                    'rc' . $attempt
+                );
 
-            // Genuinely independent workers firing at the SAME barrier
-            // instant (zero offset): the MANUAL no-show (BookingService::
-            // markNoShowByStaff, the reception-route chain) and the secretary
-            // check-in compete for the same appointment row lock. Both
-            // serialization orders are legal; in-flight overlap is asserted.
-            $workers = [
-                ['role' => 'no_show', 'offset' => 0.0],
-                ['role' => 'check_in', 'offset' => 0.0],
-            ];
-            $outcomes = $this->runRace($seed['id'], $patientId, $workers, $attempt);
-            $state = $this->raceState($seed['id'], $seed['slot_id']);
+                // Genuinely independent workers firing at the SAME barrier instant
+                // (zero offset): the MANUAL no-show (BookingService::
+                // markNoShowByStaff, the reception-route chain) and the secretary
+                // check-in compete for the same appointment row lock. Both
+                // serialization orders are legal.
+                $workers = [
+                    ['role' => 'no_show', 'offset' => 0.0],
+                    ['role' => 'check_in', 'offset' => 0.0],
+                ];
+                $outcomes = $this->runRace($seed['id'], $patientId, $workers, $attempt);
+                $state = $this->raceState($seed['id'], $seed['slot_id']);
 
-            $observations[] = [
-                'attempt' => $attempt,
-                'outcomes' => $outcomes,
-                'state' => $state,
-            ];
-            $this->assertRaceOutcomeEnvelopesOnly($outcomes, 'attempt ' . $attempt);
-            $this->assertRaceIndependenceAndOverlap($outcomes, 'attempt ' . $attempt);
-            $this->assertRaceLegal($state, $outcomes, 'attempt ' . $attempt);
+                $observations[] = [
+                    'attempt' => $attempt,
+                    'outcomes' => $outcomes,
+                    'state' => $state,
+                ];
+            }
+        } catch (Throwable $e) {
+            self::$race_harness_error = get_class($e) . ': ' . $e->getMessage();
         }
 
-        self::assertSame(self::RACE_ATTEMPTS, count($observations), 'race evidence must exist for every attempt');
+        self::$race_observations = $observations;
+
+        return $observations;
+    }
+
+    /**
+     * One observation per attempt, failing loudly when the harness did not finish.
+     *
+     * @return array<int, array{attempt: int, outcomes: array<string, array<string, mixed>>, state: array<string, mixed>}>
+     */
+    private function raceAttempts(): array
+    {
+        $observations = $this->raceObservations();
+
+        self::assertNull(
+            self::$race_harness_error,
+            'the fork harness itself must complete before any product invariant is read: ' . (string) self::$race_harness_error
+        );
+        self::assertCount(
+            self::RACE_ATTEMPTS,
+            $observations,
+            'race evidence must exist for every attempt, got ' . count($observations)
+        );
+
+        return $observations;
+    }
+
+    /** The harness must not be mistaken for a product result. */
+    public function testRaceHarnessCompletedEveryAttemptWithChildOutcomes(): void
+    {
+        $observations = $this->raceAttempts();
+
+        foreach ($observations as $row) {
+            $context = 'attempt ' . $row['attempt'];
+            self::assertArrayHasKey('check_in', $row['outcomes'], $context . ': the check-in worker must have written an outcome');
+            self::assertArrayHasKey('no_show', $row['outcomes'], $context . ': the no-show worker must have written an outcome');
+            self::assertArrayHasKey('result', $row['outcomes']['check_in'], $context . ': check-in outcome must carry a result — ' . wp_json_encode($row['outcomes']['check_in']));
+            self::assertArrayHasKey('result', $row['outcomes']['no_show'], $context . ': no-show outcome must carry a result — ' . wp_json_encode($row['outcomes']['no_show']));
+        }
+    }
+
+    public function testRaceOutcomeEnvelopesAreProductEnvelopesOnly(): void
+    {
+        foreach ($this->raceAttempts() as $row) {
+            $context = 'attempt ' . $row['attempt'];
+            foreach ($row['outcomes'] as $role => $outcome) {
+                self::assertNotSame(
+                    'fatal',
+                    $outcome['result'] ?? null,
+                    "{$context} [{$role}]: child bootstrap fatal is a harness failure, not product evidence — " . wp_json_encode($outcome)
+                );
+                self::assertNotSame(
+                    'exception',
+                    $outcome['result'] ?? null,
+                    "{$context} [{$role}]: a raw exception escaping the product call is not a legal product envelope — " . wp_json_encode($outcome)
+                );
+            }
+            // R4: the manual no-show has a legal success AND a legal refusal envelope
+            // (refused by the active-Visit guard when the check-in won the row lock).
+            self::assertContains(
+                $row['outcomes']['no_show']['result'] ?? null,
+                ['ok', 'rejected'],
+                "{$context}: the manual no-show must end in a product envelope, got " . wp_json_encode($row['outcomes']['no_show'] ?? null)
+            );
+        }
+    }
+
+    public function testRaceWorkersRanAsDistinctChildProcesses(): void
+    {
+        $parentPid = getmypid();
+        foreach ($this->raceAttempts() as $row) {
+            $context = 'attempt ' . $row['attempt'];
+            $ci = $row['outcomes']['check_in'];
+            $ns = $row['outcomes']['no_show'];
+
+            self::assertIsInt($ci['pid'] ?? null, "{$context}: check-in child must record its PID");
+            self::assertIsInt($ns['pid'] ?? null, "{$context}: no-show child must record its PID");
+            self::assertNotSame($parentPid, $ci['pid'], "{$context}: check-in must run in a child process");
+            self::assertNotSame($parentPid, $ns['pid'], "{$context}: no-show must run in a child process");
+            self::assertNotSame($ci['pid'], $ns['pid'], "{$context}: the workers must be distinct processes");
+        }
+    }
+
+    public function testRaceWorkersOwnedIndependentDbConnections(): void
+    {
+        foreach ($this->raceAttempts() as $row) {
+            $context = 'attempt ' . $row['attempt'];
+            $ci = $row['outcomes']['check_in'];
+            $ns = $row['outcomes']['no_show'];
+
+            self::assertTrue(
+                (bool) ($ci['own_wpdb_connected'] ?? false),
+                "{$context}: check-in child must own its DB connection — " . wp_json_encode($ci)
+            );
+            self::assertTrue(
+                (bool) ($ns['own_wpdb_connected'] ?? false),
+                "{$context}: no-show child must own its DB connection — " . wp_json_encode($ns)
+            );
+            foreach (['check_in' => $ci, 'no_show' => $ns] as $role => $outcome) {
+                $probes = ' child_before: ' . wp_json_encode($outcome['probe_before'] ?? null)
+                    . ' child_after: ' . wp_json_encode($outcome['probe_after'] ?? null)
+                    . ' parent_at_fork: ' . wp_json_encode($outcome['parent_probe'] ?? null);
+                self::assertGreaterThanOrEqual(
+                    1,
+                    (int) ($outcome['query_filters_before'] ?? 0),
+                    "{$context}: [{$role}] the test-only query-rewrite must have been present in the forked child" . $probes
+                );
+                self::assertSame(
+                    0,
+                    (int) ($outcome['query_filters_after'] ?? 0),
+                    "{$context}: [{$role}] the test-only query-rewrite must be removed in the child (real commits, not parent savepoints)" . $probes
+                );
+            }
+        }
+    }
+
+    public function testRaceProductCallWindowsOverlappedInFlight(): void
+    {
+        foreach ($this->raceAttempts() as $row) {
+            $context = 'attempt ' . $row['attempt'];
+            $ci = $row['outcomes']['check_in'];
+            $ns = $row['outcomes']['no_show'];
+
+            $starts = [
+                'check_in' => (float) ($ci['call_started_at'] ?? 0),
+                'no_show' => (float) ($ns['call_started_at'] ?? 0),
+            ];
+            $ends = [
+                'check_in' => (float) ($ci['call_finished_at'] ?? 0),
+                'no_show' => (float) ($ns['call_finished_at'] ?? 0),
+            ];
+            foreach (['check_in', 'no_show'] as $role) {
+                self::assertGreaterThan(0.0, $starts[$role], "{$context}: [{$role}] call window must have a start timestamp");
+                self::assertGreaterThan(
+                    0.0,
+                    $ends[$role] - $starts[$role],
+                    "{$context}: [{$role}] call window must have positive duration, got " . ($ends[$role] - $starts[$role])
+                );
+                self::assertLessThan(
+                    60.0,
+                    $ends[$role] - $starts[$role],
+                    "{$context}: [{$role}] call window must not be a hung call, got " . ($ends[$role] - $starts[$role])
+                );
+            }
+
+            $latestStart = max($starts['check_in'], $starts['no_show']);
+            $earliestEnd = min($ends['check_in'], $ends['no_show']);
+            $overlap = $earliestEnd - $latestStart;
+            $windows = sprintf(
+                'check_in=[%.6f, %.6f] no_show=[%.6f, %.6f] overlap=%.6f',
+                $starts['check_in'],
+                $ends['check_in'],
+                $starts['no_show'],
+                $ends['no_show'],
+                $overlap
+            );
+            self::assertGreaterThan(
+                0.0,
+                $overlap,
+                "{$context}: NO in-flight overlap of the two product calls (windows: {$windows}) — "
+                . 'one call finished before the other started, i.e. the attempt was effectively '
+                . 'sequential and is NOT concurrency evidence. Both workers fire at the same '
+                . 'barrier instant; in a genuine lock race the loser blocks inside its own '
+                . 'window on the winner\'s appointment row lock, so overlap must be positive.'
+            );
+        }
+    }
+
+    public function testRaceNeverLeavesLiveVisitOnNoShowAppointment(): void
+    {
+        foreach ($this->raceAttempts() as $row) {
+            $context = 'attempt ' . $row['attempt'];
+            $state = $row['state'];
+            $live = count((array) ($state['live_visits'] ?? []));
+
+            self::assertFalse(
+                $state['status'] === 'no_show' && $live > 0,
+                "{$context}: a live Visit must never sit on a no_show appointment — state: " . wp_json_encode($state)
+            );
+        }
+    }
+
+    public function testRaceExactlyOneWorkerCommits(): void
+    {
+        foreach ($this->raceAttempts() as $row) {
+            $context = 'attempt ' . $row['attempt'];
+            $ns = $row['outcomes']['no_show'] ?? [];
+            $ci = $row['outcomes']['check_in'] ?? [];
+
+            $winners = (int) (($ns['result'] ?? '') === 'ok') + (int) (($ci['result'] ?? '') === 'ok');
+            self::assertSame(
+                1,
+                $winners,
+                "{$context}: exactly one worker may commit — no_show: " . wp_json_encode($ns) . ' check_in: ' . wp_json_encode($ci)
+            );
+        }
+    }
+
+    public function testRaceNoShowWinnerStampsNoShowAndRefusesCheckIn(): void
+    {
+        $evaluated = 0;
+        foreach ($this->raceAttempts() as $row) {
+            $context = 'attempt ' . $row['attempt'];
+            $state = $row['state'];
+            $ci = $row['outcomes']['check_in'] ?? [];
+            $ns = $row['outcomes']['no_show'] ?? [];
+            if ($state['status'] !== 'no_show') {
+                continue;
+            }
+            ++$evaluated;
+
+            self::assertNotNull($state['no_show_at'], "{$context}: the committed manual no-show stamps no_show_at");
+            self::assertSame(
+                0,
+                count((array) ($state['live_visits'] ?? [])),
+                "{$context}: no Visit may exist after the no-show won — state: " . wp_json_encode($state)
+            );
+            self::assertNull($state['active_visit_id'], "{$context}: a no_show appointment holds no Visit pointer");
+            self::assertSame('rejected', $ci['result'] ?? null, "{$context}: the losing check-in must be refused — " . wp_json_encode($ci));
+            self::assertSame('CLINIC_INVALID_APPOINTMENT_STATE', $ci['error_code'] ?? null, "{$context}: terminal refusal code");
+            self::assertSame('ok', $ns['result'] ?? null, "{$context}: the manual no-show committed — " . wp_json_encode($ns));
+        }
+
+        // R4 keeps BOTH orders legal, so zero no-show wins is legal evidence too: the
+        // deterministic order-1/order-2 tests carry the both-orders proof.
+        self::assertGreaterThanOrEqual(0, $evaluated, 'no-show-winner attempts evaluated: ' . $evaluated);
+    }
+
+    public function testRaceCheckInWinnerKeepsConfirmedAppointmentAndRefusesNoShow(): void
+    {
+        $evaluated = 0;
+        foreach ($this->raceAttempts() as $row) {
+            $context = 'attempt ' . $row['attempt'];
+            $state = $row['state'];
+            $ci = $row['outcomes']['check_in'] ?? [];
+            $ns = $row['outcomes']['no_show'] ?? [];
+            if ($state['status'] === 'no_show') {
+                continue;
+            }
+            ++$evaluated;
+
+            self::assertSame('confirmed', $state['status'], "{$context}: no no_show may be written when the check-in won — state: " . wp_json_encode($state));
+            self::assertNull($state['no_show_at'], "{$context}: no_show_at must stay NULL when the check-in won");
+            self::assertSame(
+                1,
+                count((array) ($state['live_visits'] ?? [])),
+                "{$context}: the winning check-in keeps exactly one live Visit — state: " . wp_json_encode($state)
+            );
+            self::assertSame('rejected', $ns['result'] ?? null, "{$context}: the losing manual no-show must be refused — " . wp_json_encode($ns));
+            self::assertSame('HAS_ACTIVE_VISIT', $ns['error_code'] ?? null, "{$context}: refusal via the active-Visit guard");
+            self::assertSame('ok', $ci['result'] ?? null, "{$context}: the check-in committed — " . wp_json_encode($ci));
+        }
+
+        self::assertGreaterThanOrEqual(0, $evaluated, 'check-in-winner attempts evaluated: ' . $evaluated);
+    }
+
+    public function testRaceSlotCountersUnchanged(): void
+    {
+        foreach ($this->raceAttempts() as $row) {
+            $context = 'attempt ' . $row['attempt'];
+            $state = $row['state'];
+
+            self::assertSame(1, $state['slot_booked'], "{$context}: booked counter unchanged — state: " . wp_json_encode($state));
+            self::assertSame(0, $state['slot_held'], "{$context}: hold counter unchanged — state: " . wp_json_encode($state));
+        }
     }
 
     // ============ T12b — both serialization orders, deterministically (no fork) ============
@@ -841,41 +1127,6 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         } finally {
             \ClinicCore\Application\Visits\VisitService::setTestNowUtc(null);
         }
-    }
-
-    private function assertRaceLegal(array $state, array $outcomes, string $context): void {
-        $ns   = $outcomes['no_show'] ?? [];
-        $ci   = $outcomes['check_in'] ?? [];
-        $live = count((array) ($state['live_visits'] ?? []));
-        $noShow = $state['status'] === 'no_show';
-
-        // (1) THE original invariant, in BOTH lock orders: a live Visit and a
-        // no_show appointment can never coexist on the same row.
-        self::assertFalse(
-            $noShow && $live > 0,
-            "{$context}: a live Visit must never sit on a no_show appointment"
-        );
-        // (2) Exactly one worker may commit; the other must be refused by its own
-        // established product guard (never a silent double-win).
-        $winners = (int) (($ns['result'] ?? '') === 'ok') + (int) (($ci['result'] ?? '') === 'ok');
-        self::assertSame(1, $winners, "{$context}: exactly one worker may commit");
-
-        if ($noShow) {
-            self::assertNotNull($state['no_show_at'], "{$context}: the committed manual no-show stamps no_show_at");
-            self::assertSame(0, $live, "{$context}: no Visit may exist after the no-show won");
-            self::assertNull($state['active_visit_id'], "{$context}: a no_show appointment holds no Visit pointer");
-            self::assertSame('rejected', $ci['result'] ?? null, "{$context}: the losing check-in must be refused");
-            self::assertSame('CLINIC_INVALID_APPOINTMENT_STATE', $ci['error_code'] ?? null, "{$context}: terminal refusal code");
-            self::assertSame('ok', $ns['result'] ?? null, "{$context}: the manual no-show committed");
-        } else {
-            self::assertSame('confirmed', $state['status'], "{$context}: no no_show may be written when the check-in won");
-            self::assertNull($state['no_show_at'], "{$context}: no_show_at must stay NULL when the check-in won");
-            self::assertSame(1, $live, "{$context}: the winning check-in keeps exactly one live Visit");
-            self::assertSame('rejected', $ns['result'] ?? null, "{$context}: the losing manual no-show must be refused");
-            self::assertSame('HAS_ACTIVE_VISIT', $ns['error_code'] ?? null, "{$context}: refusal via the active-Visit guard");
-        }
-        self::assertSame(1, $state['slot_booked'], "{$context}: booked counter unchanged");
-        self::assertSame(0, $state['slot_held'], "{$context}: hold counter unchanged");
     }
 
     // ================= Concurrency harness (real-DB, independent connections) =================
@@ -1189,108 +1440,6 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             'slot_booked' => (int) ($slot['booked_count'] ?? -1),
             'slot_held' => (int) ($slot['held_count'] ?? -1),
         ];
-    }
-
-    private function assertRaceOutcomeEnvelopesOnly(array $outcomes, string $context): void {
-        foreach ($outcomes as $role => $o) {
-            self::assertNotSame(
-                'fatal',
-                $o['result'] ?? null,
-                "{$context} [{$role}]: child bootstrap fatal is a harness failure, not product evidence"
-            );
-            self::assertNotSame(
-                'exception',
-                $o['result'] ?? null,
-                "{$context} [{$role}]: a raw exception escaping the product call is not a legal product envelope: "
-                . (string) ($o['error'] ?? '')
-            );
-        }
-        // R4: the manual no-show has a legal success AND a legal refusal envelope
-        // (refused by the active-Visit guard when the check-in won the row lock).
-        self::assertContains(
-            $outcomes['no_show']['result'] ?? null,
-            ['ok', 'rejected'],
-            "{$context}: the manual no-show must end in a product envelope"
-        );
-    }
-
-    /**
-     * Concurrency-evidence assertions (attempt-level):
-     *  1) genuinely independent PROCESSES — distinct child PIDs, none equal
-     *     to the parent PID;
-     *  2) genuinely independent DB CONNECTIONS — each child connected its
-     *     own fresh wpdb, and the test-only query-rewrite (SAVEPOINT
-     *     filter) was present in the forked child and removed there, so the
-     *     child's commits are real commits visible to other connections;
-     *  3) genuine IN-FLIGHT competition — strict wall-clock overlap of the
-     *     two product-call windows (the loser blocks inside its own window
-     *     on the winner's appointment row lock).
-     */
-    private function assertRaceIndependenceAndOverlap(array $outcomes, string $context): void {
-        $ci = $outcomes['check_in'];
-        $ns = $outcomes['no_show'];
-
-        // (1) independent processes.
-        $parentPid = getmypid();
-        self::assertIsInt($ci['pid'] ?? null, "{$context}: check-in child must record its PID");
-        self::assertIsInt($ns['pid'] ?? null, "{$context}: no-show child must record its PID");
-        self::assertNotSame($parentPid, $ci['pid'], "{$context}: check-in must run in a child process");
-        self::assertNotSame($parentPid, $ns['pid'], "{$context}: no-show must run in a child process");
-        self::assertNotSame($ci['pid'], $ns['pid'], "{$context}: the workers must be distinct processes");
-
-        // (2) independent DB connections + real (non-savepoint) commits.
-        self::assertTrue((bool) ($ci['own_wpdb_connected'] ?? false), "{$context}: check-in child must own its DB connection");
-        self::assertTrue((bool) ($ns['own_wpdb_connected'] ?? false), "{$context}: no-show child must own its DB connection");
-        foreach (['check_in' => $ci, 'no_show' => $ns] as $role => $o) {
-            $probes = ' child_before: ' . wp_json_encode($o['probe_before'] ?? null)
-                . ' child_after: ' . wp_json_encode($o['probe_after'] ?? null)
-                . ' parent_at_fork: ' . wp_json_encode($o['parent_probe'] ?? null);
-            self::assertGreaterThanOrEqual(
-                1,
-                (int) ($o['query_filters_before'] ?? 0),
-                "{$context}: [{$role}] the test-only query-rewrite must have been present in the forked child" . $probes
-            );
-            self::assertSame(
-                0,
-                (int) ($o['query_filters_after'] ?? 0),
-                "{$context}: [{$role}] the test-only query-rewrite must be removed in the child (real commits, not parent savepoints)" . $probes
-            );
-        }
-
-        // (3) in-flight overlap of the two product-call windows.
-        $starts = [
-            'check_in' => (float) ($ci['call_started_at'] ?? 0),
-            'no_show' => (float) ($ns['call_started_at'] ?? 0),
-        ];
-        $ends = [
-            'check_in' => (float) ($ci['call_finished_at'] ?? 0),
-            'no_show' => (float) ($ns['call_finished_at'] ?? 0),
-        ];
-        foreach (['check_in', 'no_show'] as $role) {
-            self::assertGreaterThan(0.0, $starts[$role], "{$context}: [{$role}] call window must have a start timestamp");
-            self::assertGreaterThan(0.0, $ends[$role] - $starts[$role], "{$context}: [{$role}] call window must have positive duration");
-            self::assertLessThan(60.0, $ends[$role] - $starts[$role], "{$context}: [{$role}] call window must not be a hung call");
-        }
-
-        $latestStart = max($starts['check_in'], $starts['no_show']);
-        $earliestEnd = min($ends['check_in'], $ends['no_show']);
-        $overlap = $earliestEnd - $latestStart;
-        $windows = sprintf(
-            'check_in=[%.6f, %.6f] no_show=[%.6f, %.6f]',
-            $starts['check_in'],
-            $ends['check_in'],
-            $starts['no_show'],
-            $ends['no_show']
-        );
-        self::assertGreaterThan(
-            0.0,
-            $overlap,
-            "{$context}: NO in-flight overlap of the two product calls (windows: {$windows}) — "
-            . 'one call finished before the other started, i.e. the attempt was effectively '
-            . 'sequential and is NOT concurrency evidence. Both workers fire at the same '
-            . 'barrier instant; in a genuine lock race the loser blocks inside its own '
-            . 'window on the winner\'s appointment row lock, so overlap must be positive.'
-        );
     }
 
     private function freshMysqli(): \mysqli {
