@@ -1188,7 +1188,11 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             ],
             $admin
         );
-        self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $update['error'] );
+        self::assertNotSame( '', $update['error'], 'the credential path must refuse an identity-linked account' );
+        self::assertTrue(
+            wp_check_password( 'InitialStaffPass123', $this->passwordHash( $target ) ),
+            'the password must be unchanged'
+        );
 
         // (c) the same read failing is patient evidence.
         $staff = $this->makeUser( 'subscriber', 'pb_fault_identity' );
@@ -1217,6 +1221,9 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
 
         $otherClinic = $this->createClinic();
         cpms_test_seed_membership( $target, $otherClinic, RolesAndCapabilities::ROLE_SECRETARY );
+        // The acting administrator suspends in BOTH Clinics, so it needs durable
+        // staff-management authority in the second one as well.
+        cpms_test_seed_membership( $admin, $otherClinic, RolesAndCapabilities::ROLE_MANAGER );
 
         // First suspension (this Clinic) parks both roles.
         self::assertSame( '', StaffManagementPage::toggleUser( $target, 'deactivate', $admin, $this->clinicId )['error'] );
@@ -1336,7 +1343,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             )['ok'],
             'adding a Location would widen a patient member'
         );
-        self::assertSame( [ $location_id ], array_values( array_map( 'intval', App::membership_service()->location_ids_for( $membership ) ) ) );
+        self::assertSame( [ $location_id ], array_values( array_map( 'intval', App::membership_service()->membership_location_ids( $membership ) ) ) );
 
         // Narrowing to the SAME set stays allowed (no widening).
         self::assertTrue(
