@@ -1055,17 +1055,24 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             'a hard, non-ECHILD waitpid error keeps the pid owned and escalates'
         );
 
-        // The exact B1 sequence: a probe that reaps the pid, then a hard error on the same
-        // pid. The reaped pid must never enter the pending set, so the later error cannot
-        // escalate into a signal for it.
-        $pending = [];
-        foreach ([['reaped', 0], ['error', PCNTL_EINVAL]] as $probe) {
-            if ('drop' === self::reapActionFor($probe[0], $probe[1])) {
-                continue;
-            }
+        // The exact B1 sequence, modelled on the reaper's TWO passes: pass 1 probes each
+        // owned pid once and builds the pending set, pass 2 re-probes ONLY pids that pass 1
+        // kept. A pid reaped in pass 1 therefore never reaches pass 2, so the hard error in
+        // pass 2 cannot escalate into a signal for an already-reaped numeric pid.
+        $firstPassState  = 'reaped';
+        $secondPassState = 'error';
+        $pending         = [];
+        if ('drop' !== self::reapActionFor($firstPassState, 0)) {
             $pending[] = 4242;
         }
-        self::assertSame([], $pending, 'a pid reaped by its first probe must never be pending, even if a later probe errors');
+        $signalled = [];
+        foreach ($pending as $pendingPid) {
+            if ('kill' === self::reapActionFor($secondPassState, PCNTL_EINVAL)) {
+                $signalled[] = $pendingPid;
+            }
+        }
+        self::assertSame([], $pending, 'a pid reaped in the first pass must never enter the pending set');
+        self::assertSame([], $signalled, 'so the later hard error cannot escalate a signal for it');
     }
 
     /**
