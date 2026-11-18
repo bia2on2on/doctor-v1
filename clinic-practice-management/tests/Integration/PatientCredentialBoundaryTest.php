@@ -1884,15 +1884,23 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         );
         self::assertTrue( $grant['ok'], 'a staff member may receive a GRANT' );
 
-        // The competing writer: fires on the FIRST capability read for this membership
-        // (the pre-flight read) and replaces the observed GRANT with a DENY.
+        // The competing writer: it must land AFTER the pre-flight read has returned its
+        // value and BEFORE the write boundary re-reads — that is the exact window the
+        // fix closes. The first matching read is the pre-flight observation (leave it
+        // alone), the second is the in-transaction re-read (commit the DENY just before
+        // it). Injecting before the first read would be consistent and prove nothing.
         $armed  = true;
-        $inject = static function ( $query ) use ( &$armed, $membership, $capability ) {
+        $seen   = 0;
+        $inject = static function ( $query ) use ( &$armed, &$seen, $membership, $capability ) {
             $sql = (string) $query;
             if ( ! $armed || false === stripos( $sql, 'cpms_membership_capabilities' ) ) {
                 return $query;
             }
             if ( 1 !== preg_match( '/membership_id = ' . (int) $membership . '\b/', $sql ) ) {
+                return $query;
+            }
+            ++$seen;
+            if ( $seen < 2 ) {
                 return $query;
             }
             $armed = false;
