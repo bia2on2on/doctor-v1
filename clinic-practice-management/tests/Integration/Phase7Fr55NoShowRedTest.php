@@ -145,6 +145,8 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     private const RACE_FINISH_DEADLINE_SEC = 30.0;
     /** Bounded wait for a SIGKILLed child to be reaped; never block the suite on it. */
     private const RACE_REAP_DEADLINE_SEC = 5.0;
+    /** Child-side deadline: after this the child writes a fatal outcome and exits itself. */
+    private const RACE_CHILD_BARRIER_DEADLINE_SEC = 45.0;
 
     /** P2: head start that decides which worker takes the appointment row lock first. */
     private const RACE_HEAD_START_SEC = 0.35;
@@ -705,6 +707,79 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     private static array $race_phase = [];
 
     /**
+     * T2: the forked race needs fork, wait and a kill primitive. Missing `posix_kill`
+     * would leave a child polling a barrier file the parent removes, so all of them are
+     * required: CI fails loudly, a local run skips with the missing names.
+     */
+    private function requireForkCapabilities(): void
+    {
+        $missing = [];
+        if (!function_exists('pcntl_fork')) {
+            $missing[] = 'pcntl_fork';
+        }
+        if (!function_exists('pcntl_waitpid')) {
+            $missing[] = 'pcntl_waitpid';
+        }
+        if (!function_exists('posix_kill')) {
+            $missing[] = 'posix_kill';
+        }
+        if (!defined('SIGKILL')) {
+            $missing[] = 'SIGKILL';
+        }
+        if ($missing === []) {
+            return;
+        }
+
+        $detail = 'missing: ' . implode(', ', $missing);
+        if ('true' === getenv('GITHUB_ACTIONS')) {
+            self::fail(
+                'the forked race cannot run in this CI environment (' . $detail . '), so its evidence would be '
+                . 'silently skipped. This suite FAILS instead of skipping whenever GITHUB_ACTIONS=true.'
+            );
+        }
+        $this->markTestSkipped('the forked race cannot run here (' . $detail . ').');
+    }
+
+    /**
+     * T2: one non-blocking `pcntl_waitpid()` poll that separates a reaped child from a
+     * transient (EINTR) and a hard waitpid error instead of treating every -1 as ECHILD.
+     *
+     * @return array{state: string, status: int} state: reaped|running|gone|error;
+     *                                           status: wait status or the pcntl error
+     */
+    private function pollChild(int $pid): array
+    {
+        if ($pid <= 0) {
+            return ['state' => 'error', 'status' => 0];
+        }
+
+        $status = 0;
+        $waited = pcntl_waitpid($pid, $status, WNOHANG);
+        if ($pid === $waited) {
+            return ['state' => 'reaped', 'status' => $status];
+        }
+        if (0 === $waited) {
+            return ['state' => 'running', 'status' => $status];
+        }
+
+        $error = pcntl_get_last_error();
+        if (PCNTL_ECHILD === $error) {
+            return ['state' => 'gone', 'status' => 0];
+        }
+
+        return ['state' => 'error', 'status' => $error];
+    }
+
+    /** T2: SIGKILL exactly one owned pid; guarded so a missing primitive cannot fatal. */
+    private function killChild(int $pid): void
+    {
+        if ($pid <= 0 || !function_exists('posix_kill') || !defined('SIGKILL')) {
+            return;
+        }
+        @posix_kill($pid, SIGKILL);
+    }
+
+    /**
      * Run the real-DB race once per class and keep the observations.
      *
      * @return array<int, array{attempt: int, outcomes: array<string, array<string, mixed>>, state: array<string, mixed>}>
@@ -715,16 +790,10 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             return self::$race_observations ?? [];
         }
 
-        // P5: a missing pcntl must not let CI silently skip the forked race suite.
-        if (!function_exists('pcntl_fork')) {
-            if ('true' === getenv('GITHUB_ACTIONS')) {
-                self::fail(
-                    'pcntl_fork is unavailable in this CI environment, so the forked race evidence would be '
-                    . 'silently skipped. This suite FAILS instead of skipping whenever GITHUB_ACTIONS=true.'
-                );
-            }
-            $this->markTestSkipped('pcntl is not available in this CI environment.');
-        }
+        // P5/T2: a missing primitive must not let CI silently skip the forked race suite.
+        // posix_kill is required too: without it a fork/readiness failure would leave a
+        // child polling a barrier file the parent deletes, i.e. a stuck process.
+        $this->requireForkCapabilities();
         self::$race_pcntl_available = true;
 
         $observations = [];
@@ -1420,6 +1489,16 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                 'characterization: a failing settings read yields the DEFAULT grace 30, so a 10-minute-late check-in is accepted, got '
                 . (is_object($visitInside) ? get_class($visitInside) . ': ' . $visitInside->getMessage() : gettype($visitInside))
             );
+            // T1: an EMPTY array must not count as an accepted check-in — require a real,
+            // positive Visit id and the persisted Visit read back from the database.
+            self::assertArrayHasKey('id', $visitInside, 'the accepted +10 check-in must return a Visit id');
+            self::assertIsInt($visitInside['id'], 'the accepted +10 check-in must return an INTEGER Visit id, got ' . gettype($visitInside['id']));
+            self::assertGreaterThan(0, $visitInside['id'], 'the accepted +10 check-in must return a POSITIVE Visit id');
+            self::assertCount(
+                1,
+                $this->liveVisitsForAppointment($inside['id']),
+                'the accepted +10 check-in must leave exactly one live Visit for that appointment in the database'
+            );
 
             VisitService::setTestNowUtc($nowPast);
             $this->assertPersistedElapsed(40, $past['slot_id'], $nowPast, 'characterization (+40 min)');
@@ -1723,24 +1802,33 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             $finishDeadline = microtime(true) + self::RACE_FINISH_DEADLINE_SEC;
             while ($pids !== []) {
                 foreach ($pids as $idx => $pid) {
-                    $status = 0;
-                    $waited = pcntl_waitpid($pid, $status, WNOHANG);
-                    if (-1 === $waited) {
-                        unset($pids[$idx]); // ECHILD: nothing left to reap for this pid
-                        $this->fail('harness fatal: waitpid failed for child [' . $workers[$idx]['role'] . '] (pid ' . $pid . ')');
+                    $poll = $this->pollChild($pid);
+                    if ('running' === $poll['state']) {
+                        continue;
                     }
-                    if ($waited !== $pid) {
-                        continue; // still running
+                    if ('error' === $poll['state'] && PCNTL_EINTR === $poll['status']) {
+                        continue; // interrupted syscall: retry, bounded by $finishDeadline
+                    }
+                    if ('gone' === $poll['state']) {
+                        // ECHILD: someone else already reaped it, so its exit status is lost.
+                        unset($pids[$idx]);
+                        $this->fail('harness fatal: child [' . $workers[$idx]['role'] . '] (pid ' . $pid . ') was already reaped (ECHILD) before its exit status could be read');
+                    }
+                    if ('error' === $poll['state']) {
+                        // Any OTHER waitpid error: keep the pid owned, kill it and retry; the
+                        // reaper confirms it or fails the test with the pid listed.
+                        $this->killChild($pid);
+                        continue;
                     }
                     unset($pids[$idx]); // reaped here: never signal this pid again
-                    if (!pcntl_wifexited($status) || pcntl_wexitstatus($status) !== 0) {
+                    if (!pcntl_wifexited($poll['status']) || pcntl_wexitstatus($poll['status']) !== 0) {
                         $detail  = '';
                         $rawFile = $this->fileTag . '-outcome-' . $attempt . '-' . $idx;
                         if (is_file($rawFile)) {
                             $detail = ' outcome: ' . (string) @file_get_contents($rawFile);
                         }
                         $this->fail(
-                            'harness fatal: child [' . $workers[$idx]['role'] . '] exited abnormally (status=' . $status . ')' . $detail
+                            'harness fatal: child [' . $workers[$idx]['role'] . '] exited abnormally (status=' . $poll['status'] . ')' . $detail
                         );
                     }
                 }
@@ -1817,41 +1905,38 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
      * @param array<int, int> $pids parent-owned, unreaped pids
      */
     private function reapRaceChildren(array $pids, int $attempt, int $workerCount): void {
-        $canSignal = function_exists('posix_kill') && defined('SIGKILL');
-        $canReap   = function_exists('pcntl_waitpid');
+        $owned = [];
+        foreach ($pids as $pid) {
+            if ($pid > 0) {
+                $owned[] = $pid;
+            }
+        }
 
-        if ($canReap) {
-            foreach ($pids as $pid) {
-                if ($pid <= 0) {
+        // T2: probe first, then SIGKILL only what is really still running — never an
+        // already-reaped pid (pid reuse) and never pid <= 0.
+        foreach ($owned as $pid) {
+            $poll = $this->pollChild($pid);
+            if ('running' === $poll['state'] || 'error' === $poll['state']) {
+                $this->killChild($pid);
+            }
+        }
+
+        // Bounded reap: retry on EINTR, keep hard errors owned, never block the suite.
+        $reapDeadline = microtime(true) + self::RACE_REAP_DEADLINE_SEC;
+        $pending      = $owned;
+        while ($pending !== [] && microtime(true) <= $reapDeadline) {
+            foreach ($pending as $key => $pid) {
+                $poll = $this->pollChild($pid);
+                if ('reaped' === $poll['state'] || 'gone' === $poll['state']) {
+                    unset($pending[$key]);
                     continue;
                 }
-                $status = 0;
-                $probe  = pcntl_waitpid($pid, $status, WNOHANG);
-                if (0 !== $probe) {
-                    continue; // already exited (reaped here or ECHILD): nothing to kill
-                }
-                if ($canSignal) {
-                    @posix_kill($pid, SIGKILL);
+                if ('error' === $poll['state'] && PCNTL_EINTR !== $poll['status']) {
+                    $this->killChild($pid);
                 }
             }
-
-            // Bounded reap: never block the suite on a child that survives SIGKILL.
-            $reapDeadline = microtime(true) + self::RACE_REAP_DEADLINE_SEC;
-            $pending      = $pids;
-            while ($pending !== [] && microtime(true) <= $reapDeadline) {
-                foreach ($pending as $idx => $pid) {
-                    if ($pid <= 0) {
-                        unset($pending[$idx]);
-                        continue;
-                    }
-                    $status = 0;
-                    if (pcntl_waitpid($pid, $status, WNOHANG) !== 0) {
-                        unset($pending[$idx]);
-                    }
-                }
-                if ($pending !== []) {
-                    usleep(1000);
-                }
+            if ($pending !== []) {
+                usleep(1000);
             }
         }
 
@@ -1860,6 +1945,14 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             @unlink($this->fileTag . '-outcome-' . $attempt . '-' . $i);
         }
         @unlink($this->fileTag . '-barrier-' . $attempt);
+
+        if ($pending !== []) {
+            $this->fail(
+                'harness fatal: ' . count($pending) . ' child(ren) could not be confirmed reaped within '
+                . self::RACE_REAP_DEADLINE_SEC . ' s of SIGKILL (pids: ' . implode(', ', $pending)
+                . ') — they are reported, NOT silently abandoned'
+            );
+        }
     }
 
     private function raceWorker(string $role, float $offset, int $appointmentId, int $patientId, int $attempt, int $index): void {
@@ -1961,6 +2054,10 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         // every child is ready), so no child can be given a stale instant.
         $barrierFile = $this->fileTag . '-barrier-' . $attempt;
         $fireAt      = 0.0;
+        // T2: the child needs its OWN deadline. If the parent fails before releasing the
+        // barrier (fork/readiness error) the child must exit by itself instead of polling a
+        // file the parent is about to delete.
+        $childDeadline = microtime(true) + self::RACE_CHILD_BARRIER_DEADLINE_SEC;
         while (true) {
             if (0.0 === $fireAt && @is_file($barrierFile)) {
                 $raw = (string) @file_get_contents($barrierFile);
@@ -1970,6 +2067,17 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             }
             if ($fireAt > 0.0 && microtime(true) >= $fireAt + $offset) {
                 break;
+            }
+            if (0.0 === $fireAt && microtime(true) > $childDeadline) {
+                @file_put_contents(
+                    $this->fileTag . '-outcome-' . $attempt . '-' . $index,
+                    json_encode([
+                        'role' => $role,
+                        'result' => 'fatal',
+                        'detail' => 'child never saw the barrier within ' . self::RACE_CHILD_BARRIER_DEADLINE_SEC . ' s',
+                    ])
+                );
+                exit(1); // child-only — the parent reports an abnormal exit, never a pass
             }
             usleep(250);
         }
