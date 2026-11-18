@@ -133,10 +133,24 @@ final class Day2ReceptionNoShowTimingTest extends WP_UnitTestCase
      */
     private function seedFutureAppointment(int $minutesAhead = 90, int $locationId = self::FX_T_LOC_A_ID): array
     {
+        // P1: the slot columns are CLINIC-LOCAL (Location timezone Asia/Tehran), so the
+        // value must be built in that timezone. Formatting a UTC instant here produced a
+        // slot ~3.5 h EARLIER in local time — i.e. a "future" row that was already past.
+        $clinicTz = new \DateTimeZone(self::FX_T_TZ_A);
         $slot = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+            ->setTimezone($clinicTz)
             ->modify('+' . $minutesAhead . ' minutes');
         $date = $slot->format('Y-m-d');
         $time = $slot->format('H:i:s');
+
+        // Fixture invariant, asserted here so a wrong timezone fails loudly instead of
+        // silently producing a past row.
+        self::assertGreaterThan(
+            new \DateTimeImmutable('now', new \DateTimeZone('UTC')),
+            new \DateTimeImmutable($date . ' ' . $time, $clinicTz),
+            'fixture invariant: the "future" slot must be strictly in the future in the clinic timezone '
+            . self::FX_T_TZ_A . ' — slot ' . $date . ' ' . $time . ' local'
+        );
 
         $slotId = $this->fxTInsertSlot($locationId, $date, $time);
 

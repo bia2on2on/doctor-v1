@@ -142,6 +142,9 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     private const BARRIER_SEC = 1.5;
     private const RACE_ATTEMPTS = 3;
 
+    /** P2: head start that decides which worker takes the appointment row lock first. */
+    private const RACE_HEAD_START_SEC = 0.35;
+
     private string $fileTag;
 
     private int $orgA = 0;
@@ -684,6 +687,17 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     /** @var string|null (c) post-race state read: a row the state reader needs was missing. */
     private static ?string $race_error_state = null;
 
+    /** @var bool Whether this run has pcntl_fork (recorded for the report, never asserted softly). */
+    private static bool $race_pcntl_available = false;
+
+    /**
+     * Per-phase record, set WITHOUT asserting so each diagnostic test can name its own
+     * phase: 'reached' on success, otherwise the short error text.
+     *
+     * @var array<string, string>
+     */
+    private static array $race_phase = ['fork' => 'not-reached', 'seed' => 'not-reached', 'state' => 'not-reached'];
+
     /**
      * Run the real-DB race once per class and keep the observations.
      *
@@ -695,9 +709,17 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             return self::$race_observations ?? [];
         }
 
+        // P5: a missing pcntl must not let CI silently skip the forked race suite.
         if (!function_exists('pcntl_fork')) {
+            if ('true' === getenv('GITHUB_ACTIONS')) {
+                self::fail(
+                    'pcntl_fork is unavailable in this CI environment, so the forked race evidence would be '
+                    . 'silently skipped. This suite FAILS instead of skipping whenever GITHUB_ACTIONS=true.'
+                );
+            }
             $this->markTestSkipped('pcntl is not available in this CI environment.');
         }
+        self::$race_pcntl_available = true;
 
         $observations = [];
         try {
@@ -727,30 +749,56 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                 // markNoShowByStaff, the reception-route chain) and the secretary
                 // check-in compete for the same appointment row lock. Both
                 // serialization orders are legal.
-                $workers = [
-                    ['role' => 'no_show', 'offset' => 0.0],
-                    ['role' => 'check_in', 'offset' => 0.0],
-                ];
+                // P2: attempts 1 and 2 give one worker a small HEAD START so each
+                // contested interleaving is actually observed (a zero-offset pair can
+                // legitimately be won by the same side on every attempt, which would
+                // make a "named winner" assertion vacuous); attempt 3 keeps the genuine
+                // simultaneous race. The loser still blocks on the winner's appointment
+                // row lock, so the loser's refusal is product evidence either way.
+                $workers = match ($attempt) {
+                    1 => [
+                        ['role' => 'no_show', 'offset' => 0.0],
+                        ['role' => 'check_in', 'offset' => self::RACE_HEAD_START_SEC],
+                    ],
+                    2 => [
+                        ['role' => 'check_in', 'offset' => 0.0],
+                        ['role' => 'no_show', 'offset' => self::RACE_HEAD_START_SEC],
+                    ],
+                    default => [
+                        ['role' => 'no_show', 'offset' => 0.0],
+                        ['role' => 'check_in', 'offset' => 0.0],
+                    ],
+                };
                 // (b) Visibility probe: a THIRD connection must already see the
                 // committed seed. If it does not, every later read — the two
                 // workers included — is reading nothing, which is a fixture/COMMIT
                 // defect, not product evidence.
-                $this->assertRaceSeedVisible($seed['id'], $seed['slot_id'], $attempt);
+                try {
+                    $this->assertRaceSeedVisible($seed['id'], $seed['slot_id'], $attempt);
+                    self::$race_phase['seed'] = 'reached';
+                } catch (Throwable $e) {
+                    self::$race_phase['seed'] = 'attempt ' . $attempt . ': ' . get_class($e) . ': ' . $e->getMessage();
+                    throw $e;
+                }
 
                 try {
                     $outcomes = $this->runRace($seed['id'], $patientId, $workers, $attempt);
                 } catch (Throwable $e) {
                     self::$race_error_fork = 'attempt ' . $attempt . ': ' . get_class($e) . ': ' . $e->getMessage();
+                    self::$race_phase['fork'] = self::$race_error_fork;
                     throw $e;
                 }
+                self::$race_phase['fork'] = 'reached';
 
                 try {
                     $state = $this->raceState($seed['id'], $seed['slot_id']);
                 } catch (Throwable $e) {
                     self::$race_error_state = 'attempt ' . $attempt . ' (appointment ' . $seed['id'] . ', slot ' . $seed['slot_id'] . '): '
                         . get_class($e) . ': ' . $e->getMessage();
+                    self::$race_phase['state'] = self::$race_error_state;
                     throw $e;
                 }
+                self::$race_phase['state'] = 'reached';
 
                 $observations[] = [
                     'attempt' => $attempt,
@@ -796,28 +844,47 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         }
     }
 
-    /** (a) fork / child exit / outcome file. */
+    /**
+     * (a) fork / child exit / outcome file.
+     *
+     * P4: this asserts ONLY its own phase — it deliberately does not call the shared
+     * `raceAttempts()` gate, so a seed or state-read failure cannot turn this name red
+     * as well and hide which phase actually failed.
+     */
     public function testRaceHarnessForkPhaseCompleted(): void
     {
-        $this->raceAttempts();
+        $observations = $this->raceObservations();
 
-        self::assertNull(self::$race_error_fork, 'fork phase must complete: ' . (string) self::$race_error_fork);
+        self::assertTrue(self::$race_pcntl_available, 'this run recorded pcntl_fork availability: ' . var_export(self::$race_pcntl_available, true));
+        self::assertSame(
+            'reached',
+            self::$race_phase['fork'],
+            'fork phase (attempts recorded: ' . count($observations) . '): ' . self::$race_phase['fork']
+        );
     }
 
     /** (b) seeding/COMMIT: the seeded rows must be visible to an independent connection. */
     public function testRaceSeededRowsWereVisibleToAFreshConnection(): void
     {
-        $this->raceAttempts();
+        $observations = $this->raceObservations();
 
-        self::assertNull(self::$race_error_seed, 'the seed must be committed and visible: ' . (string) self::$race_error_seed);
+        self::assertSame(
+            'reached',
+            self::$race_phase['seed'],
+            'seed visibility phase (attempts recorded: ' . count($observations) . '): ' . self::$race_phase['seed']
+        );
     }
 
     /** (c) post-race state read: every row the state reader needs must exist. */
     public function testRacePostRaceStateReadFoundItsRows(): void
     {
-        $this->raceAttempts();
+        $observations = $this->raceObservations();
 
-        self::assertNull(self::$race_error_state, 'the post-race state read must find its rows: ' . (string) self::$race_error_state);
+        self::assertSame(
+            'reached',
+            self::$race_phase['state'],
+            'post-race state read (attempts recorded: ' . count($observations) . '): ' . self::$race_phase['state']
+        );
     }
 
     /**
@@ -843,6 +910,8 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     }
 
     /** The harness must not be mistaken for a product result. */
+    // Harness-only: no product mutation reds this name (it exists so a fork/child
+    // failure can never masquerade as product evidence).
     public function testRaceHarnessCompletedEveryAttemptWithChildOutcomes(): void
     {
         $observations = $this->raceAttempts();
@@ -856,6 +925,8 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         }
     }
 
+    // Product mutation: an exception escaping `markNoShowByStaff()`/`checkIn()` instead
+    // of a `CLINIC_*` envelope (e.g. removing the active-Visit guard's try boundary).
     public function testRaceOutcomeEnvelopesAreProductEnvelopesOnly(): void
     {
         foreach ($this->raceAttempts() as $row) {
@@ -882,6 +953,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         }
     }
 
+    // Harness-only: no product mutation reds this name (process topology evidence).
     public function testRaceWorkersRanAsDistinctChildProcesses(): void
     {
         $parentPid = getmypid();
@@ -898,6 +970,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         }
     }
 
+    // Harness-only: no product mutation reds this name (real-commit evidence).
     public function testRaceWorkersOwnedIndependentDbConnections(): void
     {
         foreach ($this->raceAttempts() as $row) {
@@ -933,7 +1006,14 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
 
     public function testRaceProductCallWindowsOverlappedInFlight(): void
     {
+        // Product mutation that must red this name: `VisitService::checkIn()` dropping
+        // its appointment row lock (the loser no longer blocks, so the windows stop
+        // overlapping). Only the ZERO-OFFSET attempt is judged here — attempts 1 and 2
+        // carry a deliberate head start so each winner is observed (P2).
         foreach ($this->raceAttempts() as $row) {
+            if ($row['attempt'] !== self::RACE_ATTEMPTS) {
+                continue;
+            }
             $context = 'attempt ' . $row['attempt'];
             $ci = $row['outcomes']['check_in'];
             $ns = $row['outcomes']['no_show'];
@@ -983,6 +1063,8 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         }
     }
 
+    // Product mutation: `markNoShowByStaff()` dropping `assertNoActiveVisit()` lets a
+    // no_show appointment keep a live Visit.
     public function testRaceNeverLeavesLiveVisitOnNoShowAppointment(): void
     {
         foreach ($this->raceAttempts() as $row) {
@@ -997,6 +1079,8 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         }
     }
 
+    // Product mutation: either guard removed (`assertNoActiveVisit()` or the
+    // `no_show` status check in `checkIn()`) lets both workers commit.
     public function testRaceExactlyOneWorkerCommits(): void
     {
         foreach ($this->raceAttempts() as $row) {
@@ -1013,6 +1097,8 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         }
     }
 
+    // Product mutation: `checkIn()` no longer refusing a `no_show` appointment, or the
+    // no-show path not stamping `no_show_at`/clearing the pointer.
     public function testRaceNoShowWinnerStampsNoShowAndRefusesCheckIn(): void
     {
         $evaluated = 0;
@@ -1038,11 +1124,19 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             self::assertSame('ok', $ns['result'] ?? null, "{$context}: the manual no-show committed — " . wp_json_encode($ns));
         }
 
-        // R4 keeps BOTH orders legal, so zero no-show wins is legal evidence too: the
-        // deterministic order-1/order-2 tests carry the both-orders proof.
-        self::assertGreaterThanOrEqual(0, $evaluated, 'no-show-winner attempts evaluated: ' . $evaluated);
+        // P2: this name may never pass on zero observations. Attempt 1 gives the
+        // manual no-show the head start precisely so this winner is observed; if it is
+        // not, the test FAILS with every attempt's outcomes so the next reader sees why.
+        self::assertGreaterThanOrEqual(
+            1,
+            $evaluated,
+            'the no-show winner must be OBSERVED at least once (attempt 1 forces it); evaluated='
+            . $evaluated . ' observed=' . $this->raceWinnerSummary()
+        );
     }
 
+    // Product mutation: `markNoShowByStaff()` not consulting the active Visit (writing
+    // `no_show` over a live Visit).
     public function testRaceCheckInWinnerKeepsConfirmedAppointmentAndRefusesNoShow(): void
     {
         $evaluated = 0;
@@ -1068,7 +1162,28 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             self::assertSame('ok', $ci['result'] ?? null, "{$context}: the check-in committed — " . wp_json_encode($ci));
         }
 
-        self::assertGreaterThanOrEqual(0, $evaluated, 'check-in-winner attempts evaluated: ' . $evaluated);
+        // P2: same rule for the check-in winner — attempt 2 forces it, and zero
+        // observations fail with the full summary instead of passing silently.
+        self::assertGreaterThanOrEqual(
+            1,
+            $evaluated,
+            'the check-in winner must be OBSERVED at least once (attempt 2 forces it); evaluated='
+            . $evaluated . ' observed=' . $this->raceWinnerSummary()
+        );
+    }
+
+    /** One line per attempt: who committed and with which envelope. */
+    private function raceWinnerSummary(): string
+    {
+        $parts = [];
+        foreach (self::$race_observations ?? [] as $row) {
+            $parts[] = 'attempt ' . $row['attempt']
+                . ' status=' . (string) ($row['state']['status'] ?? '?')
+                . ' no_show=' . (string) ($row['outcomes']['no_show']['result'] ?? '?')
+                . ' check_in=' . (string) ($row['outcomes']['check_in']['result'] ?? '?');
+        }
+
+        return '[' . implode(' | ', $parts) . ']';
     }
 
     public function testRaceSlotCountersUnchanged(): void
@@ -1080,6 +1195,170 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             self::assertSame(1, $state['slot_booked'], "{$context}: booked counter unchanged — state: " . wp_json_encode($state));
             self::assertSame(0, $state['slot_held'], "{$context}: hold counter unchanged — state: " . wp_json_encode($state));
         }
+    }
+
+    // ============ P3 — per-Clinic grace on the LIVE check-in path ============
+
+    /**
+     * Restores, on the path that is still live in 1.0, the protection the retired
+     * cross-Clinic no-show harness used to keep: `VisitService::checkIn()`'s ER-06
+     * lazy no-show decision resolves grace for the APPOINTMENT's Clinic
+     * (`VisitService::graceForClinic()`), and it must never borrow another Clinic's
+     * value — nor a default — when that Clinic's settings cannot be resolved.
+     *
+     * Fixture: Clinic A grace 5 min, Clinic B grace 120 min, a slot 10 minutes past
+     * its start in each. A must REFUSE (past 5), B must ACCEPT (not past 120). If the
+     * values bled, both expectations invert.
+     */
+    public function testPerClinicGraceIsNotBledAcrossClinicsOnCheckIn(): void
+    {
+        $this->setNoShowGrace($this->clinicA, 5);
+        $this->setNoShowGrace($this->clinicB, 120);
+        cpms_test_seed_membership($this->secretaryA, $this->clinicB, RolesAndCapabilities::ROLE_SECRETARY);
+
+        // A deterministic local instant, so neither expectation depends on wall clock.
+        $slotLocal = new DateTimeImmutable('today 12:00:00', new DateTimeZone(self::TZ));
+        $spec = ['date' => $slotLocal->format('Y-m-d'), 'time' => $slotLocal->format('H:i:s')];
+        VisitService::setTestNowUtc($slotLocal->modify('+10 minutes'));
+
+        try {
+            // Clinic A, grace 5: 10 minutes past the slot start is past grace -> refused.
+            $seedA = $this->seedConfirmedAppointment(
+                $this->clinicA,
+                $this->locationA,
+                $this->clinicianA,
+                $this->patientA,
+                $spec,
+                'grace-a'
+            );
+            $refusal = null;
+            $previousScope = ScopeContext::tryGet();
+            ScopeContext::set(ClinicScope::forClinic($this->clinicA));
+            try {
+                App::visitService()->checkIn($this->secretaryA, $this->patientA, $seedA['id']);
+            } catch (VisitException $e) {
+                $refusal = $e;
+            } finally {
+                if (null !== $previousScope) {
+                    ScopeContext::set($previousScope);
+                } else {
+                    ScopeContext::clear();
+                }
+            }
+
+            self::assertInstanceOf(VisitException::class, $refusal, 'Clinic A (grace 5) must refuse a check-in 10 minutes late');
+            self::assertSame('CLINIC_INVALID_APPOINTMENT_STATE', $refusal->errorCode, 'the ER-06 late-check-in refusal code');
+            self::assertSame(409, $refusal->httpStatus, 'the ER-06 late-check-in refusal status');
+            self::assertSame('confirmed', $this->appointmentRow($seedA['id'])['status'], 'a refused check-in mutates nothing');
+            self::assertCount(0, $this->liveVisitsForAppointment($seedA['id']), 'a refused check-in creates no Visit');
+
+            // Clinic B, grace 120: the SAME 10 minutes is inside grace -> accepted.
+            // If Clinic A's 5 were used, this call would be refused too.
+            $seedB = $this->seedConfirmedAppointment(
+                $this->clinicB,
+                $this->locationB,
+                $this->clinicianB,
+                $this->patientB,
+                ['date' => $spec['date'], 'time' => '12:30:00'],
+                'grace-b'
+            );
+            ScopeContext::set(ClinicScope::forClinic($this->clinicB));
+            try {
+                $visitB = App::visitService()->checkIn($this->secretaryA, $this->patientB, $seedB['id']);
+            } finally {
+                if (null !== $previousScope) {
+                    ScopeContext::set($previousScope);
+                } else {
+                    ScopeContext::clear();
+                }
+            }
+
+            self::assertGreaterThan(
+                0,
+                (int) ($visitB['id'] ?? 0),
+                'Clinic B (grace 120) must ACCEPT a check-in 10 minutes late — if Clinic A grace 5 leaked, this is refused'
+            );
+            self::assertCount(1, $this->liveVisitsForAppointment($seedB['id']), 'the accepted check-in creates exactly one live Visit');
+        } finally {
+            VisitService::setTestNowUtc(null);
+        }
+    }
+
+    /**
+     * Fail-closed half of the same protection: when the appointment Clinic's settings
+     * cannot be resolved, the check-in must NOT conclude "past grace" (which would mark
+     * `no_show` / refuse) and must not fall back to another Clinic's value.
+     */
+    public function testUnresolvableGraceForTheAppointmentClinicFailsClosedOnCheckIn(): void
+    {
+        $this->setNoShowGrace($this->clinicA, 5);
+        $this->setNoShowGrace($this->clinicB, 120);
+        cpms_test_seed_membership($this->secretaryA, $this->clinicB, RolesAndCapabilities::ROLE_SECRETARY);
+
+        $slotLocal = new DateTimeImmutable('today 09:00:00', new DateTimeZone(self::TZ));
+        $spec = ['date' => $slotLocal->format('Y-m-d'), 'time' => $slotLocal->format('H:i:s')];
+        VisitService::setTestNowUtc($slotLocal->modify('+10 minutes'));
+
+        // Clinic B loses its Settings: any read throws.
+        $factory = App::settingsFactory();
+        $reflection = new \ReflectionClass($factory);
+        $instances = $reflection->getProperty('instances');
+        $instances->setAccessible(true);
+        $saved = $instances->getValue($factory);
+        $throwing = new class {
+            public function get(string $key, mixed $default = null): mixed // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- double must match Settings::get().
+            {
+                throw new \RuntimeException('SIMULATED_SETTINGS_RESOLVE_FAILURE_FOR_CLINIC_B');
+            }
+        };
+        $instances->setValue($factory, array_replace((array) $saved, [$this->clinicB => $throwing]));
+
+        try {
+            $seed = $this->seedConfirmedAppointment(
+                $this->clinicB,
+                $this->locationB,
+                $this->clinicianB,
+                $this->patientB,
+                $spec,
+                'grace-fail'
+            );
+            $previousScope = ScopeContext::tryGet();
+            ScopeContext::set(ClinicScope::forClinic($this->clinicB));
+            try {
+                $visit = App::visitService()->checkIn($this->secretaryA, $this->patientB, $seed['id']);
+            } finally {
+                if (null !== $previousScope) {
+                    ScopeContext::set($previousScope);
+                } else {
+                    ScopeContext::clear();
+                }
+            }
+
+            self::assertGreaterThan(
+                0,
+                (int) ($visit['id'] ?? 0),
+                'an unresolvable grace must fail CLOSED (no "past grace" conclusion), so the check-in is accepted — '
+                . 'Clinic A grace 5 must never stand in for Clinic B'
+            );
+            self::assertSame('confirmed', $this->appointmentRow($seed['id'])['status'], 'fail-closed must not write no_show');
+        } finally {
+            $instances->setValue($factory, (array) $saved);
+            Settings::flushCache();
+            App::settingsFactory()->reset();
+            VisitService::setTestNowUtc(null);
+        }
+    }
+
+    /** Set one Clinic's no-show grace and drop the settings cache. */
+    private function setNoShowGrace(int $clinicId, int $minutes): void
+    {
+        (new Settings(App::db(), $clinicId, App::audit()))->set('queue.no_show_grace_minutes', $minutes);
+        Settings::flushCache();
+        self::assertSame(
+            $minutes,
+            (int) (new Settings(App::db(), $clinicId, App::audit()))->get('queue.no_show_grace_minutes', 30),
+            'fixture: Clinic ' . $clinicId . ' grace must be ' . $minutes
+        );
     }
 
     // ============ T12b — both serialization orders, deterministically (no fork) ============
@@ -1239,6 +1518,28 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                 exit(1); // backstop — a returning child is a harness fault, not a pass
             }
             $pids[] = $pid;
+        }
+
+        // P4 readiness handshake: each child writes a ready file once its own DB
+        // connection and services exist, and only then does the parent release the
+        // barrier. Without it a slow child could start its product call after the
+        // other one already finished, which would make the overlap evidence depend on
+        // process scheduling luck rather than on the row lock.
+        $readyDeadline = microtime(true) + 10.0;
+        foreach (array_keys($workers) as $readyIndex) {
+            $readyFile = $this->fileTag . '-ready-' . $attempt . '-' . $readyIndex;
+            while (!@is_file($readyFile)) {
+                if (microtime(true) > $readyDeadline) {
+                    $this->fail(
+                        'harness fatal: child [' . $workers[$readyIndex]['role'] . '] did not reach the barrier '
+                        . 'within 10 s (ready file missing: ' . $readyFile . ')'
+                    );
+                }
+                usleep(1000);
+            }
+        }
+        foreach (array_keys($workers) as $readyIndex) {
+            @unlink($this->fileTag . '-ready-' . $attempt . '-' . $readyIndex);
         }
 
         $barrier = $this->fileTag . '-barrier-' . $attempt;
@@ -1405,6 +1706,10 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             null,
             new MembershipRepository($cpms)
         );
+
+        // Tell the parent this child is fully bootstrapped (services built, own
+        // connection open) so the barrier is never released for a child still booting.
+        @file_put_contents($this->fileTag . '-ready-' . $attempt . '-' . $index, '1');
 
         $target = $fireAt + $offset;
         while (true) {
