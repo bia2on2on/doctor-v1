@@ -52,6 +52,7 @@ final class StaffMessagingHiddenReleaseOneTest extends WP_UnitTestCase
 
     public function testTheSwitchIsOffForTheReleaseOneLine(): void
     {
+        // Mutation caught: flipping `STAFF_MESSAGING_AVAILABLE` to true.
         self::assertFalse(
             StaffPortalShell::STAFF_MESSAGING_AVAILABLE,
             'R1 (1.0): staff messaging must stay hidden until the owner flips this constant'
@@ -60,6 +61,7 @@ final class StaffMessagingHiddenReleaseOneTest extends WP_UnitTestCase
 
     public function testTheMenuNeverOffersTheMessagingModuleForAnyRole(): void
     {
+        // Mutation caught: appending the messages entry to `registered_modules()` unconditionally.
         $identities = $this->identities();
 
         self::assertNotContains(
@@ -79,6 +81,7 @@ final class StaffMessagingHiddenReleaseOneTest extends WP_UnitTestCase
 
     public function testRequestedModuleMessagesFallsBackExactlyLikeAnUnknownModule(): void
     {
+        // Mutation caught: letting `requested_module()` accept `messages` while the switch is off.
         $doctor = $this->doctorId();
         $eligible = array_column(StaffPortalShell::eligible_modules($doctor), 'id');
         self::assertNotEmpty($eligible, 'precondition: this actor has at least one eligible module');
@@ -105,6 +108,7 @@ final class StaffMessagingHiddenReleaseOneTest extends WP_UnitTestCase
 
     public function testModuleSelectorNeverSelectsTheMessagingModuleForAnyRole(): void
     {
+        // Mutation caught: `module_eligible('messages')` no longer consulting the switch.
         $previous_get = $_GET;
 
         try {
@@ -123,6 +127,7 @@ final class StaffMessagingHiddenReleaseOneTest extends WP_UnitTestCase
 
     public function testThePortalDoesNotMountTheMessagingModule(): void
     {
+        // Mutation caught: dropping the switch from the template's mount condition.
         $doctor    = $this->doctorId();
         $page_id   = StaffPortalShell::ensure_portal_page();
         self::assertGreaterThan(0, $page_id);
@@ -147,6 +152,7 @@ final class StaffMessagingHiddenReleaseOneTest extends WP_UnitTestCase
 
     public function testTheFourMessagingRoutesAreAbsentAndDispatchReturnsRestNoRoute(): void
     {
+        // Mutation caught: registering `MessagingController` outside the switch in `App::register_rest_routes()`.
         // Order independence: build a FRESH server and run the real registration
         // path (`rest_api_init`, the hook App registers its controllers on), so
         // this cannot pass or fail because another test class left routes behind
@@ -198,6 +204,7 @@ final class StaffMessagingHiddenReleaseOneTest extends WP_UnitTestCase
 
     public function testOtherStaffPortalModulesAreUnaffected(): void
     {
+        // Mutation caught: hiding more than messaging (a guard that also drops doctor/reception/finance/reports).
         $registered = array_column(StaffPortalShell::registered_modules(), 'id');
         foreach (array( StaffPortalShell::MODULE_DOCTOR, StaffPortalShell::MODULE_RECEPTION, StaffPortalShell::MODULE_FINANCE, StaffPortalShell::MODULE_REPORTS, StaffPortalShell::MODULE_PRICING ) as $module) {
             self::assertContains($module, $registered, $module . ' must stay registered');
@@ -221,6 +228,7 @@ final class StaffMessagingHiddenReleaseOneTest extends WP_UnitTestCase
 
     public function testServiceTablesAndTemplatesAreUntouched(): void
     {
+        // Mutation caught: deleting or renaming the messaging service, controller, template or table instead of only hiding the module.
         $root = dirname(__DIR__, 2);
 
         self::assertFileExists($root . '/src/Application/Messaging/StaffMessagingService.php');
