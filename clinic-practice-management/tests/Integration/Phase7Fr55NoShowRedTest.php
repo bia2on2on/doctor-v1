@@ -675,6 +675,15 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     /** @var string|null Harness-level fatal (fork, child exit, outcome file); null means the harness completed. */
     private static ?string $race_harness_error = null;
 
+    /** @var string|null (a) fork / child exit / outcome file. */
+    private static ?string $race_error_fork = null;
+
+    /** @var string|null (b) seeding or COMMIT: the seeded rows were not visible to a fresh connection. */
+    private static ?string $race_error_seed = null;
+
+    /** @var string|null (c) post-race state read: a row the state reader needs was missing. */
+    private static ?string $race_error_state = null;
+
     /**
      * Run the real-DB race once per class and keep the observations.
      *
@@ -722,8 +731,26 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                     ['role' => 'no_show', 'offset' => 0.0],
                     ['role' => 'check_in', 'offset' => 0.0],
                 ];
-                $outcomes = $this->runRace($seed['id'], $patientId, $workers, $attempt);
-                $state = $this->raceState($seed['id'], $seed['slot_id']);
+                // (b) Visibility probe: a THIRD connection must already see the
+                // committed seed. If it does not, every later read — the two
+                // workers included — is reading nothing, which is a fixture/COMMIT
+                // defect, not product evidence.
+                $this->assertRaceSeedVisible($seed['id'], $seed['slot_id'], $attempt);
+
+                try {
+                    $outcomes = $this->runRace($seed['id'], $patientId, $workers, $attempt);
+                } catch (Throwable $e) {
+                    self::$race_error_fork = 'attempt ' . $attempt . ': ' . get_class($e) . ': ' . $e->getMessage();
+                    throw $e;
+                }
+
+                try {
+                    $state = $this->raceState($seed['id'], $seed['slot_id']);
+                } catch (Throwable $e) {
+                    self::$race_error_state = 'attempt ' . $attempt . ' (appointment ' . $seed['id'] . ', slot ' . $seed['slot_id'] . '): '
+                        . get_class($e) . ': ' . $e->getMessage();
+                    throw $e;
+                }
 
                 $observations[] = [
                     'attempt' => $attempt,
@@ -738,6 +765,59 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         self::$race_observations = $observations;
 
         return $observations;
+    }
+
+    /**
+     * (b) Prove the seed is visible to an INDEPENDENT connection before the race.
+     *
+     * The fixture commits with a bare `COMMIT` (the savepoint rewrite in
+         * `tests/integration-bootstrap.php` only touches statements carrying the cpms
+         * comment marker), so
+     * a third connection must see both rows. A miss here is a seeding/COMMIT defect.
+     */
+    private function assertRaceSeedVisible(int $appointmentId, int $slotId, int $attempt): void
+    {
+        $conn = $this->freshMysqli();
+        $db = App::db();
+        $appointmentCount = (int) $this->mysqliRow(
+            $conn,
+            'SELECT COUNT(*) AS c FROM ' . $db->table('cpms_appointments') . ' WHERE id = ' . (int) $appointmentId
+        )['c'];
+        $slotCount = (int) $this->mysqliRow(
+            $conn,
+            'SELECT COUNT(*) AS c FROM ' . $db->table('cpms_schedule_slots') . ' WHERE id = ' . (int) $slotId
+        )['c'];
+        $conn->close();
+
+        if ($appointmentCount !== 1 || $slotCount !== 1) {
+            self::$race_error_seed = 'attempt ' . $attempt . ': seed not visible to a fresh connection — appointment '
+                . $appointmentId . ' count=' . $appointmentCount . ', slot ' . $slotId . ' count=' . $slotCount;
+            self::fail(self::$race_error_seed);
+        }
+    }
+
+    /** (a) fork / child exit / outcome file. */
+    public function testRaceHarnessForkPhaseCompleted(): void
+    {
+        $this->raceAttempts();
+
+        self::assertNull(self::$race_error_fork, 'fork phase must complete: ' . (string) self::$race_error_fork);
+    }
+
+    /** (b) seeding/COMMIT: the seeded rows must be visible to an independent connection. */
+    public function testRaceSeededRowsWereVisibleToAFreshConnection(): void
+    {
+        $this->raceAttempts();
+
+        self::assertNull(self::$race_error_seed, 'the seed must be committed and visible: ' . (string) self::$race_error_seed);
+    }
+
+    /** (c) post-race state read: every row the state reader needs must exist. */
+    public function testRacePostRaceStateReadFoundItsRows(): void
+    {
+        $this->raceAttempts();
+
+        self::assertNull(self::$race_error_state, 'the post-race state read must find its rows: ' . (string) self::$race_error_state);
     }
 
     /**
