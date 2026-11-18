@@ -10,6 +10,7 @@ use ClinicCore\Application\Finance\FinanceException;
 use ClinicCore\Application\Onboarding\FirstPracticeSetupException;
 use ClinicCore\Admin\RoleCapabilitiesPage;
 use ClinicCore\Application\Patients\PatientAccountPolicy;
+use ClinicCore\Application\Roles\CustomRoleManagementException;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
@@ -1737,6 +1738,193 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         self::assertTrue(
             true === ( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_ACCOUNTANT )[ $droppedCap ] ?? null ),
             'a preset without a patient holder resets to its template'
+        );
+    }
+
+    /**
+     * A2(i): a role key that members ALREADY hold is never defined, because defining
+     * it would activate its capabilities for them at once.
+     *
+     * MUTATION THAT TURNS THIS RED: removing the member_user_ids_for_role() guard in
+     * CustomRoleManagementService::create() — create() then succeeds and the
+     * definition row exists.
+     */
+    public function test_custom_role_create_refuses_a_key_already_held_by_a_member(): void
+    {
+        $manager = $this->makeClinicManager( 'pb_b2_create' );
+        $holder  = $this->makeUser( 'subscriber', 'pb_b2_holder' );
+        // A member holding the key BEFORE any definition of it exists.
+        cpms_test_seed_membership( $holder, $this->clinicId, 'cpms_orphan_role' );
+
+        $service = App::custom_role_management_service();
+        $caps    = array_slice( array_values( (array) $service->delegable_capabilities( $manager, $this->clinicId ) ), 0, 1 );
+        self::assertNotSame( [], $caps, 'the fixture needs one delegable capability' );
+
+        try {
+            $service->create( $manager, $this->clinicId, 'cpms_orphan_role', 'نقش یتیم', $caps );
+            self::fail( 'a role key already held by a member must not be defined' );
+        } catch ( CustomRoleManagementException $e ) {
+            self::assertSame( CustomRoleManagementException::CODE_KEY_CONFLICT, $e->reason_code() );
+        }
+
+        self::assertNull(
+            App::db()->fetchValue(
+                'SELECT id FROM ' . App::db()->table( 'cpms_custom_role_defs' ) . ' WHERE clinic_id = %d AND role_key = %s',
+                [ $this->clinicId, 'cpms_orphan_role' ]
+            ),
+            'no definition row may be written for a refused key'
+        );
+    }
+
+    /**
+     * A2(ii): reactivating an INACTIVE definition re-grants its stored capabilities,
+     * so a patient holder refuses it and nothing is written.
+     *
+     * MUTATION THAT TURNS THIS RED: removing the holder loop (or
+     * has_membership_references_for_update()) from the activation branch of
+     * CustomRoleManagementService::transition_status() — reactivation then succeeds,
+     * status flips to active and the version increments.
+     */
+    public function test_custom_role_reactivation_refuses_a_patient_holder(): void
+    {
+        $manager = $this->makeClinicManager( 'pb_b2_react' );
+        $patient = $this->makeUser( 'subscriber', 'pb_b2_patient' );
+        $this->insertPatientLink( $patient );
+
+        $service = App::custom_role_management_service();
+        $caps    = array_slice( array_values( (array) $service->delegable_capabilities( $manager, $this->clinicId ) ), 0, 1 );
+        $created = $service->create( $manager, $this->clinicId, 'cpms_ward_role', 'نقش بخش', $caps );
+
+        $membership = cpms_test_seed_membership( $patient, $this->clinicId, 'cpms_ward_role' );
+        self::assertGreaterThan( 0, $membership );
+
+        $inactive = $service->deactivate( $manager, $this->clinicId, 'cpms_ward_role', (int) $created['version'] );
+        self::assertSame( 'inactive', (string) $inactive['status'] );
+
+        try {
+            $service->reactivate( $manager, $this->clinicId, 'cpms_ward_role', (int) $inactive['version'] );
+            self::fail( 'reactivation must be refused while a patient holds the role' );
+        } catch ( CustomRoleManagementException $e ) {
+            self::assertSame( CustomRoleManagementException::CODE_MEMBERSHIP_REFERENCES, $e->reason_code() );
+        }
+
+        self::assertSame(
+            'inactive',
+            (string) App::db()->fetchValue(
+                'SELECT status FROM ' . App::db()->table( 'cpms_custom_role_defs' ) . ' WHERE clinic_id = %d AND role_key = %s',
+                [ $this->clinicId, 'cpms_ward_role' ]
+            ),
+            'the definition must stay inactive'
+        );
+        self::assertSame(
+            0,
+            (int) App::db()->fetchValue(
+                'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_membership_capabilities' ) . ' WHERE membership_id = %d',
+                [ $membership ]
+            ),
+            'no capability row may be written for the holder'
+        );
+    }
+
+    /**
+     * A2(iii) POSITIVE CONTROL for the guard above: the same reactivation with a STAFF
+     * holder succeeds, so the refusal in (ii) is the holder policy and not a broken
+     * lifecycle.
+     *
+     * MUTATION THAT TURNS THIS RED: making the holder check refuse unconditionally.
+     */
+    public function test_custom_role_reactivation_succeeds_with_a_staff_holder(): void
+    {
+        $manager = $this->makeClinicManager( 'pb_b2_ok' );
+        $staff   = $this->makeUser( 'subscriber', 'pb_b2_staff' );
+
+        $service = App::custom_role_management_service();
+        $caps    = array_slice( array_values( (array) $service->delegable_capabilities( $manager, $this->clinicId ) ), 0, 1 );
+        $created = $service->create( $manager, $this->clinicId, 'cpms_staff_role', 'نقش کارکنان', $caps );
+
+        cpms_test_seed_membership( $staff, $this->clinicId, 'cpms_staff_role' );
+        $inactive = $service->deactivate( $manager, $this->clinicId, 'cpms_staff_role', (int) $created['version'] );
+        self::assertSame( 'inactive', (string) $inactive['status'] );
+
+        $active = $service->reactivate( $manager, $this->clinicId, 'cpms_staff_role', (int) $inactive['version'] );
+        self::assertSame( 'active', (string) $active['status'] );
+        self::assertTrue( (bool) $active['changed'], 'a staff-only holder must not block reactivation' );
+    }
+
+    /**
+     * A3 (within-session simulation): the competing change lands AFTER the portal's
+     * pre-flight read and BEFORE its write boundary. The boundary must re-read on the
+     * locked row and refuse, instead of clearing a DENY it never observed.
+     *
+     * A real second connection is impossible here: the harness runs every test inside
+     * one transaction and rewrites service START TRANSACTION into SAVEPOINT
+     * (tests/integration-bootstrap.php:229-234, :288), so another session cannot see
+     * the fixture rows. This filter commits the competing row in the SAME session.
+     *
+     * MUTATION THAT TURNS THIS RED: removing the in-transaction lock + re-read
+     * ($state_held) from set_staff_capability() — the CLEAR then succeeds and the DENY
+     * is gone.
+     */
+    public function test_portal_capability_write_refuses_when_the_state_moves_in_the_boundary(): void
+    {
+        $manager    = $this->makeClinicManager( 'pb_b4_move' );
+        $staff      = $this->makeUser( 'subscriber', 'pb_b4_staff' );
+        $membership = cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+        $capability = RolesAndCapabilities::CONFIG;
+
+        $grant = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_capability',
+            [
+                'clinic_id'     => (string) $this->clinicId,
+                'membership_id' => (string) $membership,
+                'capability'    => $capability,
+                'effect'        => 'grant',
+            ]
+        );
+        self::assertTrue( $grant['ok'], 'a staff member may receive a GRANT' );
+
+        // The competing writer: fires on the FIRST capability read for this membership
+        // (the pre-flight read) and replaces the observed GRANT with a DENY.
+        $armed  = true;
+        $inject = static function ( $query ) use ( &$armed, $membership, $capability ) {
+            $sql = (string) $query;
+            if ( ! $armed || false === stripos( $sql, 'cpms_membership_capabilities' ) ) {
+                return $query;
+            }
+            if ( 1 !== preg_match( '/membership_id = ' . (int) $membership . '\b/', $sql ) ) {
+                return $query;
+            }
+            $armed = false;
+            App::db()->query(
+                'INSERT INTO ' . App::db()->table( 'cpms_membership_capabilities' )
+                . ' (membership_id, capability, effect, created_at) VALUES (%d, %s, %s, %s)'
+                . ' ON DUPLICATE KEY UPDATE effect = VALUES(effect)',
+                [ $membership, $capability, 'deny', App::db()->nowUtcSql() ]
+            );
+
+            return $query;
+        };
+        add_filter( 'query', $inject, 7 );
+
+        $clear = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_capability',
+            [
+                'clinic_id'     => (string) $this->clinicId,
+                'membership_id' => (string) $membership,
+                'capability'    => $capability,
+                'effect'        => 'clear',
+            ]
+        );
+
+        remove_filter( 'query', $inject, 7 );
+
+        self::assertFalse( $clear['ok'], 'a CLEAR must not remove a DENY it never observed' );
+        self::assertSame(
+            [ [ 'capability' => $capability, 'effect' => 'deny' ] ],
+            $this->capabilityOverrides( $membership ),
+            'the competing DENY must survive the stale CLEAR'
         );
     }
 
