@@ -49,7 +49,7 @@ $cpms_doctor_mod    = StaffPortalShell::MODULE_DOCTOR === $cpms_module_id;
 $cpms_reception_mod = StaffPortalShell::MODULE_RECEPTION === $cpms_module_id;
 $cpms_finance_mod   = StaffPortalShell::MODULE_FINANCE === $cpms_module_id;
 $cpms_reports_mod   = StaffPortalShell::MODULE_REPORTS === $cpms_module_id;
-$cpms_messages_mod  = StaffPortalShell::MODULE_MESSAGES === $cpms_module_id;
+$cpms_messages_mod  = StaffPortalShell::STAFF_MESSAGING_AVAILABLE && StaffPortalShell::MODULE_MESSAGES === $cpms_module_id;
 $cpms_pricing_mod   = StaffPortalShell::MODULE_PRICING === $cpms_module_id;
 
 $cpms_login_name = $cpms_logged_in ? (string) $cpms_user->display_name : '';
@@ -253,8 +253,9 @@ echo $cpms_styles_html;
     $cpms_staff_embed = true;
     include StaffPortalShell::reports_module_template_path();
     ?>
-<?php elseif ( $cpms_messages_mod ) : ?>
+<?php elseif ( $cpms_messages_mod && StaffPortalShell::STAFF_MESSAGING_AVAILABLE ) : ?>
     <?php
+    // R1 (1.0): mounted only when the switch is on; hidden means never rendered.
     // Iran V1 — internal Doctor/Receptionist messaging (self-contained module).
     $cpms_staff_embed = true;
     include StaffPortalShell::messages_module_template_path();

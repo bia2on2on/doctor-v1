@@ -92,6 +92,17 @@ final class StaffPortalShell {
 	/** Iran V1 — internal Doctor/Receptionist messaging (Clinic-scoped). */
 	public const MODULE_MESSAGES = 'messages';
 
+	/**
+	 * R1 (1.0, owner decision): staff messaging is hidden for the 1.0 line.
+	 *
+	 * ONE switch for the whole feature — the menu entry, module selection/mount and
+	 * the four MessagingController REST routes. `false` keeps the routes
+	 * unregistered (WordPress answers rest_no_route) and the module unselectable for
+	 * every role, administrator included. Flipping it to `true` restores the full
+	 * line; service, tables, migrations, data and shared capabilities are untouched.
+	 */
+	public const STAFF_MESSAGING_AVAILABLE = false;
+
 	/** Iran V1 — doctor consultation fee + draft treatment charges. */
 	public const MODULE_PRICING = 'pricing';
 
@@ -488,7 +499,7 @@ final class StaffPortalShell {
 	 * @return list<array{id: string, title: string}>
 	 */
 	public static function registered_modules(): array {
-		return array(
+		$modules = array(
 			array(
 				'id'    => self::MODULE_DOCTOR,
 				'title' => 'امروز پزشک — صف زنده',
@@ -505,17 +516,25 @@ final class StaffPortalShell {
 				'id'    => self::MODULE_REPORTS,
 				'title' => 'گزارش — میانگین زمان انتظار',
 			),
-			// Iran V1 modules are APPENDED: the established doctor/reception/
-			// finance default module order and deep links stay unchanged.
-			array(
+		);
+
+		// R1 (1.0): the messaging entry is registered only while the switch is on,
+		// so the menu never offers a module the 1.0 line hides.
+		if ( self::STAFF_MESSAGING_AVAILABLE ) {
+			$modules[] = array(
 				'id'    => self::MODULE_MESSAGES,
 				'title' => 'پیامهای داخلی',
-			),
-			array(
-				'id'    => self::MODULE_PRICING,
-				'title' => 'تعرفه و خدمات ویزیت',
-			),
+			);
+		}
+
+		// Iran V1 modules are APPENDED: the established doctor/reception/finance
+		// default module order and deep links stay unchanged.
+		$modules[] = array(
+			'id'    => self::MODULE_PRICING,
+			'title' => 'تعرفه و خدمات ویزیت',
 		);
+
+		return $modules;
 	}
 
 	/**
@@ -528,6 +547,10 @@ final class StaffPortalShell {
 	public static function requested_module(): string {
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- read-only view selector, no state change.
 		$raw = isset( $_GET[ self::MODULE_PARAM ] ) ? sanitize_key( (string) wp_unslash( $_GET[ self::MODULE_PARAM ] ) ) : '';
+		// R1 (1.0): a hidden module must behave exactly like an unknown module.
+		if ( ! self::STAFF_MESSAGING_AVAILABLE && self::MODULE_MESSAGES === $raw ) {
+			return '';
+		}
 		if ( in_array( $raw, array( self::MODULE_DOCTOR, self::MODULE_RECEPTION, self::MODULE_FINANCE, self::MODULE_REPORTS, self::MODULE_MESSAGES, self::MODULE_PRICING ), true ) ) {
 			return $raw;
 		}
@@ -606,6 +629,16 @@ final class StaffPortalShell {
 	 * private, unlinked staff messaging. Every REST request re-authorizes.
 	 */
 	public static function messages_module_eligible( int $user_id ): bool {
+		// R1 (1.0): one switch decides visibility for every role, administrator
+		// included; the capability rule below stays intact for the day it is flipped.
+		return self::STAFF_MESSAGING_AVAILABLE && self::messages_capability_eligible( $user_id );
+	}
+
+	/**
+	 * The pre-R1 capability rule for the messaging module, unchanged and still
+	 * exercised, but reachable only while `STAFF_MESSAGING_AVAILABLE` is true.
+	 */
+	private static function messages_capability_eligible( int $user_id ): bool {
 		if ( $user_id <= 0 ) {
 			return false;
 		}

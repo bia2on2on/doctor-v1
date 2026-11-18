@@ -9,6 +9,7 @@ use ClinicCore\Application\Messaging\StaffMessagingService;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Frontend\StaffPortalShell;
+use ClinicCore\Rest\MessagingController;
 use ClinicCore\Tests\Integration\Fixtures\IranV1Fixture;
 use WP_UnitTestCase;
 
@@ -29,10 +30,24 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
     private const CONTEXT = '/clinic/v1/staff/portal/messages/context';
     private const THREADS = '/clinic/v1/staff/portal/messages/threads';
 
+    /** Registered once per process: the switch keeps these routes out of the real boot. */
+    private static bool $messaging_routes_registered = false;
+
     protected function setUp(): void
     {
         parent::setUp();
         $this->iv1_boot();
+
+        // R1 (1.0): `StaffPortalShell::STAFF_MESSAGING_AVAILABLE` is false for the
+        // 1.0 line, so the real boot does not register these routes (asserted in
+        // StaffMessagingHiddenReleaseOneTest). This suite registers the controller
+        // itself so every permission, rate-limit, retention and XSS assertion below
+        // keeps running — it is the evidence for the day the switch is flipped on.
+        if ( ! self::$messaging_routes_registered ) {
+            rest_get_server(); // fires rest_api_init once, so registration is not doing_it_wrong.
+            ( new MessagingController( App::staff_messaging_service() ) )->register_routes();
+            self::$messaging_routes_registered = true;
+        }
     }
 
     protected function tearDown(): void
@@ -372,9 +387,14 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
         $this->iv1_membership($finance1, (int) $world['clinic'], RolesAndCapabilities::ROLE_ACCOUNTANT);
         $finance2 = $this->iv1_user(RolesAndCapabilities::ROLE_ACCOUNTANT, 'cash2');
         $this->iv1_membership($finance2, (int) $world['clinic'], RolesAndCapabilities::ROLE_ACCOUNTANT);
-        self::assertTrue(StaffPortalShell::messages_module_eligible((int) $world['doctor']));
-        self::assertTrue(StaffPortalShell::messages_module_eligible((int) $world['secretary']));
-        self::assertTrue(StaffPortalShell::messages_module_eligible($finance1));
+        // R1 (1.0): the module is hidden for the 1.0 line, so module VISIBILITY must be
+        // false for every role that used to see it (administrator is checked below).
+        // The capability truth those roles rely on is still exercised by this same
+        // class: the service-level send/read/cross-Clinic denials above stay as they are.
+        self::assertFalse(StaffPortalShell::STAFF_MESSAGING_AVAILABLE, 'R1: the 1.0 switch must be off');
+        self::assertFalse(StaffPortalShell::messages_module_eligible((int) $world['doctor']), 'R1: hidden for a doctor');
+        self::assertFalse(StaffPortalShell::messages_module_eligible((int) $world['secretary']), 'R1: hidden for reception');
+        self::assertFalse(StaffPortalShell::messages_module_eligible($finance1), 'R1: hidden for finance');
         $admin = self::factory()->user->create(['role' => 'administrator']);
         self::assertFalse(StaffPortalShell::messages_module_eligible($admin), 'WordPress admin status alone is not sufficient');
 
