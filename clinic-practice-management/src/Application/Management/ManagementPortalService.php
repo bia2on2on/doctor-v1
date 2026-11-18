@@ -41,6 +41,7 @@ namespace ClinicCore\Application\Management;
 
 use ClinicCore\Application\Authorization\AuthorizationException;
 use ClinicCore\Application\Authorization\AuthorizationService;
+use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Application\Location\LocationException;
 use ClinicCore\Application\Onboarding\FacilitySetupException;
 use ClinicCore\Application\Onboarding\OrganizationClinicProvisioningService;
@@ -86,13 +87,17 @@ final class ManagementPortalService {
 	 * path ever touches cpms_organization_memberships, so no Organization
 	 * Manager delegation can happen here.
 	 *
+	 * B0-PR2 — the PATIENT role (`cpms_patient`) is deliberately absent as well:
+	 * no staff path may mint a patient account, hand out patient binding, or set a
+	 * patient credential. may_assign_role() refuses that key explicitly too, so
+	 * editing this list alone cannot re-open the path.
+	 *
 	 * @var list<string>
 	 */
 	public const ASSIGNABLE_BUILT_IN_ROLES = array(
 		RolesAndCapabilities::ROLE_DOCTOR,
 		RolesAndCapabilities::ROLE_SECRETARY,
 		RolesAndCapabilities::ROLE_ACCOUNTANT,
-		RolesAndCapabilities::ROLE_PATIENT,
 	);
 
 	/**
@@ -842,6 +847,12 @@ final class ManagementPortalService {
 			return self::failure();
 		}
 
+		// B0-PR2 — a patient account never receives staff capability from this
+		// staff surface (refused before any role/capability/audit write).
+		if ( PatientAccountPolicy::is_patient_account( $target_wp_user_id ) ) {
+			return self::failure();
+		}
+
 		try {
 			// D6 audit atomicity: the assignment service is atomic itself (role
 			// write + its own audit on a SAVEPOINT); this outer boundary also
@@ -881,8 +892,8 @@ final class ManagementPortalService {
 	 *  - trusted Clinic scope + scoped staff-management capability are authorized
 	 *    BEFORE the target account is resolved or provisioned;
 	 *  - delegation follows may_assign_role(): the approved operational roles
-	 *    (doctor, secretary/receptionist, accountant) and the patient membership
-	 *    role are assignable on staff-management authority ALONE — the Clinic
+	 *    (doctor, secretary/receptionist, accountant) are assignable on
+	 *    staff-management authority ALONE — the Clinic
 	 *    Manager does not need to hold the clinical/financial capabilities being
 	 *    delegated (they come from the role preset, never an arbitrary set);
 	 *  - manager/manager designation is never assignable here (explicit
@@ -1419,6 +1430,12 @@ final class ManagementPortalService {
 	 */
 
 	private function may_assign_role( string $role_key ): bool {
+		// B0-PR2 — the patient role is never assignable from a staff surface,
+		// whatever the constants say (defence in depth, not the only gate).
+		if ( PatientAccountPolicy::is_patient_role_key( $role_key ) ) {
+			return false;
+		}
+
 		return in_array( $role_key, self::ASSIGNABLE_BUILT_IN_ROLES, true );
 	}
 
@@ -1434,6 +1451,13 @@ final class ManagementPortalService {
 		}
 		$user = get_userdata( $target_wp_user_id );
 		if ( false === $user ) {
+			return false;
+		}
+
+		// B0-PR2 — a patient account (patient role, patient-role membership or a
+		// durable patient link) is never a staff target, and mixed accounts fail
+		// closed. Checked before any membership/role/audit write.
+		if ( PatientAccountPolicy::is_patient_account( $target_wp_user_id ) ) {
 			return false;
 		}
 

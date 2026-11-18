@@ -1151,6 +1151,10 @@ final class ManagementPortalTest extends WP_UnitTestCase {
         // A non-manager also cannot suspend/reactivate, change roles, or move scope.
         foreach ( array(
             array( 'action' => 'clinic_staff_status', 'input' => array( 'clinic_id' => (string) $this->clinicA, 'membership_id' => (string) (int) $target['id'], 'active' => '0' ) ),
+            // B0-PR2: this case is still refused, and now for TWO independent
+            // reasons (no staff-management authority, and the patient role key is
+            // never assignable). The manager-level patient denial — the stronger
+            // case — is asserted in PatientCredentialBoundaryTest.
             array( 'action' => 'clinic_staff_role', 'input' => array( 'clinic_id' => (string) $this->clinicA, 'target_user_id' => (string) $this->clinicManager, 'role_key' => RolesAndCapabilities::ROLE_PATIENT ) ),
             array( 'action' => 'clinic_staff_locations', 'input' => array( 'clinic_id' => (string) $this->clinicA, 'membership_id' => (string) (int) $target['id'], 'location_ids' => '' ) ),
             array( 'action' => 'clinic_staff_enroll', 'input' => array( 'clinic_id' => (string) $this->clinicA, 'identifier' => 'nope-' . bin2hex( random_bytes( 3 ) ) . '@example.test', 'role_key' => RolesAndCapabilities::ROLE_PATIENT ) ),
@@ -1312,9 +1316,36 @@ final class ManagementPortalTest extends WP_UnitTestCase {
         self::assertTrue( ManagementPortalController::dispatch( $this->clinicManager, 'clinic_staff_locations', array(
             'clinic_id' => (string) $this->clinicA, 'membership_id' => (string) $membership_id, 'location_ids' => '',
         ) )['ok'] );
+        // B0-PR2 — changed assertion (equal-or-stronger): the patient role is no
+        // longer assignable from ANY staff surface, so the audited role change in
+        // this atomicity case now uses a legal operational role (accountant). The
+        // patient-role refusal is asserted immediately below, including ZERO
+        // audit and role side effects — strictly stronger than the old assertion,
+        // which only proved that a patient-role change was audited.
         self::assertTrue( ManagementPortalController::dispatch( $this->clinicManager, 'clinic_staff_role', array(
-            'clinic_id' => (string) $this->clinicA, 'target_user_id' => (string) $this->staffMember, 'role_key' => RolesAndCapabilities::ROLE_PATIENT,
+            'clinic_id' => (string) $this->clinicA, 'target_user_id' => (string) $this->staffMember, 'role_key' => RolesAndCapabilities::ROLE_ACCOUNTANT,
         ) )['ok'] );
+
+        $audit_before_patient_role = (int) App::db()->fetchValue(
+            'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_audit_logs' ) . ' WHERE clinic_id = %d',
+            array( $this->clinicA )
+        );
+        self::assertFalse( ManagementPortalController::dispatch( $this->clinicManager, 'clinic_staff_role', array(
+            'clinic_id' => (string) $this->clinicA, 'target_user_id' => (string) $this->staffMember, 'role_key' => RolesAndCapabilities::ROLE_PATIENT,
+        ) )['ok'], 'the patient role is never assignable from a staff surface' );
+        self::assertSame(
+            $audit_before_patient_role,
+            (int) App::db()->fetchValue(
+                'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_audit_logs' ) . ' WHERE clinic_id = %d',
+                array( $this->clinicA )
+            ),
+            'a refused patient-role assignment writes no audit row'
+        );
+        self::assertSame(
+            RolesAndCapabilities::ROLE_ACCOUNTANT,
+            (string) App::membership_service()->membership_for( $this->clinicA, $this->staffMember )['role_key'],
+            'a refused patient-role assignment leaves the membership role unchanged'
+        );
 
         $rows = App::db()->fetchAll(
             'SELECT action, clinic_id, actor_wp_user_id, prev_hash, row_hash, before_json, after_json'

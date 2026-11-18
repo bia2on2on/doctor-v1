@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ClinicCore\Admin;
 
 use ClinicCore\Application\Authorization\AuthorizationException;
+use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Application\Roles\CustomRoleAssignmentException;
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Application\Scope\TrustedClinicEstablisher;
@@ -55,6 +56,20 @@ final class StaffManagementPage
         RolesAndCapabilities::ROLE_MANAGER,
     ];
 
+    /**
+     * B0-PR2 — roles this screen may CREATE or ASSIGN. The patient role is
+     * deliberately absent: no staff path may mint a patient account or hand out
+     * patient binding. `MANAGEABLE_ROLES` still describes which accounts the
+     * screen can recognise (so a patient target reaches the explicit denial in
+     * PatientAccountPolicy instead of a misleading "not found").
+     */
+    private const ASSIGNABLE_STAFF_ROLES = [
+        RolesAndCapabilities::ROLE_DOCTOR,
+        RolesAndCapabilities::ROLE_SECRETARY,
+        RolesAndCapabilities::ROLE_ACCOUNTANT,
+        RolesAndCapabilities::ROLE_MANAGER,
+    ];
+
     public static function register(): void
     {
         add_action('admin_menu', [self::class, 'menu']);
@@ -91,6 +106,8 @@ final class StaffManagementPage
         $clinic_id      = self::formClinicId();
         $rows           = self::list_users( $clinic_id );
         $roles = self::roleLabels();
+        // B0-PR2: the patient role is never offered for creation or assignment.
+        $staff_role_options = array_diff_key( $roles, [ RolesAndCapabilities::ROLE_PATIENT => true ] );
         $clinic_choices = self::managed_clinic_choices( (int) get_current_user_id() );
         $assignable     = self::assignment_options( $clinic_id, $rows );
         ?>
@@ -174,7 +191,7 @@ final class StaffManagementPage
                                 <?php if ( $edit !== null && '' !== (string) ( $edit['membership_role'] ?? '' ) && ! in_array( (string) $edit['membership_role'], array_keys( $roles ), true ) ) : ?>
                                     <option value="" selected><?php echo esc_html( '— حفظ نقش سفارشی فعلی: ' . (string) $edit['role_label'] . ' (بدون تغییر عضویت و بدون تغییر نقش WordPress) —' ); ?></option>
                                 <?php endif; ?>
-                                <?php foreach ( $roles as $slug => $label ) : ?>
+                                <?php foreach ( $staff_role_options as $slug => $label ) : ?>
                                     <option value="<?php echo esc_attr( $slug ); ?>" <?php selected( $edit === null ? '' : (string) $edit['role'], $slug ); ?>><?php echo esc_html( $label ); ?></option>
                                 <?php endforeach; ?>
                             </select>
@@ -215,7 +232,7 @@ final class StaffManagementPage
                             <tr><th><label for="cpms_existing_role">نقش عضویت در این Clinic</label></th>
                                 <td>
                                     <select id="cpms_existing_role" name="role" required>
-                                        <?php foreach ( $roles as $slug => $label ) : ?>
+                                        <?php foreach ( $staff_role_options as $slug => $label ) : ?>
                                             <option value="<?php echo esc_attr( $slug ); ?>"><?php echo esc_html( $label ); ?></option>
                                         <?php endforeach; ?>
                                     </select>
@@ -429,6 +446,13 @@ final class StaffManagementPage
             return ['error' => 'کاربر یافت نشد یا قابل مدیریت نیست.', 'display_name' => ''];
         }
 
+        // B0-PR2 — no credential/reset path may target a patient account
+        // (checked before the reset-key meta write, the audit row and the mail).
+        $patient_denial = PatientAccountPolicy::guard( $user_id );
+        if ( $patient_denial !== '' ) {
+            return ['error' => $patient_denial, 'display_name' => ''];
+        }
+
         // D6/D7 ordering: the reset-key metadata (a user-meta write) and the
         // mandatory audit event share one boundary. The notification email is a
         // non-transactional side effect, so it is dispatched ONLY after the
@@ -555,6 +579,19 @@ final class StaffManagementPage
             return ['error' => 'کاربر یافت نشد یا قابل مدیریت نیست.', 'generated' => '', 'user_id' => 0];
         }
 
+        // B0-PR2 — patient credential boundary (fail-closed, BEFORE any side
+        // effect). A patient account is never created, never edited (password,
+        // role, e-mail, display name), and no patient role key is ever assigned
+        // from this screen. `guard()` refuses a patient target and a patient
+        // role key alike, so mixed accounts fail closed too.
+        $patient_denial = PatientAccountPolicy::guard(
+            $mode === 'update' ? $user_id : 0,
+            is_string( $in['role'] ?? null ) ? trim( $in['role'] ) : ''
+        );
+        if ( $patient_denial !== '' ) {
+            return ['error' => $patient_denial, 'generated' => '', 'user_id' => 0];
+        }
+
         // Convert/validate caller-controlled profile fields only after the actor
         // has durable authority for the explicitly selected Clinic and target.
         $username     = is_string( $in['username'] ?? null ) ? trim( $in['username'] ) : '';
@@ -577,7 +614,7 @@ final class StaffManagementPage
                 && CustomRolePolicy::is_definable_role_key( $membership_role_key );
         }
 
-        if ( ! $preserve_membership_role && ( $role === '' || ! in_array( $role, self::MANAGEABLE_ROLES, true ) ) ) {
+        if ( ! $preserve_membership_role && ( $role === '' || ! in_array( $role, self::ASSIGNABLE_STAFF_ROLES, true ) ) ) {
             return ['error' => 'نقش غیرمجاز است (فقط نقش‌های CPMS قابل انتساب‌اند؛ از انتساب administrator جلوگیری شد).', 'generated' => '', 'user_id' => 0];
         }
         if ( $display_name === '' ) {
@@ -792,7 +829,7 @@ final class StaffManagementPage
         }
 
         $role = trim((string) ($in['role'] ?? ''));
-        if ($role === '' || !in_array($role, self::MANAGEABLE_ROLES, true)) {
+        if ($role === '' || !in_array($role, self::ASSIGNABLE_STAFF_ROLES, true)) {
             return ['error' => 'نقش غیرمجاز است (فقط نقش‌های CPMS قابل انتساب‌اند؛ از انتساب administrator جلوگیری شد).', 'generated' => '', 'user_id' => 0];
         }
 
@@ -800,6 +837,15 @@ final class StaffManagementPage
         $existing_user    = $existing_user_id > 0 ? get_userdata( $existing_user_id ) : false;
         if ( $existing_user === false || in_array( 'administrator', (array) $existing_user->roles, true ) ) {
             return ['error' => 'حساب انتخاب‌شده برای افزودن به این کلینیک قابل استفاده نیست.', 'generated' => '', 'user_id' => 0];
+        }
+
+        // B0-PR2 — attaching an existing account is also a patient boundary: a
+        // patient role key may never be handed out, and an account that already
+        // carries patient evidence (role, membership or patient link) is never
+        // enrolled as staff. Refused before create_membership() and its audit.
+        $patient_denial = PatientAccountPolicy::guard( $existing_user_id, $role );
+        if ( $patient_denial !== '' ) {
+            return ['error' => $patient_denial, 'generated' => '', 'user_id' => 0];
         }
 
         try {
@@ -864,6 +910,13 @@ final class StaffManagementPage
         $target_membership = $authorization['target_membership'];
         if ( $target_membership === null ) {
             return ['error' => 'عضویت هدف برای این Clinic یافت نشد.'];
+        }
+
+        // B0-PR2 — suspend/reactivate parks and restores the WordPress role, so a
+        // patient account is refused here too (before meta, role or audit writes).
+        $patient_denial = PatientAccountPolicy::guard( $user_id );
+        if ( $patient_denial !== '' ) {
+            return ['error' => $patient_denial];
         }
 
         // جلوگیری از قفل‌کردن خود: عاملِ غیرفعال‌سازی نمی‌تواند حساب خودش را غیرفعال کند.
