@@ -30,9 +30,6 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
     private const CONTEXT = '/clinic/v1/staff/portal/messages/context';
     private const THREADS = '/clinic/v1/staff/portal/messages/threads';
 
-    /** Registered once per process: the switch keeps these routes out of the real boot. */
-    private static bool $messaging_routes_registered = false;
-
     protected function setUp(): void
     {
         parent::setUp();
@@ -43,11 +40,14 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
         // StaffMessagingHiddenReleaseOneTest). This suite registers the controller
         // itself so every permission, rate-limit, retention and XSS assertion below
         // keeps running — it is the evidence for the day the switch is flipped on.
-        if ( ! self::$messaging_routes_registered ) {
-            rest_get_server(); // fires rest_api_init once, so registration is not doing_it_wrong.
-            ( new MessagingController( App::staff_messaging_service() ) )->register_routes();
-            self::$messaging_routes_registered = true;
-        }
+        //
+        // Re-registered on EVERY test against the CURRENT server: a per-process
+        // guard would silently lose the routes whenever the process-wide
+        // `$wp_rest_server` is replaced (test order), turning REST assertions into
+        // rest_no_route failures instead of product evidence. register_rest_route()
+        // is idempotent for the same namespace/route.
+        rest_get_server(); // fires rest_api_init once, so registration is not doing_it_wrong.
+        ( new MessagingController( App::staff_messaging_service() ) )->register_routes();
     }
 
     protected function tearDown(): void
@@ -121,18 +121,18 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
         self::assertNotSame('', (string) $sent['jalali_time']);
 
         $secretary_threads = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->threads((int) $world['secretary']));
-        self::assertCount(1, $secretary_threads['threads']);
-        self::assertSame(1, (int) $secretary_threads['threads'][0]['unread_count']);
-        self::assertSame(1, (int) $secretary_threads['unread_total']);
+        self::assertCount(1, $secretary_threads['threads'], 'this secretary must see exactly one thread, got ' . count((array) $secretary_threads['threads']));
+        self::assertSame(1, (int) $secretary_threads['threads'][0]['unread_count'], 'unread_count carries the one unread message, got ' . (int) $secretary_threads['threads'][0]['unread_count']);
+        self::assertSame(1, (int) $secretary_threads['unread_total'], 'unread_total sums the same one message, got ' . (int) $secretary_threads['unread_total']);
 
         $inbox = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->messages((int) $world['secretary'], (int) $thread['id'], 0, 50));
-        self::assertCount(1, $inbox['messages']);
-        self::assertFalse($inbox['messages'][0]['mine']);
+        self::assertCount(1, $inbox['messages'], 'this thread holds exactly one message, got ' . count((array) $inbox['messages']));
+        self::assertFalse($inbox['messages'][0]['mine'], 'the doctor\'s message must not be reported as the secretary\'s own');
         self::assertArrayNotHasKey('clinical_note', $inbox['messages'][0]);
         self::assertArrayNotHasKey('medical_record', $inbox['messages'][0]);
 
         $read = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->mark_read((int) $world['secretary'], (int) $thread['id']));
-        self::assertSame(0, (int) $read['unread_count']);
+        self::assertSame(0, (int) $read['unread_count'], 'mark_read clears the counter, got ' . (int) $read['unread_count']);
 
         $reply = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->send(
             (int) $world['secretary'],
@@ -154,7 +154,7 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
             . " WHERE action = 'MESSAGE_SEND' AND resource_id = %d AND COALESCE(meta_json, '') NOT LIKE %s",
             [(int) $reply['id'], '%alert(1)%']
         );
-        self::assertSame(1, (int) $audit);
+        self::assertSame(1, (int) $audit, 'exactly one MESSAGE_SEND audit must exist for the reply, body never stored; got ' . (int) $audit);
     }
 
     public function testCrossClinicAndCrossOrganizationThreadsAreDenied(): void

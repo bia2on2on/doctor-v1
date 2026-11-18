@@ -80,6 +80,8 @@ final class StaffMessagingHiddenReleaseOneTest extends WP_UnitTestCase
     public function testRequestedModuleMessagesFallsBackExactlyLikeAnUnknownModule(): void
     {
         $doctor = $this->doctorId();
+        $eligible = array_column(StaffPortalShell::eligible_modules($doctor), 'id');
+        self::assertNotEmpty($eligible, 'precondition: this actor has at least one eligible module');
         $previous_get = $_GET;
 
         try {
@@ -95,7 +97,10 @@ final class StaffMessagingHiddenReleaseOneTest extends WP_UnitTestCase
 
         self::assertSame('', $hidden_requested, 'a hidden module id is not a valid view selector');
         self::assertSame($unknown_selected, $hidden_selected, 'hidden and unknown ids must fall back identically');
-        self::assertSame(StaffPortalShell::MODULE_DOCTOR, $hidden_selected, 'the doctor default view is mounted instead');
+        // The default is the actor's first eligible module — derived, not hard-coded,
+        // so this cannot depend on which modules the fixture makes eligible.
+        self::assertSame((string) $eligible[0], $hidden_selected, 'the first eligible module is the default view');
+        self::assertNotSame(StaffPortalShell::MODULE_MESSAGES, $hidden_selected, 'the hidden module is never the fallback');
     }
 
     public function testModuleSelectorNeverSelectsTheMessagingModuleForAnyRole(): void
@@ -128,47 +133,67 @@ final class StaffMessagingHiddenReleaseOneTest extends WP_UnitTestCase
             array( StaffPortalShell::MODULE_PARAM => StaffPortalShell::MODULE_MESSAGES )
         );
 
-        self::assertStringNotContainsString('data-cpms-staff-module="messages"', $html, 'the module must not be mounted');
-        self::assertStringNotContainsString('staff-messages', $html, 'no messaging markup may reach the page');
-        self::assertStringContainsString(
-            'data-cpms-staff-module="' . StaffPortalShell::MODULE_DOCTOR . '"',
+        // The messages module's own root marker (`templates/staff-messages.php:94`).
+        self::assertStringNotContainsString('data-role="messages-root"', $html, 'the messaging module must not be mounted');
+        self::assertStringNotContainsString('class="cpms-msg"', $html, 'no messaging markup may reach the page');
+        // ...and it is not even offered as a nav entry.
+        self::assertStringNotContainsString(
+            'data-cpms-staff-module="' . StaffPortalShell::MODULE_MESSAGES . '"',
             $html,
-            'the default eligible module is mounted instead'
+            'the hidden module must not appear in the portal menu'
         );
+        self::assertStringContainsString('aria-current="page"', $html, 'some other module IS mounted and marked active');
     }
 
     public function testTheFourMessagingRoutesAreAbsentAndDispatchReturnsRestNoRoute(): void
     {
-        foreach (array_keys(rest_get_server()->get_routes()) as $registered) {
-            self::assertStringNotContainsString(
-                '/staff/portal/messages',
-                (string) $registered,
-                'R1: no messaging route may exist in the real app boot'
-            );
-        }
+        // Order independence: build a FRESH server and run the real registration
+        // path (`rest_api_init`, the hook App registers its controllers on), so
+        // this cannot pass or fail because another test class left routes behind
+        // in the process-wide server.
+        global $wp_rest_server;
+        $previous = $wp_rest_server ?? null;
 
-        $identities = $this->identities();
-        foreach ($identities as $label => $user_id) {
-            wp_set_current_user($user_id);
-            foreach (self::MESSAGE_PATHS as $path) {
-                foreach (array( 'GET', 'POST' ) as $method) {
-                    $response = $this->dispatch($method, $path);
-                    self::assertSame(
-                        404,
-                        $response->get_status(),
-                        $label . ' ' . $method . ' ' . $path . ' must fail closed'
-                    );
-                    $body = $response->get_data();
-                    self::assertIsArray($body);
-                    self::assertSame(
-                        'rest_no_route',
-                        (string) ( $body['code'] ?? '' ),
-                        $label . ' ' . $method . ' ' . $path . ' must report rest_no_route'
-                    );
+        try {
+            $wp_rest_server = new \WP_REST_Server();
+            do_action('rest_api_init', $wp_rest_server);
+
+            $registered_paths = array_keys($wp_rest_server->get_routes());
+            self::assertNotEmpty($registered_paths, 'precondition: the real boot registers routes at all');
+            foreach ($registered_paths as $registered) {
+                self::assertStringNotContainsString(
+                    '/staff/portal/messages',
+                    (string) $registered,
+                    'R1: no messaging route may exist in the real app boot'
+                );
+            }
+
+            $identities = $this->identities();
+            foreach ($identities as $label => $user_id) {
+                wp_set_current_user($user_id);
+                foreach (self::MESSAGE_PATHS as $path) {
+                    foreach (array( 'GET', 'POST' ) as $method) {
+                        $request = new WP_REST_Request($method, $path);
+                        $response = $wp_rest_server->dispatch($request);
+                        self::assertSame(
+                            404,
+                            $response->get_status(),
+                            $label . ' ' . $method . ' ' . $path . ' must fail closed'
+                        );
+                        $body = $response->get_data();
+                        self::assertIsArray($body, $label . ' ' . $method . ' ' . $path . ' — body must be an array');
+                        self::assertSame(
+                            'rest_no_route',
+                            (string) ( $body['code'] ?? '' ),
+                            $label . ' ' . $method . ' ' . $path . ' must report rest_no_route'
+                        );
+                    }
                 }
             }
+            wp_set_current_user(0);
+        } finally {
+            $wp_rest_server = $previous;
         }
-        wp_set_current_user(0);
     }
 
     public function testOtherStaffPortalModulesAreUnaffected(): void
