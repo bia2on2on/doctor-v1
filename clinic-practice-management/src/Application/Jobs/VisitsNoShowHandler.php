@@ -45,7 +45,7 @@ final class VisitsNoShowHandler
      */
     public function __invoke(array $payload): int
     {
-        $this->op?->info('visit.no_show_manual_only_skip', ['payload_keys' => array_keys($payload)]);
+        $this->op?->info( 'visit.no_show_manual_only_skip', [ 'payload_keys' => array_keys( $payload ) ] );
 
         return 0;
     }

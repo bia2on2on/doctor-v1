@@ -87,11 +87,15 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Application\Authorization\AuthorizationService;
+use ClinicCore\Application\Booking\BookingService;
+use ClinicCore\Application\Jobs\JobWake;
+use ClinicCore\Application\Notifications\SmsService;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Visits\VisitService;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Domain\Licensing\LicenseDecision;
 use ClinicCore\Domain\Licensing\LicenseGate;
 use ClinicCore\Domain\Visits\VisitException;
@@ -99,7 +103,14 @@ use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 use ClinicCore\Infrastructure\Repository\AppointmentRepository;
+use ClinicCore\Infrastructure\Queue\JobQueue;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
+use ClinicCore\Infrastructure\Repository\PatientRepository;
+use ClinicCore\Infrastructure\Repository\SlotRepository;
+use ClinicCore\Infrastructure\Security\Idempotency;
+use ClinicCore\Infrastructure\Sms\CredentialVault;
+use ClinicCore\Infrastructure\Sms\Providers\LogSmsProvider;
+use ClinicCore\Infrastructure\Sms\SmsProviderRegistry;
 use ClinicCore\Infrastructure\Repository\VisitRepository;
 use ClinicCore\Settings\Settings;
 use ClinicCore\Settings\SettingsFactory;
@@ -679,10 +690,10 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             );
 
             // Genuinely independent workers firing at the SAME barrier
-            // instant (zero offset): the no-show sweep (the FR-5.5 no-show
-            // path that exists on HEAD) and the secretary check-in compete
-            // for the same appointment row lock. Both serialization orders
-            // are legal; in-flight overlap is asserted below.
+            // instant (zero offset): the MANUAL no-show (BookingService::
+            // markNoShowByStaff, the reception-route chain) and the secretary
+            // check-in compete for the same appointment row lock. Both
+            // serialization orders are legal; in-flight overlap is asserted.
             $workers = [
                 ['role' => 'no_show', 'offset' => 0.0],
                 ['role' => 'check_in', 'offset' => 0.0],
@@ -720,15 +731,36 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     }
 
     private function assertRaceLegal(array $state, array $outcomes, string $context): void {
-        // R4 (1.0): no automatic no-show exists at all, so in BOTH lock orders the
-        // row must stay confirmed, no live Visit may exist and the counters hold.
-        self::assertSame('confirmed', $state['status'], "{$context}: no automatic no-show may ever be written");
-        self::assertNull($state['no_show_at'], "{$context}: no_show_at must stay NULL");
-        self::assertSame([], $state['live_visits'], "{$context}: denied check-in cannot create a Visit");
-        self::assertNull($state['active_visit_id'], "{$context}: no Visit pointer after denial");
-        self::assertSame('ok', $outcomes['no_show']['result'] ?? null, "{$context}: sweep completes");
-        self::assertSame('rejected', $outcomes['check_in']['result'] ?? null, "{$context}: expired check-in denied");
-        self::assertSame('CLINIC_INVALID_APPOINTMENT_STATE', $outcomes['check_in']['error_code'] ?? null);
+        $ns   = $outcomes['no_show'] ?? [];
+        $ci   = $outcomes['check_in'] ?? [];
+        $live = count((array) ($state['live_visits'] ?? []));
+        $noShow = $state['status'] === 'no_show';
+
+        // (1) THE original invariant, in BOTH lock orders: a live Visit and a
+        // no_show appointment can never coexist on the same row.
+        self::assertFalse(
+            $noShow && $live > 0,
+            "{$context}: a live Visit must never sit on a no_show appointment"
+        );
+        // (2) Exactly one worker may commit; the other must be refused by its own
+        // established product guard (never a silent double-win).
+        $winners = (int) (($ns['result'] ?? '') === 'ok') + (int) (($ci['result'] ?? '') === 'ok');
+        self::assertSame(1, $winners, "{$context}: exactly one worker may commit");
+
+        if ($noShow) {
+            self::assertNotNull($state['no_show_at'], "{$context}: the committed manual no-show stamps no_show_at");
+            self::assertSame(0, $live, "{$context}: no Visit may exist after the no-show won");
+            self::assertNull($state['active_visit_id'], "{$context}: a no_show appointment holds no Visit pointer");
+            self::assertSame('rejected', $ci['result'] ?? null, "{$context}: the losing check-in must be refused");
+            self::assertSame('CLINIC_INVALID_APPOINTMENT_STATE', $ci['error_code'] ?? null, "{$context}: terminal refusal code");
+            self::assertSame('ok', $ns['result'] ?? null, "{$context}: the manual no-show committed");
+        } else {
+            self::assertSame('confirmed', $state['status'], "{$context}: no no_show may be written when the check-in won");
+            self::assertNull($state['no_show_at'], "{$context}: no_show_at must stay NULL when the check-in won");
+            self::assertSame(1, $live, "{$context}: the winning check-in keeps exactly one live Visit");
+            self::assertSame('rejected', $ns['result'] ?? null, "{$context}: the losing manual no-show must be refused");
+            self::assertSame('HAS_ACTIVE_VISIT', $ns['error_code'] ?? null, "{$context}: refusal via the active-Visit guard");
+        }
         self::assertSame(1, $state['slot_booked'], "{$context}: booked counter unchanged");
         self::assertSame(0, $state['slot_held'], "{$context}: hold counter unchanged");
     }
@@ -913,12 +945,40 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         $outcome = ['role' => $role, 'appointment_id' => $appointmentId, 'result' => 'exception', 'error' => 'not reached'];
         try {
             if ($role === 'no_show') {
-                $res = $visits->processNoShows(null, 0);
+                // R4 (1.0): the second worker drives the REAL manual no-show path
+                // (BookingService::markNoShowByStaff — the same call chain the
+                // reception route uses). The retired automatic sweep is not a
+                // product path any more and cannot be raced.
+                $providers = new SmsProviderRegistry();
+                $providers->register(new LogSmsProvider($op));
+                $booking = new BookingService(
+                    $cpms,
+                    new SlotRepository($cpms),
+                    new AppointmentRepository($cpms),
+                    new PatientRepository($cpms),
+                    $factory,
+                    new Phase7Fr55AllowAllLicenseGate(),
+                    $audit,
+                    $op,
+                    new Idempotency($cpms),
+                    new SmsService(
+                        $cpms,
+                        $factory,
+                        $providers,
+                        new CredentialVault(),
+                        $audit,
+                        $op,
+                        new JobQueue($cpms, $op, new JobWake()),
+                        fn (): int => $this->clinicA
+                    ),
+                    null,
+                    new MembershipRepository($cpms)
+                );
+                $booking->markNoShowByStaff($this->secretaryA, $appointmentId, 'race: manual no-show');
                 $outcome = [
                     'role' => $role,
                     'appointment_id' => $appointmentId,
                     'result' => 'ok',
-                    'processed' => (int) ($res['processed'] ?? 0),
                 ];
             } else { // check_in
                 $v = $visits->checkIn($this->secretaryA, $patientId, $appointmentId);
@@ -940,6 +1000,15 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                     ];
                 }
             }
+        } catch (BookingException $e) {
+            $outcome = [
+                'role' => $role,
+                'appointment_id' => $appointmentId,
+                'result' => 'rejected',
+                'error_code' => $e->errorCode, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+                'http_status' => $e->httpStatus, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+                'error' => $e->getMessage(),
+            ];
         } catch (VisitException $e) {
             $outcome = [
                 'role' => $role,
@@ -1019,8 +1088,13 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                 . (string) ($o['error'] ?? '')
             );
         }
-        // The sweep has no rejection path — it must always complete.
-        self::assertSame('ok', $outcomes['no_show']['result'] ?? null, "{$context}: the sweep must complete as a product call");
+        // R4: the manual no-show has a legal success AND a legal refusal envelope
+        // (refused by the active-Visit guard when the check-in won the row lock).
+        self::assertContains(
+            $outcomes['no_show']['result'] ?? null,
+            ['ok', 'rejected'],
+            "{$context}: the manual no-show must end in a product envelope"
+        );
     }
 
     /**

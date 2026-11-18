@@ -898,11 +898,11 @@ final class VisitService
         // written here; the queued-job path is traced by VisitsNoShowHandler.
 
         return [
-            'processed' => 0,
+            'processed'   => 0,
             'next_cursor' => null,
-            'has_more' => false,
-            'depth' => $depth,
-            'scanned' => 0,
+            'has_more'    => false,
+            'depth'       => $depth,
+            'scanned'     => 0,
         ];
     }
 
