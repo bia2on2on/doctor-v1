@@ -7,6 +7,7 @@ namespace ClinicCore\Application\Finance;
 use ClinicCore\Application\Authorization\AuthorizationException;
 use ClinicCore\Application\Membership\MembershipService;
 use ClinicCore\Application\Patients\PatientAccountPolicy;
+use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
@@ -111,7 +112,14 @@ final class FinanceDelegationService {
 				// B0-PR2-B4 — the decision is re-made INSIDE the write boundary on a
 				// locked membership row: a DENY that committed after the pre-flight
 				// read must win over this GRANT, never be overwritten by it.
-				$this->memberships->find_by_id( $target_membership_id, true );
+				if ( ! $this->memberships->lock_row_for_update( $target_membership_id ) ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'این عضویت هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
+						409,
+						array( 'clinic_id' => $clinic_id )
+					);
+				}
 				try {
 					$current = $this->explicit_effect_strict( $target_membership_id, $capability );
 				} catch ( \Throwable $e ) {
@@ -207,7 +215,14 @@ final class FinanceDelegationService {
 				// B0-PR2-B4 — re-read on a locked row: a DENY that arrived after the
 				// pre-flight read must not be removed by a stale revocation, and a
 				// GRANT that was already withdrawn is not "revoked" twice.
-				$this->memberships->find_by_id( $target_membership_id, true );
+				if ( ! $this->memberships->lock_row_for_update( $target_membership_id ) ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'این عضویت هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
+						409,
+						array( 'clinic_id' => $clinic_id )
+					);
+				}
 				try {
 					$current_now = $this->explicit_effect_strict( $target_membership_id, $capability );
 				} catch ( \Throwable $e ) {

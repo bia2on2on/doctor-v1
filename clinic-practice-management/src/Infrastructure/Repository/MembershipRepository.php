@@ -180,13 +180,32 @@ final class MembershipRepository {
             );
             $this->require_successful_read();
 
+            $fetched = 0;
             foreach ( $rows as $row ) {
                 $user_ids[] = (int) $row['wp_user_id'];
                 $cursor     = (int) $row['wp_user_id'];
+                ++$fetched;
             }
-        } while ( count( $rows ) === $page_size );
+        } while ( $fetched === $page_size );
 
         return $user_ids;
+    }
+
+    /**
+     * Lock one membership row for the rest of the caller's transaction (B4).
+     *
+     * `false` means "not there OR not readable" — both are unknown, so the caller
+     * must refuse instead of writing over a state it could not observe. Deliberately
+     * independent of `last_error`, which an earlier statement in the same request
+     * may have left set.
+     */
+    public function lock_row_for_update( int $membership_id ): bool {
+        $row = $this->db->fetchRowForUpdate(
+            'SELECT id FROM ' . $this->db->table( 'cpms_clinic_memberships' ) . ' WHERE id = %d LIMIT 1',
+            array( $membership_id )
+        );
+
+        return is_array( $row );
     }
 
     public function active_clinic_ids_for_user( int $wp_user_id ): array {

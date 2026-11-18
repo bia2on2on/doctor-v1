@@ -1139,7 +1139,10 @@ final class ManagementPortalService {
 					// write boundary: a narrowing that commits after the pre-flight read
 					// must be what this write is judged against. Widening a
 					// patient/mixed/unknown member is refused before any write.
-					$locked       = $this->memberships->find_by_id( $membership_id, true );
+					if ( ! $this->memberships->lock_row_for_update( $membership_id ) ) {
+						throw new \RuntimeException( 'membership row could not be locked' );
+					}
+					$locked       = $this->memberships->find_by_id( $membership_id );
 					$current_mode = (string) ( $locked['scope_mode'] ?? '' );
 					$current_locs = array_values( array_map( 'intval', $this->memberships->location_ids_for( $membership_id ) ) );
 					$widens_now   = 'clinic' === $current_mode
@@ -1241,7 +1244,9 @@ final class ManagementPortalService {
 					// B0-PR2-B4 — lock the membership and re-read the prior effect here:
 					// a DENY that committed after the pre-flight read must not be cleared
 					// by a stale CLEAR, and a moved state refuses the write outright.
-					$this->memberships->find_by_id( $membership_id, true );
+					if ( ! $this->memberships->lock_row_for_update( $membership_id ) ) {
+						throw new \RuntimeException( 'membership row could not be locked' );
+					}
 					$prior_now  = $this->capability_effect_strict( $membership_id, $capability );
 					$state_held = (string) ( $before['effect'] ?? '' ) === $prior_now;
 					$widens_now = 'grant' === $effect || ( 'clear' === $effect && 'deny' === $prior_now );
