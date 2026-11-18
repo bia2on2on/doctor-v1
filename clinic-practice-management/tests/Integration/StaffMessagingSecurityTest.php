@@ -41,13 +41,22 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
         // itself so every permission, rate-limit, retention and XSS assertion below
         // keeps running — it is the evidence for the day the switch is flipped on.
         //
-        // Re-registered on EVERY test against the CURRENT server: a per-process
-        // guard would silently lose the routes whenever the process-wide
-        // `$wp_rest_server` is replaced (test order), turning REST assertions into
-        // rest_no_route failures instead of product evidence. register_rest_route()
-        // is idempotent for the same namespace/route.
-        rest_get_server(); // fires rest_api_init once, so registration is not doing_it_wrong.
-        ( new MessagingController( App::staff_messaging_service() ) )->register_routes();
+        // Registered ONCE per server instance. A per-process flag silently loses
+        // the routes when the process-wide `$wp_rest_server` is replaced (test
+        // order); registering on every test is equally wrong because
+        // register_rest_route() reports `_doing_it_wrong` for an already
+        // registered route and that WP_Error then replaces the real response.
+        $server = rest_get_server(); // fires rest_api_init, so registration is legal.
+        $already = false;
+        foreach ( array_keys( $server->get_routes() ) as $registered ) {
+            if ( false !== strpos( (string) $registered, '/staff/portal/messages/context' ) ) {
+                $already = true;
+                break;
+            }
+        }
+        if ( ! $already ) {
+            ( new MessagingController( App::staff_messaging_service() ) )->register_routes();
+        }
     }
 
     protected function tearDown(): void
