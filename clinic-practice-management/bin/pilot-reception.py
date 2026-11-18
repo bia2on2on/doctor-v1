@@ -17,7 +17,7 @@ import re
 import sys
 import time
 from datetime import date, timedelta
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 from playwright.sync_api import sync_playwright
 
@@ -1184,6 +1184,22 @@ def search_calls(state):
     return [r for r in state["rest"] if r["route"].endswith(SEARCH_ROUTE)]
 
 
+def write_calls(state):
+    """B0-PR1: the patient search is a POST read, so it is not a write.
+
+    Every other non-GET call is still a write.
+    """
+    return [r for r in state["rest"] if r["method"] != "GET" and not r["route"].endswith(SEARCH_ROUTE)]
+
+
+def search_requests(state):
+    """Search calls with their URL query dicts (B0-PR1: the term must be absent)."""
+    return [
+        r for r in state["reqs"]
+        if r["method"] == "POST" and r["route"].endswith(SEARCH_ROUTE)
+    ]
+
+
 def search_result_ids(page):
     items = page.locator('[data-role="sr-search-result"]')
     return [int(items.nth(i).get_attribute("data-patient-id") or 0) for i in range(items.count())]
@@ -1207,9 +1223,9 @@ def assert_no_horizontal_overflow(page, label):
 
 def run_search_journey(browser, vp):
     """Phase 11 Slice 2 — read-only Clinic patient search inside Reception.
-    Idle/too-short, debounced search, masked national ID, Clinic isolation,
-    Location-neutral results, read-only selection (no write traffic, no
-    action controls), no-results state, no overflow, board still intact."""
+    Idle/too-short, debounced search, NO national-ID disclosure (B0-PR1), Clinic
+    isolation, Location-neutral results, read-only selection (no write traffic,
+    no action controls), no-results state, no overflow, board still intact."""
     key = f"reception-search-{vp['vp']}"
     stage = "login"
     ctx, page, state = new_page(browser, vp)
@@ -1251,29 +1267,34 @@ def run_search_journey(browser, vp):
         calls = search_calls(state)
         if not calls or len(calls) > 2:
             raise RuntimeError(f"debounced typing must issue 1..2 search calls, got {len(calls)}")
-        if any(c["method"] != "GET" or c["status"] != 200 for c in calls):
-            raise RuntimeError(f"search calls must be successful GETs: {calls}")
+        if any(c["method"] != "POST" or c["status"] != 200 for c in calls):
+            raise RuntimeError(f"search calls must be successful body-only POSTs: {calls}")
+        # B0-PR1: the term must never appear in the URL/query string.
+        if any("q" in r["query"] or "Probe" in urlencode(r["query"]) for r in search_requests(state)):
+            raise RuntimeError("search term must never appear in the request URL")
         ids = search_result_ids(page)
         if ids != [SEARCH["probe"]]:
             raise RuntimeError(f"search must return exactly the trusted-Clinic probe, got {ids}")
         if SEARCH["foreign"] in ids:
             raise RuntimeError("foreign-Clinic patient leaked into Reception search")
         result_text = page.locator('[data-role="sr-search-result"]').first.inner_text() or ""
-        if "***" + SEARCH["nid_last4"] not in result_text:
-            raise RuntimeError("national ID must render in the established masked form")
+        # B0-PR1: the national ID must never render — not even masked.
+        if "***" + SEARCH["nid_last4"] in result_text or SEARCH["nid_last4"] in result_text:
+            raise RuntimeError("national ID must never render in the Reception search result")
         assert_no_horizontal_overflow(page, "results")
         shot(page, f"reception-{vp['vp']}-search-results")
 
         stage = "selection"
         board_before = page.locator('[data-role="sr-appointments-body"]').inner_text() or ""
-        writes_before = [r for r in state["rest"] if r["method"] != "GET"]
+        writes_before = write_calls(state)
         page.locator(f'[data-role="sr-search-result"][data-patient-id="{SEARCH["probe"]}"]').click()
         page.wait_for_selector('[data-role="sr-search-selected"]', state="visible", timeout=5000)
         if page.locator('[data-role="sr-search-result"][aria-pressed="true"]').count() != 1:
             raise RuntimeError("exactly one result must be marked selected")
         selected = page.locator('[data-role="sr-search-selected"]')
-        if "***" + SEARCH["nid_last4"] not in (selected.inner_text() or ""):
-            raise RuntimeError("selected state must keep the masked national ID")
+        # B0-PR1: the selected state must not disclose the national ID either.
+        if "***" + SEARCH["nid_last4"] in (selected.inner_text() or "") or SEARCH["nid_last4"] in (selected.inner_text() or ""):
+            raise RuntimeError("selected state must not disclose the national ID")
         buttons = selected.locator("button")
         roles = [buttons.nth(i).get_attribute("data-role") for i in range(buttons.count())]
         if roles != ["sr-search-clear"]:
@@ -1281,7 +1302,7 @@ def run_search_journey(browser, vp):
         if page.locator('[data-role="sr-search"] [data-role="sr-arrive"], [data-role="sr-search"] [data-role="sr-recover"], [data-role="sr-search"] a[href]').count() != 0:
             raise RuntimeError("search panel must not expose arrival/navigation actions")
         page.wait_for_timeout(600)
-        writes_after = [r for r in state["rest"] if r["method"] != "GET"]
+        writes_after = write_calls(state)
         if len(writes_after) != len(writes_before):
             raise RuntimeError("selecting a search result must not issue any write request")
         board_after = page.locator('[data-role="sr-appointments-body"]').inner_text() or ""
@@ -1318,14 +1339,14 @@ def run_search_journey(browser, vp):
         page.wait_for_selector('[data-role="sr-search-selected"]', state="hidden", timeout=5000)
 
         rest_delta = assert_no_product_reload(page, mark, "search")
-        if any(r["method"] != "GET" for r in state["rest"]):
-            raise RuntimeError("the search journey must be read-only (GET only)")
+        if write_calls(state):
+            raise RuntimeError("the search journey must be read-only (the only POST is the search read)")
         assert_authority_headers(state, PUB["clinic"], {PUB["loc_tehran"], PUB["loc_tokyo"]})
         assert_hygiene(state, key)
         ok(
             key,
-            "reception clinic patient search is bounded, masked, Location-neutral and read-only",
-            f"vp={vp['vp']} results=1 foreign=0 masked=1 selected=1 writes=0 search_calls={len(search_calls(state))} rest={rest_delta} reloaded=0 overflow=0",
+            "reception clinic patient search is bounded, discloses no national ID, Location-neutral and read-only",
+            f"vp={vp['vp']} results=1 foreign=0 nid_disclosed=0 selected=1 writes=0 search_calls={len(search_calls(state))} rest={rest_delta} reloaded=0 overflow=0",
         )
     except Exception as e:
         try:

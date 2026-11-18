@@ -93,9 +93,13 @@ final class PatientController extends RestBase
         ]);
 
         // ---------- Secretary (D2–D5) ----------
+        // Owner-approved API contract change (B0-PR1): the search term is accepted
+        // ONLY in the POST body. A patient identifier (e.g. national ID) must never
+        // travel in the URL/query string, where it would be written to web-server
+        // access logs, browser history and Referer headers.
         register_rest_route(self::NS, '/patients/search', [
             [
-                'methods' => WP_REST_Server::READABLE,
+                'methods' => WP_REST_Server::CREATABLE,
                 'callback' => fn (WP_REST_Request $request) => $this->search($request),
                 'permission_callback' => fn (WP_REST_Request $r) => $this->permCap($r, RolesAndCapabilities::PATIENT_READ),
                 'args' => [
@@ -171,10 +175,20 @@ final class PatientController extends RestBase
             return $denied;
         }
 
-        return $this->wrap(fn () => $this->patients->search(
-            (string) $request->get_param('q'),
-            (int) $request->get_param('limit')
-        ));
+        // B0-PR1 body-only contract: a term supplied through the URL is refused
+        // outright — it is never searched, never logged and never echoed back.
+        if (array_key_exists('q', $request->get_query_params())) {
+            return $this->error('CLINIC_VALIDATION_FAILED', 400, 'عبارت جستجو باید در بدنهٔ درخواست ارسال شود');
+        }
+
+        $body  = $this->body_only($request);
+        $q     = $body['q'] ?? null;
+        $limit = $body['limit'] ?? 25;
+        if (!is_string($q)) {
+            return $this->error('CLINIC_VALIDATION_FAILED', 400, 'عبارت جستجو باید رشته باشد');
+        }
+
+        return $this->wrap(fn () => $this->patients->search($q, is_numeric($limit) ? (int) $limit : 25));
     }
 
     private function get(WP_REST_Request $request): WP_REST_Response|WP_Error
@@ -262,6 +276,23 @@ final class PatientController extends RestBase
         $params = $request->get_params();
 
         return is_array($params) ? $params : [];
+    }
+
+    /**
+     * Body-only parameters (JSON body first, then form body). URL/query params are
+     * deliberately excluded so an identifier can never be read out of the URL.
+     *
+     * @return array<string, mixed>
+     */
+    private function body_only(WP_REST_Request $request): array
+    {
+        $json = $request->get_json_params();
+        if (is_array($json)) {
+            return $json;
+        }
+        $form = $request->get_body_params();
+
+        return is_array($form) ? $form : [];
     }
 
     /**

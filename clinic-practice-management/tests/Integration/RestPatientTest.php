@@ -118,7 +118,7 @@ final class RestPatientTest extends WP_UnitTestCase
     {
         wp_set_current_user($this->patientUserId);
 
-        $response = $this->dispatch('GET', self::NS . '/patients/search', ['q' => 'Rest']);
+        $response = $this->dispatch('POST', self::NS . '/patients/search', ['q' => 'Rest']);
 
         $this->assertSame(403, $response->get_status());
         $this->assertClinicError($response, 'CLINIC_PERMISSION_DENIED');

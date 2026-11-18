@@ -1603,7 +1603,9 @@ final class ClinicalService
             null,
             null,
             [
-                'q' => mb_substr($q, 0, 100),
+                // B0-PR1: the submitted term is deliberately NOT recorded — it may
+                // be a patient identifier (national ID) and must never reach the
+                // hash-chained audit trail. Existing rows are never rewritten.
                 'type' => $type,
                 'from' => $from,
                 'to' => $to,
@@ -1613,7 +1615,8 @@ final class ClinicalService
             $trustedClinicId
         );
 
-        return ['query' => $q, 'type' => $type, 'results' => $results];
+        // B0-PR1: the submitted term is never echoed back in the response body.
+        return ['type' => $type, 'results' => $results];
     }
 
     // ================= Helpers — مجوز و داده =================

@@ -1061,7 +1061,7 @@ M-15   (مشروط P-B/AD-14) cpms_patient_identities + patients.identity_id
 | 10 | Clinical | `PUT /notes/{id}` | `__return_true` | **1b** |
 | 11 | Clinical | `GET /prescriptions` | `__return_true` | **1b** |
 | 12 | Clinical | `POST /prescriptions/{id}/finalize` | `__return_true` | **1b** |
-| 13 | Clinical | `GET /search` | `__return_true` | **1b** |
+| 13 | Clinical | `POST /search` (بدنهٔ `q` — B0-PR1: عبارت جستجو هرگز در URL نیست) | `__return_true` | **1b** |
 | 14 | Clinical | `GET /visits` | `__return_true` | **1b** |
 | 15 | Clinical | `GET /visits/{id}` | `__return_true` | **1b** |
 | 16 | Clinical | `POST /visits/{id}/complete` | `__return_true` | **1b** |
@@ -1097,7 +1097,7 @@ M-15   (مشروط P-B/AD-14) cpms_patient_identities + patients.identity_id
 | 46 | Patient | `GET,PUT /patient/me` | requireCap | **1b** |
 | 47 | Patient | `POST /patients` | requireCap | **1b** |
 | 48 | Patient | `GET,PUT /patients/{id}` | requireCap | **1b** |
-| 49 | Patient | `GET /patients/search` | requireCap | **1b** |
+| 49 | Patient | `POST /patients/search` (بدنهٔ `q` — B0-PR1: عبارت جستجو هرگز در URL نیست) | requireCap | **1b** |
 | 50 | Queue | `GET /doctor/today` | `__return_true` | **1b** |
 | 51 | Queue | `GET /queue` | `__return_true` | **1b** |
 | 52 | Queue | `GET /rt/queue` | `__return_true` | **1b** |

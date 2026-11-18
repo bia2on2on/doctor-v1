@@ -228,29 +228,52 @@ final class PatientAdminTest extends WP_UnitTestCase
         $id = $this->seedPatient('کاوه', 'جستجو', '09120000222');
 
         wp_set_current_user($this->accountantId);
-        $this->assertSame(403, $this->dispatch('GET', self::NS . '/patients/search', ['q' => 'کاوه'])->get_status(), 'حسابدار → /patients/search DENIED');
+        $this->assertSame(403, $this->dispatch('POST', self::NS . '/patients/search', ['q' => 'کاوه'])->get_status(), 'حسابدار → /patients/search DENIED');
 
         // The CPMS-scoped model: this administrator ALSO holds an ACTIVE manager
         // membership of the Clinic, whose preset carries cpms_patient_read, so
         // the read is CPMS authority — not a WordPress-role bypass.
         wp_set_current_user($this->adminId);
-        $this->assertSame(200, $this->dispatch('GET', self::NS . '/patients/search', ['q' => 'کاوه'])->get_status(), 'admin WITH manager membership → scoped patient read');
+        $this->assertSame(200, $this->dispatch('POST', self::NS . '/patients/search', ['q' => 'کاوه'])->get_status(), 'admin WITH manager membership → scoped patient read');
 
         // An administrator WITHOUT CPMS authority is denied (no WP-role bypass).
         $bareAdmin = $this->makeUser('pat_bare_admin', 'administrator');
         wp_set_current_user($bareAdmin);
-        $this->assertSame(403, $this->dispatch('GET', self::NS . '/patients/search', ['q' => 'کاوه'])->get_status(), 'WP Admin without CPMS authority → /patients/search DENIED');
+        $this->assertSame(403, $this->dispatch('POST', self::NS . '/patients/search', ['q' => 'کاوه'])->get_status(), 'WP Admin without CPMS authority → /patients/search DENIED');
 
         wp_set_current_user($this->secretaryId);
-        $res = $this->dispatch('GET', self::NS . '/patients/search', ['q' => 'کاوه']);
+        $res = $this->dispatch('POST', self::NS . '/patients/search', ['q' => 'کاوه']);
         $this->assertSame(200, $res->get_status(), 'منشی → /patients/search ALLOWED');
         $body = $res->get_data();
         $this->assertTrue(is_array($body['data'] ?? null));
 
         // جستجوی خیلی کوتاه → خطای اعتبارسنجی (محدود).
         wp_set_current_user($this->secretaryId);
-        $short = $this->dispatch('GET', self::NS . '/patients/search', ['q' => 'ک']);
+        $short = $this->dispatch('POST', self::NS . '/patients/search', ['q' => 'ک']);
         $this->assertNotSame(200, $short->get_status(), 'جستجوی کمتر از ۲ کاراکتر باید رد شود');
+    }
+
+    // B0-PR1 — عبارت جستجو فقط در بدنهٔ POST؛ ارسال در URL رد می‌شود.
+
+    public function testRestSearchTermIsBodyOnly(): void
+    {
+        $id = $this->seedPatient('کاوه', 'جستجو', '09120000222');
+        wp_set_current_user($this->secretaryId);
+
+        // عبارت در URL/query → رد قطعی (هرگز جستجو نمی‌شود).
+        $url = $this->dispatch('POST', self::NS . '/patients/search', [], ['q' => 'کاوه']);
+        $this->assertSame(400, $url->get_status(), 'URL-supplied term is rejected');
+        $this->assertSame('CLINIC_VALIDATION_FAILED', $url->get_data()['code'] ?? null, 'body-only rejection envelope');
+        $this->assertSame(400, $url->get_data()['data']['status'] ?? null, 'rejection uses the bounded validation envelope');
+
+        // همان عبارت در بدنه → پاسخ موفق.
+        $body = $this->dispatch('POST', self::NS . '/patients/search', ['q' => 'کاوه']);
+        $this->assertSame(200, $body->get_status(), 'body term answers');
+        $this->assertContains(
+            $id,
+            array_map(static fn($r): int => (int) $r['id'], (array) ($body->get_data()['data'] ?? [])),
+            'body term finds the patient'
+        );
     }
 
     public function testRestGetPatientRequiresPatientRead(): void
@@ -342,13 +365,17 @@ final class PatientAdminTest extends WP_UnitTestCase
         return (int) $created['id'];
     }
 
-    private function dispatch(string $method, string $route, array $body = []): WP_REST_Response
+    private function dispatch(string $method, string $route, array $body = [], array $query = []): WP_REST_Response
     {
         $request = new WP_REST_Request($method, $route);
         if ($body !== []) {
             foreach ($body as $key => $value) {
                 $request->set_param($key, $value);
             }
+        }
+        if ($query !== []) {
+            // B0-PR1: simulate a term arriving through the URL/query string.
+            $request->set_query_params($query);
         }
         $request->set_header('X-WP-Nonce', wp_create_nonce('wp_rest'));
 

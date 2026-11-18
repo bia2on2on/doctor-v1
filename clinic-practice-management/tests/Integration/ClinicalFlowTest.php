@@ -431,9 +431,33 @@ final class ClinicalFlowTest extends WP_UnitTestCase
 
         // REST: بدون Cap → 403 (لایه کنترلر)
         wp_set_current_user($this->patientAUser);
-        $response = $this->dispatch('GET', self::NS . '/search', ['q' => 'MR-CF-0001']);
+        $response = $this->dispatch('POST', self::NS . '/search', ['q' => 'MR-CF-0001']);
         $this->assertSame(403, $response->get_status());
         $this->assertSame('CLINIC_PERMISSION_DENIED', $response->get_data()['code'] ?? null);
+    }
+
+    // B0-PR1 — عبارت جستجو فقط در بدنه؛ در URL رد می‌شود، در پاسخ تکرار نمی‌شود و در Audit ثبت نمی‌شود.
+
+    public function testSearchTermIsBodyOnlyAndNeverRecorded(): void
+    {
+        wp_set_current_user($this->doctorUserId);
+
+        // عبارت در URL/query → رد قطعی.
+        $url = $this->dispatch('POST', self::NS . '/search', [], true, ['q' => 'MR-CF-0001']);
+        $this->assertSame(400, $url->get_status(), 'URL-supplied term is rejected');
+        $this->assertSame('CLINIC_VALIDATION_FAILED', $url->get_data()['code'] ?? null, 'body-only rejection envelope');
+
+        // عبارت در بدنه → پاسخ موفق؛ پاسخ «query» را برنمی‌گرداند.
+        $res = $this->dispatch('POST', self::NS . '/search', ['q' => 'MR-CF-0001']);
+        $this->assertSame(200, $res->get_status(), 'body term answers');
+        $this->assertArrayNotHasKey('query', $res->get_data()['data'] ?? [], 'the submitted term is not echoed back');
+
+        // Audit هیچ‌گز عبارت جستجو را ثبت نمی‌کند (نه حتی به‌صورت masked).
+        $leak = (int) App::db()->fetchValue(
+            'SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs') . " WHERE action = 'SEARCH_EXECUTED' AND meta_json LIKE %s",
+            ['%MR-CF-0001%']
+        );
+        $this->assertSame(0, $leak, 'the audit trail never records the search term');
     }
 
     // ================= E10/E11 — نسخه دارویی =================
@@ -807,11 +831,15 @@ final class ClinicalFlowTest extends WP_UnitTestCase
         return $userId;
     }
 
-    private function dispatch(string $method, string $route, array $body = [], bool $withNonce = true): WP_REST_Response
+    private function dispatch(string $method, string $route, array $body = [], bool $withNonce = true, array $query = []): WP_REST_Response
     {
         $request = new WP_REST_Request($method, $route);
         foreach ($body as $key => $value) {
             $request->set_param($key, $value);
+        }
+        if ($query !== []) {
+            // B0-PR1: simulate a term arriving through the URL/query string.
+            $request->set_query_params($query);
         }
         if ($withNonce) {
             $request->set_header('X-WP-Nonce', wp_create_nonce('wp_rest'));
