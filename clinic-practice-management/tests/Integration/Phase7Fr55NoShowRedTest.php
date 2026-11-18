@@ -1125,6 +1125,20 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         self::assertSame([], $eintr['signals'], 'an EINTR probe is never signalled');
         self::assertSame([], $eintr['unconfirmed'], 'the retried pid is dropped once it is reaped');
 
+        // (2b) mutation caught: "signal on 'retry' in pass 2 ONLY" — pass 1 sees EINTR, pass 2
+        // sees EINTR again and only then a reaped pid, so a pass-2-only regression reds here.
+        $eintrTwice = self::driveReaper(
+            [4242],
+            [
+                ['state' => 'error', 'status' => PCNTL_EINTR],
+                ['state' => 'error', 'status' => PCNTL_EINTR],
+                ['state' => 'reaped', 'status' => 0],
+            ]
+        );
+        self::assertSame([4242, 4242, 4242], $eintrTwice['probes'], 'EINTR is retried in BOTH passes');
+        self::assertSame([], $eintrTwice['signals'], 'an EINTR probe in pass 2 is never signalled either');
+        self::assertSame([], $eintrTwice['unconfirmed'], 'the pid is dropped once a later probe reaps it');
+
         // (3) mutation caught: "drop a pid whose latest probe says running" — a live child
         // would leak instead of being killed.
         $running = self::driveReaper(
@@ -1152,9 +1166,74 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         self::assertSame([], $invalid['signals'], 'pid <= 0 is never signalled');
 
         // (6) mutation caught: "silently abandon a child that is never confirmed reaped".
+        // Exact sequences, not just counts: the injected clock advances 1 s per sleep with a
+        // 5 s bound, so the pid is probed once in pass 1 and once per bounded-reap iteration
+        // (clock 0..5 inclusive = 6 iterations) and is signalled on every one of them.
         $stuck = self::driveReaper([4242], [['state' => 'running', 'status' => 0]], 5.0, 1.0);
-        self::assertGreaterThan(1, count($stuck['probes']), 'the bounded reap re-probes while the injected clock runs');
+        self::assertSame(
+            [4242, 4242, 4242, 4242, 4242, 4242, 4242],
+            $stuck['probes'],
+            'a never-confirmed pid is probed exactly once per pass-2 iteration plus the pass-1 probe'
+        );
+        self::assertSame(
+            [4242, 4242, 4242, 4242, 4242, 4242, 4242],
+            $stuck['signals'],
+            'each bounded-reap iteration SIGKILLs the still-running pid'
+        );
         self::assertSame([4242], $stuck['unconfirmed'], 'a never-confirmed pid is REPORTED, not silently dropped');
+    }
+
+    /**
+     * B2: the CLEANUP wrapper must turn an unconfirmed result into a failure that names the
+     * pid. Testing the core's return value alone would stay green if the wrapper dropped it.
+     */
+    public function testReaperCleanupFailsAndNamesThePidWhenAChildIsNeverConfirmedReaped(): void
+    {
+        if (!defined('PCNTL_EINTR')) {
+            if ('true' === getenv('GITHUB_ACTIONS')) {
+                self::fail('the pcntl error constants are missing in CI, so this reaper rule could not be checked');
+            }
+            $this->markTestSkipped('pcntl error constants are unavailable here.');
+        }
+
+        $now    = 0.0;
+        $caught = null;
+
+        try {
+            $this->reapRaceChildren(
+                [4242],
+                99, // attempt tag with no real harness files behind it
+                0,  // no worker files to remove
+                static function (int $pid): array {
+                    unset($pid);
+
+                    return ['state' => 'running', 'status' => 0];
+                },
+                static function (int $pid): void {
+                    unset($pid);
+                },
+                static function (int $microseconds) use (&$now): void {
+                    unset($microseconds);
+                    $now += 1.0;
+                },
+                static function () use (&$now): float {
+                    return $now;
+                }
+            );
+        } catch (Throwable $e) {
+            $caught = $e;
+        }
+
+        self::assertInstanceOf(
+            \PHPUnit\Framework\AssertionFailedError::class,
+            $caught,
+            'the cleanup must FAIL when a child is never confirmed reaped'
+        );
+        self::assertStringContainsString(
+            '4242',
+            (string) $caught->getMessage(),
+            'the failure message must name the unconfirmed pid'
+        );
     }
 
     /**
@@ -2156,7 +2235,15 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
      *
      * @param array<int, int> $pids parent-owned, unreaped pids
      */
-    private function reapRaceChildren(array $pids, int $attempt, int $workerCount): void {
+    private function reapRaceChildren(
+        array $pids,
+        int $attempt,
+        int $workerCount,
+        ?callable $probe = null,
+        ?callable $signal = null,
+        ?callable $sleep = null,
+        ?callable $clock = null
+    ): void {
         $owned = [];
         foreach ($pids as $pid) {
             if ($pid > 0) {
@@ -2164,20 +2251,21 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             }
         }
         // A1: the whole pass logic lives in ONE injected method so the test can execute it
-        // with scripted probes. The production call passes the real probe, the real kill
-        // wrapper and the real sleep/clock — behaviour is unchanged.
+        // with scripted probes. The production call passes no overrides, so it uses the real
+        // probe, the real kill wrapper and the real sleep/clock — behaviour is unchanged.
+        // B2: the overrides exist only so this wrapper's OWN failure step can be tested.
         $result = self::reapOwnedChildren(
             $owned,
-            function (int $pid): array {
+            $probe ?? function (int $pid): array {
                 return $this->probeChild($pid);
             },
-            function (int $pid): void {
+            $signal ?? function (int $pid): void {
                 $this->killChild($pid);
             },
-            static function (int $microseconds): void {
+            $sleep ?? static function (int $microseconds): void {
                 usleep($microseconds);
             },
-            static function (): float {
+            $clock ?? static function (): float {
                 return microtime(true);
             },
             self::RACE_REAP_DEADLINE_SEC
