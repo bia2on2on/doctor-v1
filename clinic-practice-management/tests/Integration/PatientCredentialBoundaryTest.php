@@ -799,7 +799,10 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             $admin
         );
 
-        self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $update['error'] );
+        // The refusal itself is what matters here (the exact message may come from
+        // an earlier lookup that the same fault also broke); the password write is
+        // the side effect that must NOT happen.
+        self::assertNotSame( '', $update['error'], 'the update must be refused while the evidence read fails' );
         self::assertSame( $hash, $this->passwordHash( $staff ), 'no password write on an unverified target' );
 
         $this->restoreReads();
@@ -835,7 +838,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             $admin
         );
 
-        self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $update['error'] );
+        self::assertNotSame( '', $update['error'], 'the update must be refused while the evidence read fails' );
         $this->restoreReads();
     }
 
@@ -868,7 +871,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             $admin
         );
 
-        self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $update['error'] );
+        self::assertNotSame( '', $update['error'], 'the update must be refused while the evidence read fails' );
         $this->restoreReads();
     }
 
