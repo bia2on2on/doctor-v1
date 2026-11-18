@@ -47,6 +47,16 @@ final class StaffManagementPage
     private const NOTICE_KEY               = 'cpms_staff_notice';
     private const META_PREV_ROLE           = 'cpms_previous_role';
 
+    /**
+     * Neutral target-user rejection for the attach surface. Shared by the
+     * "unusable account" branch and the patient-target branch so an
+     * unresolvable id, a WordPress administrator and a patient account stay
+     * indistinguishable to the actor.
+     */
+    private const TARGET_REJECTION = 'حساب انتخاب‌شده برای '
+        . 'افزودن به این کلینیک '
+        . 'قابل استفاده نیست.';
+
     /** نقش‌های قابل‌مدیریت (قابل‌انتساب/ویرایش/فعال/غیرفعال). */
     private const MANAGEABLE_ROLES = [
         RolesAndCapabilities::ROLE_DOCTOR,
@@ -852,7 +862,7 @@ final class StaffManagementPage
         $existing_user_id = (int) ( $in['existing_user_id'] ?? 0 );
         $existing_user    = $existing_user_id > 0 ? get_userdata( $existing_user_id ) : false;
         if ( $existing_user === false || in_array( 'administrator', (array) $existing_user->roles, true ) ) {
-            return ['error' => 'حساب انتخاب‌شده برای افزودن به این کلینیک قابل استفاده نیست.', 'generated' => '', 'user_id' => 0];
+            return ['error' => self::TARGET_REJECTION, 'generated' => '', 'user_id' => 0];
         }
 
         // B0-PR2 — a patient TARGET (patient role, any patient-role membership or a
@@ -861,7 +871,7 @@ final class StaffManagementPage
         // message as the branch above, so an unresolvable id, an administrator and
         // a patient account stay indistinguishable to the actor (no enumeration).
         if ( PatientAccountPolicy::is_patient_account( $existing_user_id ) ) {
-            return ['error' => 'حساب انتخاب‌شده برای افزودن به این کلینیک قابل استفاده نیست.', 'generated' => '', 'user_id' => 0];
+            return ['error' => self::TARGET_REJECTION, 'generated' => '', 'user_id' => 0];
         }
 
         try {
