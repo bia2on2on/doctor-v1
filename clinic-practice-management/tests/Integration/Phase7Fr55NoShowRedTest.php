@@ -147,6 +147,8 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     private const RACE_REAP_DEADLINE_SEC = 5.0;
     /** Child-side deadline: after this the child writes a fatal outcome and exits itself. */
     private const RACE_CHILD_BARRIER_DEADLINE_SEC = 45.0;
+    /** Bounded EINTR retries for one child probe: a transient signal is never a reason to kill. */
+    private const RACE_PROBE_RETRIES = 20;
 
     /** P2: head start that decides which worker takes the appointment row lock first. */
     private const RACE_HEAD_START_SEC = 0.35;
@@ -763,11 +765,54 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         }
 
         $error = pcntl_get_last_error();
-        if (PCNTL_ECHILD === $error) {
+        if (defined('PCNTL_ECHILD') && PCNTL_ECHILD === $error) {
             return ['state' => 'gone', 'status' => 0];
         }
 
         return ['state' => 'error', 'status' => $error];
+    }
+
+    /**
+     * T1: probe one child, retrying EINTR a bounded number of times, so a transient signal
+     * can never be mistaken for "safe to kill" (and never for "safe to skip").
+     *
+     * @return array{state: string, status: int}
+     */
+    private function probeChild(int $pid): array
+    {
+        $poll    = $this->pollChild($pid);
+        $retries = 0;
+        while ('error' === $poll['state']
+            && defined('PCNTL_EINTR') && PCNTL_EINTR === $poll['status']
+            && $retries < self::RACE_PROBE_RETRIES
+        ) {
+            ++$retries;
+            usleep(1000);
+            $poll = $this->pollChild($pid);
+        }
+
+        return $poll;
+    }
+
+    /**
+     * T1: the reaper's decision for ONE probe result — pure, so the rule "a reaped child is
+     * never signalled" is testable without forking.
+     *
+     * @return string drop|kill|retry
+     */
+    private static function reapActionFor(string $state, int $status): string
+    {
+        if ('reaped' === $state || 'gone' === $state) {
+            return 'drop';
+        }
+        if ('running' === $state) {
+            return 'kill';
+        }
+        if (defined('PCNTL_EINTR') && PCNTL_EINTR === $status) {
+            return 'retry';
+        }
+
+        return 'kill';
     }
 
     /** T2: SIGKILL exactly one owned pid; guarded so a missing primitive cannot fatal. */
@@ -984,6 +1029,43 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             count($observations),
             'post-race state read: every attempt must be recorded, got ' . count($observations)
         );
+    }
+
+    /**
+     * T1: the reaper's own decision rule. A child whose probe already reaped it (or that is
+     * reported gone via ECHILD) must NEVER be signalled — PID reuse would let the signal hit
+     * an unrelated process — and a transient EINTR must retry the probe instead of killing.
+     */
+    public function testReaperNeverSignalsAReapedChildAndRetriesOnEintr(): void
+    {
+        if (!defined('PCNTL_EINTR') || !defined('PCNTL_EINVAL')) {
+            if ('true' === getenv('GITHUB_ACTIONS')) {
+                self::fail('the pcntl error constants are missing in CI, so this reaper rule could not be checked');
+            }
+            $this->markTestSkipped('pcntl error constants are unavailable here.');
+        }
+
+        self::assertSame('drop', self::reapActionFor('reaped', 0), 'a REAPED child must be dropped before any signal');
+        self::assertSame('drop', self::reapActionFor('gone', 0), 'an ECHILD child must be dropped before any signal');
+        self::assertSame('kill', self::reapActionFor('running', 0), 'a child confirmed running may be SIGKILLed');
+        self::assertSame('retry', self::reapActionFor('error', PCNTL_EINTR), 'EINTR must retry the probe, never signal');
+        self::assertSame(
+            'kill',
+            self::reapActionFor('error', PCNTL_EINVAL),
+            'a hard, non-ECHILD waitpid error keeps the pid owned and escalates'
+        );
+
+        // The exact B1 sequence: a probe that reaps the pid, then a hard error on the same
+        // pid. The reaped pid must never enter the pending set, so the later error cannot
+        // escalate into a signal for it.
+        $pending = [];
+        foreach ([['reaped', 0], ['error', PCNTL_EINVAL]] as $probe) {
+            if ('drop' === self::reapActionFor($probe[0], $probe[1])) {
+                continue;
+            }
+            $pending[] = 4242;
+        }
+        self::assertSame([], $pending, 'a pid reaped by its first probe must never be pending, even if a later probe errors');
     }
 
     /**
@@ -1806,7 +1888,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                     if ('running' === $poll['state']) {
                         continue;
                     }
-                    if ('error' === $poll['state'] && PCNTL_EINTR === $poll['status']) {
+                    if ('error' === $poll['state'] && defined('PCNTL_EINTR') && PCNTL_EINTR === $poll['status']) {
                         continue; // interrupted syscall: retry, bounded by $finishDeadline
                     }
                     if ('gone' === $poll['state']) {
@@ -1897,10 +1979,12 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     }
 
     /**
-     * G3: terminate and reap ONLY the children the parent has not reaped yet, with a
+     * G3/T1: terminate and reap ONLY the children the parent has not reaped yet, with a
      * bounded wait, then remove this attempt's harness files.
      *
-     * Never signals a pid that `waitpid` already reported (pid reuse) and never pid <= 0.
+     * A pid leaves the owned set the moment ONE probe reports it reaped or gone (ECHILD),
+     * and only pids whose LATEST probe says "running" (or a hard, non-ECHILD waitpid error)
+     * are signalled — an EINTR probe is retried, never signalled. Never pid <= 0.
      *
      * @param array<int, int> $pids parent-owned, unreaped pids
      */
@@ -1912,26 +1996,34 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             }
         }
 
-        // T2: probe first, then SIGKILL only what is really still running — never an
-        // already-reaped pid (pid reuse) and never pid <= 0.
+        // T2/T1: the FIRST probe already reaps some children, so a pid is dropped from the
+        // owned set right there — an already-reaped numeric pid must never be copied into
+        // the pending set and later escalated to a SIGKILL (PID reuse could hit an
+        // unrelated process). EINTR is retried by probeChild(), never signalled.
+        $pending = [];
         foreach ($owned as $pid) {
-            $poll = $this->pollChild($pid);
-            if ('running' === $poll['state'] || 'error' === $poll['state']) {
+            $poll   = $this->probeChild($pid);
+            $action = self::reapActionFor($poll['state'], $poll['status']);
+            if ('drop' === $action) {
+                continue;
+            }
+            $pending[] = $pid;
+            if ('kill' === $action) {
                 $this->killChild($pid);
             }
         }
 
         // Bounded reap: retry on EINTR, keep hard errors owned, never block the suite.
         $reapDeadline = microtime(true) + self::RACE_REAP_DEADLINE_SEC;
-        $pending      = $owned;
         while ($pending !== [] && microtime(true) <= $reapDeadline) {
             foreach ($pending as $key => $pid) {
-                $poll = $this->pollChild($pid);
-                if ('reaped' === $poll['state'] || 'gone' === $poll['state']) {
+                $poll   = $this->probeChild($pid);
+                $action = self::reapActionFor($poll['state'], $poll['status']);
+                if ('drop' === $action) {
                     unset($pending[$key]);
                     continue;
                 }
-                if ('error' === $poll['state'] && PCNTL_EINTR !== $poll['status']) {
+                if ('kill' === $action) {
                     $this->killChild($pid);
                 }
             }
