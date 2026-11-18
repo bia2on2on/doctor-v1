@@ -146,6 +146,29 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         return get_user_by( 'email', $email ) instanceof \WP_User;
     }
 
+    /** @return list<array<string, mixed>> */
+    private function auditRowsFor( string $action, int $wpUserId ): array
+    {
+        return App::db()->fetchAll(
+            'SELECT action, before_json, after_json FROM ' . App::db()->table( 'cpms_audit_logs' )
+            . ' WHERE action = %s AND resource_type = %s AND resource_id = %d ORDER BY id ASC',
+            [ $action, 'user', $wpUserId ]
+        );
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     *
+     * @return list<string>
+     */
+    private function sortedKeys( array $row ): array
+    {
+        $keys = array_keys( $row );
+        sort( $keys );
+
+        return array_map( 'strval', $keys );
+    }
+
     private function passwordHash( int $userId ): string
     {
         return (string) get_userdata( $userId )->user_pass;
@@ -421,23 +444,103 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         self::assertSame( $auditBefore, $this->auditCount( 'STAFF_USER_ATTACHED' ) );
     }
 
-    public function test_classic_screen_cannot_suspend_or_reactivate_a_patient_account(): void
+    public function test_classic_screen_suspends_a_patient_account_and_refuses_its_reactivation(): void
     {
+        // CHANGED ASSERTION (deliberate policy change, manager decision): this test
+        // used to assert that SUSPEND is refused for a patient account. Revocation
+        // is the safe direction, so suspend is now ALLOWED (zero credential side
+        // effects) while reactivate stays DENIED. Every reactivate-denial
+        // assertion below is the previous one, unchanged.
         $admin   = $this->makeAdmin();
         $patient = $this->makePatientAccount( 'pb_patient_toggle' );
 
-        $membershipBefore = App::membership_service()->membership_for( $this->clinicId, $patient );
-        $roleBefore       = (array) get_userdata( $patient )->roles;
+        $hashBefore = $this->passwordHash( $patient );
+        $keyBefore  = (string) get_userdata( $patient )->user_activation_key;
+        $activateBefore = $this->auditCount( 'STAFF_USER_ACTIVATED' );
+        $membershipsBefore = $this->membershipCount( $this->clinicId, $patient );
 
-        foreach ( [ 'deactivate', 'reactivate' ] as $state ) {
-            $result = StaffManagementPage::toggleUser( $patient, $state, $admin, $this->clinicId );
-            self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $result['error'] );
-        }
+        $suspend = StaffManagementPage::toggleUser( $patient, 'deactivate', $admin, $this->clinicId );
+        self::assertSame( '', $suspend['error'], 'suspension (revocation) is allowed for a patient account' );
 
-        $membershipAfter = App::membership_service()->membership_for( $this->clinicId, $patient );
-        self::assertSame( (string) $membershipBefore['status'], (string) $membershipAfter['status'] );
-        self::assertSame( $roleBefore, (array) get_userdata( $patient )->roles );
-        self::assertSame( '', (string) get_user_meta( $patient, 'cpms_previous_role', true ), 'no parked role meta' );
+        // What suspend writes: membership status, parked-role meta, WP role
+        // downgrade to subscriber, one structured audit row. No credential at all.
+        self::assertSame(
+            'suspended',
+            (string) App::membership_service()->membership_for( $this->clinicId, $patient )['status']
+        );
+        self::assertSame( 'cpms_patient', (string) get_user_meta( $patient, 'cpms_previous_role', true ) );
+        self::assertSame( [ 'subscriber' ], array_values( (array) get_userdata( $patient )->roles ) );
+        self::assertSame( $hashBefore, $this->passwordHash( $patient ), 'suspend must not touch the password' );
+        self::assertSame( $keyBefore, (string) get_userdata( $patient )->user_activation_key, 'no reset key' );
+        self::assertSame( $membershipsBefore, $this->membershipCount( $this->clinicId, $patient ), 'no membership created' );
+        self::assertSame( $activateBefore, $this->auditCount( 'STAFF_USER_ACTIVATED' ) );
+
+        $deactivated = $this->auditRowsFor( 'STAFF_USER_DEACTIVATED', $patient );
+        self::assertCount( 1, $deactivated, 'suspension is audited exactly once' );
+        $after = json_decode( (string) $deactivated[0]['after_json'], true );
+        self::assertIsArray( $after );
+        self::assertSame(
+            [ 'clinic_id', 'membership_status', 'role', 'wp_global_role' ],
+            $this->sortedKeys( $after ),
+            'the suspension audit row carries structured fields only'
+        );
+        self::assertStringNotContainsString( '@', (string) $deactivated[0]['after_json'], 'no e-mail in the audit row' );
+
+        // Reactivation stays refused with the same stable denial, zero side effects.
+        $actBefore = $this->auditCount( 'STAFF_USER_ACTIVATED' );
+        $reactivate = StaffManagementPage::toggleUser( $patient, 'activate', $admin, $this->clinicId );
+        self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $reactivate['error'] );
+        self::assertSame(
+            'suspended',
+            (string) App::membership_service()->membership_for( $this->clinicId, $patient )['status'],
+            'a refused reactivation leaves the membership suspended'
+        );
+        self::assertSame( 'cpms_patient', (string) get_user_meta( $patient, 'cpms_previous_role', true ) );
+        self::assertSame( [ 'subscriber' ], array_values( (array) get_userdata( $patient )->roles ) );
+        self::assertSame( $actBefore, $this->auditCount( 'STAFF_USER_ACTIVATED' ) );
+        self::assertSame( $hashBefore, $this->passwordHash( $patient ) );
+    }
+
+    public function test_classic_screen_suspends_a_mixed_account_but_never_reactivates_it(): void
+    {
+        $admin = $this->makeAdmin();
+        $mixed = $this->makeUser( RolesAndCapabilities::ROLE_SECRETARY, 'pb_mixed_toggle' );
+        cpms_test_seed_membership( $mixed, $this->clinicId, RolesAndCapabilities::ROLE_PATIENT );
+
+        $activateBefore = $this->auditCount( 'STAFF_USER_ACTIVATED' );
+
+        $suspend = StaffManagementPage::toggleUser( $mixed, 'deactivate', $admin, $this->clinicId );
+        self::assertSame( '', $suspend['error'], 'suspending a mixed account is the safe direction' );
+        self::assertSame( [ 'subscriber' ], array_values( (array) get_userdata( $mixed )->roles ) );
+        self::assertSame( 'cpms_secretary', (string) get_user_meta( $mixed, 'cpms_previous_role', true ) );
+
+        $reactivate = StaffManagementPage::toggleUser( $mixed, 'activate', $admin, $this->clinicId );
+        self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $reactivate['error'] );
+        self::assertSame( [ 'subscriber' ], array_values( (array) get_userdata( $mixed )->roles ), 'the staff role is never restored' );
+        self::assertSame( 'cpms_secretary', (string) get_user_meta( $mixed, 'cpms_previous_role', true ) );
+        self::assertSame( $activateBefore, $this->auditCount( 'STAFF_USER_ACTIVATED' ) );
+    }
+
+    public function test_control_staff_suspend_and_reactivate_still_work(): void
+    {
+        $admin = $this->makeAdmin();
+        $staff = $this->makeUser( RolesAndCapabilities::ROLE_SECRETARY, 'pb_staff_toggle' );
+        cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        self::assertSame( '', StaffManagementPage::toggleUser( $staff, 'deactivate', $admin, $this->clinicId )['error'] );
+        self::assertSame( [ 'subscriber' ], array_values( (array) get_userdata( $staff )->roles ) );
+
+        self::assertSame(
+            '',
+            StaffManagementPage::toggleUser( $staff, 'activate', $admin, $this->clinicId )['error'],
+            'a pure staff account keeps the normal suspend/reactivate cycle'
+        );
+        self::assertSame( [ 'cpms_secretary' ], array_values( (array) get_userdata( $staff )->roles ) );
+        self::assertSame( '', (string) get_user_meta( $staff, 'cpms_previous_role', true ) );
+        self::assertSame(
+            'active',
+            (string) App::membership_service()->membership_for( $this->clinicId, $staff )['status']
+        );
     }
 
     // ==================================================================

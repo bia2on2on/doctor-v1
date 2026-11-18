@@ -113,9 +113,10 @@ final class StaffManagementPage
             delete_transient(self::NOTICE_KEY);
         }
 
-        $clinic_id   = self::formClinicId();
-        $rows        = self::list_users( $clinic_id );
-        $roles       = self::roleLabels();
+        $clinic_id = self::formClinicId();
+        $rows      = self::list_users( $clinic_id );
+        $roles     = self::roleLabels();
+
         // B0-PR2: the patient role is never offered for creation or assignment.
         $staff_roles = array_diff_key(
             $roles,
@@ -938,13 +939,6 @@ final class StaffManagementPage
             return ['error' => 'عضویت هدف برای این Clinic یافت نشد.'];
         }
 
-        // B0-PR2 — suspend/reactivate parks and restores the WordPress role, so a
-        // patient account is refused here too (before meta, role or audit writes).
-        $patient_denial = PatientAccountPolicy::guard( $user_id );
-        if ( $patient_denial !== '' ) {
-            return ['error' => $patient_denial];
-        }
-
         // جلوگیری از قفل‌کردن خود: عاملِ غیرفعال‌سازی نمی‌تواند حساب خودش را غیرفعال کند.
         if ( $state === 'deactivate' && $user_id === $updated_by ) {
             return ['error' => 'نمی‌توانید حساب خودتان را غیرفعال کنید (جلوگیری از قفل‌شدن).'];
@@ -952,6 +946,16 @@ final class StaffManagementPage
 
         if (!in_array($state, ['deactivate', 'activate'], true)) {
             return ['error' => 'وضعیت کاربر نامعتبر است.'];
+        }
+
+        // B0-PR2 — revocation is the SAFE direction: SUSPEND remains available for
+        // a patient (or mixed) account because it only takes access away (role
+        // parked to subscriber, membership suspended). REACTIVATE restores a
+        // WordPress role from the parked meta — possibly the patient role — and
+        // re-opens participation, so it stays refused with the same stable denial
+        // and zero side effects, evaluated before any meta, role or audit write.
+        if ( $state === 'activate' && PatientAccountPolicy::is_patient_account( $user_id ) ) {
+            return ['error' => PatientAccountPolicy::DENIAL_MESSAGE];
         }
 
         if ($state === 'deactivate') {
