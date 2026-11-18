@@ -233,7 +233,13 @@ final class CustomRoleAssignmentService {
                 // then refused with the ordinary Clinic-authority denial, before
                 // any membership role/capability/audit write.
                 if ( PatientAccountPolicy::is_patient_account( $target_wp_user_id ) ) {
-                    throw new AuthorizationException( 'cpms_patient_target_not_assignable' );
+                    // Reuses the existing AUTH_DENIED code (no new public code):
+                    // a patient target is simply not an assignable target.
+                    throw new AuthorizationException(
+                        'AUTH_DENIED',
+                        'AUTH_DENIED',
+                        array( 'reason' => 'patient_target' )
+                    );
                 }
 
                 // Bounded delegation is checked while the definition remains

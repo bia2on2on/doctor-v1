@@ -103,14 +103,15 @@ final class StaffManagementPage
             delete_transient(self::NOTICE_KEY);
         }
 
-        $clinic_id      = self::formClinicId();
-        $rows           = self::list_users( $clinic_id );
-        $roles = self::roleLabels();
+        $clinic_id   = self::formClinicId();
+        $rows        = self::list_users( $clinic_id );
+        $roles       = self::roleLabels();
         // B0-PR2: the patient role is never offered for creation or assignment.
         $staff_roles = array_diff_key(
             $roles,
             [ RolesAndCapabilities::ROLE_PATIENT => true ]
         );
+
         $clinic_choices = self::managed_clinic_choices( (int) get_current_user_id() );
         $assignable     = self::assignment_options( $clinic_id, $rows );
         ?>
@@ -834,17 +835,17 @@ final class StaffManagementPage
 
         $role = trim((string) ($in['role'] ?? ''));
 
-        // B0-PR2 — evaluated FIRST so a patient role key always receives the same
-        // stable denial (never a role-validation message), with no side effect.
-        $patient_denial = PatientAccountPolicy::guard(
-            (int) ( $in['existing_user_id'] ?? 0 ),
-            $role
-        );
-        if ( $patient_denial !== '' ) {
-            return ['error' => $patient_denial, 'generated' => '', 'user_id' => 0];
+        // B0-PR2 — the patient ROLE KEY is refused FIRST, so it never reaches role
+        // validation and always gets the same stable denial (no side effect).
+        if ( PatientAccountPolicy::is_patient_role_key( $role ) ) {
+            return [
+                'error'     => PatientAccountPolicy::DENIAL_MESSAGE,
+                'generated' => '',
+                'user_id'   => 0,
+            ];
         }
 
-        if ($role === '' || !in_array($role, self::ASSIGNABLE_STAFF_ROLES, true)) {
+        if ( $role === '' || ! in_array( $role, self::ASSIGNABLE_STAFF_ROLES, true ) ) {
             return ['error' => 'نقش غیرمجاز است (فقط نقش‌های CPMS قابل انتساب‌اند؛ از انتساب administrator جلوگیری شد).', 'generated' => '', 'user_id' => 0];
         }
 
@@ -854,12 +855,13 @@ final class StaffManagementPage
             return ['error' => 'حساب انتخاب‌شده برای افزودن به این کلینیک قابل استفاده نیست.', 'generated' => '', 'user_id' => 0];
         }
 
-        // B0-PR2 — an existing account that carries patient evidence (role,
-        // membership or patient link) is never enrolled as staff; refused before
-        // create_membership() and its audit row.
-        $patient_denial = PatientAccountPolicy::guard( $existing_user_id, $role );
-        if ( $patient_denial !== '' ) {
-            return ['error' => $patient_denial, 'generated' => '', 'user_id' => 0];
+        // B0-PR2 — a patient TARGET (patient role, any patient-role membership or a
+        // durable patient link) is never enrolled as staff, refused before
+        // create_membership() and its audit row. It reuses the SAME neutral
+        // message as the branch above, so an unresolvable id, an administrator and
+        // a patient account stay indistinguishable to the actor (no enumeration).
+        if ( PatientAccountPolicy::is_patient_account( $existing_user_id ) ) {
+            return ['error' => 'حساب انتخاب‌شده برای افزودن به این کلینیک قابل استفاده نیست.', 'generated' => '', 'user_id' => 0];
         }
 
         try {

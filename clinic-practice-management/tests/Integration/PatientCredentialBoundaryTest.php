@@ -353,34 +353,70 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
     {
         $admin = $this->makeAdmin();
         $staff = $this->makeUser( 'subscriber', 'pb_attach_staff' );
+        $wpAdministrator = $this->makeUser( 'administrator', 'pb_attach_admin' );
 
         $auditBefore = $this->auditCount( 'STAFF_USER_ATTACHED' );
 
-        // (a) Attaching an existing account WITH the patient role key is refused.
+        // (a) Attaching an existing account WITH the patient role key is refused
+        // with the stable patient denial (a role-key choice, not target identity).
         $withPatientRole = StaffManagementPage::attachExistingUser(
             [
-                'clinic_id'       => $this->clinicId,
+                'clinic_id'        => $this->clinicId,
                 'existing_user_id' => $staff,
-                'role'            => RolesAndCapabilities::ROLE_PATIENT,
+                'role'             => RolesAndCapabilities::ROLE_PATIENT,
             ],
             $admin
         );
         self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $withPatientRole['error'] );
         self::assertSame( 0, $this->membershipCount( $this->clinicId, $staff ), 'no membership may be created' );
 
-        // (b) Attaching a PATIENT account as staff is refused too.
+        // (b) A PATIENT target is refused, and its refusal must be
+        // indistinguishable from every other target-user rejection: enumeration
+        // neutrality is part of the existing contract (Phase4ExistingStaffOnboardingTest).
         $patient        = $this->makePatientAccount( 'pb_patient_attach' );
         $patientMembers = $this->membershipCount( $this->clinicId, $patient );
 
-        $patientTarget = StaffManagementPage::attachExistingUser(
+        $missingTarget = StaffManagementPage::attachExistingUser(
             [
-                'clinic_id'       => $this->clinicId,
-                'existing_user_id' => $patient,
-                'role'            => RolesAndCapabilities::ROLE_SECRETARY,
+                'clinic_id'        => $this->clinicId,
+                'existing_user_id' => 999999999,
+                'role'             => RolesAndCapabilities::ROLE_SECRETARY,
             ],
             $admin
         );
-        self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $patientTarget['error'] );
+        $administratorTarget = StaffManagementPage::attachExistingUser(
+            [
+                'clinic_id'        => $this->clinicId,
+                'existing_user_id' => $wpAdministrator,
+                'role'             => RolesAndCapabilities::ROLE_SECRETARY,
+            ],
+            $admin
+        );
+        $patientTarget = StaffManagementPage::attachExistingUser(
+            [
+                'clinic_id'        => $this->clinicId,
+                'existing_user_id' => $patient,
+                'role'             => RolesAndCapabilities::ROLE_SECRETARY,
+            ],
+            $admin
+        );
+
+        self::assertNotSame( '', (string) $missingTarget['error'] );
+        self::assertSame(
+            (string) $missingTarget['error'],
+            (string) $administratorTarget['error'],
+            'unresolvable id and administrator stay indistinguishable'
+        );
+        self::assertSame(
+            (string) $missingTarget['error'],
+            (string) $patientTarget['error'],
+            'a patient target must be indistinguishable from the other rejections'
+        );
+        self::assertStringNotContainsString(
+            'بیمار',
+            (string) $patientTarget['error'],
+            'the patient denial text must never leak on the attach surface'
+        );
         self::assertSame( $patientMembers, $this->membershipCount( $this->clinicId, $patient ) );
         self::assertSame( $auditBefore, $this->auditCount( 'STAFF_USER_ATTACHED' ) );
     }
