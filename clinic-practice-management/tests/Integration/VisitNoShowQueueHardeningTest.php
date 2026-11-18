@@ -1,16 +1,21 @@
 <?php
+
 declare(strict_types=1);
+
 namespace ClinicCore\Tests\Integration;
 
-use ClinicCore\Application\Jobs\VisitsNoShowHandler;
 use ClinicCore\Bootstrap\App;
-use DateTimeImmutable;
-use DateTimeZone;
+use ClinicCore\Tests\Integration\Fixtures\Phase2MultiLocationTemporalFixture;
 use WP_UnitTestCase;
 
-require_once __DIR__ . '/Fixtures/Phase2MultiLocationTemporalFixture.php';
-use ClinicCore\Tests\Integration\Fixtures\Phase2MultiLocationTemporalFixture;
-
+/**
+ * R4 (1.0) — the queue can no longer create a no-show root of its own.
+ *
+ * Pre-R4 this suite protected root suppression while a chain was processing and
+ * fresh roots afterwards. With the recurring schedule removed, the equal-or-stronger
+ * contract is that a tick creates NO `visits.no_show` job, keeps an already-queued
+ * legacy job from failing, and never enqueues a continuation.
+ */
 final class VisitNoShowQueueHardeningTest extends WP_UnitTestCase
 {
     use Phase2MultiLocationTemporalFixture;
@@ -18,124 +23,132 @@ final class VisitNoShowQueueHardeningTest extends WP_UnitTestCase
     protected function setUp(): void
     {
         parent::setUp();
-        App::migrations()->migrate();
         $this->buildMultiLocationTemporalFixture();
-        $this->purgeJobs();
     }
 
     protected function tearDown(): void
     {
-        $this->purgeJobs();
         $this->purgeMultiLocationTemporalFixture();
         parent::tearDown();
     }
 
-    private function purgeJobs(): void
-    {
-        global $wpdb;
-        $db = App::db();
-        $wpdb->query('DELETE FROM ' . $db->table('cpms_jobs') . ' WHERE type = "visits.no_show"');
-    }
-
     public function testSchedulerSuppressesRootWhileProcessing(): void
     {
-        global $wpdb;
-        $db = App::db();
-        $this->purgeJobs();
-
-        $nowSql = $db->nowUtcSql();
-        $futureLock = gmdate('Y-m-d H:i:s', time() + 600) . '.000';
-
-        // Insert PROCESSING job
-        $wpdb->query($wpdb->prepare(
-            'INSERT INTO ' . $db->table('cpms_jobs') . ' (type, payload_json, status, priority, attempts, max_attempts, run_after, locked_by, lock_expires_at, created_at) VALUES (%s, %s, %s, %d, %d, %d, %s, %s, %s, %s)',
-            'visits.no_show',
-            '[]',
-            'processing',
-            5,
-            1,
-            3,
-            $nowSql,
-            'test-worker',
-            $futureLock,
-            $nowSql
-        ));
-        self::assertGreaterThan(0, $wpdb->insert_id, 'fixture: processing job inserted');
-
-        $countBeforeQueued = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type = "visits.no_show" AND status = "queued"');
-        $countBeforeTotal = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type = "visits.no_show" AND status IN ("queued","processing")');
-
-        // This is the contract: scheduler must NOT enqueue new root while PROCESSING exists
-        App::scheduleRecurringJobs();
-
-        $countAfterQueued = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type = "visits.no_show" AND status = "queued"');
-        $countAfterTotal = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type = "visits.no_show" AND status IN ("queued","processing")');
-
-        // Before fix: countAfterQueued = 1 (duplicate root) -> RED
-        // After fix: countAfterQueued = 0, total still 1 -> GREEN
-        self::assertSame(0, $countAfterQueued, 'scheduler must suppress duplicate root while PROCESSING exists — found queued=' . $countAfterQueued . ' total=' . $countAfterTotal);
-        self::assertSame(1, $countAfterTotal, 'only original PROCESSING should remain');
+        self::assertSame(0, $this->noShowJobCount(), 'precondition: no legacy job rows');
+        App::runTick(20);
+        self::assertSame(0, $this->noShowJobCount(), 'R4: a tick must not create a no-show root job');
     }
 
     public function testSchedulerCreatesFreshRootAfterChainFinishes(): void
     {
-        global $wpdb;
-        $db = App::db();
-        $this->purgeJobs();
+        App::runTick(20);
+        App::runTick(20);
+        self::assertSame(0, $this->noShowJobCount(), 'no root is ever re-created: the schedule entry is gone');
+        self::assertArrayNotHasKey('visits.no_show', App::RECURRING_JOBS);
+    }
 
-        $countBefore = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type = "visits.no_show" AND status IN ("queued","processing")');
-        self::assertSame(0, $countBefore, 'precondition: no active jobs');
+    /**
+     * A4 — the GENERIC queue-hardening rule ("an existing PROCESSING recurring job
+     * suppresses a duplicate root") lost its home when the no-show schedule entry
+     * was removed. It is re-homed here on an ACTIVE recurring lane
+     * (`notif.dispatch`), so the protection stays asserted somewhere real.
+     */
+    public function testSchedulerSuppressesDuplicateRootWhileProcessingOnAnActiveLane(): void
+    {
+        global $wpdb;
+        $db      = App::db();
+        $nowSql  = $db->nowUtcSql();
+        $lockExp = gmdate('Y-m-d H:i:s', time() + 600) . '.000';
+
+        $wpdb->query($wpdb->prepare('DELETE FROM ' . $db->table('cpms_jobs') . ' WHERE type = %s', 'notif.dispatch'));
+
+        $ok = $wpdb->insert(
+            $db->table('cpms_jobs'),
+            [
+                'type'            => 'notif.dispatch',
+                'payload_json'    => '[]',
+                'status'          => 'processing',
+                'priority'        => 6,
+                'attempts'        => 1,
+                'max_attempts'    => 3,
+                'run_after'       => $nowSql,
+                'locked_by'       => 'test-worker',
+                'lock_expires_at' => $lockExp,
+                'created_at'      => $nowSql,
+            ]
+        );
+        self::assertTrue((bool) $ok, 'fixture: PROCESSING notif.dispatch job inserted — ' . $wpdb->last_error);
+        self::assertGreaterThan(0, (int) $wpdb->insert_id, 'fixture: PROCESSING job id');
 
         App::scheduleRecurringJobs();
 
-        $countAfter = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type = "visits.no_show" AND status = "queued"');
-        self::assertSame(1, $countAfter, 'after chain finishes, scheduler must be able to create fresh root');
+        $queued = (int) $wpdb->get_var(
+            'SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . " WHERE type = 'notif.dispatch' AND status = 'queued'"
+        );
+        $total = (int) $wpdb->get_var(
+            'SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . " WHERE type = 'notif.dispatch' AND status IN ('queued','processing')"
+        );
 
-        $row = $wpdb->get_row('SELECT payload_json FROM ' . $db->table('cpms_jobs') . ' WHERE type = "visits.no_show" AND status = "queued" LIMIT 1', ARRAY_A);
-        self::assertNotNull($row, 'root row exists');
-        $payload = json_decode($row['payload_json'] ?? '[]', true);
-        self::assertSame([], $payload, 'fresh root payload must be empty []');
+        self::assertSame(0, $queued, 'a PROCESSING job must suppress a duplicate root on an active lane — queued=' . $queued);
+        self::assertSame(1, $total, 'only the original PROCESSING job may remain — total=' . $total);
+
+        $wpdb->query($wpdb->prepare('DELETE FROM ' . $db->table('cpms_jobs') . ' WHERE type = %s', 'notif.dispatch'));
     }
 
     public function testContinuationDedupPreventsDuplicateSameCursor(): void
     {
-        global $wpdb;
-        $db = App::db();
-        $queue = App::jobs();
-        $this->purgeJobs();
+        $appointmentId = $this->seedPastAppointment('10:00:00', self::FX_T_LOC_A_ID);
+        $jobId = App::jobs()->enqueue('visits.no_show', [], null, 5, 3);
+        App::runTick(20);
 
-        $now = new DateTimeImmutable('now', new DateTimeZone('UTC'));
-        $cursor = ['slot_date' => '2026-01-01', 'slot_time' => '00:00:00', 'id' => 1];
-        $payload = ['cursor' => $cursor, 'continuation' => true, 'depth' => 1];
+        $job = App::db()->fetchRow(
+            'SELECT status FROM ' . App::db()->table('cpms_jobs') . ' WHERE id = %d',
+            [$jobId]
+        );
+        self::assertIsArray($job);
+        self::assertSame('success', (string) $job['status'], 'the legacy job drains cleanly');
+        self::assertSame(1, $this->noShowJobCount(), 'no continuation row is added');
+        self::assertSame('confirmed', (string) $this->appointmentRow($appointmentId)['status']);
+    }
 
-        // First enqueue
-        $queue->enqueue('visits.no_show', $payload, $now, 5, 3);
-        $count1 = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type = "visits.no_show" AND status = "queued"');
-        self::assertSame(1, $count1, 'first continuation enqueued');
+    private function noShowJobCount(): int
+    {
+        return (int) App::db()->fetchValue(
+            'SELECT COUNT(*) FROM ' . App::db()->table('cpms_jobs') . " WHERE type = 'visits.no_show'"
+        );
+    }
 
-        // Simulate parent retry trying to enqueue same cursor again via handler's maybeEnqueue path
-        // We use the handler directly with a stub result that has same next_cursor
-        $handler = new VisitsNoShowHandler(App::visitService(), $queue, $db, App::op());
+    /**
+     * @return array<string, mixed>
+     */
+    private function appointmentRow(int $appointmentId): array
+    {
+        $row = App::db()->fetchRow(
+            'SELECT status, no_show_at FROM ' . App::db()->table('cpms_appointments') . ' WHERE id = %d',
+            [$appointmentId]
+        );
 
-        // Use reflection to call maybeEnqueueContinuation with same next_cursor
-        $ref = new \ReflectionClass($handler);
-        $method = $ref->getMethod('maybeEnqueueContinuation');
-        $method->setAccessible(true);
+        self::assertIsArray($row, 'the appointment row must exist: id=' . $appointmentId);
+        self::assertArrayHasKey('status', $row);
 
-        $result = [
-            'processed' => 0,
-            'next_cursor' => $cursor,
-            'has_more' => true,
-            'depth' => 0,
-            'scanned' => 100,
-        ];
+        return $row;
+    }
 
-        // This second attempt should be deduped — not create second job with same cursor
-        $method->invoke($handler, $result, null, 0);
+    private function pastDate(int $days = 3): string
+    {
+        return (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+            ->modify('-' . $days . ' days')
+            ->format('Y-m-d');
+    }
 
-        $count2 = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type = "visits.no_show" AND status = "queued"');
-        // Before fix: count2 = 2 (duplicate) -> RED
-        // After fix: count2 = 1 (deduped) -> GREEN
-        self::assertSame(1, $count2, 'duplicate continuation with same cursor must be suppressed — found count=' . $count2);
+    private function seedPastAppointment(string $time, int $locationId = self::FX_T_LOC_A_ID): int
+    {
+        $date = $this->pastDate();
+        // The slot must be the appointment's own slot: `fxTInsertSlot()` enforces the
+        // (location, clinician, date, time) unique key, so a second implicit slot at the
+        // same wall-clock would fail and leave the appointment unlinked.
+        $slotId = $this->fxTInsertSlot($locationId, $date, $time);
+
+        return $this->fxTInsertAppointment($locationId, $date, $time, 'confirmed', $slotId);
     }
 }
