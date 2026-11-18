@@ -74,7 +74,6 @@ final class PatientBoundaryWriterInventoryTest extends TestCase
         'src/Application/Roles/CustomRoleManagementService.php'             => 'NOT NEEDED: changes role DEFINITIONS only; it never writes a membership or an account (G9 residual risk is documented).',
         'src/Infrastructure/Repository/CustomRoleRepository.php'            => 'NOT NEEDED: storage layer for role definitions only.',
         'src/Infrastructure/Repository/MembershipRepository.php'            => 'NOT NEEDED: storage layer; no authorization decision lives here.',
-        'src/Infrastructure/UserCacheRollback.php'                          => 'NOT NEEDED: only evicts WordPress caches for an account the caller just rolled back.',
     );
 
     /**
