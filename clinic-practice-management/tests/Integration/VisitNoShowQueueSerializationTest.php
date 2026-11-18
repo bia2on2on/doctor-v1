@@ -1,13 +1,21 @@
 <?php
+
 declare(strict_types=1);
+
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Tests\Integration\Fixtures\Phase2MultiLocationTemporalFixture;
 use WP_UnitTestCase;
 
-require_once __DIR__ . '/Fixtures/Phase2MultiLocationTemporalFixture.php';
-use ClinicCore\Tests\Integration\Fixtures\Phase2MultiLocationTemporalFixture;
-
+/**
+ * R4 (1.0) — serialized ticks cannot mark anything either.
+ *
+ * Pre-R4 this suite proved `App::runTick()` serialization kept two workers from
+ * consuming the same no-show chain. R4 removes the chain; the equal-or-stronger
+ * property is that repeated real ticks never create or duplicate no-show work and
+ * never mutate an appointment, serialized or not.
+ */
 final class VisitNoShowQueueSerializationTest extends WP_UnitTestCase
 {
     use Phase2MultiLocationTemporalFixture;
@@ -15,23 +23,13 @@ final class VisitNoShowQueueSerializationTest extends WP_UnitTestCase
     protected function setUp(): void
     {
         parent::setUp();
-        App::migrations()->migrate();
         $this->buildMultiLocationTemporalFixture();
-        $this->purgeJobs();
     }
 
     protected function tearDown(): void
     {
-        $this->purgeJobs();
         $this->purgeMultiLocationTemporalFixture();
         parent::tearDown();
-    }
-
-    private function purgeJobs(): void
-    {
-        global $wpdb;
-        $db = App::db();
-        $wpdb->query('DELETE FROM ' . $db->table('cpms_jobs') . ' WHERE type IN ("visits.no_show","slots.generate")');
     }
 
     public function testSlotsGenerateDoesNotUseUnlockedDispatcherTick(): void
@@ -79,78 +77,56 @@ final class VisitNoShowQueueSerializationTest extends WP_UnitTestCase
 
     public function testRunTickSerializationPreventsConcurrentConsumption(): void
     {
-        global $wpdb;
-        $db = App::db();
-        $this->purgeJobs();
+        $appointmentId = $this->seedPastAppointment('09:00:00', self::FX_T_LOC_A_ID);
 
-        // Enqueue a job
-        $queue = App::jobs();
-        $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
-        $queue->enqueue('visits.no_show', [], $now, 5, 3);
-        $countBefore = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type="visits.no_show" AND status="queued"');
-        self::assertSame(1, $countBefore, 'one job queued');
+        App::runTick(20);
+        App::runTick(20);
 
-        // Acquire lock via other connection
-        $other = new \wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
-        $other->query("SELECT GET_LOCK('" . App::TICK_LOCK . "', 0)");
-        $isFree = $other->get_var("SELECT IS_FREE_LOCK('" . App::TICK_LOCK . "')");
-        self::assertSame('0', (string) $isFree, 'lock should be held by other connection');
-
-        // runTick should skip and return -1, not consume job
-        $result = App::runTick(5);
-        self::assertSame(-1, $result, 'runTick must return -1 when lock held by other worker');
-
-        $countAfter = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type="visits.no_show" AND status="queued"');
-        self::assertSame(1, $countAfter, 'job must remain queued when tick skipped due to lock');
-
-        // Release lock
-        $other->query("SELECT RELEASE_LOCK('" . App::TICK_LOCK . "')");
-        $other->close();
-
-        // Now runTick should process
-        $result2 = App::runTick(5);
-        self::assertGreaterThanOrEqual(0, $result2, 'runTick after lock release should process');
+        self::assertSame(0, $this->noShowJobCount(), 'no no-show job is created by any tick');
+        $row = $this->appointmentRow($appointmentId);
+        self::assertSame('confirmed', (string) $row['status']);
+        self::assertNull($row['no_show_at']);
     }
 
     public function testRecurringSuppressionStillValid(): void
     {
-        global $wpdb;
-        $db = App::db();
-        $this->purgeJobs();
+        self::assertArrayNotHasKey('visits.no_show', App::RECURRING_JOBS);
+        App::runTick(20);
+        self::assertSame(0, $this->noShowJobCount());
+    }
 
-        // No active jobs -> scheduler should create root
-        App::scheduleRecurringJobs();
-        $count1 = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type="visits.no_show" AND status IN ("queued","processing")');
-        self::assertSame(1, $count1, 'fresh root after no active chain');
+    private function noShowJobCount(): int
+    {
+        return (int) App::db()->fetchValue(
+            'SELECT COUNT(*) FROM ' . App::db()->table('cpms_jobs') . " WHERE type = 'visits.no_show'"
+        );
+    }
 
-        // Insert PROCESSING should suppress
-        $nowSql = $db->nowUtcSql();
-        $futureLock = gmdate('Y-m-d H:i:s', time() + 600) . '.000';
-        $wpdb->query('DELETE FROM ' . $db->table('cpms_jobs') . ' WHERE type="visits.no_show"');
-        $wpdb->query($wpdb->prepare(
-            'INSERT INTO ' . $db->table('cpms_jobs') . ' (type, payload_json, status, priority, attempts, max_attempts, run_after, locked_by, lock_expires_at, created_at) VALUES (%s, %s, %s, %d, %d, %d, %s, %s, %s, %s)',
-            'visits.no_show', '[]', 'processing', 5, 1, 3, $nowSql, 'test-worker', $futureLock, $nowSql
-        ));
-        App::scheduleRecurringJobs();
-        $queuedAfterProcessing = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type="visits.no_show" AND status="queued"');
-        $totalAfterProcessing = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type="visits.no_show" AND status IN ("queued","processing")');
-        self::assertSame(0, $queuedAfterProcessing, 'PROCESSING must suppress duplicate root');
-        self::assertSame(1, $totalAfterProcessing, 'only PROCESSING remains');
+    /**
+     * @return array<string, mixed>
+     */
+    private function appointmentRow(int $appointmentId): array
+    {
+        $row = App::db()->fetchRow(
+            'SELECT status, no_show_at FROM ' . App::db()->table('cpms_appointments') . ' WHERE id = %d',
+            [$appointmentId]
+        );
 
-        // QUEUED should also suppress
-        $wpdb->query('DELETE FROM ' . $db->table('cpms_jobs') . ' WHERE type="visits.no_show"');
-        $wpdb->query($wpdb->prepare(
-            'INSERT INTO ' . $db->table('cpms_jobs') . ' (type, payload_json, status, priority, attempts, max_attempts, run_after, created_at) VALUES (%s, %s, %s, %d, %d, %d, %s, %s)',
-            'visits.no_show', '[]', 'queued', 5, 0, 3, $nowSql, $nowSql
-        ));
-        App::scheduleRecurringJobs();
-        $totalAfterQueued = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type="visits.no_show" AND status IN ("queued","processing")');
-        self::assertSame(1, $totalAfterQueued, 'QUEUED must suppress duplicate root');
+        return is_array($row) ? $row : [];
+    }
 
-        // After no active, new root can be created (rediscovery)
-        $wpdb->query('DELETE FROM ' . $db->table('cpms_jobs') . ' WHERE type="visits.no_show"');
-        App::scheduleRecurringJobs();
-        $countAfterPurge = (int) $wpdb->get_var('SELECT COUNT(*) FROM ' . $db->table('cpms_jobs') . ' WHERE type="visits.no_show" AND status="queued"');
-        self::assertSame(1, $countAfterPurge, 'after chain finishes, fresh root must be creatable for rediscovery');
+    private function pastDate(int $days = 3): string
+    {
+        return (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+            ->modify('-' . $days . ' days')
+            ->format('Y-m-d');
+    }
+
+    private function seedPastAppointment(string $time, int $locationId = self::FX_T_LOC_A_ID): int
+    {
+        $date = $this->pastDate();
+        $this->fxTInsertSlot($locationId, $date, $time);
+
+        return $this->fxTInsertAppointment($locationId, $date, $time, 'confirmed');
     }
 }

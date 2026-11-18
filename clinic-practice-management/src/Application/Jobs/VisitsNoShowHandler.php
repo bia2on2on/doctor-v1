@@ -12,16 +12,22 @@ use DateTimeImmutable;
 use DateTimeZone;
 
 /**
- * No-show خودکار (FR-5.5 — Job: visits.no_show — هر دقیقه).
+ * No-show — **MANUAL-ONLY in 1.0 (owner decision R4)**.
+ *
+ * The automatic sweep is retired for 1.0: `App::RECURRING_JOBS` no longer schedules
+ * `visits.no_show`, and this handler is an inert no-op so that any *already queued*
+ * job (or a direct invocation) completes successfully with zero appointment
+ * mutations, zero audit rows, zero continuation jobs and no retry storm.
+ * The manual path is untouched (`BookingService::markNoShowByStaff` +
+ * `POST /appointments/{id}/no-show`, reason required, actor recorded, audited).
+ * The private payload/continuation helpers below are intentionally retained
+ * (unused) so the full line can re-enable the sweep without rewriting them.
+ *
+ * Historical behaviour (pre-R4, retained for context) — FR-5.5 job `visits.no_show`:
  *
  * T2 starvation fix: از payload در cpms_jobs برای cursor پایدار استفاده می‌کند.
- * - [] = root معتبر (legacy)
- * - {cursor:{slot_date,slot_time,id}, continuation:true, depth:int} = continuation معتبر
- * - malformed => throw JobPayloadInvalidException با کد JOB_PAYLOAD_INVALID (fail-closed، نه silent root)
- * - cursor باید strictly greater باشد
- * - حداکثر یک continuation از نوع visits.no_show در هر اجرا enqueue می‌شود
- * - depth برای observability/diagnostics است، نه سقف گرسنگی مصنوعی — پیشرفت از طریق cursor اثبات می‌شود
- * - idempotent: sweep داخل Row Lock دوباره وضعیت را چک می‌کند
+ * - pre-R4 payload shapes (root `[]` and cursor continuations) are no longer validated
+ *   or acted on: the handler returns 0 immediately for every payload
  */
 final class VisitsNoShowHandler
 {
@@ -36,51 +42,19 @@ final class VisitsNoShowHandler
     }
 
     /**
-     * @param array<string,mixed> $payload
-     * @return int تعداد no_show شده در این تیک
-     * @throws JobPayloadInvalidException وقتی payload ادامه نامعتبر است
+     * R4 (1.0): inert. Completes without retry, without continuation and without
+     * mutating any appointment, so queued legacy jobs drain harmlessly.
+     *
+     * @param array<string,mixed> $payload Ignored (legacy payload shapes are not validated).
+     * @return int Always 0 (no appointment was marked no-show automatically).
      */
     public function __invoke(array $payload): int
     {
-        // Empty payload = valid root (legacy compatibility)
-        if ($payload === []) {
-            $result = $this->visits->processNoShows(null, 0);
-            $this->maybeEnqueueContinuation($result, null, 0);
-            return (int) ($result['processed'] ?? 0);
-        }
+        $this->op?->info('visit.no_show_manual_only_skip', [
+            'payload_keys' => array_keys($payload),
+        ]);
 
-        // Size bound check
-        $json = json_encode($payload, JSON_UNESCAPED_UNICODE);
-        if ($json !== false && strlen($json) > self::MAX_PAYLOAD_SIZE) {
-            $this->op?->warning('visit.no_show_payload_too_large', ['size' => strlen($json)]);
-            throw new JobPayloadInvalidException('JOB_PAYLOAD_INVALID', 'Payload exceeds max size', ['size' => strlen($json)]);
-        }
-
-        // Validate continuation payload structure
-        $validation = $this->validateContinuationPayload($payload);
-        if ($validation !== null) {
-            // validation returns error array if invalid
-            $this->op?->warning('visit.no_show_payload_invalid', $validation);
-            throw new JobPayloadInvalidException('JOB_PAYLOAD_INVALID', $validation['message'] ?? 'Invalid continuation payload', $validation);
-        }
-
-        /** @var array{slot_date:string, slot_time:string, id:int} $cursor */
-        $cursor = $payload['cursor'];
-        $depth = (int) $payload['depth'];
-
-        // Depth is observability only — must be int >=0, no arbitrary product ceiling.
-        // PHP integer safety: depth must be >=0 and <= PHP_INT_MAX (always true for int >=0, but check overflow via is_int)
-        if ($depth < 0) {
-            $this->op?->warning('visit.no_show_depth_out_of_bounds', ['depth' => $depth]);
-            throw new JobPayloadInvalidException('JOB_PAYLOAD_INVALID', 'Depth out of bounds (negative)', ['depth' => $depth]);
-        }
-
-        // Process with cursor
-        $result = $this->visits->processNoShows($cursor, $depth);
-
-        $this->maybeEnqueueContinuation($result, $cursor, $depth);
-
-        return (int) ($result['processed'] ?? 0);
+        return 0;
     }
 
     /**

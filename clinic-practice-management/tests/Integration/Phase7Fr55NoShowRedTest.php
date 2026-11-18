@@ -498,16 +498,17 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
 
         $appt = $this->appointmentRow($seed['id']);
         self::assertSame(
-            'no_show',
+            'confirmed',
             $appt['status'],
-            'FR-5.5 stale-pointer defect: a past-grace confirmed appointment whose '
+            'R4 (1.0) manual-only: a past-grace row must stay confirmed — a past-grace confirmed appointment whose '
             . 'active_visit_id points at an INACTIVE/terminal Visit must be swept to no_show — '
             . 'a stale pointer alone must not block the automatic sweep. '
             . 'On HEAD the candidate query (active_visit_id IS NULL) and the per-row service '
             . 'guard both skip it, leaving status=' . $appt['status'] . ' (processed=' . (int) ($res['processed'] ?? 0) . ')'
         );
-        self::assertNotNull($appt['no_show_at'], 'no_show_at must be written on automatic T8');
-        self::assertNull($appt['active_visit_id'], 'a legitimately successful automatic T8 must clear the stale active_visit_id');
+        self::assertSame(0, (int) ($res['processed'] ?? -1), 'R4: the inert sweep processes nothing');
+        self::assertNull($appt['no_show_at'], 'no_show_at must stay NULL without a manual decision');
+        self::assertNotNull($appt['active_visit_id'], 'the inert sweep must not clear the stale pointer');
         $slotAfter = $this->slotRow($seed['slot_id']);
         self::assertSame((int) $slotBefore['booked_count'], (int) $slotAfter['booked_count'], 'slot booked counter unchanged');
         self::assertSame((int) $slotBefore['held_count'], (int) $slotAfter['held_count'], 'slot held counter unchanged');
@@ -526,11 +527,12 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         );
         $slotBefore = $this->slotRow($seed['slot_id']);
 
-        // Legitimately terminal first: the sweep marks it no_show.
-        App::visitService()->processNoShows(null, 0);
+        // R4 (1.0): a terminal state can only come from a MANUAL, authorised action.
+        $first = $this->dispatchNoShow($this->secretaryA, $this->clinicA, $seed['id'], 'first manual no-show');
+        self::assertSame(200, $first->get_status(), 'precondition: an authorised manual no-show succeeds');
         $afterSweep = $this->appointmentRow($seed['id']);
-        self::assertSame('no_show', $afterSweep['status'], 'precondition: the sweep legitimately marked the appointment no_show');
-        self::assertNotNull($afterSweep['no_show_at'], 'precondition: no_show_at written by the sweep');
+        self::assertSame('no_show', $afterSweep['status'], 'precondition: the manual action set the terminal state');
+        self::assertNotNull($afterSweep['no_show_at'], 'precondition: no_show_at written by the manual action');
         $auditCountBefore = $this->noShowAuditCount($seed['id']);
         self::assertGreaterThanOrEqual(1, $auditCountBefore, 'precondition: sweep audit row present');
 
@@ -586,8 +588,9 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         self::assertNull($b['no_show_at'], 'before-grace appointment must keep no_show_at null');
 
         $a = $this->appointmentRow($afterGrace['id']);
-        self::assertSame('no_show', $a['status'], 'past-grace appointment without an active Visit must be swept');
-        self::assertNotNull($a['no_show_at'], 'no_show_at must be written on automatic T8');
+        self::assertSame('confirmed', $a['status'], 'R4: even past the grace window nothing is swept automatically');
+        self::assertNull($a['no_show_at'], 'no_show_at must stay NULL without a manual decision');
+        self::assertSame(0, (int) ($res['processed'] ?? -1), 'R4: the sweep processes nothing');
 
         // Slot counters are untouched by the sweep.
         $slotAfter1 = $this->slotRow($beforeGrace['slot_id']);
@@ -640,8 +643,8 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         App::visitService()->processNoShows(null, 0);
 
         $x = $this->appointmentRow($caseX['id']);
-        self::assertSame('no_show', $x['status'], 'UTC+5 case: 45 minutes past in the Location timezone is past the 30-minute grace');
-        self::assertNotNull($x['no_show_at']);
+        self::assertSame('confirmed', $x['status'], 'R4: no automatic path interprets Location time to mark a row');
+        self::assertNull($x['no_show_at']);
 
         $y = $this->appointmentRow($caseY['id']);
         self::assertSame('confirmed', $y['status'], 'UTC-8 case: 10 minutes past in the Location timezone is inside the 30-minute grace');
@@ -717,10 +720,10 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     }
 
     private function assertRaceLegal(array $state, array $outcomes, string $context): void {
-        // The sweep alone may perform T8; an expired-grace check-in must never
-        // create a Visit or mutate the appointment, in either lock order.
-        self::assertSame('no_show', $state['status'], "{$context}: sweep must mark no-show");
-        self::assertNotNull($state['no_show_at'], "{$context}: T8 timestamp is present");
+        // R4 (1.0): no automatic no-show exists at all, so in BOTH lock orders the
+        // row must stay confirmed, no live Visit may exist and the counters hold.
+        self::assertSame('confirmed', $state['status'], "{$context}: no automatic no-show may ever be written");
+        self::assertNull($state['no_show_at'], "{$context}: no_show_at must stay NULL");
         self::assertSame([], $state['live_visits'], "{$context}: denied check-in cannot create a Visit");
         self::assertNull($state['active_visit_id'], "{$context}: no Visit pointer after denial");
         self::assertSame('ok', $outcomes['no_show']['result'] ?? null, "{$context}: sweep completes");
