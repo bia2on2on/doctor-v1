@@ -1032,6 +1032,57 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     }
 
     /**
+     * A2: run the REAL reaper with a scripted probe sequence, recording probes and signals.
+     * The clock only moves when the reaper sleeps, so no test waits real seconds.
+     *
+     * @param int[] $pids
+     * @param array<int, array{state: string, status: int}> $script answers in call order;
+     *                                                            the last answer repeats
+     *
+     * @return array{probes: array<int, int>, signals: array<int, int>, unconfirmed: array<int, int>, sleeps: int}
+     */
+    private static function driveReaper(array $pids, array $script, float $deadline = 5.0, float $secondsPerSleep = 1.0): array
+    {
+        $probes  = [];
+        $signals = [];
+        $sleeps  = 0;
+        $now     = 0.0;
+
+        $answers = array_values($script);
+
+        $result = self::reapOwnedChildren(
+            $pids,
+            static function (int $pid) use (&$probes, &$answers): array {
+                $probes[] = $pid;
+                if ([] === $answers) {
+                    return ['state' => 'error', 'status' => PCNTL_EINVAL];
+                }
+
+                return count($answers) === 1 ? $answers[0] : array_shift($answers);
+            },
+            static function (int $pid) use (&$signals): void {
+                $signals[] = $pid;
+            },
+            static function (int $microseconds) use (&$sleeps, &$now, $secondsPerSleep): void {
+                ++$sleeps;
+                $now += $secondsPerSleep;
+                unset($microseconds);
+            },
+            static function () use (&$now): float {
+                return $now;
+            },
+            $deadline
+        );
+
+        return [
+            'probes'      => $probes,
+            'signals'     => $signals,
+            'unconfirmed' => $result['unconfirmed'],
+            'sleeps'      => $sleeps,
+        ];
+    }
+
+    /**
      * T1: the reaper's own decision rule. A child whose probe already reaped it (or that is
      * reported gone via ECHILD) must NEVER be signalled — PID reuse would let the signal hit
      * an unrelated process — and a transient EINTR must retry the probe instead of killing.
@@ -1055,24 +1106,55 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             'a hard, non-ECHILD waitpid error keeps the pid owned and escalates'
         );
 
-        // The exact B1 sequence, modelled on the reaper's TWO passes: pass 1 probes each
-        // owned pid once and builds the pending set, pass 2 re-probes ONLY pids that pass 1
-        // kept. A pid reaped in pass 1 therefore never reaches pass 2, so the hard error in
-        // pass 2 cannot escalate into a signal for an already-reaped numeric pid.
-        $firstPassState  = 'reaped';
-        $secondPassState = 'error';
-        $pending         = [];
-        if ('drop' !== self::reapActionFor($firstPassState, 0)) {
-            $pending[] = 4242;
-        }
-        $signalled = [];
-        foreach ($pending as $pendingPid) {
-            if ('kill' === self::reapActionFor($secondPassState, PCNTL_EINVAL)) {
-                $signalled[] = $pendingPid;
-            }
-        }
-        self::assertSame([], $pending, 'a pid reaped in the first pass must never enter the pending set');
-        self::assertSame([], $signalled, 'so the later hard error cannot escalate a signal for it');
+        // A2: every scenario below runs the REAL reaper (reapOwnedChildren) — the method the
+        // cleanup itself calls — with scripted probes, not a model of it.
+
+        // (1) mutation caught: "restore $pending = $owned after pass 1" — a pid reaped on
+        // pass 1 would be re-probed and, on the scripted hard error, escalated to a SIGKILL.
+        $reaped = self::driveReaper([4242], [['state' => 'reaped', 'status' => 0]]);
+        self::assertSame([4242], $reaped['probes'], 'a pid reaped on pass 1 is probed exactly once');
+        self::assertSame([], $reaped['signals'], 'a pid reaped on pass 1 is never signalled');
+        self::assertSame([], $reaped['unconfirmed'], 'a pid reaped on pass 1 never stays pending');
+
+        // (2) mutation caught: "signal on retry" — EINTR is a transient syscall interruption.
+        $eintr = self::driveReaper(
+            [4242],
+            [['state' => 'error', 'status' => PCNTL_EINTR], ['state' => 'reaped', 'status' => 0]]
+        );
+        self::assertSame([4242, 4242], $eintr['probes'], 'an EINTR probe is retried');
+        self::assertSame([], $eintr['signals'], 'an EINTR probe is never signalled');
+        self::assertSame([], $eintr['unconfirmed'], 'the retried pid is dropped once it is reaped');
+
+        // (3) mutation caught: "drop a pid whose latest probe says running" — a live child
+        // would leak instead of being killed.
+        $running = self::driveReaper(
+            [4242],
+            [['state' => 'running', 'status' => 0], ['state' => 'reaped', 'status' => 0]]
+        );
+        self::assertSame([4242, 4242], $running['probes'], 'a running child is re-probed in pass 2');
+        self::assertSame([4242], $running['signals'], 'a running child is SIGKILLed exactly once');
+        self::assertSame([], $running['unconfirmed'], 'the killed child is dropped once a probe reaps it');
+
+        // (4) mutation caught: "treat a hard waitpid error as gone" — that would abandon a
+        // child the kernel may still be running.
+        $hard = self::driveReaper(
+            [4242],
+            [['state' => 'error', 'status' => PCNTL_EINVAL], ['state' => 'reaped', 'status' => 0]]
+        );
+        self::assertSame([4242, 4242], $hard['probes'], 'a hard error keeps the pid owned and re-probed');
+        self::assertSame([4242], $hard['signals'], 'a hard error escalates to exactly one SIGKILL');
+        self::assertSame([], $hard['unconfirmed'], 'the pid is dropped once a later probe reaps it');
+
+        // (5) mutation caught: "probe or signal pid <= 0" — posix_kill(0) signals the whole
+        // process group.
+        $invalid = self::driveReaper([0, -7], [['state' => 'reaped', 'status' => 0]]);
+        self::assertSame([], $invalid['probes'], 'pid <= 0 is never probed');
+        self::assertSame([], $invalid['signals'], 'pid <= 0 is never signalled');
+
+        // (6) mutation caught: "silently abandon a child that is never confirmed reaped".
+        $stuck = self::driveReaper([4242], [['state' => 'running', 'status' => 0]], 5.0, 1.0);
+        self::assertGreaterThan(1, count($stuck['probes']), 'the bounded reap re-probes while the injected clock runs');
+        self::assertSame([4242], $stuck['unconfirmed'], 'a never-confirmed pid is REPORTED, not silently dropped');
     }
 
     /**
@@ -1986,6 +2068,85 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     }
 
     /**
+     * A1: the reaper's whole pass logic with the probe, the signal, the sleep and the clock
+     * injected, so a test executes THIS code — not a copy of it — without forking.
+     *
+     * Pass 1 probes each owned pid once and builds the pending set: a pid the probe reports
+     * reaped or gone (ECHILD) is dropped right there and never enters it. Pass 2 re-probes
+     * ONLY pending pids until the injected deadline. Every probe result goes through
+     * reapActionFor(), so "reaped" and "gone" can never become a signal and EINTR can never
+     * become one either. pid <= 0 is never probed and never signalled.
+     *
+     * @param int[] $pids
+     * @param callable(int): array{state: string, status: int} $probe one raw poll of one pid
+     * @param callable(int): void $signal SIGKILL exactly one pid
+     * @param callable(int): void $sleep microseconds
+     * @param callable(): float $clock monotonic seconds
+     *
+     * @return array{probes: array<int, int>, signals: array<int, int>, unconfirmed: array<int, int>}
+     */
+    private static function reapOwnedChildren(
+        array $pids,
+        callable $probe,
+        callable $signal,
+        callable $sleep,
+        callable $clock,
+        float $reapDeadlineSeconds
+    ): array {
+        $probes  = [];
+        $signals = [];
+        $pending = [];
+
+        // Pass 1: probe once per owned pid; a reaped/gone pid is dropped before it can ever
+        // reach the pending set (the pre-round-8 bug copied it in and could later SIGKILL a
+        // numeric pid the kernel had already freed).
+        foreach ($pids as $pid) {
+            if ($pid <= 0) {
+                continue;
+            }
+            $poll     = $probe($pid);
+            $probes[] = $pid;
+            $action   = self::reapActionFor($poll['state'], $poll['status']);
+            if ('drop' === $action) {
+                continue;
+            }
+            $pending[] = $pid;
+            if ('kill' === $action) {
+                $signal($pid);
+                $signals[] = $pid;
+            }
+        }
+
+        // Pass 2: bounded reap over the injected clock — retry on EINTR, escalate on a hard
+        // waitpid error, never block the suite.
+        $reapDeadline = $clock() + $reapDeadlineSeconds;
+        while ($pending !== [] && $clock() <= $reapDeadline) {
+            foreach ($pending as $key => $pid) {
+                $poll     = $probe($pid);
+                $probes[] = $pid;
+                $action   = self::reapActionFor($poll['state'], $poll['status']);
+                if ('drop' === $action) {
+                    unset($pending[$key]);
+                    continue;
+                }
+                if ('kill' === $action) {
+                    $signal($pid);
+                    $signals[] = $pid;
+                }
+            }
+            if ($pending !== []) {
+                $sleep(1000);
+            }
+        }
+
+        return [
+            'probes'      => $probes,
+            'signals'     => $signals,
+            'unconfirmed' => array_values($pending),
+        ];
+    }
+
+    /**
      * G3/T1: terminate and reap ONLY the children the parent has not reaped yet, with a
      * bounded wait, then remove this attempt's harness files.
      *
@@ -2002,42 +2163,25 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                 $owned[] = $pid;
             }
         }
-
-        // T2/T1: the FIRST probe already reaps some children, so a pid is dropped from the
-        // owned set right there — an already-reaped numeric pid must never be copied into
-        // the pending set and later escalated to a SIGKILL (PID reuse could hit an
-        // unrelated process). EINTR is retried by probeChild(), never signalled.
-        $pending = [];
-        foreach ($owned as $pid) {
-            $poll   = $this->probeChild($pid);
-            $action = self::reapActionFor($poll['state'], $poll['status']);
-            if ('drop' === $action) {
-                continue;
-            }
-            $pending[] = $pid;
-            if ('kill' === $action) {
+        // A1: the whole pass logic lives in ONE injected method so the test can execute it
+        // with scripted probes. The production call passes the real probe, the real kill
+        // wrapper and the real sleep/clock — behaviour is unchanged.
+        $result = self::reapOwnedChildren(
+            $owned,
+            function (int $pid): array {
+                return $this->probeChild($pid);
+            },
+            function (int $pid): void {
                 $this->killChild($pid);
-            }
-        }
-
-        // Bounded reap: retry on EINTR, keep hard errors owned, never block the suite.
-        $reapDeadline = microtime(true) + self::RACE_REAP_DEADLINE_SEC;
-        while ($pending !== [] && microtime(true) <= $reapDeadline) {
-            foreach ($pending as $key => $pid) {
-                $poll   = $this->probeChild($pid);
-                $action = self::reapActionFor($poll['state'], $poll['status']);
-                if ('drop' === $action) {
-                    unset($pending[$key]);
-                    continue;
-                }
-                if ('kill' === $action) {
-                    $this->killChild($pid);
-                }
-            }
-            if ($pending !== []) {
-                usleep(1000);
-            }
-        }
+            },
+            static function (int $microseconds): void {
+                usleep($microseconds);
+            },
+            static function (): float {
+                return microtime(true);
+            },
+            self::RACE_REAP_DEADLINE_SEC
+        );
 
         for ($i = 0; $i < $workerCount; $i++) {
             @unlink($this->fileTag . '-ready-' . $attempt . '-' . $i);
@@ -2045,10 +2189,10 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         }
         @unlink($this->fileTag . '-barrier-' . $attempt);
 
-        if ($pending !== []) {
+        if ($result['unconfirmed'] !== []) {
             $this->fail(
-                'harness fatal: ' . count($pending) . ' child(ren) could not be confirmed reaped within '
-                . self::RACE_REAP_DEADLINE_SEC . ' s of SIGKILL (pids: ' . implode(', ', $pending)
+                'harness fatal: ' . count($result['unconfirmed']) . ' child(ren) could not be confirmed reaped within '
+                . self::RACE_REAP_DEADLINE_SEC . ' s of SIGKILL (pids: ' . implode(', ', $result['unconfirmed'])
                 . ') — they are reported, NOT silently abandoned'
             );
         }
