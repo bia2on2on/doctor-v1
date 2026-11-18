@@ -833,6 +833,17 @@ final class StaffManagementPage
         }
 
         $role = trim((string) ($in['role'] ?? ''));
+
+        // B0-PR2 — evaluated FIRST so a patient role key always receives the same
+        // stable denial (never a role-validation message), with no side effect.
+        $patient_denial = PatientAccountPolicy::guard(
+            (int) ( $in['existing_user_id'] ?? 0 ),
+            $role
+        );
+        if ( $patient_denial !== '' ) {
+            return ['error' => $patient_denial, 'generated' => '', 'user_id' => 0];
+        }
+
         if ($role === '' || !in_array($role, self::ASSIGNABLE_STAFF_ROLES, true)) {
             return ['error' => 'نقش غیرمجاز است (فقط نقش‌های CPMS قابل انتساب‌اند؛ از انتساب administrator جلوگیری شد).', 'generated' => '', 'user_id' => 0];
         }
@@ -843,10 +854,9 @@ final class StaffManagementPage
             return ['error' => 'حساب انتخاب‌شده برای افزودن به این کلینیک قابل استفاده نیست.', 'generated' => '', 'user_id' => 0];
         }
 
-        // B0-PR2 — attaching an existing account is also a patient boundary: a
-        // patient role key may never be handed out, and an account that already
-        // carries patient evidence (role, membership or patient link) is never
-        // enrolled as staff. Refused before create_membership() and its audit.
+        // B0-PR2 — an existing account that carries patient evidence (role,
+        // membership or patient link) is never enrolled as staff; refused before
+        // create_membership() and its audit row.
         $patient_denial = PatientAccountPolicy::guard( $existing_user_id, $role );
         if ( $patient_denial !== '' ) {
             return ['error' => $patient_denial, 'generated' => '', 'user_id' => 0];

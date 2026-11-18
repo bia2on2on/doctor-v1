@@ -30,8 +30,7 @@ use WP_User;
  * must evaluate this BEFORE any side effect: user row, password write,
  * membership, e-mail or audit row.
  */
-final class PatientAccountPolicy
-{
+final class PatientAccountPolicy {
     /**
      * Stable, non-revealing denial. Deliberately does not say WHY the target is
      * a patient (role vs membership vs link) and does not echo any identifier.
@@ -43,16 +42,14 @@ final class PatientAccountPolicy
      * Whether a role key is the patient role. Used for the created/assigned role
      * (there is no target account to inspect when a new account would be made).
      */
-    public static function is_patient_role_key( string $role_key ): bool
-    {
+    public static function is_patient_role_key( string $role_key ): bool {
         return $role_key === RolesAndCapabilities::ROLE_PATIENT;
     }
 
     /**
      * Whether a target account is a patient account (fail-closed on any doubt).
      */
-    public static function is_patient_account( int $wp_user_id ): bool
-    {
+    public static function is_patient_account( int $wp_user_id ): bool {
         if ( $wp_user_id <= 0 ) {
             return true; // no resolvable target: never treat it as staff
         }
@@ -84,8 +81,7 @@ final class PatientAccountPolicy
      *
      * @return string '' when allowed, otherwise the stable denial message.
      */
-    public static function guard( int $target_wp_user_id, string $role_key = '' ): string
-    {
+    public static function guard( int $target_wp_user_id, string $role_key = '' ): string {
         if ( self::is_patient_role_key( $role_key ) ) {
             return self::DENIAL_MESSAGE;
         }
@@ -100,8 +96,7 @@ final class PatientAccountPolicy
     /**
      * Any membership row (active OR suspended) carrying the patient role key.
      */
-    private static function has_patient_membership( int $wp_user_id ): bool
-    {
+    private static function has_patient_membership( int $wp_user_id ): bool {
         $db = App::db();
 
         $count = $db->fetchValue(
@@ -116,8 +111,7 @@ final class PatientAccountPolicy
     /**
      * A durable patient↔account link (any status) is patient evidence.
      */
-    private static function has_patient_link( int $wp_user_id ): bool
-    {
+    private static function has_patient_link( int $wp_user_id ): bool {
         $db = App::db();
 
         $count = $db->fetchValue(
