@@ -155,15 +155,38 @@ final class MembershipRepository {
      *
      * @return list<int>
      */
-    public function member_user_ids_for_role( string $role_key ): array {
-        $rows = $this->db->fetch_all_strict(
-            'SELECT DISTINCT wp_user_id FROM ' . $this->db->table( 'cpms_clinic_memberships' )
-                . ' WHERE role_key = %s AND status = %s ORDER BY wp_user_id ASC LIMIT 5000',
-            [ $role_key, 'active' ]
-        );
-        $this->require_successful_read();
+    /**
+     * EVERY active holder of a role key, page by page (B1).
+     *
+     * A single LIMIT silently ignored holders beyond the bound, so a patient at
+     * position 5001 was invisible to the widening guard. The keyset cursor
+     * (wp_user_id > last seen, ordered) makes the scan exhaustive without OFFSET
+     * and without a bound; a failed page refuses instead of returning a short list.
+     *
+     * @return list<int>
+     */
+    public function member_user_ids_for_role( string $role_key, int $page_size = 500 ): array {
+        $page_size = max( 1, $page_size );
+        $user_ids  = array();
+        $cursor    = 0;
+        $rows      = array();
 
-        return array_map( 'intval', array_column( $rows, 'wp_user_id' ) );
+        do {
+            $rows = $this->db->fetch_all_strict(
+                'SELECT DISTINCT wp_user_id FROM ' . $this->db->table( 'cpms_clinic_memberships' )
+                    . ' WHERE role_key = %s AND status = %s AND wp_user_id > %d'
+                    . ' ORDER BY wp_user_id ASC LIMIT %d',
+                array( $role_key, 'active', $cursor, $page_size )
+            );
+            $this->require_successful_read();
+
+            foreach ( $rows as $row ) {
+                $user_ids[] = (int) $row['wp_user_id'];
+                $cursor     = (int) $row['wp_user_id'];
+            }
+        } while ( count( $rows ) === $page_size );
+
+        return $user_ids;
     }
 
     public function active_clinic_ids_for_user( int $wp_user_id ): array {

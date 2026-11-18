@@ -460,9 +460,12 @@ final class RoleCapabilitiesPage
         try {
             App::db()->transactional(
                 function () use ( $input, $actor_wp_user_id, &$report ) {
+                    // B0-PR2-B3 — one locking read of the durable override row: it
+                    // both serializes the preset writers and gives the real before-state.
+                    $snapshot = self::locked_override_snapshot();
                     foreach ( self::ROLE_PRESETS as $role ) {
                         $requested = isset( $input[ $role ] ) && is_array( $input[ $role ] ) ? $input[ $role ] : [];
-                        $before    = array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
+                        $before    = self::caps_from_snapshot( $role, $snapshot );
                         // B0-PR2-H2 — widening a BUILT-IN preset is refused while any
                         // active holder of that role is a patient/mixed/unknown account,
                         // because the preset applies to those members immediately.
@@ -499,6 +502,60 @@ final class RoleCapabilitiesPage
         }
 
         return $report;
+    }
+
+    /**
+     * Lock-protected, STRICT snapshot of the durable capability overrides (B3).
+     *
+     * `capsMap()` falls back to the template when the override option cannot be
+     * read, so a narrowed preset looked like its template and could be "widened"
+     * past the guard, and a stale before-state could restore a capability after a
+     * concurrent narrowing. This reads the option ROW itself, inside the caller's
+     * transaction, with `FOR UPDATE` so the two preset writers serialize on it
+     * (https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html), and
+     * refuses on a malformed value instead of guessing.
+     *
+     * @return array<string, mixed>
+     */
+    private static function locked_override_snapshot(): array {
+        $wpdb = App::db()->wpdb();
+        $rows = App::db()->fetch_all_strict(
+            'SELECT option_value FROM ' . $wpdb->options . ' WHERE option_name = %s LIMIT 1 FOR UPDATE',
+            [ RolesAndCapabilities::OPTION_OVERRIDE ]
+        );
+
+        $snapshot = array();
+        if ( array() !== $rows ) {
+            $stored = maybe_unserialize( (string) ( $rows[0]['option_value'] ?? '' ) );
+            if ( ! is_array( $stored ) ) {
+                throw new \RuntimeException( 'the capability override option is unreadable' );
+            }
+            $snapshot = $stored;
+        }
+
+        // The row was just read from the database, so drop any cached copy: the
+        // writers below build their new value from this durable state.
+        wp_cache_delete( RolesAndCapabilities::OPTION_OVERRIDE, 'options' );
+        wp_cache_delete( 'alloptions', 'options' );
+
+        return $snapshot;
+    }
+
+    /**
+     * Current capabilities of one preset, from the locked snapshot (never a guess).
+     *
+     * @param array<string, mixed> $snapshot
+     * @return list<string>
+     */
+    private static function caps_from_snapshot( string $role, array $snapshot ): array {
+        if ( ! array_key_exists( $role, $snapshot ) ) {
+            return array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
+        }
+        if ( ! is_array( $snapshot[ $role ] ) ) {
+            throw new \RuntimeException( 'the capability override option is malformed' );
+        }
+
+        return RolesAndCapabilities::sanitizeCapList( $snapshot[ $role ] );
     }
 
     /**
@@ -551,7 +608,9 @@ final class RoleCapabilitiesPage
         try {
             App::db()->transactional(
                 function () use ( $role ) {
-                    $before   = array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
+                    // B0-PR2-B3 — the same locking, strict read as the matrix editor.
+                    $snapshot = self::locked_override_snapshot();
+                    $before   = self::caps_from_snapshot( $role, $snapshot );
                     $template = self::template_caps( $role );
                     // B0-PR2-H2 — a reset restores the template, which can WIDEN a
                     // currently narrowed preset; refused under the same condition.

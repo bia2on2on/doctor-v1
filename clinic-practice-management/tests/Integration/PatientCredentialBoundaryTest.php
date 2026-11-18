@@ -12,6 +12,7 @@ use ClinicCore\Admin\RoleCapabilitiesPage;
 use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use WP_UnitTestCase;
 
 /**
@@ -1301,7 +1302,16 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         // (`WHERE membership_id = %d` with no ORDER BY); a table-wide fault would
         // break the manager-authorization read (AuthorizationService.php:97) first
         // and the arm would pass for the wrong reason.
-        $this->failReadsMatching( '/SELECT capability, effect FROM \S+ WHERE membership_id = \d+\z/', null, true );
+        // B5 — the fault must survive a change of READER SHAPE: it matches ANY
+        // SELECT on the capability rows of THIS membership (the strict reader and the
+        // soft capabilities_for() alike, with or without ORDER BY), so swapping the
+        // reader cannot dodge it. It is scoped to the target id, so the manager's own
+        // authorization read is never faulted first.
+        $this->failReadsMatching(
+            '/FROM \S*cpms_membership_capabilities\b[^;]*\bWHERE\s+membership_id = ' . (int) $membership . '\b/s',
+            null,
+            true
+        );
         $faulted = ManagementPortalController::dispatch(
             $manager,
             'clinic_staff_capability',
@@ -1727,6 +1737,80 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         self::assertTrue(
             true === ( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_ACCOUNTANT )[ $droppedCap ] ?? null ),
             'a preset without a patient holder resets to its template'
+        );
+    }
+
+    /**
+     * B1: the role-holder scan must read EVERY page, so a holder beyond the first
+     * page is still visible to the widening guard.
+     *
+     * MUTATION THAT TURNS THIS RED: reverting member_user_ids_for_role() to one
+     * bounded query (a single LIMIT) — the holder on page 2 and 3 disappear and the
+     * page counter drops to one read.
+     */
+    public function test_role_holder_scan_reads_every_page_of_holders(): void
+    {
+        $repository = new MembershipRepository( App::db() );
+        $expected   = array();
+
+        foreach ( array( 0 => 'pb_page_a', 1 => 'pb_page_b', 2 => 'pb_page_c' ) as $index => $login ) {
+            $user = $this->makeUser( 'subscriber', $login );
+            if ( 1 === $index ) {
+                $this->insertPatientLink( $user );
+            }
+            cpms_test_seed_membership( $user, $this->clinicId, RolesAndCapabilities::ROLE_ACCOUNTANT );
+            $expected[] = (int) $user;
+        }
+        sort( $expected );
+
+        $reads   = 0;
+        $counter = static function ( $query ) use ( &$reads ) {
+            $sql = (string) $query;
+            if ( false !== stripos( $sql, 'role_key' ) && false !== stripos( $sql, 'cpms_clinic_memberships' ) ) {
+                ++$reads;
+            }
+
+            return $query;
+        };
+        add_filter( 'query', $counter, 6 );
+        $found = $repository->member_user_ids_for_role( RolesAndCapabilities::ROLE_ACCOUNTANT, 1 );
+        remove_filter( 'query', $counter, 6 );
+
+        self::assertSame( $expected, $found, 'every active holder must be returned, in ascending order' );
+        self::assertGreaterThan( 2, $reads, 'a one-row page size must page through the holders (no silent truncation)' );
+        self::assertTrue(
+            PatientAccountPolicy::is_patient_account( $expected[1] ),
+            'the patient holder must be visible to the guard, not skipped by a bound'
+        );
+    }
+
+    /**
+     * B3: an override row that cannot be read refuses the preset write; capsMap()'s
+     * template fallback would have shown the template and let the write through.
+     *
+     * MUTATION THAT TURNS THIS RED: replacing locked_override_snapshot() with
+     * RolesAndCapabilities::capsMap() (the soft, template-falling-back read).
+     */
+    public function test_preset_matrix_refuses_when_the_override_row_cannot_be_read(): void
+    {
+        $admin  = $this->makeAdmin();
+        $input  = $this->matrixWithCurrentCaps();
+        $before = RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY );
+
+        $this->failReadsMatching( "option_name = 'cpms_role_caps_override'" );
+        $threw = false;
+        try {
+            RoleCapabilitiesPage::apply_capability_matrix( $input, $admin );
+        } catch ( \Throwable $e ) {
+            $threw = true;
+        }
+        $this->restoreReads();
+
+        self::assertTrue( $threw, 'an unreadable override row must refuse the write, never fall back to the template' );
+        self::assertSame(
+            $before,
+            RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY ),
+            'nothing may be written when the before-state is unknown'
         );
     }
 

@@ -158,6 +158,13 @@ final class CustomRoleManagementService {
             throw CustomRoleManagementException::key_conflict( $role_key );
         }
 
+        // B0-PR2-B2 — a role key that members ALREADY hold must not be defined here:
+        // defining it activates its capabilities for them at once, which is a
+        // widening nobody asked for. Refused as a key conflict, no write at all.
+        if ( array() !== ( new MembershipRepository( $this->db ) )->member_user_ids_for_role( $role_key ) ) {
+            throw CustomRoleManagementException::key_conflict( $role_key );
+        }
+
         // Atomicidade (F2-1): تعریف نقش و رویداد Audit اجباری آن در یک مرزِ
         // تراکنش. شکست ذخیره‌سازی Audit کل تعریف (و ردیف‌های capability)
         // را عقب می‌برد؛ هیچ نقشِ بدونِ Audit و هیچ «موفقیتِ کاذب» نمی‌ماند.
@@ -468,6 +475,18 @@ final class CustomRoleManagementService {
                         $existing['capabilities'],
                         true
                     );
+
+                    // B0-PR2-B2 — reactivation re-grants the STORED capabilities to
+                    // every active holder, so a patient/mixed/unknown holder refuses
+                    // it (same rule as widening a preset). The locking reference scan
+                    // serializes this with assignment, which locks the same rows.
+                    $this->roles->has_membership_references_for_update( $clinic_id, (string) $existing['role_key'] );
+                    $holders = ( new MembershipRepository( $this->db ) )->member_user_ids_for_role( (string) $existing['role_key'] );
+                    foreach ( $holders as $holder_user_id ) {
+                        if ( PatientAccountPolicy::is_patient_account( $holder_user_id ) ) {
+                            throw CustomRoleManagementException::membership_references();
+                        }
+                    }
                 }
 
                 $updated = $this->roles->transition_status(

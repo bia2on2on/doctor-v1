@@ -1135,6 +1135,20 @@ final class ManagementPortalService {
 			// one boundary (the membership service runs on a nested SAVEPOINT).
 			$this->db()->transactional(
 				function () use ( $location_ids, $membership_id, $actor_wp_user_id, $before, $membership, $trusted ) {
+					// B0-PR2-B4 — lock this membership row and RE-DECIDE inside the
+					// write boundary: a narrowing that commits after the pre-flight read
+					// must be what this write is judged against. Widening a
+					// patient/mixed/unknown member is refused before any write.
+					$locked       = $this->memberships->find_by_id( $membership_id, true );
+					$current_mode = (string) ( $locked['scope_mode'] ?? '' );
+					$current_locs = array_values( array_map( 'intval', $this->memberships->location_ids_for( $membership_id ) ) );
+					$widens_now   = 'clinic' === $current_mode
+						? false
+						: ( array() === $location_ids || array() !== array_diff( $location_ids, $current_locs ) );
+					if ( $widens_now && PatientAccountPolicy::is_patient_account( (int) ( $membership['wp_user_id'] ?? 0 ) ) ) {
+						throw new \RuntimeException( 'scope widening refused inside the write boundary' );
+					}
+
 					if ( array() === $location_ids ) {
 						App::membership_service()->set_scope_mode( $membership_id, 'clinic' );
 					} else {
@@ -1224,6 +1238,19 @@ final class ManagementPortalService {
 			// resolved by the authorization checks above and stays unchanged).
 			$this->db()->transactional(
 				function () use ( $effect, $membership_id, $capability, $actor_wp_user_id, $before, $membership, $trusted ) {
+					// B0-PR2-B4 — lock the membership and re-read the prior effect here:
+					// a DENY that committed after the pre-flight read must not be cleared
+					// by a stale CLEAR, and a moved state refuses the write outright.
+					$this->memberships->find_by_id( $membership_id, true );
+					$prior_now  = $this->capability_effect_strict( $membership_id, $capability );
+					$state_held = (string) ( $before['effect'] ?? '' ) === $prior_now;
+					$widens_now = 'grant' === $effect || ( 'clear' === $effect && 'deny' === $prior_now );
+					if ( ! $state_held
+						|| ( $widens_now && PatientAccountPolicy::is_patient_account( (int) ( $membership['wp_user_id'] ?? 0 ) ) )
+					) {
+						throw new \RuntimeException( 'concurrent capability change refused inside the write boundary' );
+					}
+
 					if ( 'clear' === $effect ) {
 						App::membership_service()->remove_capability( $membership_id, $capability );
 					} else {

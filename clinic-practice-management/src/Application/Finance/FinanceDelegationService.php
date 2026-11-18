@@ -11,7 +11,6 @@ use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
-use ClinicCore\Infrastructure\Repository\MembershipRepository;
 
 /**
  * 2026-10-15 — واگذاری صریح و محدود مجوزهای مالی حساس توسط مدیر کلینیک.
@@ -109,6 +108,32 @@ final class FinanceDelegationService {
 
 		$this->db->transactional(
 			function () use ( $actor_user_id, $clinic_id, $target_membership_id, $capability, $before, $target_user_id ): void {
+				// B0-PR2-B4 — the decision is re-made INSIDE the write boundary on a
+				// locked membership row: a DENY that committed after the pre-flight
+				// read must win over this GRANT, never be overwritten by it.
+				$this->memberships->find_by_id( $target_membership_id, true );
+				try {
+					$current = $this->explicit_effect_strict( $target_membership_id, $capability );
+				} catch ( \Throwable $e ) {
+					throw FinanceException::of( 'CLINIC_DELEGATION_DENIED', 'وضعیت فعلی واگذاری خوانده نشد؛ عملیات انجام نشد.', 409, [ 'clinic_id' => $clinic_id ] );
+				}
+				if ( 'deny' === $current ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENY_PRECEDENCE',
+						'برای این عضو Deny صریح ثبت شده است؛ واگذاری نمی‌تواند آن را نقض کند.',
+						409,
+						[ 'capability' => $capability, 'membership_id' => $target_membership_id ]
+					);
+				}
+				if ( PatientAccountPolicy::is_patient_account( $target_user_id ) ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'واگذاری مجوز به این عضویت مجاز نیست.',
+						403,
+						[ 'clinic_id' => $clinic_id ]
+					);
+				}
+
 				$this->membership_service->set_capability( $target_membership_id, $capability, 'grant' );
 
 				$meta = [ 'clinic_id' => $clinic_id, 'target_wp_user_id' => $target_user_id ];
@@ -179,6 +204,40 @@ final class FinanceDelegationService {
 
 		$this->db->transactional(
 			function () use ( $actor_user_id, $clinic_id, $target_membership_id, $capability, $current, $target_user_id ): void {
+				// B0-PR2-B4 — re-read on a locked row: a DENY that arrived after the
+				// pre-flight read must not be removed by a stale revocation, and a
+				// GRANT that was already withdrawn is not "revoked" twice.
+				$this->memberships->find_by_id( $target_membership_id, true );
+				try {
+					$current_now = $this->explicit_effect_strict( $target_membership_id, $capability );
+				} catch ( \Throwable $e ) {
+					throw FinanceException::of( 'CLINIC_DELEGATION_DENIED', 'وضعیت فعلی واگذاری خوانده نشد؛ عملیات انجام نشد.', 409, [ 'clinic_id' => $clinic_id ] );
+				}
+				if ( null === $current_now ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_NOT_FOUND',
+						'واگذاری فعالی برای این Capability وجود ندارد.',
+						404,
+						[ 'capability' => $capability, 'membership_id' => $target_membership_id ]
+					);
+				}
+				if ( $current_now !== $current ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'وضعیت واگذاری هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
+						409,
+						[ 'clinic_id' => $clinic_id ]
+					);
+				}
+				if ( 'deny' === $current_now && PatientAccountPolicy::is_patient_account( $target_user_id ) ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'واگذاری مجوز به این عضویت مجاز نیست.',
+						403,
+						[ 'clinic_id' => $clinic_id ]
+					);
+				}
+
 				$this->membership_service->remove_capability( $target_membership_id, $capability );
 
 				$meta = [ 'clinic_id' => $clinic_id, 'target_wp_user_id' => $target_user_id ];
