@@ -83,12 +83,12 @@ final class PatientAdminPage
         // written to web-server access logs and browser history. A POST without a
         // valid nonce is refused outright (fail closed); the search stays read-only.
         $q = '';
-        if (isset($_SERVER['REQUEST_METHOD']) && sanitize_text_field(wp_unslash($_SERVER['REQUEST_METHOD'])) === 'POST') {
-            $nonce = isset($_POST['_wpnonce']) ? sanitize_text_field(wp_unslash($_POST['_wpnonce'])) : '';
-            if (!wp_verify_nonce($nonce, self::SEARCH_NONCE_ACTION)) {
-                wp_die('دسترسی ندارید', 403);
+        if ( isset( $_SERVER['REQUEST_METHOD'] ) && sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) === 'POST' ) {
+            $nonce = isset( $_POST['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ) ) : '';
+            if ( ! wp_verify_nonce( $nonce, self::SEARCH_NONCE_ACTION ) ) {
+                wp_die( 'دسترسی ندارید', 403 );
             }
-            $q = isset($_POST['q']) ? sanitize_text_field(wp_unslash($_POST['q'])) : '';
+            $q = isset( $_POST['q'] ) ? sanitize_text_field( wp_unslash( $_POST['q'] ) ) : '';
         }
         $results = [];
         $searchError = '';
@@ -117,9 +117,9 @@ final class PatientAdminPage
                 <div class="notice <?php echo str_starts_with($notice, 'خطا') ? 'notice-error' : 'notice-success'; ?> is-dismissible"><p><?php echo esc_html($notice); ?></p></div>
             <?php endif; ?>
 
-            <form method="post" action="<?php echo esc_url(admin_url('admin.php')); ?>" class="cpms-autofocus">
+            <form method="post" action="<?php echo esc_url( admin_url( 'admin.php' ) ); ?>" class="cpms-autofocus">
                 <input type="hidden" name="page" value="<?php echo esc_attr(self::PAGE_SLUG); ?>">
-                <?php wp_nonce_field(self::SEARCH_NONCE_ACTION); // B0-PR1: body-only search needs the CSRF token. ?>
+                <?php wp_nonce_field( self::SEARCH_NONCE_ACTION ); // B0-PR1: body-only search needs the CSRF token. ?>
                 <table class="form-table" role="presentation">
                     <tr>
                         <th><label for="cpms_pat_q">جستجوی بیمار</label></th>

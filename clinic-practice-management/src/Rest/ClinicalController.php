@@ -217,8 +217,8 @@ final class ClinicalController extends RestBase
         register_rest_route(self::NS, '/search', [
             [
                 // B0-PR1: the search term is accepted ONLY in the POST body.
-                'methods' => WP_REST_Server::CREATABLE,
-                'callback' => fn (WP_REST_Request $r) => $this->search($r),
+                'methods'             => WP_REST_Server::CREATABLE,
+                'callback'            => fn ( WP_REST_Request $r ) => $this->search( $r ),
                 'permission_callback' => fn (WP_REST_Request $r) => $this->permCap($r, RolesAndCapabilities::SEARCH),
                 'args' => [
                     'q' => ['required' => true, 'type' => 'string'],
@@ -268,25 +268,24 @@ final class ClinicalController extends RestBase
      * history or Referer headers. Authorization (nonce + cpms_search) is unchanged
      * and still runs before the service call.
      */
-    private function search(WP_REST_Request $r): WP_REST_Response|WP_Error
-    {
-        if (array_key_exists('q', $r->get_query_params())) {
-            return $this->error('CLINIC_VALIDATION_FAILED', 400, 'عبارت جستجو باید در بدنهٔ درخواست ارسال شود');
+    private function search( WP_REST_Request $r ): WP_REST_Response|WP_Error {
+        if ( array_key_exists( 'q', $r->get_query_params() ) ) {
+            return $this->error( 'CLINIC_VALIDATION_FAILED', 400, 'عبارت جستجو باید در بدنهٔ درخواست ارسال شود' );
         }
 
-        $body = $this->body_only($r);
+        $body = $this->body_only( $r );
         $q    = $body['q'] ?? null;
-        if (!is_string($q)) {
-            return $this->error('CLINIC_VALIDATION_FAILED', 400, 'عبارت جستجو باید رشته باشد');
+        if ( ! is_string( $q ) ) {
+            return $this->error( 'CLINIC_VALIDATION_FAILED', 400, 'عبارت جستجو باید رشته باشد' );
         }
-        $type = isset($body['type']) && is_string($body['type']) ? $body['type'] : 'all';
-        $from = isset($body['from']) && is_string($body['from']) ? $body['from'] : null;
-        $to   = isset($body['to']) && is_string($body['to']) ? $body['to'] : null;
+        $type = isset( $body['type'] ) && is_string( $body['type'] ) ? $body['type'] : 'all';
+        $from = isset( $body['from'] ) && is_string( $body['from'] ) ? $body['from'] : null;
+        $to   = isset( $body['to'] ) && is_string( $body['to'] ) ? $body['to'] : null;
 
         return $this->staff(
             $r,
             RolesAndCapabilities::SEARCH,
-            fn () => $this->clinical->globalSearch($this->userId($r), $q, $type, $from, $to)
+            fn () => $this->clinical->globalSearch( $this->userId( $r ), $q, $type, $from, $to )
         );
     }
 
@@ -395,14 +394,13 @@ final class ClinicalController extends RestBase
      *
      * @return array<string, mixed>
      */
-    private function body_only(WP_REST_Request $r): array
-    {
+    private function body_only( WP_REST_Request $r ): array {
         $params = $r->get_json_params();
-        if (is_array($params)) {
+        if ( is_array( $params ) ) {
             return $params;
         }
         $params = $r->get_body_params();
 
-        return is_array($params) ? $params : [];
+        return is_array( $params ) ? $params : [];
     }
 }
