@@ -49,7 +49,8 @@ $cpms_doctor_mod    = StaffPortalShell::MODULE_DOCTOR === $cpms_module_id;
 $cpms_reception_mod = StaffPortalShell::MODULE_RECEPTION === $cpms_module_id;
 $cpms_finance_mod   = StaffPortalShell::MODULE_FINANCE === $cpms_module_id;
 $cpms_reports_mod   = StaffPortalShell::MODULE_REPORTS === $cpms_module_id;
-$cpms_messages_mod  = StaffPortalShell::STAFF_MESSAGING_AVAILABLE && StaffPortalShell::MODULE_MESSAGES === $cpms_module_id;
+$cpms_messages_mod  = StaffPortalShell::STAFF_MESSAGING_AVAILABLE
+	&& StaffPortalShell::MODULE_MESSAGES === $cpms_module_id;
 $cpms_pricing_mod   = StaffPortalShell::MODULE_PRICING === $cpms_module_id;
 
 $cpms_login_name = $cpms_logged_in ? (string) $cpms_user->display_name : '';
