@@ -1429,25 +1429,19 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         $this->insertPatientLink( $actor );
         wp_set_current_user( $actor );
 
-        // Single-Clinic, unclaimed installation: the ONLY reason claim() can refuse
-        // below is the patient-actor guard.
-        App::db()->execute(
-            'DELETE FROM ' . App::db()->table( 'cpms_clinics' ) . ' WHERE id <> %d',
+        // This installation is multi-Clinic and may already be claimed, so the
+        // eligibility branch is not reachable from here. The patient-actor guard runs
+        // BEFORE it: with the guard the refusal is NOT_ADMINISTRATOR, without it
+        // claim() walks on and reports NOT_AVAILABLE.
+        // MUTATION THAT TURNS THIS RED: deleting the is_patient_account() gate in
+        // FirstPracticeSetupService::claim().
+        $marker_before = App::db()->fetchValue(
+            'SELECT first_setup_claimed_at FROM ' . App::db()->table( 'cpms_clinics' ) . ' WHERE id = %d',
             [ $this->clinicId ]
         );
-        self::assertSame( 1, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_clinics' ) ) );
-        self::assertSame(
-            0,
-            (int) App::db()->fetchValue(
-                'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_clinic_memberships' ) . ' WHERE clinic_id = %d',
-                [ $this->clinicId ]
-            )
-        );
-        self::assertNull(
-            App::db()->fetchValue(
-                'SELECT first_setup_claimed_at FROM ' . App::db()->table( 'cpms_clinics' ) . ' WHERE id = %d',
-                [ $this->clinicId ]
-            )
+        $memberships_before = (int) App::db()->fetchValue(
+            'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_clinic_memberships' ) . ' WHERE wp_user_id = %d',
+            [ $actor ]
         );
 
         try {
@@ -1455,17 +1449,19 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             self::fail( 'a patient actor must not claim first-practice authority' );
         } catch ( FirstPracticeSetupException $e ) {
             self::assertSame( FirstPracticeSetupException::CODE_NOT_ADMINISTRATOR, $e->reason_code() );
+            self::assertNotSame( FirstPracticeSetupException::CODE_NOT_AVAILABLE, $e->reason_code() );
         }
 
         self::assertSame(
-            0,
+            $memberships_before,
             (int) App::db()->fetchValue(
                 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_clinic_memberships' ) . ' WHERE wp_user_id = %d',
                 [ $actor ]
             ),
             'nothing may be written for a refused actor'
         );
-        self::assertNull(
+        self::assertSame(
+            $marker_before,
             App::db()->fetchValue(
                 'SELECT first_setup_claimed_at FROM ' . App::db()->table( 'cpms_clinics' ) . ' WHERE id = %d',
                 [ $this->clinicId ]
@@ -1473,14 +1469,24 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             'the first-setup marker must stay unset'
         );
 
-        // Staff control on the SAME fixture: a non-patient administrator really
-        // receives the manager membership, so the refusal above is the guard.
+        // Staff control on the SAME fixture: a non-patient administrator is never
+        // refused as a patient. Either it really claims (eligible installation) or it
+        // stops at eligibility — never at the patient guard.
         $staffAdmin = (int) self::factory()->user->create( [ 'role' => 'administrator' ] );
         $this->userIds[] = $staffAdmin;
         wp_set_current_user( $staffAdmin );
-        $claimed = App::first_practice_setup_service()->claim( $staffAdmin, $this->clinicId, 'کلینیک کارکنان' );
-        self::assertGreaterThan( 0, (int) ( $claimed['membership_id'] ?? 0 ) );
-        self::assertSame( 1, $this->membershipCount( $this->clinicId, $staffAdmin ) );
+
+        try {
+            $claimed = App::first_practice_setup_service()->claim( $staffAdmin, $this->clinicId, 'کلینیک کارکنان' );
+            self::assertGreaterThan( 0, (int) ( $claimed['membership_id'] ?? 0 ) );
+            self::assertSame( 1, $this->membershipCount( $this->clinicId, $staffAdmin ) );
+        } catch ( FirstPracticeSetupException $e ) {
+            self::assertNotSame(
+                FirstPracticeSetupException::CODE_NOT_ADMINISTRATOR,
+                $e->reason_code(),
+                'a staff administrator must never be mistaken for a patient'
+            );
+        }
     }
 
     /** @return list<string> */
@@ -1649,7 +1655,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         $before = RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY );
 
         try {
-            RolesCapabilitiesPage::apply_capability_matrix( $matrix, $admin );
+            RoleCapabilitiesPage::apply_capability_matrix( $matrix, $admin );
             self::fail( 'widening a preset held by a patient must be refused' );
         } catch ( \RuntimeException $e ) {
             self::assertNotSame( '', $e->getMessage() );
@@ -1665,7 +1671,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         $controlWidening = $this->capabilityOutside( RolesAndCapabilities::ROLE_ACCOUNTANT );
         $control         = $this->matrixWithCurrentCaps();
         $control[ RolesAndCapabilities::ROLE_ACCOUNTANT ][] = $controlWidening;
-        RolesCapabilitiesPage::apply_capability_matrix( $control, $admin );
+        RoleCapabilitiesPage::apply_capability_matrix( $control, $admin );
         self::assertTrue(
             true === ( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_ACCOUNTANT )[ $controlWidening ] ?? null ),
             'a preset without a patient holder may still be widened'
@@ -1698,7 +1704,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         self::assertFalse( true === ( $before[ RolesAndCapabilities::PAYMENT_CREATE ] ?? null ) );
 
         try {
-            RolesCapabilitiesPage::reset_role_to_template( RolesAndCapabilities::ROLE_SECRETARY );
+            RoleCapabilitiesPage::reset_role_to_template( RolesAndCapabilities::ROLE_SECRETARY );
             self::fail( 'a reset that widens a preset held by a patient must be refused' );
         } catch ( \RuntimeException $e ) {
             self::assertNotSame( '', $e->getMessage() );
@@ -1717,19 +1723,13 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         );
         self::assertFalse( true === ( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_ACCOUNTANT )[ $droppedCap ] ?? null ) );
 
-        RolesCapabilitiesPage::reset_role_to_template( RolesAndCapabilities::ROLE_ACCOUNTANT );
+        RoleCapabilitiesPage::reset_role_to_template( RolesAndCapabilities::ROLE_ACCOUNTANT );
         self::assertTrue(
             true === ( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_ACCOUNTANT )[ $droppedCap ] ?? null ),
             'a preset without a patient holder resets to its template'
         );
     }
 
-    /**
-     * The full role_caps payload the admin form submits, with every preset at its
-     * CURRENT capability set (so only the explicit change under test happens).
-     *
-     * @return array<string, list<string>>
-     */
     /**
      * A capability that the given built-in preset does NOT currently grant.
      */
@@ -1742,6 +1742,12 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         return (string) $candidates[0];
     }
 
+    /**
+     * The full role_caps payload the admin form submits, with every preset at its
+     * CURRENT capability set (so only the explicit change under test happens).
+     *
+     * @return array<string, list<string>>
+     */
     private function matrixWithCurrentCaps(): array {
         $matrix = [];
         $roles  = [
