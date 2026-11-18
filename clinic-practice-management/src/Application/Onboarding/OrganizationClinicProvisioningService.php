@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ClinicCore\Application\Onboarding;
 
 use ClinicCore\Application\Clinic\ClinicLifecyclePolicy;
+use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use InvalidArgumentException;
@@ -364,6 +365,12 @@ final class OrganizationClinicProvisioningService {
             throw new InvalidArgumentException( 'invalid membership subject' );
         }
 
+        // B0-PR2 — organization-manager GRANT only: never to a patient account.
+        // $active === false is a revocation and stays allowed.
+        if ( $active && PatientAccountPolicy::is_patient_account( $target_user_id ) ) {
+            throw new InvalidArgumentException( 'invalid membership subject' );
+        }
+
         return $this->db->transactional(
             function () use ( $actor_id, $organization_id, $target_user_id, $active ): int {
                 $organization = $this->db->fetchRowForUpdate(
@@ -497,6 +504,7 @@ final class OrganizationClinicProvisioningService {
             || $organization_id <= 0
             || $target_user_id <= 0
             || get_userdata( $target_user_id ) === false
+            || PatientAccountPolicy::is_patient_account( $target_user_id )
         ) {
             throw new RuntimeException( 'organization manager bootstrap denied' );
         }
@@ -917,6 +925,13 @@ final class OrganizationClinicProvisioningService {
                 // lookup; no WordPress write happens inside this transaction).
                 if ( $target_user_id <= 0 || false === get_userdata( $target_user_id ) ) {
                     throw new InvalidArgumentException( 'clinic manager user not found' );
+                }
+
+                // B0-PR2 — a patient account is never designated as Clinic manager.
+                // Refused before the membership read/write; the internal message stays
+                // in the same neutral family as the lookup refusal.
+                if ( PatientAccountPolicy::is_patient_account( $target_user_id ) ) {
+                    throw new InvalidArgumentException( 'clinic manager user not eligible' );
                 }
 
                 $existing = $this->db->fetchRowForUpdate(

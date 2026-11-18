@@ -1170,6 +1170,39 @@ final class ManagementPortalTest extends WP_UnitTestCase {
         self::assertSame( 'active', (string) $still['status'] );
     }
 
+    /**
+     * B0-PR2 (B7) — the staff-management authority boundary itself, proven with a
+     * VALID staff role: the refusals below cannot come from the patient-role
+     * check, so they show the non-manager authority check still holds.
+     */
+    public function test_non_manager_cannot_assign_or_enroll_a_valid_staff_role(): void {
+        $before = App::membership_service()->membership_for( $this->clinicA, $this->clinicManager );
+        self::assertNotNull( $before );
+
+        self::assertFalse(
+            ManagementPortalController::dispatch(
+                $this->staffMember,
+                'clinic_staff_role',
+                array( 'clinic_id' => (string) $this->clinicA, 'target_user_id' => (string) $this->clinicManager, 'role_key' => RolesAndCapabilities::ROLE_ACCOUNTANT )
+            )['ok'],
+            'a non-manager cannot reassign a membership to a valid staff role'
+        );
+        $after = App::membership_service()->membership_for( $this->clinicA, $this->clinicManager );
+        self::assertNotNull( $after );
+        self::assertSame( (string) $before['role_key'], (string) $after['role_key'] );
+
+        $email = 'valid-role-enroll-' . bin2hex( random_bytes( 4 ) ) . '@example.test';
+        self::assertFalse(
+            ManagementPortalController::dispatch(
+                $this->staffMember,
+                'clinic_staff_enroll',
+                array( 'clinic_id' => (string) $this->clinicA, 'identifier' => $email, 'role_key' => RolesAndCapabilities::ROLE_ACCOUNTANT )
+            )['ok'],
+            'a non-manager cannot enroll a staff account with a valid role either'
+        );
+        self::assertFalse( get_user_by( 'email', $email ) instanceof \WP_User, 'no account may be provisioned' );
+    }
+
     public function test_self_role_escalation_is_refused(): void {
         $before = App::membership_service()->membership_for( $this->clinicA, $this->clinicManager );
         self::assertNotNull( $before );

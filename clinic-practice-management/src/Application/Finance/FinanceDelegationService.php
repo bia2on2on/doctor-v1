@@ -6,6 +6,7 @@ namespace ClinicCore\Application\Finance;
 
 use ClinicCore\Application\Authorization\AuthorizationException;
 use ClinicCore\Application\Membership\MembershipService;
+use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
@@ -95,6 +96,17 @@ final class FinanceDelegationService {
 		}
 
 		$target_user_id = (int) ( $membership['wp_user_id'] ?? 0 );
+		// B0-PR2 — a sensitive financial capability is never granted to a patient
+		// account. Revocation (revoke()) is unaffected and stays allowed.
+		if ( PatientAccountPolicy::is_patient_account( $target_user_id ) ) {
+			throw FinanceException::of(
+				'CLINIC_DELEGATION_DENIED',
+				'واگذاری مجوز به این عضویت مجاز نیست.',
+				403,
+				[ 'clinic_id' => $clinic_id ]
+			);
+		}
+
 		$this->db->transactional(
 			function () use ( $actor_user_id, $clinic_id, $target_membership_id, $capability, $before, $target_user_id ): void {
 				$this->membership_service->set_capability( $target_membership_id, $capability, 'grant' );

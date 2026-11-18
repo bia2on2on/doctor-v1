@@ -6,6 +6,7 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Admin\StaffManagementPage;
 use ClinicCore\Frontend\ManagementPortalController;
+use ClinicCore\Application\Finance\FinanceException;
 use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
@@ -31,6 +32,11 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
     /** @var list<int> */
     private array $userIds = [];
 
+    /** @var callable|null Installed `query` fault, if any. */
+    private $queryFault = null;
+
+    private ?bool $previousSuppression = null;
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -41,8 +47,71 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
+        $this->restoreReads();
         wp_set_current_user(0);
         parent::tearDown();
+    }
+
+    /**
+     * Force a database error on every SELECT touching $needle (no DDL: a
+     * CREATE/DROP would implicitly commit the fixture transaction).
+     *
+     * @param callable|null $onlyWhen Additional condition: break the read only
+     *                               while it returns true.
+     */
+    private function failReadsMatching( string $needle, ?callable $onlyWhen = null ): void
+    {
+        global $wpdb;
+
+        self::assertNull( $this->queryFault, 'the read fault must not be installed twice' );
+
+        $fault = static function ( $query ) use ( $needle, $onlyWhen ) {
+            $sql = (string) $query;
+            if ( $onlyWhen !== null && true !== $onlyWhen() ) {
+                return $query;
+            }
+            if ( 1 === preg_match( '/\A\s*SELECT/i', $sql ) && false !== strpos( $sql, $needle ) ) {
+                return 'SELECT cpms_fault_injection_no_such_column FROM ' . $needle;
+            }
+
+            return $query;
+        };
+
+        $this->previousSuppression = (bool) $wpdb->suppress_errors( true );
+        add_filter( 'query', $fault, 5 );
+        $this->queryFault = $fault;
+    }
+
+    private function restoreReads(): void
+    {
+        if ( $this->queryFault === null ) {
+            return;
+        }
+
+        remove_filter( 'query', $this->queryFault, 5 );
+        $this->queryFault = null;
+
+        global $wpdb;
+        $wpdb->suppress_errors( (bool) $this->previousSuppression );
+        $this->previousSuppression = null;
+    }
+
+    private function membershipRow( int $membershipId ): array
+    {
+        return (array) App::db()->fetchRow(
+            'SELECT id, role_key, status FROM ' . App::db()->table( 'cpms_clinic_memberships' )
+            . ' WHERE id = %d LIMIT 1',
+            [ $membershipId ]
+        );
+    }
+
+    private function capabilityOverrides( int $membershipId ): array
+    {
+        return App::db()->fetchAll(
+            'SELECT capability, effect FROM ' . App::db()->table( 'cpms_membership_capabilities' )
+            . ' WHERE membership_id = %d ORDER BY capability ASC',
+            [ $membershipId ]
+        );
     }
 
     // ==================================================================
@@ -571,14 +640,18 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
 
     public function test_portal_cannot_enroll_an_existing_patient_account_as_staff(): void
     {
-        $manager   = $this->makeClinicManager( 'pb_mgr_existing' );
-        $patient = $this->makePatientAccount( 'pb_portal_existing' );
-        $email   = (string) get_userdata( $patient )->user_email;
+        $manager = $this->makeClinicManager( 'pb_mgr_existing' );
 
-        $membershipsBefore = (int) App::db()->fetchValue(
-            'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_clinic_memberships' ) . ' WHERE wp_user_id = %d',
-            [ $patient ]
-        );
+        // LINK-ONLY target: no membership at all in this Clinic, so the
+        // duplicate-membership refusal cannot be what refuses the enrollment —
+        // only the patient-account policy can. Without the guard the enrollment
+        // would succeed and create a staff membership for a patient.
+        $patient = $this->makeUser( 'subscriber', 'pb_portal_existing' );
+        $this->insertPatientLink( $patient );
+        $email = (string) get_userdata( $patient )->user_email;
+
+        self::assertSame( 0, $this->membershipCount( $this->clinicId, $patient ) );
+        $auditBefore = $this->auditCount( 'STAFF_MEMBERSHIP_CREATED' );
 
         $result = ManagementPortalController::dispatch(
             $manager,
@@ -592,12 +665,30 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
 
         self::assertFalse( $result['ok'], 'an existing patient account is never a staff target' );
         self::assertSame(
-            $membershipsBefore,
-            (int) App::db()->fetchValue(
-                'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_clinic_memberships' ) . ' WHERE wp_user_id = %d',
-                [ $patient ]
-            ),
-            'no membership may be added'
+            0,
+            $this->membershipCount( $this->clinicId, $patient ),
+            'no membership may be added to the patient account'
+        );
+        self::assertSame( $auditBefore, $this->auditCount( 'STAFF_MEMBERSHIP_CREATED' ) );
+
+        // Control: the same path still enrolls an ordinary new staff account.
+        $controlEmail = 'pb_portal_control_' . bin2hex( random_bytes( 4 ) ) . '@boundary.test';
+        $control      = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_enroll',
+            [
+                'clinic_id'  => (string) $this->clinicId,
+                'identifier' => $controlEmail,
+                'role_key'   => RolesAndCapabilities::ROLE_SECRETARY,
+            ]
+        );
+        self::assertTrue( $control['ok'], 'staff enrollment of a non-patient target is unchanged' );
+        $controlUser = get_user_by( 'email', $controlEmail );
+        self::assertInstanceOf( \WP_User::class, $controlUser );
+        self::assertSame(
+            1,
+            $this->membershipCount( $this->clinicId, (int) $controlUser->ID ),
+            'the control target really receives a membership'
         );
     }
 
@@ -669,5 +760,326 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
 
         $reset = StaffManagementPage::initiatePasswordReset( $staffId, $admin, $this->clinicId );
         self::assertSame( '', $reset['error'], 'staff password reset is unchanged' );
+    }
+
+    // ==================================================================
+    // 5. Fail-closed evidence reads — a failed read is patient evidence
+    // ==================================================================
+
+    public function test_failed_membership_read_is_patient_evidence(): void
+    {
+        $admin = $this->makeAdmin();
+        $staff = $this->makeUser( 'subscriber', 'pb_fault_membership' );
+        cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+        $email = (string) get_userdata( $staff )->user_email;
+        $hash  = $this->passwordHash( $staff );
+
+        // Positive control: with working reads the same account is ordinary staff.
+        // WITHOUT the fail-closed read the fault below looks exactly like
+        // "no patient membership", so the update would silently succeed.
+        self::assertFalse( PatientAccountPolicy::is_patient_account( $staff ) );
+
+        $this->failReadsMatching( 'cpms_clinic_memberships' );
+
+        self::assertTrue(
+            PatientAccountPolicy::is_patient_account( $staff ),
+            'a failed membership read must never look like absence of evidence'
+        );
+
+        $update = StaffManagementPage::upsertUser(
+            [
+                'clinic_id'    => $this->clinicId,
+                'mode'         => 'update',
+                'user_id'      => $staff,
+                'display_name' => 'کارمند خرابی',
+                'email'        => $email,
+                'role'         => RolesAndCapabilities::ROLE_SECRETARY,
+                'password'     => 'FaultMembershipPass123',
+            ],
+            $admin
+        );
+
+        self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $update['error'] );
+        self::assertSame( $hash, $this->passwordHash( $staff ), 'no password write on an unverified target' );
+
+        $this->restoreReads();
+        self::assertFalse( PatientAccountPolicy::is_patient_account( $staff ), 'reads work again' );
+    }
+
+    public function test_failed_patient_link_read_is_patient_evidence(): void
+    {
+        $admin = $this->makeAdmin();
+        $staff = $this->makeUser( 'subscriber', 'pb_fault_link' );
+        cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+        $email = (string) get_userdata( $staff )->user_email;
+
+        self::assertFalse( PatientAccountPolicy::is_patient_account( $staff ) );
+
+        $this->failReadsMatching( 'cpms_patient_user_links' );
+
+        self::assertTrue(
+            PatientAccountPolicy::is_patient_account( $staff ),
+            'a failed durable-link read must deny'
+        );
+
+        $update = StaffManagementPage::upsertUser(
+            [
+                'clinic_id'    => $this->clinicId,
+                'mode'         => 'update',
+                'user_id'      => $staff,
+                'display_name' => 'کارمند خرابی',
+                'email'        => $email,
+                'role'         => RolesAndCapabilities::ROLE_SECRETARY,
+                'password'     => 'FaultLinkPass123',
+            ],
+            $admin
+        );
+
+        self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $update['error'] );
+        $this->restoreReads();
+    }
+
+    public function test_failed_parked_role_read_is_patient_evidence(): void
+    {
+        $admin = $this->makeAdmin();
+        $staff = $this->makeUser( 'subscriber', 'pb_fault_parked' );
+        cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+        $email = (string) get_userdata( $staff )->user_email;
+
+        self::assertFalse( PatientAccountPolicy::is_patient_account( $staff ) );
+
+        $this->failReadsMatching( 'cpms_previous_role' );
+
+        self::assertTrue(
+            PatientAccountPolicy::is_patient_account( $staff ),
+            'a failed parked-role read must deny'
+        );
+
+        $update = StaffManagementPage::upsertUser(
+            [
+                'clinic_id'    => $this->clinicId,
+                'mode'         => 'update',
+                'user_id'      => $staff,
+                'display_name' => 'کارمند خرابی',
+                'email'        => $email,
+                'role'         => RolesAndCapabilities::ROLE_SECRETARY,
+                'password'     => 'FaultParkedPass123',
+            ],
+            $admin
+        );
+
+        self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $update['error'] );
+        $this->restoreReads();
+    }
+
+    // ==================================================================
+    // 6. Parked patient role — suspension must not erase the evidence
+    // ==================================================================
+
+    public function test_parked_patient_role_keeps_denying_after_suspension(): void
+    {
+        $admin  = $this->makeAdmin();
+        $target = $this->makeUser( RolesAndCapabilities::ROLE_PATIENT, 'pb_parked_patient' );
+        // The staff membership is the ONLY non-patient evidence: if the parked
+        // role were ignored, this account would look like a plain staff account
+        // after the suspension downgraded its WordPress role to Subscriber.
+        cpms_test_seed_membership( $target, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+        $email = (string) get_userdata( $target )->user_email;
+
+        self::assertSame( '', StaffManagementPage::toggleUser( $target, 'deactivate', $admin, $this->clinicId )['error'] );
+        self::assertSame( [ 'subscriber' ], array_values( (array) get_userdata( $target )->roles ) );
+        self::assertSame(
+            RolesAndCapabilities::ROLE_PATIENT,
+            (string) get_user_meta( $target, 'cpms_previous_role', true )
+        );
+
+        self::assertTrue(
+            PatientAccountPolicy::is_patient_account( $target ),
+            'the parked patient role is still patient evidence'
+        );
+
+        // (a) classic screen: reactivation stays denied.
+        self::assertSame(
+            PatientAccountPolicy::DENIAL_MESSAGE,
+            StaffManagementPage::toggleUser( $target, 'activate', $admin, $this->clinicId )['error']
+        );
+
+        // (b) classic screen: profile/password update stays denied.
+        $hash   = $this->passwordHash( $target );
+        $update = StaffManagementPage::upsertUser(
+            [
+                'clinic_id'    => $this->clinicId,
+                'mode'         => 'update',
+                'user_id'      => $target,
+                'display_name' => 'بیمار',
+                'email'        => $email,
+                'role'         => RolesAndCapabilities::ROLE_SECRETARY,
+                'password'     => 'ParkedPatientPass123',
+            ],
+            $admin
+        );
+        self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $update['error'] );
+        self::assertSame( $hash, $this->passwordHash( $target ) );
+
+        // (c) management portal: enrollment of the same account stays denied.
+        $manager = $this->makeClinicManager( 'pb_mgr_parked' );
+        self::assertFalse(
+            ManagementPortalController::dispatch(
+                $manager,
+                'clinic_staff_enroll',
+                [
+                    'clinic_id'  => (string) $this->clinicId,
+                    'identifier' => $email,
+                    'role_key'   => RolesAndCapabilities::ROLE_SECRETARY,
+                ]
+            )['ok']
+        );
+        self::assertSame( 1, $this->membershipCount( $this->clinicId, $target ) );
+    }
+
+    // ==================================================================
+    // 7. Portal reactivation is a NEW participation: always denied
+    // ==================================================================
+
+    public function test_portal_refuses_reactivation_of_a_patient_membership(): void
+    {
+        $manager    = $this->makeClinicManager( 'pb_mgr_reactivate' );
+        $patient    = $this->makeUser( 'subscriber', 'pb_reactivate_patient' );
+        $this->insertPatientLink( $patient );
+        $membership = cpms_test_seed_membership( $patient, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $suspended = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_status',
+            [
+                'clinic_id'     => (string) $this->clinicId,
+                'membership_id' => (string) $membership,
+                'active'        => '0',
+            ]
+        );
+        self::assertTrue( $suspended['ok'], 'suspending patient-side access is allowed' );
+        self::assertSame( 'suspended', (string) $this->membershipRow( $membership )['status'] );
+
+        $auditBefore = $this->auditCount( 'MEMBERSHIP_REACTIVATED' );
+
+        $reactivated = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_status',
+            [
+                'clinic_id'     => (string) $this->clinicId,
+                'membership_id' => (string) $membership,
+                'active'        => '1',
+            ]
+        );
+
+        self::assertFalse( $reactivated['ok'], 'a patient membership is never reactivated' );
+        self::assertSame( 'suspended', (string) $this->membershipRow( $membership )['status'] );
+        self::assertSame( $auditBefore, $this->auditCount( 'MEMBERSHIP_REACTIVATED' ) );
+    }
+
+    // ==================================================================
+    // 8. Enrollment: a refusal inside the boundary leaves nothing behind
+    // ==================================================================
+
+    public function test_enrollment_rolls_back_when_the_new_target_becomes_patient_evidence(): void
+    {
+        $manager = $this->makeClinicManager( 'pb_mgr_rollback' );
+        $email   = 'pb_rollback_' . bin2hex( random_bytes( 4 ) ) . '@boundary.test';
+        $created = false;
+
+        $markCreated = static function () use ( &$created ): void {
+            $created = true;
+        };
+        add_action( 'user_register', $markCreated );
+
+        // Before provisioning the evidence reads work, so the pre-boundary check
+        // passes; from the moment the account exists every membership read fails,
+        // which the in-transaction re-check must treat as patient evidence.
+        $this->failReadsMatching(
+            'cpms_clinic_memberships',
+            static function () use ( &$created ): bool {
+                return true === $created;
+            }
+        );
+
+        $auditBefore = $this->auditCount( 'STAFF_MEMBERSHIP_CREATED' );
+
+        $result = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_enroll',
+            [
+                'clinic_id'  => (string) $this->clinicId,
+                'identifier' => $email,
+                'role_key'   => RolesAndCapabilities::ROLE_SECRETARY,
+            ]
+        );
+
+        $this->restoreReads();
+        remove_action( 'user_register', $markCreated );
+
+        self::assertTrue( $created, 'the account was provisioned before the in-boundary refusal' );
+        self::assertFalse( $result['ok'], 'the enrollment must fail' );
+        self::assertFalse( $this->userExistsByEmail( $email ), 'no account may survive the refusal' );
+        self::assertSame( $auditBefore, $this->auditCount( 'STAFF_MEMBERSHIP_CREATED' ) );
+    }
+
+    // ==================================================================
+    // 9. Every other grant path refuses a patient target
+    // ==================================================================
+
+    public function test_capability_grants_refuse_a_patient_membership(): void
+    {
+        $manager    = $this->makeClinicManager( 'pb_mgr_caps' );
+        $patient    = $this->makeUser( 'subscriber', 'pb_caps_patient' );
+        $this->insertPatientLink( $patient );
+        $membership = cpms_test_seed_membership( $patient, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $granted = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_capability',
+            [
+                'clinic_id'     => (string) $this->clinicId,
+                'membership_id' => (string) $membership,
+                'capability'    => RolesAndCapabilities::CONFIG,
+                'effect'        => 'grant',
+            ]
+        );
+        self::assertFalse( $granted['ok'], 'no explicit GRANT may widen a patient membership' );
+        self::assertSame( [], $this->capabilityOverrides( $membership ) );
+
+        $denied = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_capability',
+            [
+                'clinic_id'     => (string) $this->clinicId,
+                'membership_id' => (string) $membership,
+                'capability'    => RolesAndCapabilities::CONFIG,
+                'effect'        => 'deny',
+            ]
+        );
+        self::assertTrue( $denied['ok'], 'adding a DENY only narrows access and stays allowed' );
+        self::assertSame(
+            [ [ 'capability' => RolesAndCapabilities::CONFIG, 'effect' => 'deny' ] ],
+            $this->capabilityOverrides( $membership )
+        );
+
+        // Financial delegation is a GRANT of a sensitive capability.
+        try {
+            App::finance_delegation_service()->delegate(
+                $manager,
+                $this->clinicId,
+                $membership,
+                RolesAndCapabilities::PAYMENT_REFUND
+            );
+            self::fail( 'financial delegation to a patient membership must be refused' );
+        } catch ( FinanceException $e ) {
+            self::assertSame( 'CLINIC_DELEGATION_DENIED', $e->errorCode );
+        }
+
+        self::assertSame(
+            [ [ 'capability' => RolesAndCapabilities::CONFIG, 'effect' => 'deny' ] ],
+            $this->capabilityOverrides( $membership ),
+            'the refused delegation wrote no override'
+        );
     }
 }

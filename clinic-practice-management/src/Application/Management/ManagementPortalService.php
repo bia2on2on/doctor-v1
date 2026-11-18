@@ -922,6 +922,17 @@ final class ManagementPortalService {
 			return self::failure();
 		}
 
+		// B0-PR2 — resolve an EXISTING target before the boundary opens, so a
+		// refused target is refused before anything is provisioned. Provisioning
+		// (only for an e-mail that resolves to nothing) stays inside the boundary
+		// and is rolled back if the re-check below refuses it.
+		$existing_target = $this->resolve_existing_subscriber( $identifier );
+		if ( $existing_target > 0
+			&& $existing_target !== $actor_wp_user_id
+			&& ! $this->staff_target_is_eligible( $existing_target ) ) {
+			return self::failure();
+		}
+
 		$membership_id = 0;
 		$target        = 0;
 		// Descriptor of a subscriber provisioned inside the boundary; populated
@@ -943,7 +954,11 @@ final class ManagementPortalService {
 						return self::invalid( 'افزودن خودتان به کارکنان این درمانگاه مجاز نیست.' );
 					}
 					if ( ! $this->staff_target_is_eligible( $target ) ) {
-						return self::failure();
+						// A fresh account can only reach this line through a failed
+						// evidence read; THROW so the boundary rolls the provisioned
+						// subscriber (and anything else) back instead of committing a
+						// refusal that silently created an account.
+						throw new \RuntimeException( 'staff target refused inside the boundary' );
 					}
 					if ( $this->memberships->find( $trusted, $target ) !== null ) {
 						return self::prerequisite(
@@ -1019,6 +1034,14 @@ final class ManagementPortalService {
 				return self::failure();
 			}
 			$membership = $found;
+
+			// B0-PR2 — revocation is the safe direction: SUSPENDING a patient or
+			// mixed account stays allowed (it only withdraws access), while
+			// REACTIVATING one re-opens participation and is refused here with the
+			// uniform portal failure, before any membership or audit write.
+			if ( $active && PatientAccountPolicy::is_patient_account( (int) ( $membership['wp_user_id'] ?? 0 ) ) ) {
+				return self::failure();
+			}
 
 			// D6 audit atomicity: the lifecycle transition and its mandatory
 			// audit event commit or roll back together. A failed audit rolls
@@ -1171,6 +1194,15 @@ final class ManagementPortalService {
 				'effect'       => $this->capability_effect( $membership_id, $capability ),
 				'target_user'  => (int) ( $membership['wp_user_id'] ?? 0 ),
 			);
+
+			// B0-PR2 — a patient account never gains access here: a GRANT, or a CLEAR
+			// that removes an explicit DENY, would widen it and is refused with the
+			// stable denial. Adding a DENY, or clearing a GRANT, only narrows access
+			// and stays allowed.
+			$widens = 'grant' === $effect || ( 'clear' === $effect && 'deny' === (string) $before['effect'] );
+			if ( $widens && PatientAccountPolicy::is_patient_account( (int) ( $membership['wp_user_id'] ?? 0 ) ) ) {
+				return self::failure();
+			}
 
 			// D6 audit atomicity: the GRANT/DENY/clear override and its
 			// mandatory audit event share one boundary (DENY > GRANT policy is
@@ -1534,6 +1566,24 @@ final class ManagementPortalService {
 		}
 
 		return $membership;
+	}
+
+	/**
+	 * Read-only resolution of an EXISTING account by e-mail/login (0 when the
+	 * identifier matches no account). Used before the enrollment boundary opens,
+	 * so an existing refused target is refused before anything can be written;
+	 * provisioning itself stays inside the boundary (see below).
+	 */
+	private function resolve_existing_subscriber( string $identifier ): int {
+		if ( ! is_email( $identifier ) ) {
+			$by_login = get_user_by( 'login', $identifier );
+
+			return $by_login instanceof WP_User ? (int) $by_login->ID : 0;
+		}
+
+		$existing = get_user_by( 'email', $identifier );
+
+		return $existing instanceof WP_User ? (int) $existing->ID : 0;
 	}
 
 	/**
