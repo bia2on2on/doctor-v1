@@ -1403,7 +1403,9 @@ final class StaffManagementPage
 
         foreach ( $roles as $role ) {
             $role = (string) $role;
-            if ( '' !== $role ) {
+            // `subscriber` is the downgrade this very suspension performs; it
+            // carries no evidence and must not accumulate on every suspension.
+            if ( '' !== $role && 'subscriber' !== $role ) {
                 $parked[] = $role;
             }
         }

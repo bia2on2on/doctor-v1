@@ -1369,7 +1369,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             'clinic_clinician_register',
             [
                 'clinic_id'    => (string) $this->clinicId,
-                'wp_user_id'   => (string) $patient,
+                'target_user_id' => (string) $patient,
                 'full_name'    => 'پزشک بیمار',
                 'specialty'    => '',
             ]
@@ -1428,9 +1428,12 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         $wpdb->query(
             $wpdb->prepare(
                 'INSERT INTO ' . $wpdb->prefix . 'cpms_patient_identity_links'
-                . ' (identity_id, wp_user_id, linked_at) VALUES (%d, %d, %s)',
+                . ' (organization_id, identity_id, wp_user_id, mobile_at_link, linked_at)'
+                . ' VALUES (%d, %d, %d, %s, %s)',
+                (int) $wpdb->get_var( 'SELECT id FROM ' . $wpdb->prefix . 'cpms_organizations ORDER BY id ASC LIMIT 1' ),
                 $identityId,
                 $wpUserId,
+                '09120000000',
                 $now
             )
         );
