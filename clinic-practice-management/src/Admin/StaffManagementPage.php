@@ -107,7 +107,10 @@ final class StaffManagementPage
         $rows           = self::list_users( $clinic_id );
         $roles = self::roleLabels();
         // B0-PR2: the patient role is never offered for creation or assignment.
-        $staff_role_options = array_diff_key( $roles, [ RolesAndCapabilities::ROLE_PATIENT => true ] );
+        $staff_roles = array_diff_key(
+            $roles,
+            [ RolesAndCapabilities::ROLE_PATIENT => true ]
+        );
         $clinic_choices = self::managed_clinic_choices( (int) get_current_user_id() );
         $assignable     = self::assignment_options( $clinic_id, $rows );
         ?>
@@ -191,7 +194,7 @@ final class StaffManagementPage
                                 <?php if ( $edit !== null && '' !== (string) ( $edit['membership_role'] ?? '' ) && ! in_array( (string) $edit['membership_role'], array_keys( $roles ), true ) ) : ?>
                                     <option value="" selected><?php echo esc_html( '— حفظ نقش سفارشی فعلی: ' . (string) $edit['role_label'] . ' (بدون تغییر عضویت و بدون تغییر نقش WordPress) —' ); ?></option>
                                 <?php endif; ?>
-                                <?php foreach ( $staff_role_options as $slug => $label ) : ?>
+                                <?php foreach ( $staff_roles as $slug => $label ) : ?>
                                     <option value="<?php echo esc_attr( $slug ); ?>" <?php selected( $edit === null ? '' : (string) $edit['role'], $slug ); ?>><?php echo esc_html( $label ); ?></option>
                                 <?php endforeach; ?>
                             </select>
@@ -232,7 +235,7 @@ final class StaffManagementPage
                             <tr><th><label for="cpms_existing_role">نقش عضویت در این Clinic</label></th>
                                 <td>
                                     <select id="cpms_existing_role" name="role" required>
-                                        <?php foreach ( $staff_role_options as $slug => $label ) : ?>
+                                        <?php foreach ( $staff_roles as $slug => $label ) : ?>
                                             <option value="<?php echo esc_attr( $slug ); ?>"><?php echo esc_html( $label ); ?></option>
                                         <?php endforeach; ?>
                                     </select>
@@ -614,7 +617,8 @@ final class StaffManagementPage
                 && CustomRolePolicy::is_definable_role_key( $membership_role_key );
         }
 
-        if ( ! $preserve_membership_role && ( $role === '' || ! in_array( $role, self::ASSIGNABLE_STAFF_ROLES, true ) ) ) {
+        $role_is_assignable = in_array( $role, self::ASSIGNABLE_STAFF_ROLES, true );
+        if ( ! $preserve_membership_role && ( $role === '' || ! $role_is_assignable ) ) {
             return ['error' => 'نقش غیرمجاز است (فقط نقش‌های CPMS قابل انتساب‌اند؛ از انتساب administrator جلوگیری شد).', 'generated' => '', 'user_id' => 0];
         }
         if ( $display_name === '' ) {

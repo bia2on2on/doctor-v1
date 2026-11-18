@@ -36,7 +36,8 @@ final class PatientAccountPolicy
      * Stable, non-revealing denial. Deliberately does not say WHY the target is
      * a patient (role vs membership vs link) and does not echo any identifier.
      */
-    public const DENIAL_MESSAGE = 'این عملیات برای حساب بیمار مجاز نیست؛ حساب بیمار فقط از مسیر خود بیمار مدیریت می‌شود.';
+    public const DENIAL_MESSAGE = 'این عملیات برای حساب بیمار مجاز نیست؛ '
+        . 'حساب بیمار فقط از مسیر خود بیمار مدیریت می‌شود.';
 
     /**
      * Whether a role key is the patient role. Used for the created/assigned role
@@ -68,7 +69,8 @@ final class PatientAccountPolicy
         }
 
         try {
-            return self::has_patient_membership( $wp_user_id ) || self::has_patient_link( $wp_user_id );
+            return self::has_patient_membership( $wp_user_id )
+                || self::has_patient_link( $wp_user_id );
         } catch ( \Throwable $e ) {
             return true; // unreadable evidence is never a staff grant
         }
@@ -119,7 +121,8 @@ final class PatientAccountPolicy
         $db = App::db();
 
         $count = $db->fetchValue(
-            'SELECT COUNT(*) FROM ' . $db->table( 'cpms_patient_user_links' ) . ' WHERE wp_user_id = %d',
+            'SELECT COUNT(*) FROM ' . $db->table( 'cpms_patient_user_links' )
+            . ' WHERE wp_user_id = %d',
             array( $wp_user_id )
         );
 
