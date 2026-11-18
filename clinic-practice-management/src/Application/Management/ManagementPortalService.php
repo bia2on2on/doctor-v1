@@ -1113,6 +1113,17 @@ final class ManagementPortalService {
 				'location_ids' => array_values( array_map( 'intval', $this->memberships->location_ids_for( $membership_id ) ) ),
 			);
 
+			// B0-PR2-G6 — a patient/mixed/unknown member is never WIDENED here:
+			// clinic-wide from a Location-scoped membership, or any added Location,
+			// is refused. Narrowing (fewer Locations, or clinic → Location subset)
+			// stays allowed, and the comparison is made before the write boundary.
+			$widens = 'clinic' === (string) $before['scope_mode']
+				? false
+				: ( array() === $location_ids || array() !== array_diff( $location_ids, $before['location_ids'] ) );
+			if ( $widens && PatientAccountPolicy::is_patient_account( (int) ( $membership['wp_user_id'] ?? 0 ) ) ) {
+				return self::failure();
+			}
+
 			// Every Location must be real, ACTIVE and owned by this Clinic.
 			foreach ( $location_ids as $location_id ) {
 				if ( $this->locations->findActiveForClinic( $trusted, $location_id ) === null ) {
@@ -1189,10 +1200,14 @@ final class ManagementPortalService {
 			if ( $found === null || (string) ( $found['status'] ?? '' ) !== 'active' ) {
 				return self::failure();
 			}
-			$membership = $found;
-			$before     = array(
-				'effect'       => $this->capability_effect( $membership_id, $capability ),
-				'target_user'  => (int) ( $membership['wp_user_id'] ?? 0 ),
+			// B0-PR2-G5 — the prior override is read STRICTLY: a failed read must
+			// never look like "no DENY" (that is what let CLEAR widen access). An
+			// unreadable prior state refuses the mutation outright.
+			$prior_effect = $this->capability_effect_strict( $membership_id, $capability );
+			$membership   = $found;
+			$before       = array(
+				'effect'      => $prior_effect,
+				'target_user' => (int) ( $membership['wp_user_id'] ?? 0 ),
 			);
 
 			// B0-PR2 — a patient account never gains access here: a GRANT, or a CLEAR
@@ -1284,6 +1299,11 @@ final class ManagementPortalService {
 					if ( $wp_user_id > 0 ) {
 						$membership = $this->memberships->find( $trusted, $wp_user_id );
 						if ( $membership === null || (string) ( $membership['status'] ?? '' ) !== 'active' ) {
+							return self::failure();
+						}
+						// B0-PR2-G7 — a patient/mixed/unknown account is never linked to a
+						// clinician profile from here (it would hand out a clinician identity).
+						if ( PatientAccountPolicy::is_patient_account( $wp_user_id ) ) {
 							return self::failure();
 						}
 						// Existing profile: adopt it only inside the same Organization so a
@@ -1497,10 +1517,19 @@ final class ManagementPortalService {
 	}
 
 	/**
-	 * Current explicit override effect for one capability ('' when none).
+	 * Strict variant: throws when the override rows cannot be read, so callers can
+	 * refuse instead of treating an unknown state as "no override".
+	 *
+	 * @throws \RuntimeException
 	 */
-	private function capability_effect( int $membership_id, string $capability ): string {
-		foreach ( $this->memberships->capabilities_for( $membership_id ) as $row ) {
+	private function capability_effect_strict( int $membership_id, string $capability ): string {
+		$rows = $this->db()->fetch_all_strict(
+			'SELECT capability, effect FROM ' . $this->db()->table( 'cpms_membership_capabilities' )
+			. ' WHERE membership_id = %d',
+			array( $membership_id )
+		);
+
+		foreach ( $rows as $row ) {
 			if ( (string) ( $row['capability'] ?? '' ) === $capability ) {
 				return (string) ( $row['effect'] ?? '' );
 			}

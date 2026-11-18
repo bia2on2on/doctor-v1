@@ -23,9 +23,16 @@ use WP_User;
  *      inspected, not only the first one);
  *   2. a Clinic membership row (any status) carries the `cpms_patient` role key;
  *   3. a durable `cpms_patient_user_links` row binds the account to a patient;
- *   4. the parked-role meta `cpms_previous_role` records `cpms_patient` — a
- *      suspension parks the role there and downgrades the live role, so without
- *      this the parked account would lose its only durable patient evidence.
+ *   4. the parked-role meta `cpms_previous_role` records `cpms_patient`, or the
+ *      merged parked-roles meta `cpms_parked_roles` lists `cpms_patient` — a
+ *      suspension parks roles there and downgrades the live role, so without
+ *      this the parked account would lose its only durable patient evidence;
+ *   5. an Organization-level `cpms_patient_identity_links` row binds the account
+ *      to a patient identity (distinct from the Clinic-level links above);
+ *   6. the current-site capabilities usermeta (`{prefix}capabilities`) still
+ *      grants `cpms_patient` — read independently of `WP_User->roles`, because
+ *      that array is filled from the SAME meta and can arrive empty on a failed
+ *      read while the other evidence reads succeed.
  * Mixed accounts (a staff role plus any of the above) therefore fail closed: a
  * person who is both patient and staff must use two separate accounts.
  *
@@ -43,6 +50,13 @@ final class PatientAccountPolicy {
      * staff suspension writes for the parked WordPress role.
      */
     private const META_PREV_ROLE = 'cpms_previous_role';
+
+    /**
+     * Merged list of every WordPress role a suspension parked (JSON array), so a
+     * second suspension in another Clinic merges instead of overwriting and a
+     * patient role in ANY position stays durable evidence.
+     */
+    private const META_PARKED_ROLES = 'cpms_parked_roles';
 
     /**
      * Stable, non-revealing denial. Deliberately does not say WHY the target is
@@ -81,6 +95,8 @@ final class PatientAccountPolicy {
         try {
             return self::has_patient_membership( $wp_user_id )
                 || self::has_patient_link( $wp_user_id )
+                || self::has_patient_identity_link( $wp_user_id )
+                || self::has_patient_capability_row( $wp_user_id )
                 || self::has_parked_patient_role( $wp_user_id );
         } catch ( \Throwable $e ) {
             return true; // a failed evidence read is never a staff grant
@@ -141,19 +157,75 @@ final class PatientAccountPolicy {
     }
 
     /**
-     * The parked role written by a staff suspension, when it records the patient
-     * role. Strict read against the WordPress usermeta table, so a failed read
-     * denies instead of silently erasing the account's only patient evidence.
+     * An Organization-level identity↔account link (any state) is patient
+     * evidence. Strict read: a failed query denies.
      */
-    private static function has_parked_patient_role( int $wp_user_id ): bool {
+    private static function has_patient_identity_link( int $wp_user_id ): bool {
         $db = App::db();
 
         $rows = $db->fetch_all_strict(
-            'SELECT umeta_id FROM ' . $db->dbPrefix() . 'usermeta'
-            . ' WHERE user_id = %d AND meta_key = %s AND meta_value = %s LIMIT 1',
-            array( $wp_user_id, self::META_PREV_ROLE, RolesAndCapabilities::ROLE_PATIENT )
+            'SELECT id FROM ' . $db->table( 'cpms_patient_identity_links' )
+            . ' WHERE wp_user_id = %d LIMIT 1',
+            array( $wp_user_id )
         );
 
         return $rows !== array();
+    }
+
+    /**
+     * The current-site capabilities usermeta still grants the patient role.
+     *
+     * `WP_User->roles` is filled from exactly this row, so a failed read there
+     * yields an empty roles array that looks like a staff account. This read is
+     * independent and strict, and its failure is patient evidence (deny).
+     */
+    private static function has_patient_capability_row( int $wp_user_id ): bool {
+        global $wpdb;
+
+        $rows = App::db()->fetch_all_strict(
+            'SELECT meta_value FROM ' . $wpdb->usermeta
+            . ' WHERE user_id = %d AND meta_key = %s LIMIT 1',
+            array( $wp_user_id, $wpdb->prefix . 'capabilities' )
+        );
+
+        foreach ( $rows as $row ) {
+            $value = (string) ( $row['meta_value'] ?? '' );
+            if ( false !== strpos( $value, '"' . RolesAndCapabilities::ROLE_PATIENT . '"' ) ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * The parked roles written by a staff suspension, when any of them is the
+     * patient role. Strict read against the WordPress usermeta table, so a failed
+     * read denies instead of silently erasing the account's only patient
+     * evidence. Both keys are read: `cpms_previous_role` (restored on
+     * reactivation) and the merged `cpms_parked_roles` list.
+     */
+    private static function has_parked_patient_role( int $wp_user_id ): bool {
+        global $wpdb;
+
+        $patient = RolesAndCapabilities::ROLE_PATIENT;
+
+        $single = App::db()->fetch_all_strict(
+            'SELECT umeta_id FROM ' . $wpdb->usermeta
+            . ' WHERE user_id = %d AND meta_key = %s AND meta_value = %s LIMIT 1',
+            array( $wp_user_id, self::META_PREV_ROLE, $patient )
+        );
+
+        if ( $single !== array() ) {
+            return true;
+        }
+
+        $merged = App::db()->fetch_all_strict(
+            'SELECT umeta_id FROM ' . $wpdb->usermeta
+            . ' WHERE user_id = %d AND meta_key = %s AND meta_value LIKE %s LIMIT 1',
+            array( $wp_user_id, self::META_PARKED_ROLES, '%"' . $patient . '"%' )
+        );
+
+        return $merged !== array();
     }
 }

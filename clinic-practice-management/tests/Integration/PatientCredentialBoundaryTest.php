@@ -7,6 +7,7 @@ namespace ClinicCore\Tests\Integration;
 use ClinicCore\Admin\StaffManagementPage;
 use ClinicCore\Frontend\ManagementPortalController;
 use ClinicCore\Application\Finance\FinanceException;
+use ClinicCore\Application\Onboarding\FirstPracticeSetupException;
 use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
@@ -667,7 +668,17 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         self::assertSame(
             0,
             $this->membershipCount( $this->clinicId, $patient ),
-            'no membership may be added to the patient account'
+            'no membership may be added to the patient account in THIS Clinic'
+        );
+        // G10(b): the total across ALL Clinics is asserted too, so a membership
+        // added anywhere (not only in the selected Clinic) is caught.
+        self::assertSame(
+            0,
+            (int) App::db()->fetchValue(
+                'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_clinic_memberships' ) . ' WHERE wp_user_id = %d',
+                [ $patient ]
+            ),
+            'no membership may be added to the patient account in ANY Clinic'
         );
         self::assertSame( $auditBefore, $this->auditCount( 'STAFF_MEMBERSHIP_CREATED' ) );
 
@@ -924,19 +935,27 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $update['error'] );
         self::assertSame( $hash, $this->passwordHash( $target ) );
 
-        // (c) management portal: enrollment of the same account stays denied.
-        $manager = $this->makeClinicManager( 'pb_mgr_parked' );
+        // (c) management portal: enrollment stays denied in ANOTHER Clinic too.
+        //     G10(a): the same-Clinic arm was vacuous — the existing membership
+        //     rejects it first — so the target must hold NO membership there.
+        $otherClinic = $this->createClinic();
+        $manager     = $this->makeClinicManager( 'pb_mgr_parked' );
+        cpms_test_seed_membership( $manager, $otherClinic, RolesAndCapabilities::ROLE_MANAGER );
+        self::assertSame( 0, $this->membershipCount( $otherClinic, $target ) );
+
         self::assertFalse(
             ManagementPortalController::dispatch(
                 $manager,
                 'clinic_staff_enroll',
                 [
-                    'clinic_id'  => (string) $this->clinicId,
+                    'clinic_id'  => (string) $otherClinic,
                     'identifier' => $email,
                     'role_key'   => RolesAndCapabilities::ROLE_SECRETARY,
                 ]
-            )['ok']
+            )['ok'],
+            'Fails if the parked-patient-role evidence read is removed from PatientAccountPolicy'
         );
+        self::assertSame( 0, $this->membershipCount( $otherClinic, $target ) );
         self::assertSame( 1, $this->membershipCount( $this->clinicId, $target ) );
     }
 
@@ -1084,5 +1103,357 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             $this->capabilityOverrides( $membership ),
             'the refused delegation wrote no override'
         );
+    }
+
+    // ==================================================================
+    // 10. G1-G8 — additional evidence sources and widening guards
+    // ==================================================================
+
+    /**
+     * G1: the roles array comes from the capabilities usermeta; a failed read
+     * there must not look like "no patient role". Fails if the strict
+     * capabilities-usermeta read is removed from PatientAccountPolicy.
+     */
+    public function test_failed_capabilities_usermeta_read_is_patient_evidence(): void
+    {
+        $admin = $this->makeAdmin();
+        $staff = $this->makeUser( 'subscriber', 'pb_fault_capsrow' );
+        cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+        $email = (string) get_userdata( $staff )->user_email;
+
+        self::assertFalse( PatientAccountPolicy::is_patient_account( $staff ) );
+
+        $this->failReadsMatching( 'capabilities' );
+
+        self::assertTrue(
+            PatientAccountPolicy::is_patient_account( $staff ),
+            'a failed capabilities-usermeta read is patient evidence'
+        );
+
+        $update = StaffManagementPage::upsertUser(
+            [
+                'clinic_id'    => $this->clinicId,
+                'mode'         => 'update',
+                'user_id'      => $staff,
+                'display_name' => 'کارمند خرابی',
+                'email'        => $email,
+                'role'         => RolesAndCapabilities::ROLE_SECRETARY,
+                'password'     => 'FaultCapsRowPass123',
+            ],
+            $admin
+        );
+        self::assertNotSame( '', $update['error'], 'the update must be refused while the role read fails' );
+        $this->restoreReads();
+    }
+
+    /**
+     * G2: an Organization-level identity link alone is patient evidence.
+     * Fails if has_patient_identity_link() is removed from the union.
+     */
+    public function test_identity_link_only_account_is_refused_on_every_staff_path(): void
+    {
+        $manager = $this->makeClinicManager( 'pb_mgr_identity' );
+        $target  = $this->makeUser( 'subscriber', 'pb_identity_only' );
+        $this->insertIdentityLink( $target );
+        $email = (string) get_userdata( $target )->user_email;
+
+        self::assertTrue( PatientAccountPolicy::is_patient_account( $target ) );
+
+        // (a) portal enrollment in a Clinic where the account has NO membership.
+        self::assertFalse(
+            ManagementPortalController::dispatch(
+                $manager,
+                'clinic_staff_enroll',
+                [
+                    'clinic_id'  => (string) $this->clinicId,
+                    'identifier' => $email,
+                    'role_key'   => RolesAndCapabilities::ROLE_SECRETARY,
+                ]
+            )['ok'],
+            'Fails if the identity-link evidence source is removed'
+        );
+        self::assertSame( 0, $this->membershipCount( $this->clinicId, $target ) );
+
+        // (b) credential path.
+        $admin  = $this->makeAdmin();
+        $update = StaffManagementPage::upsertUser(
+            [
+                'clinic_id'    => $this->clinicId,
+                'mode'         => 'update',
+                'user_id'      => $target,
+                'display_name' => 'بیمار',
+                'email'        => $email,
+                'role'         => RolesAndCapabilities::ROLE_SECRETARY,
+                'password'     => 'IdentityOnlyPass123',
+            ],
+            $admin
+        );
+        self::assertSame( PatientAccountPolicy::DENIAL_MESSAGE, $update['error'] );
+
+        // (c) the same read failing is patient evidence.
+        $staff = $this->makeUser( 'subscriber', 'pb_fault_identity' );
+        cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+        self::assertFalse( PatientAccountPolicy::is_patient_account( $staff ) );
+        $this->failReadsMatching( 'cpms_patient_identity_links' );
+        self::assertTrue( PatientAccountPolicy::is_patient_account( $staff ) );
+        $this->restoreReads();
+
+        // (d) a non-patient control is unaffected.
+        self::assertFalse( PatientAccountPolicy::is_patient_account( $staff ) );
+    }
+
+    /**
+     * G4: the patient role in ANY position, and across two Clinic suspensions.
+     * Fails if the merged parked-roles meta or the all-roles merge is removed.
+     */
+    public function test_parked_roles_survive_role_order_and_a_second_clinic_suspension(): void
+    {
+        $admin  = $this->makeAdmin();
+        $target = $this->makeUser( RolesAndCapabilities::ROLE_SECRETARY, 'pb_parked_two_clinics' );
+        // Staff role FIRST, patient role SECOND: $user->roles[0] is the staff role.
+        $user = get_userdata( $target );
+        $user->add_role( RolesAndCapabilities::ROLE_PATIENT );
+        cpms_test_seed_membership( $target, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $otherClinic = $this->createClinic();
+        cpms_test_seed_membership( $target, $otherClinic, RolesAndCapabilities::ROLE_SECRETARY );
+
+        // First suspension (this Clinic) parks both roles.
+        self::assertSame( '', StaffManagementPage::toggleUser( $target, 'deactivate', $admin, $this->clinicId )['error'] );
+        self::assertSame( [ 'cpms_patient', 'cpms_secretary' ], self::parkedRoles( $target ) );
+        self::assertTrue( PatientAccountPolicy::is_patient_account( $target ) );
+
+        // Second suspension (another Clinic) must MERGE, never overwrite.
+        self::assertSame( '', StaffManagementPage::toggleUser( $target, 'deactivate', $admin, $otherClinic )['error'] );
+        self::assertSame( [ 'cpms_patient', 'cpms_secretary' ], self::parkedRoles( $target ), 'a second suspension must merge' );
+
+        self::assertTrue( PatientAccountPolicy::is_patient_account( $target ) );
+        self::assertSame(
+            PatientAccountPolicy::DENIAL_MESSAGE,
+            StaffManagementPage::toggleUser( $target, 'activate', $admin, $this->clinicId )['error'],
+            'Fails if the parked-roles evidence read is removed'
+        );
+    }
+
+    /**
+     * G5: CLEAR of an explicit DENY widens a patient member; a failed prior-read
+     * refuses. Fails if capability_effect_strict() or the widening guard is removed.
+     */
+    public function test_clear_of_an_explicit_deny_is_refused_for_a_patient_member(): void
+    {
+        $manager    = $this->makeClinicManager( 'pb_mgr_clear' );
+        $patient    = $this->makeUser( 'subscriber', 'pb_clear_patient' );
+        $this->insertPatientLink( $patient );
+        $membership = cpms_test_seed_membership( $patient, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $deny = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_capability',
+            [
+                'clinic_id'     => (string) $this->clinicId,
+                'membership_id' => (string) $membership,
+                'capability'    => RolesAndCapabilities::CONFIG,
+                'effect'        => 'deny',
+            ]
+        );
+        self::assertTrue( $deny['ok'], 'a DENY only narrows and stays allowed' );
+
+        $clear = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_capability',
+            [
+                'clinic_id'     => (string) $this->clinicId,
+                'membership_id' => (string) $membership,
+                'capability'    => RolesAndCapabilities::CONFIG,
+                'effect'        => 'clear',
+            ]
+        );
+        self::assertFalse( $clear['ok'], 'clearing a DENY would widen a patient member' );
+        self::assertSame(
+            [ [ 'capability' => RolesAndCapabilities::CONFIG, 'effect' => 'deny' ] ],
+            $this->capabilityOverrides( $membership ),
+            'the DENY must survive the refused CLEAR'
+        );
+
+        // The prior override read failing must refuse too (unknown != "no DENY").
+        $this->failReadsMatching( 'cpms_membership_capabilities' );
+        $faulted = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_capability',
+            [
+                'clinic_id'     => (string) $this->clinicId,
+                'membership_id' => (string) $membership,
+                'capability'    => RolesAndCapabilities::CONFIG,
+                'effect'        => 'clear',
+            ]
+        );
+        $this->restoreReads();
+        self::assertFalse( $faulted['ok'], 'Fails if the strict prior-override read is removed' );
+    }
+
+    /**
+     * G6: a patient member is never widened from Location scope to clinic-wide
+     * or by adding Locations; narrowing stays allowed. Fails if the G6 widening
+     * guard in set_staff_locations() is removed.
+     */
+    public function test_patient_member_scope_can_only_narrow(): void
+    {
+        $manager = $this->makeClinicManager( 'pb_mgr_scope' );
+        $patient = $this->makeUser( 'subscriber', 'pb_scope_patient' );
+        $this->insertPatientLink( $patient );
+        $membership = cpms_test_seed_membership( $patient, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $location_id = $this->createLocation();
+
+        App::membership_service()->set_scope_mode( $membership, 'location', [ $location_id ] );
+
+        // Widening: Location-scoped -> clinic-wide.
+        self::assertFalse(
+            ManagementPortalController::dispatch(
+                $manager,
+                'clinic_staff_locations',
+                [
+                    'clinic_id'     => (string) $this->clinicId,
+                    'membership_id' => (string) $membership,
+                    'location_ids'  => '',
+                ]
+            )['ok'],
+            'clinic-wide scope would widen a patient member'
+        );
+        self::assertSame( 'location', (string) $this->membershipRow( $membership )['scope_mode'] );
+
+        // Widening: adding another Location.
+        $second_location = $this->createLocation();
+        self::assertFalse(
+            ManagementPortalController::dispatch(
+                $manager,
+                'clinic_staff_locations',
+                [
+                    'clinic_id'     => (string) $this->clinicId,
+                    'membership_id' => (string) $membership,
+                    'location_ids'  => $location_id . ',' . $second_location,
+                ]
+            )['ok'],
+            'adding a Location would widen a patient member'
+        );
+        self::assertSame( [ $location_id ], array_values( array_map( 'intval', App::membership_service()->location_ids_for( $membership ) ) ) );
+
+        // Narrowing to the SAME set stays allowed (no widening).
+        self::assertTrue(
+            ManagementPortalController::dispatch(
+                $manager,
+                'clinic_staff_locations',
+                [
+                    'clinic_id'     => (string) $this->clinicId,
+                    'membership_id' => (string) $membership,
+                    'location_ids'  => (string) $location_id,
+                ]
+            )['ok'],
+            'an identical (non-widening) scope change stays allowed'
+        );
+    }
+
+    /**
+     * G7: a patient account is never linked to a clinician profile from the
+     * portal. Fails if the portal clinician-link guard is removed.
+     */
+    public function test_patient_account_is_never_linked_to_a_clinician_profile(): void
+    {
+        $manager = $this->makeClinicManager( 'pb_mgr_clinician' );
+        $patient = $this->makeUser( 'subscriber', 'pb_clinician_patient' );
+        $this->insertPatientLink( $patient );
+        cpms_test_seed_membership( $patient, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $result = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_clinician_register',
+            [
+                'clinic_id'    => (string) $this->clinicId,
+                'wp_user_id'   => (string) $patient,
+                'full_name'    => 'پزشک بیمار',
+                'specialty'    => '',
+            ]
+        );
+
+        self::assertFalse( $result['ok'], 'a patient account is never a clinician identity' );
+        self::assertSame(
+            0,
+            (int) App::db()->fetchValue(
+                'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_clinicians' ) . ' WHERE wp_user_id = %d',
+                [ $patient ]
+            )
+        );
+    }
+
+    /**
+     * G8: a patient account never claims first-practice manager authority even
+     * holding manage_options. Fails if the actor guard in claim() is removed.
+     */
+    public function test_patient_actor_cannot_claim_first_practice_manager_membership(): void
+    {
+        $actor = (int) self::factory()->user->create( [ 'role' => 'administrator' ] );
+        $this->userIds[] = $actor;
+        $this->insertPatientLink( $actor );
+        wp_set_current_user( $actor );
+
+        $this->expectException( FirstPracticeSetupException::class );
+        App::first_practice_setup_service()->claim( $actor, $this->clinicId, 'کلینیک بیمار' );
+    }
+
+    /** @return list<string> */
+    private static function parkedRoles( int $userId ): array {
+        $raw     = (string) get_user_meta( $userId, 'cpms_parked_roles', true );
+        $decoded = json_decode( $raw, true );
+
+        return is_array( $decoded ) ? array_map( 'strval', $decoded ) : [];
+    }
+
+    private function insertIdentityLink( int $wpUserId ): void {
+        global $wpdb;
+
+        $now = App::db()->nowUtcSql();
+        $wpdb->query(
+            $wpdb->prepare(
+                'INSERT INTO ' . $wpdb->prefix . 'cpms_patient_identities'
+                . ' (organization_id, internal_ref, created_at, updated_at)'
+                . ' VALUES (%d, %s, %s, %s)',
+                (int) $wpdb->get_var( 'SELECT id FROM ' . $wpdb->prefix . 'cpms_organizations ORDER BY id ASC LIMIT 1' ),
+                'REF-' . bin2hex( random_bytes( 4 ) ),
+                $now,
+                $now
+            )
+        );
+        $identityId = (int) $wpdb->insert_id;
+
+        $wpdb->query(
+            $wpdb->prepare(
+                'INSERT INTO ' . $wpdb->prefix . 'cpms_patient_identity_links'
+                . ' (identity_id, wp_user_id, linked_at) VALUES (%d, %d, %s)',
+                $identityId,
+                $wpUserId,
+                $now
+            )
+        );
+    }
+
+    private function createLocation(): int {
+        global $wpdb;
+
+        $now = App::db()->nowUtcSql();
+        $wpdb->query(
+            $wpdb->prepare(
+                'INSERT INTO ' . $wpdb->prefix . 'cpms_locations'
+                . ' (clinic_id, name, slug, timezone, is_active, created_at, updated_at)'
+                . ' VALUES (%d, %s, %s, %s, 1, %s, %s)',
+                $this->clinicId,
+                'Loc ' . bin2hex( random_bytes( 3 ) ),
+                'loc-' . bin2hex( random_bytes( 3 ) ),
+                'UTC',
+                $now,
+                $now
+            )
+        );
+
+        return (int) $wpdb->insert_id;
     }
 }

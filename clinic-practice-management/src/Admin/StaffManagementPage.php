@@ -46,6 +46,7 @@ final class StaffManagementPage
     private const NONCE_REASSIGN_SUSPENDED = 'cpms_staff_reassign_suspended_custom_role';
     private const NOTICE_KEY               = 'cpms_staff_notice';
     private const META_PREV_ROLE           = 'cpms_previous_role';
+    private const META_PARKED_ROLES        = 'cpms_parked_roles';
 
     /**
      * Neutral target-user rejection for the attach surface. Shared by the
@@ -974,6 +975,12 @@ final class StaffManagementPage
             if ( (string) ( $target_membership['status'] ?? '' ) !== 'active' ) {
                 return ['error' => 'عضویت هدف از قبل غیرفعال است.'];
             }
+
+            // B0-PR2-G4 — durable evidence for EVERY parked role, merged with any
+            // value an earlier suspension (another Clinic) wrote. `$user->roles[0]`
+            // alone is not durable: the patient role may sit at any position, and a
+            // second suspension sees only `subscriber` after the first downgrade.
+            $parked_roles = self::merge_parked_roles( $user_id, (array) $user->roles );
             // D6 audit atomicity: suspension, role parking/meta and the
             // mandatory audit event share one transaction boundary. The old
             // manual reactivation compensation on a wp_update_user() failure is
@@ -982,9 +989,10 @@ final class StaffManagementPage
             // rolls everything back — no un-audited suspension, no false success.
             try {
                 App::db()->transactional(
-                    function () use ( $target_membership, $user_id, $prev_role, $park_wp_role, $updated_by, $authorization ) {
+                    function () use ( $target_membership, $user_id, $prev_role, $park_wp_role, $parked_roles, $updated_by, $authorization ) {
                         App::membership_service()->suspend_membership( (int) $target_membership['id'] );
                         update_user_meta( $user_id, self::META_PREV_ROLE, $prev_role );
+                        update_user_meta( $user_id, self::META_PARKED_ROLES, (string) wp_json_encode( $parked_roles ) );
                         if ( $park_wp_role ) {
                             $updated = wp_update_user( [ 'ID' => $user_id, 'role' => 'subscriber' ] );
                             if ( is_wp_error( $updated ) ) {
@@ -1043,6 +1051,7 @@ final class StaffManagementPage
                     function () use ( $target_membership, $user_id, $prev_role, $restore_wp_role, $updated_by, $authorization ) {
                         App::membership_service()->reactivate_membership( (int) $target_membership['id'] );
                         delete_user_meta( $user_id, self::META_PREV_ROLE );
+                        delete_user_meta( $user_id, self::META_PARKED_ROLES );
                         if ( $restore_wp_role ) {
                             $updated = wp_update_user( [ 'ID' => $user_id, 'role' => $prev_role ] );
                             if ( is_wp_error( $updated ) ) {
@@ -1367,6 +1376,44 @@ final class StaffManagementPage
     }
 
     /** آیا این کاربر هر عضویتی در هر Clinic دارد؟ (معیار قابلیت‌مدیریت، نه مجوز) */
+    /**
+     * Merge the account's current WordPress roles into the parked-roles list.
+     *
+     * Existing values are never dropped, so a suspension in a second Clinic
+     * MERGES instead of overwriting what the first suspension parked. The value
+     * is stored as a JSON array and is only ever read back as patient evidence
+     * (any patient role in the list).
+     *
+     * @param array<int|string, mixed> $roles
+     *
+     * @return list<string>
+     */
+    private static function merge_parked_roles( int $user_id, array $roles ): array {
+        $existing = get_user_meta( $user_id, self::META_PARKED_ROLES, true );
+        $parked   = [];
+
+        if ( is_string( $existing ) && '' !== $existing ) {
+            $decoded = json_decode( $existing, true );
+            if ( is_array( $decoded ) ) {
+                $parked = array_map( 'strval', $decoded );
+            }
+        } elseif ( is_array( $existing ) ) {
+            $parked = array_map( 'strval', $existing );
+        }
+
+        foreach ( $roles as $role ) {
+            $role = (string) $role;
+            if ( '' !== $role ) {
+                $parked[] = $role;
+            }
+        }
+
+        $parked = array_values( array_unique( $parked ) );
+        sort( $parked );
+
+        return $parked;
+    }
+
     private static function has_any_membership( int $user_id ): bool {
         if ( $user_id <= 0 ) {
             return false;

@@ -143,7 +143,18 @@ final class FinanceDelegationService {
 		$this->assert_bounded( $capability );
 		$membership = $this->authorized_target( $actor_user_id, $clinic_id, $target_membership_id );
 
-		$current = $this->explicit_effect( $target_membership_id, $capability );
+		// B0-PR2-G5 — the prior override is read strictly: an unreadable state must
+		// never be treated as "nothing to remove".
+		try {
+			$current = $this->explicit_effect_strict( $target_membership_id, $capability );
+		} catch ( \Throwable $e ) {
+			throw FinanceException::of(
+				'CLINIC_DELEGATION_DENIED',
+				'وضعیت فعلی واگذاری خوانده نشد؛ عملیات انجام نشد.',
+				409,
+				[ 'clinic_id' => $clinic_id ]
+			);
+		}
 		if ( $current === null ) {
 			throw FinanceException::of(
 				'CLINIC_DELEGATION_NOT_FOUND',
@@ -154,6 +165,18 @@ final class FinanceDelegationService {
 		}
 
 		$target_user_id = (int) ( $membership['wp_user_id'] ?? 0 );
+		// B0-PR2-G5 — removing an explicit DENY WIDENS the member, so it is refused
+		// for a patient/mixed/unknown account. A real GRANT revocation only narrows
+		// and stays allowed.
+		if ( 'deny' === $current && PatientAccountPolicy::is_patient_account( $target_user_id ) ) {
+			throw FinanceException::of(
+				'CLINIC_DELEGATION_DENIED',
+				'واگذاری مجوز به این عضویت مجاز نیست.',
+				403,
+				[ 'clinic_id' => $clinic_id ]
+			);
+		}
+
 		$this->db->transactional(
 			function () use ( $actor_user_id, $clinic_id, $target_membership_id, $capability, $current, $target_user_id ): void {
 				$this->membership_service->remove_capability( $target_membership_id, $capability );
@@ -188,6 +211,26 @@ final class FinanceDelegationService {
 			if ( ! is_array( $row ) ) {
 				continue;
 			}
+			if ( (string) ( $row['capability'] ?? '' ) === $capability ) {
+				return (string) ( $row['effect'] ?? '' );
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * STRICT variant of explicit_effect(): throws when the override rows cannot be
+	 * read, so a mutation never decides on an unknown prior state.
+	 */
+	private function explicit_effect_strict( int $membership_id, string $capability ): ?string {
+		$rows = $this->db->fetch_all_strict(
+			'SELECT capability, effect FROM ' . $this->db->table( 'cpms_membership_capabilities' )
+			. ' WHERE membership_id = %d',
+			[ $membership_id ]
+		);
+
+		foreach ( $rows as $row ) {
 			if ( (string) ( $row['capability'] ?? '' ) === $capability ) {
 				return (string) ( $row['effect'] ?? '' );
 			}
