@@ -268,7 +268,10 @@ final class Phase2MultiLocationTemporalRedTest extends WP_UnitTestCase
             'SELECT status FROM ' . $db->table('cpms_appointments') . ' WHERE id = %d',
             $overdueApptId
         ));
-        self::assertSame('no_show', $overdueStatus, 'positive control: actually overdue appointment must become no_show (fix does not disable all no-show)');
+        // R4 (1.0): MANUAL-ONLY no-show. Even a genuinely overdue row is untouched by
+        // any automatic path; only an authorised manual action may set the state.
+        self::assertSame('confirmed', $overdueStatus, 'R4: an overdue row must stay confirmed without a manual decision');
+        self::assertSame(0, $processed2, 'R4: the sweep processes nothing');
     }
 
     // =================================================================
@@ -628,8 +631,9 @@ final class Phase2MultiLocationTemporalRedTest extends WP_UnitTestCase
         $statusA = $wpdb->get_var($wpdb->prepare('SELECT status FROM ' . $db->table('cpms_appointments') . ' WHERE id = %d', $apptA));
         $statusB = $wpdb->get_var($wpdb->prepare('SELECT status FROM ' . $db->table('cpms_appointments') . ' WHERE id = %d', $apptB));
 
-        // Clinic A grace 30, 40 min ago => no_show
-        self::assertSame('no_show', $statusA, 'Clinic A grace 30, 40 min ago => must be no_show');
+        // R4 (1.0): per-clinic grace is irrelevant now — no automatic marking happens
+        // in EITHER clinic, so a shared setting could never be reused by mistake.
+        self::assertSame('confirmed', $statusA, 'R4: Clinic A row must stay confirmed (no automatic marking)');
         // Clinic B grace 120, 40 min ago => must remain confirmed (not share Clinic A grace)
         self::assertSame('confirmed', $statusB, 'Clinic B grace 120, 40 min ago => must remain confirmed, W sweep must not reuse Clinic A settings');
 
