@@ -208,6 +208,40 @@ final class MembershipRepository {
         return is_array( $row );
     }
 
+    /**
+     * STRICT read of one membership row for a decision taken under the row lock (R2).
+     *
+     * `fetch_all_strict` throws on a failed read, so "unreadable" can never be
+     * mistaken for "unchanged"; `null` means the row really is gone.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function read_membership_strict( int $membership_id ): ?array {
+        $rows = $this->db->fetch_all_strict(
+            'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode FROM ' . $this->db->table( 'cpms_clinic_memberships' )
+                . ' WHERE id = %d LIMIT 1',
+            array( $membership_id )
+        );
+
+        return array() === $rows ? null : $rows[0];
+    }
+
+    /**
+     * STRICT Location list of one membership (R2): a failed read throws instead of
+     * returning an empty list that would read as "no Locations".
+     *
+     * @return list<int>
+     */
+    public function location_ids_for_strict( int $membership_id ): array {
+        $rows = $this->db->fetch_all_strict(
+            'SELECT location_id FROM ' . $this->db->table( 'cpms_membership_locations' )
+                . ' WHERE membership_id = %d ORDER BY location_id',
+            array( $membership_id )
+        );
+
+        return array_map( static fn( array $row ): int => (int) $row['location_id'], $rows );
+    }
+
     public function active_clinic_ids_for_user( int $wp_user_id ): array {
         $rows = $this->db->fetchAll(
             'SELECT clinic_id FROM ' . $this->db->table( 'cpms_clinic_memberships' ) .

@@ -85,7 +85,18 @@ final class FinanceDelegationService {
 		$this->assert_bounded( $capability );
 		$membership = $this->authorized_target( $actor_user_id, $clinic_id, $target_membership_id );
 
-		$before = $this->explicit_effect( $target_membership_id, $capability );
+		// R2 — the pre-flight observation is STRICT: an unreadable state must refuse,
+		// and the same value must still hold inside the write boundary.
+		try {
+			$before = $this->explicit_effect_strict( $target_membership_id, $capability );
+		} catch ( \Throwable $e ) {
+			throw FinanceException::of(
+				'CLINIC_DELEGATION_DENIED',
+				'وضعیت فعلی واگذاری خوانده نشد؛ عملیات انجام نشد.',
+				409,
+				array( 'clinic_id' => $clinic_id )
+			);
+		}
 		if ( $before === 'deny' ) {
 			throw FinanceException::of(
 				'CLINIC_DELEGATION_DENY_PRECEDENCE',
@@ -120,10 +131,29 @@ final class FinanceDelegationService {
 						array( 'clinic_id' => $clinic_id )
 					);
 				}
+				// R2 — the membership is re-read strictly under the lock: suspended or
+				// vanished refuses, and any moved effect refuses before the write.
+				$locked = $this->memberships->read_membership_strict( $target_membership_id );
+				if ( null === $locked || 'active' !== (string) ( $locked['status'] ?? '' ) ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'این عضویت هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
+						409,
+						array( 'clinic_id' => $clinic_id )
+					);
+				}
 				try {
 					$current = $this->explicit_effect_strict( $target_membership_id, $capability );
 				} catch ( \Throwable $e ) {
 					throw FinanceException::of( 'CLINIC_DELEGATION_DENIED', 'وضعیت فعلی واگذاری خوانده نشد؛ عملیات انجام نشد.', 409, [ 'clinic_id' => $clinic_id ] );
+				}
+				if ( $current !== $before ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'وضعیت واگذاری هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
+						409,
+						array( 'clinic_id' => $clinic_id )
+					);
 				}
 				if ( 'deny' === $current ) {
 					throw FinanceException::of(
@@ -216,6 +246,16 @@ final class FinanceDelegationService {
 				// pre-flight read must not be removed by a stale revocation, and a
 				// GRANT that was already withdrawn is not "revoked" twice.
 				if ( ! $this->memberships->lock_row_for_update( $target_membership_id ) ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'این عضویت هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
+						409,
+						array( 'clinic_id' => $clinic_id )
+					);
+				}
+				// R2 — strict membership re-read under the same lock as delegate().
+				$locked = $this->memberships->read_membership_strict( $target_membership_id );
+				if ( null === $locked || 'active' !== (string) ( $locked['status'] ?? '' ) ) {
 					throw FinanceException::of(
 						'CLINIC_DELEGATION_DENIED',
 						'این عضویت هم‌زمان تغییر کرد؛ عملیات انجام نشد.',

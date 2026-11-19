@@ -1142,9 +1142,19 @@ final class ManagementPortalService {
 					if ( ! $this->memberships->lock_row_for_update( $membership_id ) ) {
 						throw new \RuntimeException( 'membership row could not be locked' );
 					}
-					$locked       = $this->memberships->find_by_id( $membership_id );
+					// R2 — every input of this decision is re-read STRICTLY under the
+					// lock: a failed read throws (fail closed), and a row that moved or
+					// is no longer active refuses the write instead of trusting the
+					// pre-lock view.
+					$locked = $this->memberships->read_membership_strict( $membership_id );
+					if ( null === $locked || 'active' !== (string) ( $locked['status'] ?? '' ) ) {
+						throw new \RuntimeException( 'membership row is unreadable or no longer active' );
+					}
 					$current_mode = (string) ( $locked['scope_mode'] ?? '' );
-					$current_locs = array_values( array_map( 'intval', $this->memberships->location_ids_for( $membership_id ) ) );
+					$current_locs = $this->memberships->location_ids_for_strict( $membership_id );
+					if ( (string) ( $before['scope_mode'] ?? '' ) !== $current_mode || $before['location_ids'] !== $current_locs ) {
+						throw new \RuntimeException( 'scope changed inside the write boundary' );
+					}
 					$widens_now   = 'clinic' === $current_mode
 						? false
 						: ( array() === $location_ids || array() !== array_diff( $location_ids, $current_locs ) );
@@ -1246,6 +1256,12 @@ final class ManagementPortalService {
 					// by a stale CLEAR, and a moved state refuses the write outright.
 					if ( ! $this->memberships->lock_row_for_update( $membership_id ) ) {
 						throw new \RuntimeException( 'membership row could not be locked' );
+					}
+					// R2 — the membership itself is re-read strictly too: a suspended or
+					// vanished row must refuse the override, not take it.
+					$locked = $this->memberships->read_membership_strict( $membership_id );
+					if ( null === $locked || 'active' !== (string) ( $locked['status'] ?? '' ) ) {
+						throw new \RuntimeException( 'membership row is unreadable or no longer active' );
 					}
 					$prior_now  = $this->capability_effect_strict( $membership_id, $capability );
 					$state_held = (string) ( $before['effect'] ?? '' ) === $prior_now;

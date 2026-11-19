@@ -1742,6 +1742,57 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
     }
 
     /**
+     * R1: the preset before-state comes from the LOCKED override row, never from a
+     * cached (consistent-read) copy that can be wider than the durable state.
+     *
+     * MUTATION THAT TURNS THIS RED: replacing locked_override_snapshot() /
+     * caps_from_snapshot() with RolesCapabilities::capsMap() — the primed cache then
+     * reports the wide template, the template request looks like "no change", and the
+     * widening is written for a preset held by a patient.
+     */
+    public function test_preset_before_state_ignores_a_stale_cached_override(): void
+    {
+        $admin   = $this->makeAdmin();
+        $patient = $this->makeUser( 'subscriber', 'pb_r1_patient' );
+        $this->insertPatientLink( $patient );
+        cpms_test_seed_membership( $patient, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        // Durable state: the secretary preset is NARROWED (PAYMENT_CREATE removed).
+        $narrowed = array_values(
+            array_diff(
+                array_keys( array_filter( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY ) ) ),
+                [ RolesAndCapabilities::PAYMENT_CREATE ]
+            )
+        );
+        self::assertTrue( RolesAndCapabilities::setRoleCaps( RolesAndCapabilities::ROLE_SECRETARY, $narrowed ) );
+
+        // A stale WIDER copy sits in the object cache, as a concurrent writer (or a
+        // dropped invalidation) could leave it.
+        $wide = [ RolesAndCapabilities::ROLE_SECRETARY => RolesAndCapabilities::SECRETARY_CAPS ];
+        wp_cache_set( RolesAndCapabilities::OPTION_OVERRIDE, $wide, 'options' );
+        $alloptions = wp_load_alloptions();
+        $alloptions[ RolesAndCapabilities::OPTION_OVERRIDE ] = $wide;
+        wp_cache_set( 'alloptions', $alloptions, 'options' );
+
+        // Requesting the TEMPLATE is a widening against the durable (narrowed) preset.
+        $input = $this->matrixWithCurrentCaps();
+        // The widening under test: ask for the built-in template, not the narrowed set.
+        $input[ RolesAndCapabilities::ROLE_SECRETARY ] = RolesAndCapabilities::SECRETARY_CAPS;
+
+        try {
+            RoleCapabilitiesPage::apply_capability_matrix( $input, $admin );
+            self::fail( 'restoring a template over a patient holder must be refused' );
+        } catch ( \RuntimeException $e ) {
+            self::assertNotSame( '', $e->getMessage() );
+        }
+
+        self::assertFalse(
+            true === ( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY )[ RolesAndCapabilities::PAYMENT_CREATE ] ?? null ),
+            'the narrowed preset must be unchanged after the refusal'
+        );
+    }
+
+    /**
      * A2(i): a role key that members ALREADY hold is never defined, because defining
      * it would activate its capabilities for them at once.
      *
@@ -1780,10 +1831,16 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
      * A2(ii): reactivating an INACTIVE definition re-grants its stored capabilities,
      * so a patient holder refuses it and nothing is written.
      *
-     * MUTATION THAT TURNS THIS RED: removing the holder loop (or
-     * has_membership_references_for_update()) from the activation branch of
-     * CustomRoleManagementService::transition_status() — reactivation then succeeds,
-     * status flips to active and the version increments.
+     * MUTATIONS THAT TURN THIS RED (two separate guards, two separate assertions):
+     *  - removing the HOLDER LOOP in the activation branch of
+     *    CustomRoleManagementService::transition_status() — reactivation succeeds, the
+     *    status flips to active and the version increments;
+     *  - removing the LOCKING REFERENCE SCAN
+     *    (has_membership_references_for_update()) — the scan counter below drops to 0.
+     *    R3: the scan's SERIALIZATION (a concurrent holder blocking on the gap lock)
+     *    is not observable in this harness — one transaction per test, service
+     *    START TRANSACTION rewritten to SAVEPOINT — so the test asserts that the scan
+     *    is actually issued, and says so instead of claiming a blocking proof.
      */
     public function test_custom_role_reactivation_refuses_a_patient_holder(): void
     {
@@ -1793,7 +1850,8 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
 
         $service = App::custom_role_management_service();
         $caps    = array_slice( array_values( (array) $service->delegable_capabilities( $manager, $this->clinicId ) ), 0, 1 );
-        $created = $service->create( $manager, $this->clinicId, 'cpms_ward_role', 'نقش بخش', $caps );
+        $role_key = 'cpms_ward_role';
+        $created  = $service->create( $manager, $this->clinicId, $role_key, 'نقش بخش', $caps );
 
         $membership = cpms_test_seed_membership( $patient, $this->clinicId, 'cpms_ward_role' );
         self::assertGreaterThan( 0, $membership );
@@ -1801,12 +1859,34 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         $inactive = $service->deactivate( $manager, $this->clinicId, 'cpms_ward_role', (int) $created['version'] );
         self::assertSame( 'inactive', (string) $inactive['status'] );
 
+        // Count the locking reference scan this reactivation must issue:
+        //   SELECT id FROM <prefix>cpms_clinic_memberships
+        //    WHERE clinic_id = N AND role_key = 'cpms_ward_role' ORDER BY id LIMIT 1 FOR UPDATE
+        // (CustomRoleRepository::has_membership_references_for_update()).
+        $scans = 0;
+        $count = static function ( $query ) use ( &$scans, $role_key ) {
+            $sql = (string) $query;
+            if ( false === stripos( $sql, 'cpms_clinic_memberships' ) || false === stripos( $sql, 'FOR UPDATE' ) ) {
+                return $query;
+            }
+            if ( 1 === preg_match( '/\bAND\s+role_key = \'' . preg_quote( (string) $role_key, '/' ) . '\'\s+ORDER BY id LIMIT 1 FOR UPDATE\b/', $sql ) ) {
+                ++$scans;
+            }
+
+            return $query;
+        };
+        add_filter( 'query', $count, 7 );
+
         try {
-            $service->reactivate( $manager, $this->clinicId, 'cpms_ward_role', (int) $inactive['version'] );
+            $service->reactivate( $manager, $this->clinicId, $role_key, (int) $inactive['version'] );
             self::fail( 'reactivation must be refused while a patient holds the role' );
         } catch ( CustomRoleManagementException $e ) {
             self::assertSame( CustomRoleManagementException::CODE_MEMBERSHIP_REFERENCES, $e->reason_code() );
+        } finally {
+            remove_filter( 'query', $count, 7 );
         }
+
+        self::assertSame( 1, $scans, 'the locking reference scan must be issued exactly once (R3)' );
 
         self::assertSame(
             'inactive',

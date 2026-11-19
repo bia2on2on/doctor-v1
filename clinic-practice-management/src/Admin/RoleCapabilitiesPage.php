@@ -549,7 +549,10 @@ final class RoleCapabilitiesPage
      */
     private static function caps_from_snapshot( string $role, array $snapshot ): array {
         if ( ! array_key_exists( $role, $snapshot ) ) {
-            return array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
+            // R1 — the built-in TEMPLATE, never capsMap(): that reader can serve a
+            // cached (consistent-read) copy that differs from the row this snapshot
+            // locked, which would let a stale wider set look like "no change".
+            return RolesAndCapabilities::sanitizeCapList( self::template_caps( $role ) );
         }
         if ( ! is_array( $snapshot[ $role ] ) ) {
             throw new \RuntimeException( 'the capability override option is malformed' );
