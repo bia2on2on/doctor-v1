@@ -814,8 +814,10 @@ final class PatientService
     }
 
     /**
-     * Bounded Clinic-search / Reception-selection presentation (masked national ID).
+     * Bounded Clinic-search / Reception-selection presentation.
      * Reused by Reception create so the UI never receives staffView clinical fields.
+     * B0-PR1: the national ID is deliberately absent — not even masked — so a
+     * patient identifier can never be disclosed through a search/create response.
      *
      * @param array<string, mixed> $row Patient row or staff view of the same keys.
      * @return array<string, mixed>
@@ -836,7 +838,6 @@ final class PatientService
             'first_name' => (string) $row['first_name'],
             'last_name' => (string) $row['last_name'],
             'mobile' => (string) $row['mobile'],
-            'national_id' => $row['national_id'] !== null ? NationalIdValidator::mask((string) $row['national_id']) : null,
             'birth_date' => $row['birth_date'] !== null ? (string) $row['birth_date'] : null,
             'gender' => (string) $row['gender'],
             'status' => (string) $row['status'],

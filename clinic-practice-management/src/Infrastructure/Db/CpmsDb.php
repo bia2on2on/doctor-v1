@@ -87,6 +87,16 @@ final class CpmsDb
         return $this->wpdb->prefix;
     }
 
+    /**
+     * Escape LIKE metacharacters (`\\`, `%`, `_`) using WordPress core, so
+     * request input is matched literally inside a LIKE pattern. LIKE operands
+     * built from request input must pass through this; server-generated
+     * constant prefixes need not.
+     */
+    public function esc_like( string $text ): string {
+        return $this->wpdb->esc_like( $text );
+    }
+
     /** Count CPMS tables using the active WordPress database prefix. */
     public function count_cpms_tables(): int {
         $prefix_pattern = $this->wpdb->esc_like( $this->wpdb->prefix . $this->prefix ) . '%';

@@ -72,8 +72,12 @@ final class Phase11ReceptionPatientCreateRedTest extends WP_UnitTestCase
     private const SHARED_CREATE = '/clinic/v1/patients';
     private const SEARCH = '/clinic/v1/staff/portal/reception/patients/search';
 
-    /** Established searchView presentation — the ONLY keys a Reception create result may carry. */
-    private const SEARCH_KEYS = ['birth_date', 'first_name', 'gender', 'id', 'last_name', 'mobile', 'mrn', 'national_id', 'status'];
+    /**
+     * Established searchView presentation — the ONLY keys a Reception create result
+     * may carry. B0-PR1: `national_id` is deliberately absent (never disclosed,
+     * not even masked).
+     */
+    private const SEARCH_KEYS = ['birth_date', 'first_name', 'gender', 'id', 'last_name', 'mobile', 'mrn', 'status'];
 
     /** Checksum-valid national IDs (not sequential fakes). */
     private const NID_A = '0499370899';
@@ -362,7 +366,7 @@ final class Phase11ReceptionPatientCreateRedTest extends WP_UnitTestCase
         ], $this->scopeHeaders($fx['clinic'], $fx['loc_a']));
         self::assertSame(200, $ok->get_status(), 'S7: valid national ID accepted — ' . $this->errCode($ok));
         $row = $this->createPayload($ok);
-        self::assertSame('***0899', (string) $row['national_id'], 'S7: national ID masked in the Reception presentation');
+        self::assertArrayNotHasKey('national_id', $row, 'S7: national ID is never disclosed, not even masked');
         self::assertSame('1985-04-01', (string) $row['birth_date']);
         self::assertSame('female', (string) $row['gender']);
     }
@@ -486,7 +490,7 @@ final class Phase11ReceptionPatientCreateRedTest extends WP_UnitTestCase
         $keys = array_keys($row);
         sort($keys);
         self::assertSame(self::SEARCH_KEYS, $keys, 'S11: Reception create returns only the established search presentation');
-        self::assertSame('***2419', (string) $row['national_id'], 'S11: national ID masked');
+        self::assertArrayNotHasKey('national_id', $row, 'S11: national ID is never disclosed, not even masked');
 
         $json = (string) wp_json_encode($res->get_data());
         foreach (['0013542419', 'SECRET', '09990000000', 'medication_allergies', 'medical_history', 'address', 'emergency_contact', 'blood_group', 'staffView'] as $needle) {
@@ -531,7 +535,7 @@ final class Phase11ReceptionPatientCreateRedTest extends WP_UnitTestCase
         $pid = $this->insertPatient($fx['clinic'], 'Slice', 'Twox', '09121110111', null, 'MR-S12-0001');
         wp_set_current_user($fx['secretary']);
 
-        $search = $this->dispatch('GET', self::SEARCH, ['q' => 'Twox'], $this->scopeHeaders($fx['clinic'], $fx['loc_a']));
+        $search = $this->dispatch('POST', self::SEARCH, ['q' => 'Twox'], $this->scopeHeaders($fx['clinic'], $fx['loc_a']));
         self::assertSame(200, $search->get_status(), 'S12: Slice 2 reception search still answers');
         self::assertSame([$pid], $this->searchIds($search), 'S12: Slice 2 search still finds the Clinic patient');
 

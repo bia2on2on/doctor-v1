@@ -564,7 +564,7 @@ final class SubscriberOperationalAccessTest extends WP_UnitTestCase
         self::assertSame(200, $handwriting->get_status(), 'workspace handwriting list — ' . $this->errDetail($handwriting));
 
         $search = $this->dispatch(
-            'GET',
+            'POST',
             '/' . self::REST_NS . '/search',
             ['q' => 'Subscriber', 'type' => 'all'],
             ['X-CPMS-Clinic-Id' => (string) $this->clinic, 'X-CPMS-Location-Id' => (string) $fx['location']]

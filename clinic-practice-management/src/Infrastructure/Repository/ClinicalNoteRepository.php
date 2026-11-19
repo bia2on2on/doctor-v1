@@ -165,7 +165,7 @@ final class ClinicalNoteRepository
             ' WHERE ' . $where . ' AND content_text LIKE %s' .
             ' AND created_at >= %s AND created_at < %s' .
             ' ORDER BY created_at DESC, id DESC LIMIT %d';
-        $params[] = '%' . self::escapeLike($q) . '%';
+        $params[] = '%' . $this->db->esc_like( $q ) . '%';
         $params[] = $from . ' 00:00:00';
         $params[] = $to . ' 23:59:59.999';
         $params[] = $limit;
@@ -235,11 +235,5 @@ final class ClinicalNoteRepository
             ' WHERE ' . $where . ' ORDER BY created_at ASC, id ASC',
             $params
         ) ?: [];
-    }
-
-    /** LIKE wildcardهای کاربر را خنثی می‌کند (فرار کامل در prepare). */
-    private static function escapeLike(string $q): string
-    {
-        return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q);
     }
 }
