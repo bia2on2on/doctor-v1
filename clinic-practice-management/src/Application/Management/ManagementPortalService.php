@@ -1155,7 +1155,7 @@ final class ManagementPortalService {
 					if ( (string) ( $before['scope_mode'] ?? '' ) !== $current_mode || $before['location_ids'] !== $current_locs ) {
 						throw new \RuntimeException( 'scope changed inside the write boundary' );
 					}
-					$widens_now   = 'clinic' === $current_mode
+					$widens_now = 'clinic' === $current_mode
 						? false
 						: ( array() === $location_ids || array() !== array_diff( $location_ids, $current_locs ) );
 					if ( $widens_now && PatientAccountPolicy::is_patient_account( (int) ( $membership['wp_user_id'] ?? 0 ) ) ) {
