@@ -7119,3 +7119,13 @@ Integration assertion counts differ between pushes (76873/76877/76874) with no t
 - Mutations now caught with the assertion that reds: restore `$pending = $owned` after pass 1 (scenario 1 probes); signal on 'retry' in pass 1 (scenario 2 signals); signal on 'retry' in pass 2 (scenario 2b signals); drop a pid whose latest probe says running (scenario 3 probes); treat a hard waitpid error as gone (scenario 4 signals); probe or signal pid <= 0 (scenario 5); discard the unconfirmed set in the core (scenario 6 unconfirmed and exact signals); remove the wrapper failure (new wrapper test).
 - REMOVED/SHORTENED: no assertion was deleted or loosened. Scenario 6's `assertGreaterThan(1, count(probes))` was REPLACED by exact sequence assertions, which is strictly stronger; every other assertion is additive.
 - LIMITATION: native PHP is absent: `php -l`, PHPCS and PHPUnit were not run locally; CI is the gate; no re-run, no merge.
+
+### [2026-11-18 UTC] — doctor-v1 Phase 2 origin and Release 1.0 decisions
+- OBSERVED: The imported main snapshot matched the expected baseline. The live workflow inventory contained only CI and Closure Gate active; the other 15 workflows were manually disabled.
+- OBSERVED: Added `docs/ORIGIN.md` and appended the Release 1.0 owner decisions, migration rule, and License decision A to `docs/status/ledger.md`. Recorded the older technical design separately from the 1.0 target. This change is documentation only; no build, implementation, or merge is authorized here.
+- LIMITATION: Both Actions permissions reads returned HTTP 403 (UNKNOWN). Release acceptance is NOT verified; the exact-head CI census is separate from this entry.
+
+### [2026-11-18 UTC] — PR #4 docs sync after PR #5
+- OBSERVED: Synced the docs branch with main. The only conflict was in this log; kept the 7,006 shared lines, 115 lines appended on main, and 5 lines appended by PR #4, byte-for-byte.
+- OBSERVED: PR #5 removed recurring no-show scheduling and made the sweep inert. The Release 1.0 manual-only decision aligns with staff recording a reason and actor. The older ledger references to automatic D10 describe the pre-R4 policy.
+- LIMITATION: The PR diff against main remains documentation only. No local PHP or release acceptance was run.
