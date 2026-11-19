@@ -1859,11 +1859,14 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
      * A real second connection is impossible here: the harness runs every test inside
      * one transaction and rewrites service START TRANSACTION into SAVEPOINT
      * (tests/integration-bootstrap.php:229-234, :288), so another session cannot see
-     * the fixture rows. This filter commits the competing row in the SAME session.
+     * the fixture rows. The competing row is therefore written by a `query` filter in
+     * the SAME session, keyed on the LOCKING read's unique SQL shape (never on a
+     * guessed read order), and its own rollback is expected: what proves the refusal
+     * is that nothing was written or removed by the CLEAR.
      *
-     * MUTATION THAT TURNS THIS RED: removing the in-transaction lock + re-read
-     * ($state_held) from set_staff_capability() — the CLEAR then succeeds and the DENY
-     * is gone.
+     * MUTATION THAT TURNS THIS RED: removing the lock + in-transaction re-read
+     * ($state_held) from set_staff_capability() — no locking read is issued (the
+     * counter stays 0), the CLEAR deletes the observed GRANT and reports success.
      */
     public function test_portal_capability_write_refuses_when_the_state_moves_in_the_boundary(): void
     {
@@ -1884,26 +1887,28 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         );
         self::assertTrue( $grant['ok'], 'a staff member may receive a GRANT' );
 
-        // The competing writer: it must land AFTER the pre-flight read has returned its
-        // value and BEFORE the write boundary re-reads — that is the exact window the
-        // fix closes. The first matching read is the pre-flight observation (leave it
-        // alone), the second is the in-transaction re-read (commit the DENY just before
-        // it). Injecting before the first read would be consistent and prove nothing.
-        $armed  = true;
-        $seen   = 0;
-        $inject = static function ( $query ) use ( &$armed, &$seen, $membership, $capability ) {
+        // The competing writer lands at the LOCKING read that the write boundary
+        // issues for THIS membership — after the state was observed and before it is
+        // re-read under the lock. That query is unique in shape:
+        //   SELECT id FROM <prefix>cpms_clinic_memberships WHERE id = N LIMIT 1 FOR UPDATE
+        // (MembershipRepository::lock_row_for_update() -> CpmsDb::fetchRowForUpdate(),
+        // which appends " FOR UPDATE" at CpmsDb.php:345), so no read-order assumption
+        // is needed.
+        $fired     = 0;
+        $injections = 0;
+        $inject    = static function ( $query ) use ( &$fired, &$injections, $membership, $capability ) {
             $sql = (string) $query;
-            if ( ! $armed || false === stripos( $sql, 'cpms_membership_capabilities' ) ) {
+            if ( false === stripos( $sql, 'cpms_clinic_memberships' ) || false === stripos( $sql, 'FOR UPDATE' ) ) {
                 return $query;
             }
-            if ( 1 !== preg_match( '/membership_id = ' . (int) $membership . '\b/', $sql ) ) {
+            if ( 1 !== preg_match( '/\bWHERE\s+id = ' . (int) $membership . '\b/', $sql ) ) {
                 return $query;
             }
-            ++$seen;
-            if ( $seen < 2 ) {
+            ++$fired;
+            if ( $injections > 0 ) {
                 return $query;
             }
-            $armed = false;
+            ++$injections;
             App::db()->query(
                 'INSERT INTO ' . App::db()->table( 'cpms_membership_capabilities' )
                 . ' (membership_id, capability, effect, created_at) VALUES (%d, %s, %s, %s)'
@@ -1928,11 +1933,16 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
 
         remove_filter( 'query', $inject, 7 );
 
+        self::assertSame( 1, $injections, 'the competing DENY must be written exactly once (non-vacuity guard)' );
+        self::assertGreaterThanOrEqual( 1, $fired, 'the filter must have matched the locked-membership read' );
         self::assertFalse( $clear['ok'], 'a CLEAR must not remove a DENY it never observed' );
+        // The competing DENY is written INSIDE the transaction, so the refusal's
+        // rollback removes it again; what must be intact is the override the CLEAR
+        // OBSERVED. Nothing written, nothing removed.
         self::assertSame(
-            [ [ 'capability' => $capability, 'effect' => 'deny' ] ],
+            [ [ 'capability' => $capability, 'effect' => 'grant' ] ],
             $this->capabilityOverrides( $membership ),
-            'the competing DENY must survive the stale CLEAR'
+            'the refused CLEAR must neither add nor remove a capability row'
         );
     }
 
