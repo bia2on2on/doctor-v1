@@ -1177,6 +1177,9 @@ def run_queue_states_journey(browser, vp):
 
 
 SEARCH_ROUTE = "/staff/portal/reception/patients/search"
+# route_of() returns the path from "/clinic/v1" onwards (query stripped, trailing
+# slash removed), so the recorded route of the search endpoint is exactly this.
+SEARCH_PATH = "/clinic/v1" + SEARCH_ROUTE
 CREATE_ROUTE = "/staff/portal/reception/patients"
 
 
@@ -1187,9 +1190,14 @@ def search_calls(state):
 def write_calls(state):
     """B0-PR1: the patient search is a POST read, so it is not a write.
 
-    Every other non-GET call is still a write.
+    ONLY a POST to the exact reception-search route is exempt; every other
+    non-GET call — any other verb to that route included — is still a write.
     """
-    return [r for r in state["rest"] if r["method"] != "GET" and not r["route"].endswith(SEARCH_ROUTE)]
+    return [
+        r
+        for r in state["rest"]
+        if r["method"] != "GET" and not (r["method"] == "POST" and r["route"].rstrip("/") == SEARCH_PATH)
+    ]
 
 
 def search_requests(state):
