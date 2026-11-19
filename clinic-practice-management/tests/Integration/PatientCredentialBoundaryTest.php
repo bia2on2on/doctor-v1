@@ -2035,16 +2035,23 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
 
         self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
         self::assertFalse( $result['ok'], 'a membership that moved at the lock must be refused' );
-        self::assertSame(
-            $other,
-            (int) App::db()->fetchValue(
-                'SELECT wp_user_id FROM ' . App::db()->table( 'cpms_clinic_memberships' ) . ' WHERE id = %d LIMIT 1',
-                [ $membership ]
-            ),
-            'fixture: the row really moved at the locking read, so the refusal is the identity guard'
-        );
         self::assertSame( [], $this->capabilityOverrides( $membership ), 'nothing may be written for the moved row' );
         self::assertSame( $audit_before, $this->auditCount( 'MEMBERSHIP_CAPABILITY_CHANGED' ), 'no success audit may be committed' );
+
+        // Control: the SAME request without the injected move is accepted, so the refusal
+        // above can only come from the identity guard (the injected UPDATE itself was
+        // rolled back with the refused transaction, so the row is the seeded one again).
+        $control = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_capability',
+            [
+                'clinic_id'     => (string) $this->clinicId,
+                'membership_id' => (string) $membership,
+                'capability'    => RolesAndCapabilities::CONFIG,
+                'effect'        => 'deny',
+            ]
+        );
+        self::assertTrue( $control['ok'], 'control: the same request without the move must be accepted' );
     }
 
     /**
