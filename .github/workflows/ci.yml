@@ -49,6 +49,7 @@ jobs:
         run: |
           python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --quiet pyyaml
           python3 -m unittest discover -s .github/workflows -p 'test_workflow_contracts.py' -v
+          python3 -m unittest discover -s .github/scripts -p 'test_phpunit_failure_text.py' -v
         working-directory: ${{ github.workspace }}
 
       - name: MariaDB step 7 pin gate shell test
@@ -169,7 +170,13 @@ jobs:
       - name: Run unit tests (no WP)
         run: |
           set -o pipefail
-          php -d memory_limit=512M vendor/bin/phpunit --testsuite Unit 2>&1 | tee /tmp/cpms-unit.log
+          php -d memory_limit=512M vendor/bin/phpunit --testsuite Unit --log-junit "$RUNNER_TEMP/phpunit-unit.xml" 2>&1 | tee /tmp/cpms-unit.log
+
+      - name: Describe PHPUnit failures
+        if: failure()
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}
+        run: python3 .github/scripts/phpunit-failure-text.py "$RUNNER_TEMP/phpunit-unit.xml"
 
       # The same failure-mirror pattern the Integration job already uses. Unit
       # failures were previously visible only inside the job log, whose blob some
@@ -844,6 +851,12 @@ jobs:
             echo '::error::Integration PHPUnit terminated WITHOUT a terminal summary (premature exit with rc=0 — suite did not complete). This is a CI failure, not a pass.'
             exit 1
           fi
+
+      - name: Describe PHPUnit failures
+        if: failure()
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}
+        run: python3 .github/scripts/phpunit-failure-text.py /tmp/phpunit-int-junit.xml
 
       # Focused, real-DB proof that the WpSqlFailureLedger publication boundary
       # was exercised against the Integration MySQL service — not skipped and

@@ -7013,5 +7013,40 @@ class Day2ClosedVocabularyProjectionTests(unittest.TestCase):
         )
 
 
+class PHPUnitFailureDescriptionContracts(unittest.TestCase):
+    def test_report_reads_the_suite_output_immediately_after_failure_only(self):
+        """Moving the reader, changing the file or working directory, or making it blocking fails this contract."""
+        jobs = _ci_document(workflow("ci.yml"))["jobs"]
+        for key, suite, path in (("unit", "Run unit tests (no WP)", '"$RUNNER_TEMP/phpunit-unit.xml"'),
+                                 ("integration", "Run integration tests", "/tmp/phpunit-int-junit.xml")):
+            with self.subTest(job=key):
+                steps = jobs[key]["steps"]
+                index = [step.get("name") for step in steps].index(suite)
+                self.assertIn("--log-junit " + path, steps[index]["run"])
+                self.assertEqual(steps[index + 1], {
+                    "name": "Describe PHPUnit failures", "if": "failure()", "continue-on-error": True,
+                    "working-directory": "${{ github.workspace }}",
+                    "run": "python3 .github/scripts/phpunit-failure-text.py " + path,
+                })
+
+    def test_check_contexts_triggers_and_permissions(self):
+        """Renaming a check, removing a matrix lane, adding a trigger or changing permissions turns this red."""
+        ci = _ci_document(workflow("ci.yml"))
+        self.assertEqual(ci.get("on", ci.get(True)), {"push": {"branches": ["main"]},
+                                                     "pull_request": None, "workflow_dispatch": None})
+        self.assertEqual(ci["permissions"], {"contents": "read", "pull-requests": "write"})
+        self.assertFalse(any("permissions" in job for job in ci["jobs"].values()))
+        self.assertEqual({key: job["name"] for key, job in ci["jobs"].items()}, {
+            "unit": "Unit Tests (PHP ${{ matrix.php }})", "integration": "Integration (WP 7.1 + MySQL 8)",
+            "tripwire": "Tenant Tripwire (hardcode scan)", "phpstan": "Static Analysis (PHPStan)",
+            "wpcs": "WPCS (changed code)",
+        })
+        self.assertEqual(ci["jobs"]["unit"]["strategy"]["matrix"]["php"], ["8.1", "8.2", "8.3", "8.4", "8.5"])
+        closure = _ci_document(workflow("closure-gate.yml"))["jobs"]
+        self.assertEqual(closure["runtime-php"]["name"], "Closure — PHP ${{ matrix.php }} runtime (WP 7.1.3)")
+        self.assertEqual(closure["runtime-php"]["strategy"]["matrix"]["php"], ["8.1", "8.3", "8.4"])
+        self.assertEqual(closure["restore-apply"]["name"], "Closure — destructive restoreApply (isolated)")
+
+
 if __name__ == "__main__":
     unittest.main()
