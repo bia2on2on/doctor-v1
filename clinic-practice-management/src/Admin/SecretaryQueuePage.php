@@ -531,7 +531,7 @@ window.CPMS_Q = <?php echo wp_json_encode($config); ?>;
             var q = input.value.trim();
             if (q.length < 2) { box.innerHTML = ''; return; }
             t = setTimeout(function () {
-                api('GET', 'patients/search?q=' + encodeURIComponent(q)).then(function (r) {
+                api('POST', 'patients/search', { q: q }).then(function (r) {
                     if (r.__status !== 200) { box.innerHTML = '<p class="description">' + errMessage(r) + '</p>'; return; }
                     var items = r.body.data || [];
                     if (!items.length) { box.innerHTML = '<p class="description">بیماری یافت نشد.</p>'; return; }

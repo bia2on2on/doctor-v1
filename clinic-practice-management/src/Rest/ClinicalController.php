@@ -216,15 +216,9 @@ final class ClinicalController extends RestBase
         // فیلتر می‌کند، منشی فقط بیمار می‌بیند → TP-08 در جستجو هم برقرار است).
         register_rest_route(self::NS, '/search', [
             [
-                'methods' => WP_REST_Server::READABLE,
-                'callback' => fn (WP_REST_Request $r) => $this->staff($r, RolesAndCapabilities::SEARCH,
-                    fn () => $this->clinical->globalSearch(
-                        $this->userId($r),
-                        (string) $r['q'],
-                        (string) ($r['type'] ?? 'all'),
-                        $r['from'] ?? null,
-                        $r['to'] ?? null
-                    )),
+                // B0-PR1: the search term is accepted ONLY in the POST body.
+                'methods'             => WP_REST_Server::CREATABLE,
+                'callback'            => fn ( WP_REST_Request $r ) => $this->search( $r ),
                 'permission_callback' => fn (WP_REST_Request $r) => $this->permCap($r, RolesAndCapabilities::SEARCH),
                 'args' => [
                     'q' => ['required' => true, 'type' => 'string'],
@@ -263,6 +257,40 @@ final class ClinicalController extends RestBase
         }
 
         return $this->wrap($fn);
+    }
+
+    /**
+     * E18 جستجوی جامع — B0-PR1 body-only contract.
+     *
+     * The term (which may be a patient identifier such as a national ID) is read
+     * from the request BODY only. If `q` is present in the URL/query string this
+     * callback refuses with 400 CLINIC_VALIDATION_FAILED after the route's
+     * permission_callback (nonce + cpms_search) has already run — the service is
+     * never called and no audit row is written. What this cannot do is stop a web
+     * server/proxy access log or a Referer header from recording a request line
+     * that a client still chooses to carry the identifier in; callers must never
+     * place the term in the URL. The guard guarantees only that this API never
+     * reads, searches, logs or echoes that value.
+     */
+    private function search( WP_REST_Request $r ): WP_REST_Response|WP_Error {
+        if ( array_key_exists( 'q', $r->get_query_params() ) ) {
+            return $this->error( 'CLINIC_VALIDATION_FAILED', 400, 'عبارت جستجو باید در بدنهٔ درخواست ارسال شود' );
+        }
+
+        $body = $this->body_only( $r );
+        $q    = $body['q'] ?? null;
+        if ( ! is_string( $q ) ) {
+            return $this->error( 'CLINIC_VALIDATION_FAILED', 400, 'عبارت جستجو باید رشته باشد' );
+        }
+        $type = isset( $body['type'] ) && is_string( $body['type'] ) ? $body['type'] : 'all';
+        $from = isset( $body['from'] ) && is_string( $body['from'] ) ? $body['from'] : null;
+        $to   = isset( $body['to'] ) && is_string( $body['to'] ) ? $body['to'] : null;
+
+        return $this->staff(
+            $r,
+            RolesAndCapabilities::SEARCH,
+            fn () => $this->clinical->globalSearch( $this->userId( $r ), $q, $type, $from, $to )
+        );
     }
 
     /**
@@ -362,5 +390,21 @@ final class ClinicalController extends RestBase
         $params = $r->get_params();
 
         return is_array($params) ? $params : [];
+    }
+
+    /**
+     * Body-only parameters (JSON body first, then form body). URL/query params are
+     * deliberately excluded so an identifier can never be read out of the URL.
+     *
+     * @return array<string, mixed>
+     */
+    private function body_only( WP_REST_Request $r ): array {
+        $params = $r->get_json_params();
+        if ( is_array( $params ) ) {
+            return $params;
+        }
+        $params = $r->get_body_params();
+
+        return is_array( $params ) ? $params : [];
     }
 }

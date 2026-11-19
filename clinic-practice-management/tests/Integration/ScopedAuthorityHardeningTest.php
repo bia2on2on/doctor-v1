@@ -127,7 +127,7 @@ final class ScopedAuthorityHardeningTest extends WP_UnitTestCase
         self::assertTrue(user_can($user, RolesAndCapabilities::PATIENT_READ), 'precondition: the global capability is present');
 
         $denied = $this->dispatch(
-            'GET',
+            'POST',
             '/' . self::REST_NS . '/patients/search',
             ['q' => 'zz'],
             ['X-CPMS-Clinic-Id' => (string) $this->clinic]

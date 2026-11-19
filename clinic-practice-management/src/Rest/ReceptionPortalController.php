@@ -38,7 +38,7 @@
  * Phase 11 Slice 2 — Clinic patient search (read-only selection): the
  * reception search route is a thin adapter over the ESTABLISHED
  * PatientService::search() (→ PatientRepository::search() + the bounded
- * searchView presentation with masked national ID). It adds only the strict
+ * searchView presentation, which carries no national ID at all). It adds only the strict
  * reception boundary (secretary role + ACTIVE membership + clinic-scoped
  * cpms_patient_read) in front of that contract. Patient identity is
  * Clinic-scoped: the reception Location selection is deliberately NOT a
@@ -160,7 +160,8 @@ final class ReceptionPortalController extends RestBase {
 			'/staff/portal/reception/patients/search',
 			[
 				[
-					'methods'             => WP_REST_Server::READABLE,
+					// B0-PR1: body-only search term (never the URL/query string).
+					'methods'             => WP_REST_Server::CREATABLE,
 					'callback'            => fn( WP_REST_Request $r ) => $this->patient_search( $r ),
 					'permission_callback' => fn( WP_REST_Request $r ) => $this->perm_reception( $r, [ RolesAndCapabilities::PATIENT_READ ] ),
 					'args'                => [
@@ -532,18 +533,34 @@ final class ReceptionPortalController extends RestBase {
 	 * Reception Clinic patient search (read-only): delegates to the ESTABLISHED
 	 * PatientService::search() contract — trimmed query, minimum 2 characters
 	 * (CLINIC_VALIDATION_FAILED otherwise), limit clamped by the service, trusted
-	 * Clinic from App::scope(), active patients only, bounded searchView with the
-	 * masked national ID. The explicit Reception Location is validated at the
+	 * Clinic from App::scope(), active patients only, bounded searchView (no
+	 * national ID at all). The explicit Reception Location is validated at the
 	 * permission boundary; patient identity remains Clinic-scoped and Location
 	 * never filters this search.
-	 * Nothing is written; a returned patient id stays a selector only.
+	 * B0-PR1: the term is read from the request BODY only; if `q` is present in
+	 * the URL/query string this callback refuses with 400 CLINIC_VALIDATION_FAILED
+	 * after the route's permission_callback (nonce + Reception boundary) has
+	 * already run — nothing is searched and the value is never read, stored or
+	 * echoed. This cannot stop a web server/proxy access log or a Referer header
+	 * from recording a request line that carries the identifier; callers must
+	 * never place the term in the URL. Nothing is written; a returned patient id
+	 * stays a selector only.
 	 */
 	private function patient_search( WP_REST_Request $r ): WP_REST_Response|WP_Error {
+		if ( array_key_exists( 'q', $r->get_query_params() ) ) {
+			return $this->error( 'CLINIC_VALIDATION_FAILED', 400, 'عبارت جستجو باید در بدنهٔ درخواست ارسال شود' );
+		}
+		$body  = $this->body_only( $r );
+		$q     = $body['q'] ?? null;
+		$limit = $body['limit'] ?? 25;
+		if ( ! is_string( $q ) ) {
+			return $this->error( 'CLINIC_VALIDATION_FAILED', 400, 'عبارت جستجو باید رشته باشد' );
+		}
 		try {
 			return $this->success(
 				App::patientService()->search(
-					(string) $r->get_param( 'q' ),
-					(int) $r->get_param( 'limit' )
+					$q,
+					is_numeric( $limit ) ? (int) $limit : 25
 				)
 			);
 		} catch ( BookingException $e ) {
@@ -552,12 +569,28 @@ final class ReceptionPortalController extends RestBase {
 	}
 
 	/**
+	 * Body-only parameters (JSON body first, then form body). URL/query params are
+	 * deliberately excluded so an identifier can never be read out of the URL.
+	 *
+	 * @return array<string, mixed>
+	 */
+	private function body_only( WP_REST_Request $r ): array {
+		$json = $r->get_json_params();
+		if ( is_array( $json ) ) {
+			return $json;
+		}
+		$form = $r->get_body_params();
+
+		return is_array( $form ) ? $form : [];
+	}
+
+	/**
 	 * Reception Clinic patient create: delegates to the ESTABLISHED
 	 * PatientService::create() contract (trusted Clinic from App::scope(),
 	 * mobile normalize/duplicate, generated MRN). Only the small form fields
 	 * are forwarded — clinical/address/emergency/MRN/clinic_id/location_id
 	 * from the body never become writes. The response is the Slice 2
-	 * searchView (masked national ID), never staffView. Location is not a
+	 * searchView (no national ID at all), never staffView. Location is not a
 	 * patient-ownership field; explicit Clinic/Location selection is still
 	 * required at the Reception permission boundary.
 	 */

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Infrastructure\Repository;
 
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 
 /**
@@ -206,24 +207,32 @@ final class PatientRepository
     }
 
     /**
-     * جستجوی منشی (D2): نام / موبایل / کد ملی / MRN.
+     * جستجوی منشی (D2): نام / موبایل / MRN با LIKE-escapeِ $wpdb->esc_like؛
+     * کد ملی فقط وقتی عبارت دقیقاً پس از trim و تا کردن ارقام فارسی/عربی ۱۰ رقمی
+     * ASCII باشد با تساویِ دقیق (=) مقایسه می‌شود — در غیر این صورت national_id
+     * اصلاً در شرط جستجو نمی‌آید و هیچ عبارتِ دیگری با کد ملی Match نمی‌شود.
      *
      * @return list<array<string, mixed>>
      */
     public function search(int $clinicId, string $q, int $limit = 25): array
     {
-        $like = '%' . $q . '%';
+        $nid  = NationalIdValidator::exact_ascii_digits( $q );
+        $like = '%' . $this->db->esc_like( $q ) . '%';
+
+        $where  = 'first_name LIKE %s OR last_name LIKE %s OR mobile LIKE %s OR mrn LIKE %s';
+        $params = [ $like, $like, $like, $like ];
+        if ( $nid !== null ) {
+            $where   .= ' OR national_id = %s';
+            $params[] = $nid;
+        }
 
         return $this->db->fetchAll(
             'SELECT id, mrn, first_name, last_name, mobile, national_id, birth_date, gender, status
              FROM ' . $this->db->table('cpms_patients') . '
-             WHERE clinic_id = %d AND status = %s AND (
-                first_name LIKE %s OR last_name LIKE %s OR mobile LIKE %s
-                OR national_id LIKE %s OR mrn LIKE %s
-             )
+             WHERE clinic_id = %d AND status = %s AND (' . $where . ')
              ORDER BY last_name, first_name
              LIMIT ' . (int) $limit,
-            [$clinicId, 'active', $like, $like, $like, $like, $like]
+            array_merge( [ $clinicId, 'active' ], $params ), // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- in-file legacy camelCase parameter kept for consistency with the pre-existing signature.
         );
     }
 

@@ -1992,9 +1992,8 @@ $cpms_reception_cfg = [
         if (p.mobile) {
             meta.push('موبایل: <bdi>' + escapeHtml(p.mobile) + '</bdi>');
         }
-        if (p.national_id) {
-            meta.push('کد ملی: <bdi>' + escapeHtml(p.national_id) + '</bdi>');
-        }
+        // B0-PR1: the national ID is deliberately never rendered — the search
+        // projection does not carry it at all.
         return meta.join(' · ');
     }
 
@@ -2088,8 +2087,7 @@ $cpms_reception_cfg = [
         search.seq += 1;
         var seq = search.seq;
         setSearchState('در حال جستجو…', false);
-        var path = '/staff/portal/reception/patients/search' + (CONFIG.restRoot.indexOf('?') === -1 ? '?' : '&') + 'q=' + encodeURIComponent(q);
-        api(path).then(function (result) {
+        api('/staff/portal/reception/patients/search', { method: 'POST', body: { q: q } }).then(function (result) {
             if (seq !== search.seq) {
                 return;
             }

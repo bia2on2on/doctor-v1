@@ -105,7 +105,7 @@ Phase 1A فقط کنترل‌های امنیتیِ **مستقل از Scope** ر�
 |---|---|---|---|
 | `/appointments` | GET | `APPT_READ` | — |
 | `/appointments` | POST | `APPT_CREATE` | ✅ |
-| `/patients/search` | GET | `PATIENT_READ` | — |
+| `/patients/search` | POST (بدنه) | `PATIENT_READ` | — |
 | `/patients/{id}` | GET | `PATIENT_READ` | — |
 | `/patients/{id}` | PUT، PATCH | `PATIENT_UPDATE` | ✅ |
 | `/patients` | POST | `PATIENT_CREATE` | ✅ |

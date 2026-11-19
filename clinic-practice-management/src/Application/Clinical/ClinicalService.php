@@ -23,6 +23,7 @@ use ClinicCore\Settings\SettingsFactory;
 use ClinicCore\Domain\Time\Jalali;
 use ClinicCore\Domain\Time\PersianDigits;
 use ClinicCore\Domain\Booking\BookingException;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 
 /**
  * سرویس بالینی (F5) — فضای کار ویزیت پزشک + نمای بیمار.
@@ -1513,6 +1514,10 @@ final class ClinicalService
         if (mb_strlen($q) < 2) {
             throw ClinicalException::of('CLINIC_VALIDATION_FAILED', 'عبارت جستجو باید حداقل ۲ کاراکتر باشد', 422);
         }
+        // B0-PR1 (F3): a term that normalizes to exactly ten ASCII digits is a
+        // national-ID candidate — notes/prescriptions are NOT searched by it;
+        // the patient branch matches national_id by exact equality only.
+        $nid_candidate = NationalIdValidator::exact_ascii_digits( $q );
         if (!in_array($type, ['patient', 'note', 'rx', 'all'], true)) {
             throw ClinicalException::of('CLINIC_VALIDATION_FAILED', 'type باید patient|note|rx|all باشد', 422);
         }
@@ -1567,7 +1572,7 @@ final class ClinicalService
         // Clinic-local authority is required in addition to the WP-global doctor
         // role: the WP role never supplies scoped clinical read (membership DENY
         // and Clinic-local presets win).
-        if ($isDoctor && ($type === 'all' || $type === 'note') && $this->has_clinic_read($actorUserId, $trustedClinicId, RolesAndCapabilities::MEDICAL_READ)) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase,WordPress.WhiteSpace.ControlStructureSpacing,Generic.WhiteSpace.ArbitraryParenthesesSpacing,PEAR.Functions.FunctionCallSignature -- Existing legacy camelCase/spacing preserved in this branch.
+        if (null === $nid_candidate && $isDoctor && ($type === 'all' || $type === 'note') && $this->has_clinic_read($actorUserId, $trustedClinicId, RolesAndCapabilities::MEDICAL_READ)) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase,WordPress.WhiteSpace.ControlStructureSpacing,Generic.WhiteSpace.ArbitraryParenthesesSpacing,PEAR.Functions.FunctionCallSignature -- Existing legacy camelCase/spacing preserved in this branch.
             $has_private_read = App::authorization_service()->can( // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
                 $actorUserId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
                 $trustedClinicId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
@@ -1587,7 +1592,7 @@ final class ClinicalService
                 $this->notes->search( App::scope()->clinicId, $q, $search_visibility, $from, $to, 20, $own_clinician_id ) // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
             );
         }
-        if ($isDoctor && ($type === 'all' || $type === 'rx') && $this->has_clinic_read($actorUserId, $trustedClinicId, RolesAndCapabilities::RX_READ)) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase,WordPress.WhiteSpace.ControlStructureSpacing,Generic.WhiteSpace.ArbitraryParenthesesSpacing,PEAR.Functions.FunctionCallSignature -- Existing legacy camelCase/spacing preserved in this branch.
+        if (null === $nid_candidate && $isDoctor && ($type === 'all' || $type === 'rx') && $this->has_clinic_read($actorUserId, $trustedClinicId, RolesAndCapabilities::RX_READ)) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase,WordPress.WhiteSpace.ControlStructureSpacing,Generic.WhiteSpace.ArbitraryParenthesesSpacing,PEAR.Functions.FunctionCallSignature -- Existing legacy camelCase/spacing preserved in this branch.
             $results['prescriptions'] = array_map(
                 fn (array $rx): array => $this->presentPrescription($rx, $this->prescriptions->itemsFor((int) $rx['id'])),
                 $this->prescriptions->searchByDrug(App::scope()->clinicId, $q, $from, $to, 20)
@@ -1603,7 +1608,9 @@ final class ClinicalService
             null,
             null,
             [
-                'q' => mb_substr($q, 0, 100),
+                // B0-PR1: the submitted term is deliberately NOT recorded — it may
+                // be a patient identifier (national ID) and must never reach the
+                // hash-chained audit trail. Existing rows are never rewritten.
                 'type' => $type,
                 'from' => $from,
                 'to' => $to,
@@ -1613,7 +1620,8 @@ final class ClinicalService
             $trustedClinicId
         );
 
-        return ['query' => $q, 'type' => $type, 'results' => $results];
+        // B0-PR1: the submitted term is never echoed back in the response body.
+        return ['type' => $type, 'results' => $results];
     }
 
     // ================= Helpers — مجوز و داده =================
