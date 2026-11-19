@@ -1903,8 +1903,9 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         // The write silently does nothing: the filter hands update_option() the OLD value.
         $block = static function ( $value, $old_value ) {
             // A non-empty value is replaced by the OLD one: update_option() then sees no
-            // change and writes nothing, which is exactly the failed-write case.
-            return '' === (string) $value ? $value : $old_value;
+            // change and writes nothing, which is exactly the failed-write case. The value
+            // is never cast (it is an array: a cast would raise a warning-exception).
+            return is_array( $value ) && [] !== $value ? $old_value : $value;
         };
         $hook = 'pre_update_option_' . RolesAndCapabilities::OPTION_OVERRIDE;
         add_filter( $hook, $block, 10, 2 );
