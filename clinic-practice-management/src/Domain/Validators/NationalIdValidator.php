@@ -46,8 +46,7 @@ final class NationalIdValidator
      * NOT required: matching an exact stored national_id is independent of
      * checksum validity.
      */
-    public static function exactAsciiDigits( string $input ): ?string
-    {
+    public static function exact_ascii_digits( string $input ): ?string {
         $folded = strtr( trim( $input ), self::DIGIT_FOLD );
 
         return 1 === preg_match( '/^[0-9]{10}$/', $folded ) ? $folded : null;

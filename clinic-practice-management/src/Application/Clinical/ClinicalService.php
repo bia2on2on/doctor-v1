@@ -1517,7 +1517,7 @@ final class ClinicalService
         // B0-PR1 (F3): a term that normalizes to exactly ten ASCII digits is a
         // national-ID candidate — notes/prescriptions are NOT searched by it;
         // the patient branch matches national_id by exact equality only.
-        $nid_candidate = NationalIdValidator::exactAsciiDigits( $q );
+        $nid_candidate = NationalIdValidator::exact_ascii_digits( $q );
         if (!in_array($type, ['patient', 'note', 'rx', 'all'], true)) {
             throw ClinicalException::of('CLINIC_VALIDATION_FAILED', 'type باید patient|note|rx|all باشد', 422);
         }

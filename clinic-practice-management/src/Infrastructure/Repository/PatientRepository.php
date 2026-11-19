@@ -216,7 +216,7 @@ final class PatientRepository
      */
     public function search(int $clinicId, string $q, int $limit = 25): array
     {
-        $nid  = NationalIdValidator::exactAsciiDigits( $q );
+        $nid  = NationalIdValidator::exact_ascii_digits( $q );
         $like = '%' . $this->db->esc_like( $q ) . '%';
 
         $where  = 'first_name LIKE %s OR last_name LIKE %s OR mobile LIKE %s OR mrn LIKE %s';
@@ -232,7 +232,7 @@ final class PatientRepository
              WHERE clinic_id = %d AND status = %s AND (' . $where . ')
              ORDER BY last_name, first_name
              LIMIT ' . (int) $limit,
-            array_merge( [ $clinicId, 'active' ], $params )
+            array_merge( [ $clinicId, 'active' ], $params ), // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- in-file legacy camelCase parameter kept for consistency with the pre-existing signature.
         );
     }
 

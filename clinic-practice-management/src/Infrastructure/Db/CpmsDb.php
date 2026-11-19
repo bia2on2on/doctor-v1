@@ -93,8 +93,7 @@ final class CpmsDb
      * built from request input must pass through this; server-generated
      * constant prefixes need not.
      */
-    public function esc_like( string $text ): string
-    {
+    public function esc_like( string $text ): string {
         return $this->wpdb->esc_like( $text );
     }
 
