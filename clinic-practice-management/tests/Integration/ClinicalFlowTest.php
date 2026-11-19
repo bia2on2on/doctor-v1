@@ -438,19 +438,42 @@ final class ClinicalFlowTest extends WP_UnitTestCase
 
     // B0-PR1 — عبارت جستجو فقط در بدنه؛ در URL رد می‌شود، در پاسخ تکرار نمی‌شود و در Audit ثبت نمی‌شود.
 
+    // Mutation caught: removing the body_only() refusal guard (or merging the
+    // query string into the body) in ClinicalController::search — the 400
+    // assertions and the unchanged-audit-count assertion go red.
     public function testSearchTermIsBodyOnlyAndNeverRecorded(): void
     {
         wp_set_current_user($this->doctorUserId);
+        $auditCount = static fn (): int => (int) App::db()->fetchValue(
+            "SELECT COUNT(*) FROM " . App::db()->table('cpms_audit_logs') . " WHERE action = 'SEARCH_EXECUTED'",
+            []
+        );
+        $countBefore = $auditCount();
 
-        // عبارت در URL/query → رد قطعی.
+        // عبارت در URL **و** بدنه → رد قطعی؛ جستجو اجرا نمی‌شود و Audit نوشته نمی‌شود.
+        $both = $this->dispatch('POST', self::NS . '/search', ['q' => 'MR-CF-0001'], true, ['q' => 'MR-CF-0001']);
+        $this->assertSame(400, $both->get_status(), 'URL+body term is rejected');
+        $this->assertSame('CLINIC_VALIDATION_FAILED', $both->get_data()['code'] ?? null, 'body-only rejection envelope');
+        $this->assertSame($countBefore, $auditCount(), 'refused request writes no SEARCH_EXECUTED row');
+
+        // عبارت فقط در URL/query → رد قطعی.
         $url = $this->dispatch('POST', self::NS . '/search', [], true, ['q' => 'MR-CF-0001']);
         $this->assertSame(400, $url->get_status(), 'URL-supplied term is rejected');
         $this->assertSame('CLINIC_VALIDATION_FAILED', $url->get_data()['code'] ?? null, 'body-only rejection envelope');
+        $this->assertSame($countBefore, $auditCount(), 'refused request writes no SEARCH_EXECUTED row');
 
-        // عبارت در بدنه → پاسخ موفق؛ پاسخ «query» را برنمی‌گرداند.
+        // متدهای غیرمجاز → رد (route فقط POST را می‌پذیرد).
+        foreach (['GET', 'PUT', 'PATCH', 'DELETE'] as $verb) {
+            $res = $this->dispatch($verb, self::NS . '/search', ['q' => 'MR-CF-0001']);
+            $this->assertContains($res->get_status(), [404, 405], $verb . ' is not allowed on the search route');
+        }
+        $this->assertSame($countBefore, $auditCount(), 'refused verbs write no SEARCH_EXECUTED row');
+
+        // جستجوی مشروعِ بدنه → 200؛ SEARCH_EXECUTED نوشته می‌شود **بدون** عبارت.
         $res = $this->dispatch('POST', self::NS . '/search', ['q' => 'MR-CF-0001']);
         $this->assertSame(200, $res->get_status(), 'body term answers');
         $this->assertArrayNotHasKey('query', $res->get_data()['data'] ?? [], 'the submitted term is not echoed back');
+        $this->assertGreaterThan($countBefore, $auditCount(), 'a legitimate body search writes SEARCH_EXECUTED');
 
         // Audit هیچ‌گز عبارت جستجو را ثبت نمی‌کند (نه حتی به‌صورت masked).
         $leak = (int) App::db()->fetchValue(
@@ -458,6 +481,54 @@ final class ClinicalFlowTest extends WP_UnitTestCase
             ['%MR-CF-0001%']
         );
         $this->assertSame(0, $leak, 'the audit trail never records the search term');
+    }
+
+    // B0-PR1/F3 — کد ملی فقط با تطابقِ دقیقِ ۱۰ رقمی ASCII Match می‌شود؛ یادداشت/نسخه هرگز با عبارتِ کد ملی جستجو نمی‌شوند.
+
+    // Mutation caught: reverting national_id to LIKE matching in
+    // PatientRepository::search, or letting a ten-digit national-ID term reach
+    // the notes/prescriptions search — the notes/prescriptions assertions go red.
+    public function testGlobalSearchNationalIdExactTenDigitsOnly(): void
+    {
+        global $wpdb;
+        $nid = '4445556667';
+        // یادداشتی که محتوای آن ارقامِ همان کد ملی را در بر دارد.
+        $visitId = $this->makeConsultation($this->patientAId);
+        $this->clinical()->addNote($this->doctorUserId, $visitId, [
+            'category' => 'diagnosis',
+            'visibility' => 'patient_visible',
+            'content_text' => 'یادداشت تست حاوی ارقام 4445556667 در متن',
+        ]);
+        $wpdb->update($wpdb->prefix . 'cpms_patients', ['national_id' => $nid], ['id' => $this->patientAId]);
+
+        // عبارتِ ۱۰ رقمیِ دقیق (پزشک): بیمار با تساوی Match می‌شود؛ یادداشتِ حاوی
+        // همان ارقام **برنمی‌گردد** (یادداشت با عبارتِ کد ملی جستجو نمی‌شود)؛ نسخه هم نه.
+        $byNid = $this->clinical()->globalSearch($this->doctorUserId, $nid, 'all');
+        $patIds = array_map(static fn (array $p): int => (int) $p['id'], $byNid['results']['patients']);
+        $this->assertSame([$this->patientAId], $patIds, 'exact NID matches the patient');
+        $this->assertSame([], $byNid['results']['notes'], 'notes are not searched by an NID term');
+        $this->assertSame([], $byNid['results']['prescriptions'], 'prescriptions are not searched by an NID term');
+
+        // نه و یازده رقمی: هرگز Matchِ national_id نیستند.
+        foreach (['444555666', '44455566677'] as $q) {
+            $res = $this->clinical()->globalSearch($this->doctorUserId, $q, 'patient');
+            $this->assertSame([], $res['results']['patients'], 'a ' . strlen($q) . '-digit term never matches national_id');
+        }
+
+        // همان یادداشت با عبارتِ ۹ رقمیِ محتوایی Match می‌شود (یادداشت با عباراتِ
+        // معمولی همچنان جستجوپذیر است — اسکپ فقط برای عبارتِ کد ملی است).
+        $byContent = $this->clinical()->globalSearch($this->doctorUserId, '444555666', 'note');
+        $this->assertSame(1, count($byContent['results']['notes']), 'ordinary digit terms still search notes');
+
+        // نقش منشی (پذیرش): کد ملی دقیق بیمار را می‌یابد؛ بردارهای بالینی برایش خالی‌اند.
+        $asSecretary = $this->clinical()->globalSearch($this->secretaryUserId, $nid, 'all');
+        $this->assertSame(
+            [$this->patientAId],
+            array_map(static fn (array $p): int => (int) $p['id'], $asSecretary['results']['patients']),
+            'secretary exact-NID patient search finds the patient'
+        );
+        $this->assertSame([], $asSecretary['results']['notes'], 'secretary never sees notes');
+        $this->assertSame([], $asSecretary['results']['prescriptions'], 'secretary never sees prescriptions');
     }
 
     // ================= E10/E11 — نسخه دارویی =================

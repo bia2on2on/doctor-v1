@@ -537,9 +537,14 @@ final class ReceptionPortalController extends RestBase {
 	 * national ID at all). The explicit Reception Location is validated at the
 	 * permission boundary; patient identity remains Clinic-scoped and Location
 	 * never filters this search.
-	 * B0-PR1: the term is read from the request BODY only; a URL/query term is
-	 * refused outright so an identifier never reaches logs or the Referer chain.
-	 * Nothing is written; a returned patient id stays a selector only.
+	 * B0-PR1: the term is read from the request BODY only; if `q` is present in
+	 * the URL/query string this callback refuses with 400 CLINIC_VALIDATION_FAILED
+	 * after the route's permission_callback (nonce + Reception boundary) has
+	 * already run — nothing is searched and the value is never read, stored or
+	 * echoed. This cannot stop a web server/proxy access log or a Referer header
+	 * from recording a request line that carries the identifier; callers must
+	 * never place the term in the URL. Nothing is written; a returned patient id
+	 * stays a selector only.
 	 */
 	private function patient_search( WP_REST_Request $r ): WP_REST_Response|WP_Error {
 		if ( array_key_exists( 'q', $r->get_query_params() ) ) {

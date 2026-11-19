@@ -263,10 +263,14 @@ final class ClinicalController extends RestBase
      * E18 جستجوی جامع — B0-PR1 body-only contract.
      *
      * The term (which may be a patient identifier such as a national ID) is read
-     * from the request BODY only. A term supplied through the URL/query string is
-     * refused outright so it can never reach web-server access logs, browser
-     * history or Referer headers. Authorization (nonce + cpms_search) is unchanged
-     * and still runs before the service call.
+     * from the request BODY only. If `q` is present in the URL/query string this
+     * callback refuses with 400 CLINIC_VALIDATION_FAILED after the route's
+     * permission_callback (nonce + cpms_search) has already run — the service is
+     * never called and no audit row is written. What this cannot do is stop a web
+     * server/proxy access log or a Referer header from recording a request line
+     * that a client still chooses to carry the identifier in; callers must never
+     * place the term in the URL. The guard guarantees only that this API never
+     * reads, searches, logs or echoes that value.
      */
     private function search( WP_REST_Request $r ): WP_REST_Response|WP_Error {
         if ( array_key_exists( 'q', $r->get_query_params() ) ) {

@@ -184,6 +184,38 @@ final class PatientAdminTest extends WP_UnitTestCase
         $this->assertStringContainsString('تنها مجاز به جستجو', $docHtml, 'پزشک باید پیام «جستجو فقط» را ببیند');
     }
 
+    // B0-PR1 — فرم جستجو: dispatch POST به admin.php?page=<slug> با Nonce؛ عبارت فقط در بدنهٔ POST.
+
+    // Mutation caught: (a) form action retargeted to bare admin.php — the
+    // action assertion goes red; (b) the term echoed back into the HTML (e.g.
+    // the input value attribute) — the full-HTML assertion goes red.
+    public function testSearchFormPostsToPatientsPageAndNeverEchoesTerm(): void
+    {
+        wp_set_current_user($this->secretaryId);
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_POST = [
+            '_wpnonce' => wp_create_nonce('cpms_patient_search'),
+            'q'        => 'UNIQUE-TERM-Zz123',
+        ];
+        try {
+            ob_start();
+            PatientAdminPage::render();
+            $html = (string) ob_get_clean();
+        } finally {
+            $_SERVER['REQUEST_METHOD'] = 'GET';
+            $_POST = [];
+        }
+
+        $this->assertStringContainsString(
+            'action="' . esc_url(admin_url('admin.php?page=' . PatientAdminPage::PAGE_SLUG)) . '"',
+            $html,
+            'the search form POSTs to admin.php?page=<slug>, never bare admin.php'
+        );
+        $this->assertStringContainsString('name="_wpnonce"', $html, 'the search form carries the cpms_patient_search CSRF nonce');
+        $this->assertStringNotContainsString('admin.php?page=' . PatientAdminPage::PAGE_SLUG . '&q=', $html, 'the action URL never carries the term');
+        $this->assertStringNotContainsString('UNIQUE-TERM-Zz123', $html, 'the submitted term never appears in the HTML, not even as an input value');
+    }
+
     // ================= 3) ایجاد + Audit (مسیر امن) =================
 
     public function testSecretaryCreatePatientAndAuditLogged(): void
@@ -255,18 +287,44 @@ final class PatientAdminTest extends WP_UnitTestCase
 
     // B0-PR1 — عبارت جستجو فقط در بدنهٔ POST؛ ارسال در URL رد می‌شود.
 
+    // Mutation caught: removing the body_only() refusal guard (or merging the
+    // query string into the body) in PatientController::search — the 400
+    // assertions go red.
     public function testRestSearchTermIsBodyOnly(): void
     {
         $id = $this->seedPatient('کاوه', 'جستجو', '09120000222');
         wp_set_current_user($this->secretaryId);
+
+        global $wpdb;
+        $auditLeak = static function (string $needle) use ($wpdb): int {
+            return (int) $wpdb->get_var(
+                $wpdb->prepare(
+                    'SELECT COUNT(*) FROM ' . $wpdb->prefix . 'cpms_audit_logs WHERE meta_json LIKE %s',
+                    '%' . $needle . '%'
+                ) // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+            );
+        };
+
+        // عبارت در URL **و** بدنه → رد قطعی؛ جستجو اجرا نمی‌شود.
+        $both = $this->dispatch('POST', self::NS . '/patients/search', ['q' => 'کاوه'], ['q' => 'کاوه']);
+        $this->assertSame(400, $both->get_status(), 'URL+body term is rejected');
+        $this->assertSame('CLINIC_VALIDATION_FAILED', $both->get_data()['code'] ?? null, 'body-only rejection envelope');
+        $this->assertSame(400, $both->get_data()['data']['status'] ?? null, 'URL+body rejection uses the bounded validation envelope (no patient payload)');
 
         // عبارت در URL/query → رد قطعی (هرگز جستجو نمی‌شود).
         $url = $this->dispatch('POST', self::NS . '/patients/search', [], ['q' => 'کاوه']);
         $this->assertSame(400, $url->get_status(), 'URL-supplied term is rejected');
         $this->assertSame('CLINIC_VALIDATION_FAILED', $url->get_data()['code'] ?? null, 'body-only rejection envelope');
         $this->assertSame(400, $url->get_data()['data']['status'] ?? null, 'rejection uses the bounded validation envelope');
+        $this->assertSame(['status' => 400], $url->get_data()['data'] ?? null, 'URL-only rejection carries only the bounded validation status, never patient rows');
 
-        // همان عبارت در بدنه → پاسخ موفق.
+        // متدهای غیرمجاز → رد (route فقط POST را می‌پذیرد).
+        foreach (['GET', 'PUT', 'PATCH', 'DELETE'] as $verb) {
+            $res = $this->dispatch($verb, self::NS . '/patients/search', ['q' => 'کاوه']);
+            $this->assertContains($res->get_status(), [404, 405], $verb . ' is not allowed on the search route');
+        }
+
+        // همان عبارت در بدنه → پاسخ موفق؛ هیچ Audit-ردیفی حاوی عبارت نوشته نمی‌شود.
         $body = $this->dispatch('POST', self::NS . '/patients/search', ['q' => 'کاوه']);
         $this->assertSame(200, $body->get_status(), 'body term answers');
         $this->assertContains(
@@ -274,6 +332,7 @@ final class PatientAdminTest extends WP_UnitTestCase
             array_map(static fn($r): int => (int) $r['id'], (array) ($body->get_data()['data'] ?? [])),
             'body term finds the patient'
         );
+        $this->assertSame(0, $auditLeak('کاوه'), 'no audit row ever carries the search term');
     }
 
     public function testRestGetPatientRequiresPatientRead(): void

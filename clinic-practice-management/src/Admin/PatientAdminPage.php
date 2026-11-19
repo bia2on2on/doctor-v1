@@ -117,14 +117,14 @@ final class PatientAdminPage
                 <div class="notice <?php echo str_starts_with($notice, 'خطا') ? 'notice-error' : 'notice-success'; ?> is-dismissible"><p><?php echo esc_html($notice); ?></p></div>
             <?php endif; ?>
 
-            <form method="post" action="<?php echo esc_url( admin_url( 'admin.php' ) ); ?>" class="cpms-autofocus">
+            <form method="post" action="<?php echo esc_url( admin_url( 'admin.php?page=' . self::PAGE_SLUG ) ); ?>" class="cpms-autofocus">
                 <input type="hidden" name="page" value="<?php echo esc_attr(self::PAGE_SLUG); ?>">
                 <?php wp_nonce_field( self::SEARCH_NONCE_ACTION ); // B0-PR1: body-only search needs the CSRF token. ?>
                 <table class="form-table" role="presentation">
                     <tr>
                         <th><label for="cpms_pat_q">جستجوی بیمار</label></th>
                         <td>
-                            <input type="search" id="cpms_pat_q" name="q" class="regular-text" value="<?php echo esc_attr($q); ?>"
+                            <input type="search" id="cpms_pat_q" name="q" class="regular-text"
                                    placeholder="نام، نام خانوادگی، موبایل، کد ملی یا کد پرونده (MRN)" autocomplete="off">
                         </td>
                     </tr>

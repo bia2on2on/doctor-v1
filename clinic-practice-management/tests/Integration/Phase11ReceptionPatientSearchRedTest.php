@@ -18,7 +18,8 @@
  *   POST /clinic/v1/patients/search (B0-PR1: body-only `q`) → PatientService::search
  *   (trim, min 2 chars ⇒ 400 CLINIC_VALIDATION_FAILED, limit clamped 1..50,
  *   default 25) → PatientRepository::search (trusted clinic_id, status=active,
- *   LIKE on first_name/last_name/mobile/national_id/mrn) → searchView (bounded
+ *   LIKE-escaped on first_name/last_name/mobile/mrn; national_id only by
+ *   exact ten-ASCII-digit equality) → searchView (bounded
  *   keys, NO national ID at all). The shared route gates on cpms_patient_read
  *   only — it does NOT carry the Reception secretary-role boundary.
  *
@@ -41,6 +42,7 @@
  *  S9  No national ID (not even masked) + no clinical/private keys  INTENDED RED
  *  S10 Search/selection performs no mutation; read-only route ..... INTENDED RED
  *  S11 B0-PR1: term is body-only; URL term rejected; no echo .... INTENDED RED
+ *  S12 B0-PR1/F3: national ID matches only as exactly ten ASCII digits ..... INTENDED RED
  *
  * Slice 1 Arrival Board regression stays covered by the existing
  * Phase11StaffPortalReceptionArrivalRedTest / Phase11ReceptionPartialArrivalRecoveryRedTest.
@@ -206,12 +208,24 @@ final class Phase11ReceptionPatientSearchRedTest extends WP_UnitTestCase
         $pb = $this->insertPatient($b['clinic'], 'Twin', 'Samename', '09121110042', '1112223335', 'MR-S4-TWIN-B');
 
         wp_set_current_user($a['secretary']);
-        foreach (['Samename', 'Twin', '0912111004', '111222333', 'MR-S4-TWIN'] as $q) {
+        // B0-PR1/F3: exact ten-digit terms match national_id exactly; any
+        // other term (a 9-digit prefix included) never matches national_id.
+        foreach (['Samename', 'Twin', '0912111004', '1112223334', 'MR-S4-TWIN'] as $q) {
             $res = $this->dispatch('POST', self::SEARCH, ['q' => $q], $this->scopeHeaders($a['clinic'], $a['loc_a']));
             self::assertSame(200, $res->get_status(), 'S4: search answers for "' . $q . '"');
             self::assertSame([$pa], $this->ids($res), 'S4: Clinic A search returns only the Clinic A patient for "' . $q . '"');
             self::assertNotContains($pb, $this->ids($res), 'S4: Clinic B patient absent for "' . $q . '"');
         }
+
+        // Exact ten-digit term that IS the other Clinic's national ID: never
+        // matches from Clinic A (exact match is Clinic-scoped too).
+        $crossNid = $this->dispatch('POST', self::SEARCH, ['q' => '1112223335'], $this->scopeHeaders($a['clinic'], $a['loc_a']));
+        self::assertSame(200, $crossNid->get_status(), 'S4: exact foreign NID search answers');
+        self::assertSame([], $this->ids($crossNid), 'S4: exact foreign NID never matches across Clinics');
+        // A 9-digit prefix of either national ID never matches national_id.
+        $nine = $this->dispatch('POST', self::SEARCH, ['q' => '111222333'], $this->scopeHeaders($a['clinic'], $a['loc_a']));
+        self::assertSame(200, $nine->get_status(), 'S4: 9-digit prefix answers');
+        self::assertSame([], $this->ids($nine), 'S4: a 9-digit prefix never matches national_id (exact 10-digit only)');
 
         // Raw Clinic B selector from a Clinic A secretary fails closed (no membership in B).
         $cross = $this->dispatch('POST', self::SEARCH, ['q' => 'Samename'], $this->scopeHeaders($b['clinic'], $b['loc_a']));
@@ -377,6 +391,9 @@ final class Phase11ReceptionPatientSearchRedTest extends WP_UnitTestCase
 
     // ============ S11 — B0-PR1 body-only search term ============
 
+    // Mutation caught: removing the body_only() refusal guard (or letting the
+    // query string merge into the body) in ReceptionPortalController::patient_search —
+    // the 400 assertions go red.
     public function testS11_SearchTermIsBodyOnly(): void
     {
         $fx = $this->makeStage('s11');
@@ -384,12 +401,35 @@ final class Phase11ReceptionPatientSearchRedTest extends WP_UnitTestCase
         $pid = $this->insertPatient($fx['clinic'], 'Body', 'Onlyx', '09121110111', '7778889990', 'MR-S11-0001');
         wp_set_current_user($fx['secretary']);
 
-        // A national-ID term supplied through the URL/query string is refused
-        // outright — never searched, never logged, never echoed.
+        $auditOf = static function (string $needle): int {
+            return (int) App::db()->fetchValue(
+                'SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs') . " WHERE meta_json LIKE %s",
+                ['%' . $needle . '%']
+            );
+        };
+        $auditBefore = $auditOf('7778889990');
+
+        // Term in the URL AND in the body: refused before any search runs.
+        $both = $this->dispatch('POST', self::SEARCH, ['q' => '7778889990'], $this->scopeHeaders($fx['clinic'], $fx['loc_a']), true, ['q' => '7778889990']);
+        self::assertSame(400, $both->get_status(), 'S11: URL+body term is rejected');
+        self::assertSame('CLINIC_VALIDATION_FAILED', $this->errCode($both), 'S11: URL+body rejection envelope');
+        self::assertSame([], $this->ids($both), 'S11: URL+body rejection returns no rows');
+        self::assertSame($auditBefore, $auditOf('7778889990'), 'S11: refused request writes no audit row containing the term');
+
+        // Term supplied through the URL/query string is refused
+        // outright — never searched, never echoed.
         $urlTerm = $this->dispatch('POST', self::SEARCH, [], $this->scopeHeaders($fx['clinic'], $fx['loc_a']), true, ['q' => '7778889990']);
         self::assertSame(400, $urlTerm->get_status(), 'S11: URL-supplied term is rejected');
         self::assertSame('CLINIC_VALIDATION_FAILED', $this->errCode($urlTerm), 'S11: body-only rejection envelope');
         self::assertSame([], $this->ids($urlTerm), 'S11: rejection returns no rows');
+        self::assertSame($auditBefore, $auditOf('7778889990'), 'S11: refused request writes no audit row containing the term');
+
+        // Unsupported verbs are refused (the route only allows POST).
+        foreach (['GET', 'PUT', 'PATCH', 'DELETE'] as $verb) {
+            $res = $this->dispatch($verb, self::SEARCH, ['q' => '7778889990'], $this->scopeHeaders($fx['clinic'], $fx['loc_a']));
+            self::assertContains($res->get_status(), [404, 405], 'S11: ' . $verb . ' is not allowed on the search route');
+            self::assertSame([], $this->ids($res), 'S11: ' . $verb . ' returns no rows');
+        }
 
         // The same national-ID term in the body answers, and neither the term nor
         // the patient's national ID appears anywhere in the response.
@@ -397,6 +437,49 @@ final class Phase11ReceptionPatientSearchRedTest extends WP_UnitTestCase
         self::assertSame(200, $bodyTerm->get_status(), 'S11: body term answers');
         self::assertSame([$pid], $this->ids($bodyTerm), 'S11: body term finds the patient');
         self::assertStringNotContainsString('7778889990', (string) wp_json_encode($bodyTerm->get_data()), 'S11: the national ID is not echoed back');
+        self::assertSame($auditBefore, $auditOf('7778889990'), 'S11: even a legitimate body search writes no audit row containing the term');
+    }
+
+    // ============ S12 — B0-PR1/F3: national ID matches only exactly ten ASCII digits ============
+
+    // Mutation caught: the pre-F3 national_id LIKE semantics (prefix/substring
+    // matching) — the 9-digit and 11-digit assertions and the LIKE-metacharacter
+    // assertions go red.
+    public function testS12_NationalIdMatchesOnlyExactTenAsciiDigits(): void
+    {
+        $fx = $this->makeStage('s12');
+        $this->seedMembership($fx['secretary'], $fx['clinic'], 'cpms_secretary');
+        $pid = $this->insertPatient($fx['clinic'], 'Nidmatch', 'Exacty', '09121110121', '1234567890', 'MR-S12-0001');
+        $this->insertPatient($fx['clinic'], 'Wild', 'Cardx', '09121110122', '2223334445', 'MR-S12-0002');
+        wp_set_current_user($fx['secretary']);
+
+        // Exact ten ASCII digits — plain and Persian-digit spelling — match.
+        foreach (['1234567890', '۱۲۳۴۵۶۷۸۹۰'] as $q) {
+            $res = $this->dispatch('POST', self::SEARCH, ['q' => $q], $this->scopeHeaders($fx['clinic'], $fx['loc_a']));
+            self::assertSame(200, $res->get_status(), 'S12: exact NID search answers for "' . $q . '"');
+            self::assertSame([$pid], $this->ids($res), 'S12: exact NID matches for "' . $q . '"');
+        }
+
+        // Nine and eleven digits never match national_id.
+        foreach (['123456789', '12345678901'] as $q) {
+            $res = $this->dispatch('POST', self::SEARCH, ['q' => $q], $this->scopeHeaders($fx['clinic'], $fx['loc_a']));
+            self::assertSame(200, $res->get_status(), 'S12: ' . strlen($q) . '-digit term answers');
+            self::assertSame([], $this->ids($res), 'S12: ' . strlen($q) . '-digit term never matches national_id');
+        }
+
+        // LIKE metacharacters are matched literally (esc_like): no wildcard dump.
+        foreach (['%%', '__', '%12%', '12_45', 'N%x'] as $q) {
+            $res = $this->dispatch('POST', self::SEARCH, ['q' => $q], $this->scopeHeaders($fx['clinic'], $fx['loc_a']));
+            self::assertSame(200, $res->get_status(), 'S12: metachar term "' . $q . '" answers');
+            self::assertSame([], $this->ids($res), 'S12: metachar term "' . $q . '" matches nothing (LIKE escaped)');
+        }
+
+        // Name and mobile search keep working alongside the NID rule (an
+        // 11-digit mobile term still finds via mobile LIKE, never via NID).
+        $byName = $this->dispatch('POST', self::SEARCH, ['q' => 'Exacty'], $this->scopeHeaders($fx['clinic'], $fx['loc_a']));
+        self::assertSame([$pid], $this->ids($byName), 'S12: name search still finds the patient');
+        $byMobile = $this->dispatch('POST', self::SEARCH, ['q' => '09121110121'], $this->scopeHeaders($fx['clinic'], $fx['loc_a']));
+        self::assertSame([$pid], $this->ids($byMobile), 'S12: mobile search still finds the patient');
     }
 
     // ============ Helpers ============
