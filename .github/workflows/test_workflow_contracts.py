@@ -7026,7 +7026,7 @@ class PHPUnitFailureDescriptionContracts(unittest.TestCase):
                 self.assertEqual(steps[index + 1], {
                     "name": "Describe PHPUnit failures", "if": "failure()", "continue-on-error": True,
                     "working-directory": "${{ github.workspace }}",
-                    "run": "python3 .github/scripts/phpunit-failure-text.py " + path,
+                    "run": "python3 clinic-practice-management/bin/phpunit-failure-text.py " + path,
                 })
 
     def test_check_contexts_triggers_and_permissions(self):

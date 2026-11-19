@@ -9,7 +9,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
-SCRIPT = Path(__file__).with_name('phpunit-failure-text.py')
+SCRIPT = Path(__file__).resolve().parents[2] / 'bin/phpunit-failure-text.py'
 REL = 'clinic-practice-management/tests/Unit/SampleTest.php'
 CLS = r'ClinicCore\Tests\Unit\SampleTest'
 CANARIES = ['SECRET_CANARY', 'SELECT private_value', '0' * 10, 'https://invalid.example/private']
@@ -36,7 +36,7 @@ class PublicationTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name).resolve()
-        self.script = self.root / '.github/scripts' / SCRIPT.name
+        self.script = self.root / 'clinic-practice-management/bin' / SCRIPT.name
         self.script.parent.mkdir(parents=True)
         shutil.copyfile(SCRIPT, self.script)
         self.source = self.root / REL

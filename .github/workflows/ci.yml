@@ -49,7 +49,7 @@ jobs:
         run: |
           python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --quiet pyyaml
           python3 -m unittest discover -s .github/workflows -p 'test_workflow_contracts.py' -v
-          python3 -m unittest discover -s .github/scripts -p 'test_phpunit_failure_text.py' -v
+          python3 -m unittest discover -s clinic-practice-management/tests/bin -p 'test_phpunit_failure_text.py' -v
         working-directory: ${{ github.workspace }}
 
       - name: MariaDB step 7 pin gate shell test
@@ -176,7 +176,7 @@ jobs:
         if: failure()
         continue-on-error: true
         working-directory: ${{ github.workspace }}
-        run: python3 .github/scripts/phpunit-failure-text.py "$RUNNER_TEMP/phpunit-unit.xml"
+        run: python3 clinic-practice-management/bin/phpunit-failure-text.py "$RUNNER_TEMP/phpunit-unit.xml"
 
       # The same failure-mirror pattern the Integration job already uses. Unit
       # failures were previously visible only inside the job log, whose blob some
@@ -856,7 +856,7 @@ jobs:
         if: failure()
         continue-on-error: true
         working-directory: ${{ github.workspace }}
-        run: python3 .github/scripts/phpunit-failure-text.py /tmp/phpunit-int-junit.xml
+        run: python3 clinic-practice-management/bin/phpunit-failure-text.py /tmp/phpunit-int-junit.xml
 
       # Focused, real-DB proof that the WpSqlFailureLedger publication boundary
       # was exercised against the Integration MySQL service — not skipped and
