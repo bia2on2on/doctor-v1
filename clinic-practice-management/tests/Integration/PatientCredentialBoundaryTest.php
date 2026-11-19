@@ -1933,7 +1933,11 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
      *
      * MUTATION THAT TURNS THIS RED: replacing strict_override_read() with get_option(),
      * which answers array() for a missing row — equal to the intended empty map, so the
-     * refusal disappears and a success audit commits.
+     * refusal disappears.
+     *
+     * SCOPE OF THIS ARM: the request changes no preset, so it writes NO success audit at
+     * all and the audit assertion here is not evidence of a rollback. The audit claim is
+     * pinned by test_reset_refuses_when_the_empty_map_does_not_persist() below.
      */
     public function test_preset_write_refuses_when_an_empty_map_does_not_persist(): void
     {
@@ -1997,10 +2001,10 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             if ( false === strpos( $current, 'SELECT option_value FROM' ) ) {
                 return $query;
             }
-            if ( false !== strpos( $current, 'FOR UPDATE' ) ) {
+            if ( false === strpos( $current, RolesAndCapabilities::OPTION_OVERRIDE ) ) {
                 return $query;
             }
-            if ( false === strpos( $current, RolesAndCapabilities::OPTION_OVERRIDE ) ) {
+            if ( false === strpos( $current, 'FOR UPDATE' ) ) {
                 return $query;
             }
             if ( $state->fired > 0 ) {
@@ -2036,6 +2040,115 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             array_keys( array_filter( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_DOCTOR ) ) ),
             'permissions must be unchanged after the refused write'
         );
+    }
+
+    /**
+     * B1: the read-back must be a LOCKING read, issued exactly once, so it can never answer
+     * from an older consistent-read snapshot than the row this writer already holds.
+     *
+     * MUTATION THAT TURNS THIS RED: removing FOR UPDATE from strict_override_read() — the
+     * probe never matches and the counter stays 0.
+     */
+    public function test_preset_read_back_is_a_locking_read(): void
+    {
+        $admin = $this->makeAdmin();
+
+        $input = $this->matrixWithCurrentCaps();
+        $dropped = RolesAndCapabilities::SEARCH;
+        self::assertContains( $dropped, $input[ RolesAndCapabilities::ROLE_DOCTOR ], 'fixture: the request must change something' );
+        $input[ RolesAndCapabilities::ROLE_DOCTOR ] = array_values( array_diff( $input[ RolesAndCapabilities::ROLE_DOCTOR ], [ $dropped ] ) );
+
+        // Armed from pre_update_option: the snapshot read runs BEFORE the write, so only the
+        // post-write read-back is observed.
+        $state = (object) [ 'fired' => 0 ];
+        $probe = static function ( $query ) use ( $state ) {
+            $current = (string) $query;
+            if ( false === strpos( $current, 'SELECT option_value FROM' ) ) {
+                return $query;
+            }
+            if ( false === strpos( $current, RolesAndCapabilities::OPTION_OVERRIDE ) ) {
+                return $query;
+            }
+            if ( false === strpos( $current, 'FOR UPDATE' ) ) {
+                return $query;
+            }
+            ++$state->fired;
+
+            return $query;
+        };
+        $arm = static function ( $value ) use ( $probe ) {
+            add_filter( 'query', $probe, 7 );
+
+            return $value;
+        };
+        $hook = 'pre_update_option_' . RolesAndCapabilities::OPTION_OVERRIDE;
+        add_filter( $hook, $arm, 20, 1 );
+
+        RoleCapabilitiesPage::apply_capability_matrix( $input, $admin );
+
+        remove_filter( 'query', $probe, 7 );
+        remove_filter( $hook, $arm, 20 );
+
+        self::assertSame( 1, $state->fired, 'the read-back must be a locking read, issued exactly once' );
+    }
+
+    /**
+     * B2: the empty/absent-row failure driven through reset_role_to_template(), where a
+     * successful reset DOES write a RESET audit row — so the control below gives the
+     * "no audit committed" assertion teeth.
+     *
+     * MUTATION THAT TURNS THIS RED: replacing strict_override_read() with get_option() — a
+     * missing row then reads back as the empty map, the reset succeeds and its RESET audit
+     * row is written.
+     */
+    public function test_reset_refuses_when_the_empty_map_does_not_persist(): void
+    {
+        // CONTROL: the same reset WITH a durable row present persists and writes its audit.
+        $secretary_caps = array_values(
+            array_diff(
+                array_keys( array_filter( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY ) ) ),
+                [ RolesAndCapabilities::SEARCH ]
+            )
+        );
+        self::assertTrue( RolesAndCapabilities::setRoleCaps( RolesAndCapabilities::ROLE_SECRETARY, $secretary_caps ) );
+
+        $audit_control = $this->auditCount( 'ROLE_PERMISSION_RESET' );
+        RoleCapabilitiesPage::reset_role_to_template( RolesAndCapabilities::ROLE_SECRETARY );
+        self::assertSame(
+            $audit_control + 1,
+            $this->auditCount( 'ROLE_PERMISSION_RESET' ),
+            'control: a reset that persists writes its RESET audit row'
+        );
+
+        // FAILING ARM: no row at all, and the write is silently dropped.
+        delete_option( RolesAndCapabilities::OPTION_OVERRIDE );
+        self::assertFalse( get_option( RolesAndCapabilities::OPTION_OVERRIDE ), 'fixture: no durable override row' );
+
+        $audit_before = $this->auditCount( 'ROLE_PERMISSION_RESET' );
+        $state_before = array_keys( array_filter( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY ) ) );
+
+        $block = static function ( $value, $old_value ) {
+            return $old_value;
+        };
+        $hook = 'pre_update_option_' . RolesAndCapabilities::OPTION_OVERRIDE;
+        add_filter( $hook, $block, 10, 2 );
+
+        $refused = false;
+        try {
+            RoleCapabilitiesPage::reset_role_to_template( RolesAndCapabilities::ROLE_SECRETARY );
+        } catch ( \RuntimeException $e ) {
+            $refused = '' !== $e->getMessage();
+        }
+        remove_filter( $hook, $block, 10 );
+
+        self::assertTrue( $refused, 'a reset whose empty map did not persist must refuse' );
+        self::assertSame( $audit_before, $this->auditCount( 'ROLE_PERMISSION_RESET' ), 'no RESET audit row may be committed' );
+        self::assertSame(
+            $state_before,
+            array_keys( array_filter( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_SECRETARY ) ) ),
+            'the capability state must be unchanged'
+        );
+        self::assertFalse( get_option( RolesAndCapabilities::OPTION_OVERRIDE ), 'no override row may exist after the refused reset' );
     }
 
     /**

@@ -617,12 +617,19 @@ final class RoleCapabilitiesPage
      * value is unserialized with `maybe_unserialize()` and a non-array payload is a
      * failure too — the caller compares the normalized result with the map it intended.
      *
+     * The SELECT is a LOCKING read (`FOR UPDATE`). A plain SELECT would be a consistent
+     * read: inside a transaction whose snapshot was established before this write it can
+     * answer with the pre-write version of the row, which would mis-report the write this
+     * request just made — https://dev.mysql.com/doc/refman/8.0/en/innodb-consistent-read.html
+     * and https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html. A locking read
+     * always returns the latest committed version of the row the writer already holds.
+     *
      * @return array<string, mixed>
      */
     private static function strict_override_read(): array {
         $wpdb = App::db()->wpdb();
         $rows = App::db()->fetch_all_strict(
-            'SELECT option_value FROM ' . $wpdb->options . ' WHERE option_name = %s LIMIT 1',
+            'SELECT option_value FROM ' . $wpdb->options . ' WHERE option_name = %s LIMIT 1 FOR UPDATE',
             [ RolesAndCapabilities::OPTION_OVERRIDE ]
         );
         if ( array() === $rows ) {
