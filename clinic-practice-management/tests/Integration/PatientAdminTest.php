@@ -216,6 +216,158 @@ final class PatientAdminTest extends WP_UnitTestCase
         $this->assertStringNotContainsString('UNIQUE-TERM-Zz123', $html, 'the submitted term never appears in the HTML, not even as an input value');
     }
 
+    // B0-PR1/B3 — Nonce و متد فرم جستجو: POST بدون/با Nonce نامعتبر رد می‌شود.
+
+    // Mutation caught: remove the cpms_patient_search nonce check in
+    // PatientAdminPage::render — the refusal assertion goes red (render proceeds).
+    public function testSearchRefusedWithoutNonceBeforeAnySearchOrAudit(): void {
+        wp_set_current_user($this->secretaryId);
+        $this->seedPatient('کاوه', 'بی‌نانس', '09120000666');
+        $auditBefore = (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs'));
+
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_POST = ['q' => 'کاوه']; // بدون _wpnonce
+        try {
+            $result = $this->renderSearchPageWithDieCapture();
+        } finally {
+            $_SERVER['REQUEST_METHOD'] = 'GET';
+            $_POST = [];
+        }
+
+        $this->assertNotNull($result['die'], 'a POST without nonce must refuse before any search runs');
+        $this->assertSame(403, (int) ($result['die']['args']['response'] ?? 0), 'the refusal is a 403 wp_die');
+        $this->assertSame('', $result['html'], 'nothing renders — the seeded matching patient proves the search never executed');
+        $this->assertSame(
+            $auditBefore,
+            (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs')),
+            'the refused request writes no audit row'
+        );
+    }
+
+    // Mutation caught: accept a nonce issued for another action (drop the
+    // wp_verify_nonce binding to cpms_patient_search) — the refusal goes red.
+    public function testSearchRefusedWithWrongActionNonceBeforeAnySearchOrAudit(): void {
+        wp_set_current_user($this->secretaryId);
+        $this->seedPatient('کاوه', 'نادرست', '09120000777');
+        $auditBefore = (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs'));
+
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_POST = [
+            '_wpnonce' => wp_create_nonce('cpms_patient_create'),
+            'q'        => 'کاوه',
+        ];
+        try {
+            $result = $this->renderSearchPageWithDieCapture();
+        } finally {
+            $_SERVER['REQUEST_METHOD'] = 'GET';
+            $_POST = [];
+        }
+
+        $this->assertNotNull($result['die'], 'a wrong-action nonce must refuse before any search runs');
+        $this->assertSame(403, (int) ($result['die']['args']['response'] ?? 0), 'the refusal is a 403 wp_die');
+        $this->assertSame('', $result['html'], 'nothing renders — the seeded matching patient proves the search never executed');
+        $this->assertSame(
+            $auditBefore,
+            (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs')),
+            'the refused request writes no audit row'
+        );
+    }
+
+    // B0-PR1/B3 — فرم جستجو باید method="post" باشد و action هرگز q= نداشته باشد.
+
+    // Mutation caught: switch the search form to method="get" (or append q= to
+    // its action) — the method/action assertions go red.
+    public function testSearchFormIsPostOnlyAndActionCarriesNoQuery(): void {
+        wp_set_current_user($this->secretaryId);
+        $_SERVER['REQUEST_METHOD'] = 'GET';
+        $_POST = [];
+        ob_start();
+        PatientAdminPage::render();
+        $html = (string) ob_get_clean();
+
+        $this->assertStringContainsString(
+            '<form method="post" action="' . esc_url(admin_url('admin.php?page=' . PatientAdminPage::PAGE_SLUG)) . '"',
+            $html,
+            'the search form is method="post" to admin.php?page=<slug>'
+        );
+        $this->assertStringNotContainsString(PatientAdminPage::PAGE_SLUG . '&q=', $html, 'the action URL never carries q=');
+    }
+
+    // B0-PR1/B1 — جستجوی منطبق با national_id نباید عبارتِ ۱۰ رقمی را به هیچ پاسخی برگرداند.
+
+    // Mutation caught: echoing the term (query key / input value) or projecting
+    // national_id into the search results — the absence assertions go red.
+    public function testSearchMatchedByNationalIdNeverEchoesTermInHtmlOrJson(): void {
+        global $wpdb;
+        $nid = '5556667778';
+        $id  = $this->seedPatient('کاوه', 'نیدتست', '09120000555');
+        $wpdb->update($wpdb->prefix . 'cpms_patients', ['national_id' => $nid], ['id' => $id]);
+
+        // JSON — REST: تطابق فقط با تساویِ national_id؛ عبارت در هیچ جای پاسخ نیست.
+        wp_set_current_user($this->secretaryId);
+        $res = $this->dispatch('POST', self::NS . '/patients/search', ['q' => $nid]);
+        $this->assertSame(200, $res->get_status(), 'the NID term search answers');
+        $this->assertContains(
+            $id,
+            array_map(static fn($r): int => (int) $r['id'], (array) ($res->get_data()['data'] ?? [])),
+            'the patient is matched by national_id equality'
+        );
+        $this->assertStringNotContainsString($nid, (string) wp_json_encode($res->get_data()), 'the 10-digit term never reaches the JSON response');
+
+        // HTML — صفحهٔ مدیریت: همان عبارت در هیچ جای رندر نیامده است.
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_POST = [
+            '_wpnonce' => wp_create_nonce('cpms_patient_search'),
+            'q'        => $nid,
+        ];
+        try {
+            ob_start();
+            PatientAdminPage::render();
+            $html = (string) ob_get_clean();
+        } finally {
+            $_SERVER['REQUEST_METHOD'] = 'GET';
+            $_POST = [];
+        }
+        $this->assertStringContainsString('نیدتست', $html, 'the admin search matched the patient');
+        $this->assertStringNotContainsString($nid, $html, 'the 10-digit term never reaches the rendered HTML');
+    }
+
+    /**
+     * الگوی جاافتادهٔ مخزن برای گرفتنِ wp_die بدون کشتنِ PHPUnit
+     * (AppActivationDatabaseGateTest::captureWpDie) — همان ثابت‌های خطایابی.
+     *
+     * @return array{html: string, die: array{message: string, title: string, args: array<string, mixed>}|null}
+     */
+    private function renderSearchPageWithDieCapture(): array {
+        $captured = [];
+        $handler  = static function () use (&$captured): callable {
+            return static function ($message, $title = '', $args = []) use (&$captured): void {
+                $captured[] = [
+                    'message' => is_string($message) ? $message : '',
+                    'title'   => is_string($title) ? $title : '',
+                    'args'    => is_array($args) ? $args : [],
+                ];
+                throw new \RuntimeException('CPMS_TEST_WP_DIE');
+            };
+        };
+        add_filter('wp_die_handler', $handler, PHP_INT_MAX);
+
+        try {
+            ob_start();
+            PatientAdminPage::render();
+            $html = (string) ob_get_clean();
+        } catch (\RuntimeException $e) {
+            $html = (string) ob_get_clean();
+            if ($e->getMessage() !== 'CPMS_TEST_WP_DIE') {
+                throw $e;
+            }
+        } finally {
+            remove_filter('wp_die_handler', $handler, PHP_INT_MAX);
+        }
+
+        return ['html' => $html, 'die' => $captured[0] ?? null];
+    }
+
     // ================= 3) ایجاد + Audit (مسیر امن) =================
 
     public function testSecretaryCreatePatientAndAuditLogged(): void

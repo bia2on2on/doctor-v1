@@ -501,6 +501,20 @@ final class ClinicalFlowTest extends WP_UnitTestCase
         ]);
         $wpdb->update($wpdb->prefix . 'cpms_patients', ['national_id' => $nid], ['id' => $this->patientAId]);
 
+        // B0-PR1/B2: نسخه‌ای که نامِ دارویش حاوی همان ۱۰ رقم است — اگر نگهبانِ
+        // نسخه (ClinicalService) حذف شود، جستجوی عبارتِ کد ملی این نسخه را
+        // برمی‌گرداند و assertion نسخه‌ی خالیِ پایین قرمز می‌شود.
+        $rxSeed = $this->clinical()->createPrescription($this->doctorUserId, $visitId, [
+            'items' => [
+                [
+                    'generic_name' => 'TESTDRUG 4445556667',
+                    'dose' => '1',
+                    'frequency' => 'daily',
+                ],
+            ],
+            'is_patient_visible' => true,
+        ]);
+
         // عبارتِ ۱۰ رقمیِ دقیق (پزشک): بیمار با تساوی Match می‌شود؛ یادداشتِ حاوی
         // همان ارقام **برنمی‌گردد** (یادداشت با عبارتِ کد ملی جستجو نمی‌شود)؛ نسخه هم نه.
         $byNid = $this->clinical()->globalSearch($this->doctorUserId, $nid, 'all');
@@ -508,6 +522,12 @@ final class ClinicalFlowTest extends WP_UnitTestCase
         $this->assertSame([$this->patientAId], $patIds, 'exact NID matches the patient');
         $this->assertSame([], $byNid['results']['notes'], 'notes are not searched by an NID term');
         $this->assertSame([], $byNid['results']['prescriptions'], 'prescriptions are not searched by an NID term');
+
+        // کنترلِ مثبت (ضدِ vacuous): همان نسخه با عبارتِ معمولیِ نامِ دارو پیدا
+        // می‌شود — پس خالی‌بودنِ نتیجه‌ی نسخه در جستجوی کد ملی از نبودِ داده نیست.
+        $byDrug = $this->clinical()->globalSearch($this->doctorUserId, 'TESTDRUG', 'rx');
+        $this->assertCount(1, $byDrug['results']['prescriptions'], 'an ordinary drug term finds the seeded prescription');
+        $this->assertSame((int) $rxSeed['id'], (int) $byDrug['results']['prescriptions'][0]['id'], 'the seeded prescription is the ordinary-term match');
 
         // نه و یازده رقمی: هرگز Matchِ national_id نیستند.
         foreach (['444555666', '44455566677'] as $q) {
