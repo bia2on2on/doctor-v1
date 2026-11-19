@@ -134,7 +134,22 @@ final class FinanceDelegationService {
 				}
 				// R2/R3 — the membership is re-read strictly under the lock and its
 				// identity is proved before any decision or write.
-				$this->locked_target_membership( $clinic_id, $target_membership_id, $target_user_id, $target_role );
+				$locked = $this->locked_target_membership(
+					$clinic_id,
+					$target_membership_id,
+					$target_user_id,
+					$target_role
+				);
+				// R3 — the patient/mixed classification is re-made on the LOCKED user id:
+				// evidence that appeared after the pre-flight read must refuse the GRANT.
+				if ( PatientAccountPolicy::is_patient_account( (int) $locked['wp_user_id'] ) ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'واگذاری مجوز به این عضویت مجاز نیست.',
+						403,
+						array( 'clinic_id' => $clinic_id )
+					);
+				}
 				try {
 					$current = $this->explicit_effect_strict( $target_membership_id, $capability );
 				} catch ( \Throwable $e ) {

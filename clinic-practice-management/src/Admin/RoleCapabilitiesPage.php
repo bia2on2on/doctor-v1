@@ -595,7 +595,40 @@ final class RoleCapabilitiesPage
      */
     private static function persist_override_map( array $map ): void {
         update_option( RolesAndCapabilities::OPTION_OVERRIDE, $map, true );
+        // R1 — `update_option()` also returns false for an unchanged value, so a failed
+        // write is detected by READING the map back from the database, never by the
+        // return value: a narrowing that did not persist must not commit a success audit.
+        wp_cache_delete( RolesAndCapabilities::OPTION_OVERRIDE, 'options' );
+        wp_cache_delete( 'alloptions', 'options' );
+        $read_back = get_option( RolesAndCapabilities::OPTION_OVERRIDE, array() );
+        if ( ! is_array( $read_back )
+            || self::normalize_override_map( $read_back ) !== self::normalize_override_map( $map )
+        ) {
+            throw new \RuntimeException( 'the capability override write did not persist' );
+        }
         RolesAndCapabilities::register();
+    }
+
+    /**
+     * Order-independent form of an override map, for the read-back comparison (R1).
+     *
+     * @param array<string, mixed> $map
+     * @return array<string, list<string>|null> null marks a malformed entry
+     */
+    private static function normalize_override_map( array $map ): array {
+        $normal = array();
+        foreach ( $map as $role => $caps ) {
+            if ( ! is_array( $caps ) ) {
+                $normal[ (string) $role ] = null;
+                continue;
+            }
+            $list = RolesAndCapabilities::sanitizeCapList( $caps );
+            sort( $list );
+            $normal[ (string) $role ] = $list;
+        }
+        ksort( $normal );
+
+        return $normal;
     }
 
     /**
