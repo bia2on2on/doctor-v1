@@ -10,6 +10,7 @@ use ClinicCore\Application\Booking\ScheduleService;
 use ClinicCore\Application\Location\LocationException;
 use ClinicCore\Application\Location\LocationService;
 use ClinicCore\Application\Membership\MembershipService;
+use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Scope\ScopeRequiredException;
@@ -660,6 +661,13 @@ final class FacilitySetupService {
         if ( $wp_user_id <= 0 || false === get_userdata( $wp_user_id ) ) {
             throw new FacilitySetupException( 'user_not_found', 'کاربر انتخاب‌شده یافت نشد.' );
         }
+
+        // B0-PR2 — a patient account is never taken on as a clinician from this
+        // staff onboarding step. The refusal reuses the neutral "not found"
+        // wording so the target's patient status is not observable.
+        if ( PatientAccountPolicy::is_patient_account( $wp_user_id ) ) {
+            throw new FacilitySetupException( 'user_not_found', 'کاربر انتخاب‌شده یافت نشد.' );
+        }
         $location_ids = $this->room_location_ids( $entry, $room_keys );
         $full_name    = trim( $full_name );
         if ( mb_strlen( $full_name ) > 190 ) {
@@ -898,6 +906,12 @@ final class FacilitySetupService {
         }
         $user = $wp_user_id > 0 ? get_userdata( $wp_user_id ) : false;
         if ( false === $user || in_array( 'administrator', (array) $user->roles, true ) ) {
+            throw new FacilitySetupException( 'user_not_eligible', 'کاربر انتخاب‌شده یافت نشد یا برای نقش کارکنان این درمانگاه قابل انتخاب نیست؛ چیزی ثبت نشد.' );
+        }
+
+        // B0-PR2 — staff membership is never granted to a patient account; same
+        // neutral wording as the eligibility refusal above (no enumeration).
+        if ( PatientAccountPolicy::is_patient_account( $wp_user_id ) ) {
             throw new FacilitySetupException( 'user_not_eligible', 'کاربر انتخاب‌شده یافت نشد یا برای نقش کارکنان این درمانگاه قابل انتخاب نیست؛ چیزی ثبت نشد.' );
         }
 
