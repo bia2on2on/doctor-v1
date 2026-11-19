@@ -264,3 +264,74 @@ A PR that changes an item's status, or resolves/introduces debt, **amends this l
 - Repository has no markdown/link checker; docs checks applied: see report.
 
 *Prepared 2026-11-08 (UTC) across multiple correction passes; earlier revisions retained in git history (`855906fd`, `a69c89c5`, `fbaf16bf`, `be81b857`, `68ce45cd`, `5c614133`, `33274780`, `95c0aed8`). No claim is made about any event after the revision this footer ships in, other than what the file records against exact timestamps/SHAs taken at the time of each pass. Documentation-only; no merge performed; owner go/no-go pending.*
+
+## 9. Release 1.0 owner decisions
+
+Recorded from the owner's Phase 2 instruction (2026-11-18 UTC). This is the
+Release 1.0 target, not a claim about the imported code, test results, or release
+readiness. See [project origin and scope](../ORIGIN.md).
+
+1. **Customers and clinic setups.** Serve independent doctors (one doctor in a
+   single clinic, including a clinic with several locations) and doctor buildings
+   (several doctors with independent clinics).
+2. **Included capabilities.** Patient panel, patient SMS login and identity,
+   new-patient registration, public booking, patient and medical-record
+   management, scheduling and reception, visit recording including handwriting
+   and prescriptions, basic finance, security and RBAC, backup and restore,
+   reports, and custom roles.
+3. **Deferred capabilities.** Hide staff messaging in 1.0; do not delete it.
+   Remove child-specific features from the 1.0 scope; they belong in the next
+   version only.
+4. **No-shows.** Record a no-show only by manual action, with a reason and the
+   acting user recorded. Do not mark no-shows automatically.
+5. **Verified mobile.** Never release or change a verified mobile automatically.
+   Examine in-person correction separately. If the restriction blocks 1.0,
+   document the limitation and report it to the owner before dropping any
+   capability.
+6. **Patient identity.** Require both mobile possession (valid SMS OTP) and a
+   matching national ID (NID). Mobile proof alone never grants access, and no
+   staff path can grant it. The NID appears only in the request body, never in a
+   URL, log, audit record, or response. An administrator must not create or set
+   credentials for patient accounts.
+7. **Staff and doctor login.** Use an admin-created username or email and
+   password, separately from the patient login path.
+8. **Backup and restore.** Provide a full, encrypted, restorable backup. Backup
+   is manual only, with a measured short read-only window. Restore only onto an
+   **EMPTY** install; refuse restore on a host without reliable file locking.
+   After restore, all login bindings are closed.
+9. **Internal TEST ZIP.** Allowed only for installation and upgrade testing,
+   without a real license key. Never sell or publish it, and do not change the
+   official version for it.
+10. **Owner approval.** Every change in `doctor-v1` needs separate owner
+    approval, including code, migrations, plugin header, repo settings,
+    workflows, version, releases, and tags. Sensitive merges (login,
+    authentication, access, finance, database, migrations, or security) need
+    explicit owner approval to merge.
+
+**Technical-source divergence:** Old PR #354 describes in-scope dependents and a
+staff-approved binding path. Those remain facts about the older design, not
+1.0 decisions: child-specific features are deferred and staff cannot grant
+patient access in 1.0. This entry does not change the design or the code.
+
+### Migration rule
+
+1. Assign every new migration number in the full line first, then copy the
+   migration file byte-identically to 1.0.
+2. The 1.0 line never creates a migration absent from the full line.
+3. The current schema head is `2026_10_31_0031`. On reaching the planned
+   `cpms_patient_logins` table (migration `0032` or later), **STOP and ask the
+   owner** before proceeding.
+
+### License decision A
+
+Option A: Release 1.0 uses a real license.
+
+1. **M1 — Existing care continues.** Licensing never blocks admission for an
+   existing appointment. Expiry never blocks handwriting for an existing visit;
+   only new patients and new appointments may be restricted by expiry.
+2. **M2 — Release-build gate.** A key gate is mandatory for release builds. The
+   real key pair is a release blocker; an internal TEST ZIP is not a release.
+3. **M3 — Ed25519 and offline validation.** The plugin validates the license
+   offline. An issuer outage never locks patient data, and licensing sends no
+   patient data. The private key never goes in the repository, logs, CI, plugin,
+   or customer site. Private-key custody will be studied separately.

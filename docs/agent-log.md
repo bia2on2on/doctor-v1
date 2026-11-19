@@ -7142,3 +7142,13 @@ Integration assertion counts differ between pushes (76873/76877/76874) with no t
 - OBSERVED (added): one comment line above each of the eight `StaffMessagingHiddenReleaseOneTest` tests naming the mutation it catches (flip the switch; unguarded registry entry; selector accepting `messages`; eligibility ignoring the switch; template mount without the switch; controller registered outside the switch; over-broad hiding; deleting the module instead of hiding it). Comment-only: no assertion or behaviour changed.
 - REMOVED/SHORTENED: none in this round. From the earlier R1 round and unchanged here: three eligibility expectations moved from "visible" to "hidden" (equal or stronger, they now pin the 1.0 decision), `PkgP1JalaliAssetsTest` renders the module template directly with the same four no-date/no-Jalali assertions plus one "not offered" assertion, and `StaffMessagingSecurityTest` keeps all 14 REST dispatches behind its own controller registration.
 - LIMITATION: native PHP is absent, so `php -l`, PHPCS and PHPUnit were not run locally; every added line was read for PEAR call spacing, `=>` alignment, brace style, Yoda conditions and doc-block full stops. CI status is reported in the pull request; no merge, no re-run.
+
+### [2026-11-18 UTC] — doctor-v1 Phase 2 origin and Release 1.0 decisions
+- OBSERVED: The imported main snapshot matched the expected baseline. The live workflow inventory contained only CI and Closure Gate active; the other 15 workflows were manually disabled.
+- OBSERVED: Added `docs/ORIGIN.md` and appended the Release 1.0 owner decisions, migration rule, and License decision A to `docs/status/ledger.md`. Recorded the older technical design separately from the 1.0 target. This change is documentation only; no build, implementation, or merge is authorized here.
+- LIMITATION: Both Actions permissions reads returned HTTP 403 (UNKNOWN). Release acceptance is NOT verified; the exact-head CI census is separate from this entry.
+
+### [2026-11-18 UTC] — PR #4 docs sync after PR #5
+- OBSERVED: Synced the docs branch with main. The only conflict was in this log; kept the 7,006 shared lines, 115 lines appended on main, and 5 lines appended by PR #4, byte-for-byte.
+- OBSERVED: PR #5 removed recurring no-show scheduling and made the sweep inert. The Release 1.0 manual-only decision aligns with staff recording a reason and actor. The older ledger references to automatic D10 describe the pre-R4 policy.
+- LIMITATION: The PR diff against main remains documentation only. No local PHP or release acceptance was run.
