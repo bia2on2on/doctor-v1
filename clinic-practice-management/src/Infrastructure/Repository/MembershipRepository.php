@@ -146,6 +146,105 @@ final class MembershipRepository {
      *
      * @return list<int>
      */
+    /**
+     * شناسهٔ کاربرانِ دارای عضویتِ **فعال** با این role_key در همهٔ Clinicها — مبنای
+     * بررسیِ «گسترشِ» یک نقشِ دارای عضوِ بیمار/مختلط (B0-PR2-H2/G9).
+     *
+     * خواندنِ strict است: خطای دیتابیس throw می‌شود تا «نامعلوم» هرگز «بدون عضو»
+     * تلقی نشود (`require_successful_read()`).
+     *
+     * @return list<int>
+     */
+    /**
+     * EVERY active holder of a role key, page by page (B1).
+     *
+     * A single LIMIT silently ignored holders beyond the bound, so a patient at
+     * position 5001 was invisible to the widening guard. The keyset cursor
+     * (wp_user_id > last seen, ordered) makes the scan exhaustive without OFFSET
+     * and without a bound; a failed page refuses instead of returning a short list.
+     *
+     * @return list<int>
+     */
+    public function member_user_ids_for_role( string $role_key, int $page_size = 500 ): array {
+        $page_size = max( 1, $page_size );
+        $user_ids  = array();
+        $cursor    = 0;
+        $rows      = array();
+
+        do {
+            $rows = $this->db->fetch_all_strict(
+                'SELECT DISTINCT wp_user_id FROM ' . $this->db->table( 'cpms_clinic_memberships' )
+                    . ' WHERE role_key = %s AND status = %s AND wp_user_id > %d'
+                    . ' ORDER BY wp_user_id ASC LIMIT %d',
+                array( $role_key, 'active', $cursor, $page_size )
+            );
+            $this->require_successful_read();
+
+            $fetched = 0;
+            foreach ( $rows as $row ) {
+                $user_ids[] = (int) $row['wp_user_id'];
+                $cursor     = (int) $row['wp_user_id'];
+                ++$fetched;
+            }
+        } while ( $fetched === $page_size );
+
+        return $user_ids;
+    }
+
+    /**
+     * Lock one membership row for the rest of the caller's transaction (B4).
+     *
+     * `false` means "not there OR not readable" — both are unknown, so the caller
+     * must refuse instead of writing over a state it could not observe. Deliberately
+     * independent of `last_error`, which an earlier statement in the same request
+     * may have left set.
+     */
+    public function lock_row_for_update( int $membership_id ): bool {
+        $row = $this->db->fetchRowForUpdate(
+            'SELECT id FROM ' . $this->db->table( 'cpms_clinic_memberships' ) . ' WHERE id = %d LIMIT 1',
+            array( $membership_id )
+        );
+
+        return is_array( $row );
+    }
+
+    /**
+     * STRICT LOCKING read of one membership row for a decision taken under the lock
+     * (R2/R3): the SELECT ... FOR UPDATE makes the row unchangeable for the rest of the
+     * caller's transaction, and the identity columns are returned so the caller can
+     * prove the row is still the one it decided about.
+     *
+     * `fetch_all_strict` throws on a failed read, so "unreadable" can never be
+     * mistaken for "unchanged"; `null` means the row really is gone.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function read_membership_strict( int $membership_id ): ?array {
+        $rows = $this->db->fetch_all_strict(
+            'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode FROM ' . $this->db->table( 'cpms_clinic_memberships' )
+                . ' WHERE id = %d LIMIT 1 FOR UPDATE',
+            array( $membership_id )
+        );
+
+        return array() === $rows ? null : $rows[0];
+    }
+
+    /**
+     * STRICT Location list of one membership (R2): a failed read throws instead of
+     * returning an empty list that would read as "no Locations".
+     *
+     * @return list<int>
+     */
+    public function location_ids_for_strict( int $membership_id ): array {
+        $rows = $this->db->fetch_all_strict(
+            'SELECT location_id FROM ' . $this->db->table( 'cpms_membership_locations' )
+                . ' WHERE membership_id = %d ORDER BY location_id',
+            array( $membership_id )
+        );
+
+        return array_map( static fn( array $row ): int => (int) $row['location_id'], $rows );
+    }
+
     public function active_clinic_ids_for_user( int $wp_user_id ): array {
         $rows = $this->db->fetchAll(
             'SELECT clinic_id FROM ' . $this->db->table( 'cpms_clinic_memberships' ) .

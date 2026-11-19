@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ClinicCore\Admin;
 
 use ClinicCore\Application\Authorization\AuthorizationException;
+use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Application\Scope\TrustedClinicEstablisher;
@@ -610,6 +611,12 @@ final class ClinicianAdminPage
                 if ( $current === null ) {
                     self::backWithError( $id, 'خطا: پزشک در این Clinic یافت نشد.' );
                 }
+                // B0-PR2-G7 — a patient/mixed/unknown account is never linked to a
+                // clinician profile from the staff screen (neutral message).
+                if ( (int) ( $fields['wp_user_id'] ?? 0 ) > 0
+                    && PatientAccountPolicy::is_patient_account( (int) $fields['wp_user_id'] ) ) {
+                    self::backWithError( $id, 'خطا: تغییر وضعیت پزشک مجاز نیست.' );
+                }
                 // D6 audit atomicity: the profile UPDATE and its mandatory audit
                 // share one boundary; a failed audit INSERT rolls the update back
                 // (fail closed). A zero-row change keeps the legacy behavior: no
@@ -652,6 +659,12 @@ final class ClinicianAdminPage
             // StaffManagementPage::upsertUser() runs on a nested SAVEPOINT inside it,
             // so a failed CLINICIAN_CREATED audit rolls the freshly created account
             // back too — no orphan account / clinician row can survive without audit.
+            // B0-PR2-G7 — same boundary for a CREATE that links an existing account.
+            if ( (int) ( $fields['wp_user_id'] ?? 0 ) > 0
+                && PatientAccountPolicy::is_patient_account( (int) $fields['wp_user_id'] ) ) {
+                self::backWithError( 0, 'خطا: تغییر وضعیت پزشک مجاز نیست.' );
+            }
+
             $created         = App::db()->transactional(
                 function () use ( $fields, $generated, $clinic_id, $repo, &$provisioned ) {
                     $account_created = self::maybeCreateDoctorAccount( $fields, $generated, $clinic_id );
@@ -734,6 +747,13 @@ final class ClinicianAdminPage
             self::backWithError( 0, 'خطا: پزشک در این Clinic یافت نشد.' );
         }
         $new_state = (int) $current['is_active'] === 1 ? 0 : 1;
+        // B0-PR2-G7 — reactivating a profile linked to a patient/mixed/unknown
+        // account would hand that account a clinician identity; deactivation stays
+        // allowed (revocation).
+        if ( 1 === $new_state && (int) ( $current['wp_user_id'] ?? 0 ) > 0
+            && PatientAccountPolicy::is_patient_account( (int) $current['wp_user_id'] ) ) {
+            self::backWithError( 0, 'خطا: تغییر وضعیت پزشک مجاز نیست.' );
+        }
         // D6 audit atomicity: status write and mandatory audit commit/roll back together.
         // D7: nothing terminating may run inside the closure — a zero-row write
         // raises a structured signal and the redirect happens after rollback.

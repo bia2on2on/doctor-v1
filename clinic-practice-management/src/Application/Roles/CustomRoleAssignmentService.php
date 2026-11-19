@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace ClinicCore\Application\Roles;
 
+use ClinicCore\Application\Authorization\AuthorizationException;
 use ClinicCore\Application\Authorization\AuthorizationService;
+use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Application\Scope\TrustedClinicEstablisher;
 use ClinicCore\Auth\CustomRolePolicy;
@@ -225,6 +227,20 @@ final class CustomRoleAssignmentService {
                     (int) $target['clinic_id'],
                     true
                 );
+
+                // B0-PR2 — a patient account never receives staff capability from
+                // a staff surface. Authorized first (no probing / ordering leak),
+                // then refused with the ordinary Clinic-authority denial, before
+                // any membership role/capability/audit write.
+                if ( PatientAccountPolicy::is_patient_account( $target_wp_user_id ) ) {
+                    // Reuses the existing AUTH_DENIED code (no new public code):
+                    // a patient target is simply not an assignable target.
+                    throw new AuthorizationException(
+                        'AUTH_DENIED',
+                        'AUTH_DENIED',
+                        array( 'reason' => 'patient_target' )
+                    );
+                }
 
                 // Bounded delegation is checked while the definition remains
                 // locked. A changed manager capability set cannot race a role
