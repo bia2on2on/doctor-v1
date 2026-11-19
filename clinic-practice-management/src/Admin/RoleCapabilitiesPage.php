@@ -466,7 +466,7 @@ final class RoleCapabilitiesPage
                     // R1 — the write is built from the LOCKED snapshot, role by role, and
                     // persisted once at the end: no other role's consistent-read entry
                     // can be written back over the state this request locked.
-                    $map      = $snapshot;
+                    $map = $snapshot;
                     foreach ( self::ROLE_PRESETS as $role ) {
                         $requested = isset( $input[ $role ] ) && is_array( $input[ $role ] ) ? $input[ $role ] : [];
                         $before    = self::caps_from_snapshot( $role, $snapshot );
