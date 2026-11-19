@@ -463,6 +463,10 @@ final class RoleCapabilitiesPage
                     // B0-PR2-B3 — one locking read of the durable override row: it
                     // both serializes the preset writers and gives the real before-state.
                     $snapshot = self::locked_override_snapshot();
+                    // R1 — the write is built from the LOCKED snapshot, role by role, and
+                    // persisted once at the end: no other role's consistent-read entry
+                    // can be written back over the state this request locked.
+                    $map      = $snapshot;
                     foreach ( self::ROLE_PRESETS as $role ) {
                         $requested = isset( $input[ $role ] ) && is_array( $input[ $role ] ) ? $input[ $role ] : [];
                         $before    = self::caps_from_snapshot( $role, $snapshot );
@@ -470,10 +474,7 @@ final class RoleCapabilitiesPage
                         // active holder of that role is a patient/mixed/unknown account,
                         // because the preset applies to those members immediately.
                         self::assert_widening_has_no_patient_holder( $role, $requested, $before );
-                        if ( ! RolesAndCapabilities::setRoleCaps( $role, $requested ) ) {
-                            continue;
-                        }
-                        $after   = array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
+                        $after   = self::apply_to_locked_map( $map, $role, $requested );
                         $added   = array_values( array_diff( $after, $before ) );
                         $removed = array_values( array_diff( $before, $after ) );
                         if ( $added !== [] || $removed !== [] ) {
@@ -490,6 +491,7 @@ final class RoleCapabilitiesPage
                             $report[] = $role . ': +' . count( $added ) . '/-' . count( $removed );
                         }
                     }
+                    self::persist_override_map( $map );
                 }
             );
         } catch ( \Throwable $e ) {
@@ -562,6 +564,41 @@ final class RoleCapabilitiesPage
     }
 
     /**
+     * Write one role's requested set into the LOCKED map (R1): stored when it differs
+     * from the built-in template, removed when it equals it — the same rule
+     * `RolesAndCapabilities::setRoleCaps()` applies, without its `get_option()` read.
+     *
+     * @param array<string, mixed>     $map
+     * @param array<int|string, mixed> $requested
+     * @return list<string> the persisted (sanitized) capability list
+     */
+    private static function apply_to_locked_map( array &$map, string $role, array $requested ): array {
+        $clean = RolesAndCapabilities::sanitizeCapList( $requested );
+        if ( $clean === RolesAndCapabilities::sanitizeCapList( self::template_caps( $role ) ) ) {
+            unset( $map[ $role ] );
+        } else {
+            $map[ $role ] = $clean;
+        }
+
+        return $clean;
+    }
+
+    /**
+     * Persist the COMPLETE override map that was built from the locked snapshot (R1).
+     *
+     * `setRoleCaps()` rebuilds the option from `get_option()` — a consistent read that
+     * can carry a stale, wider entry for a role this request never touched, writing it
+     * back over durable state. The map written here starts from the row the writer
+     * locked, so only the roles this request changed can differ from durable state.
+     *
+     * @param array<string, mixed> $map
+     */
+    private static function persist_override_map( array $map ): void {
+        update_option( RolesAndCapabilities::OPTION_OVERRIDE, $map, true );
+        RolesAndCapabilities::register();
+    }
+
+    /**
      * Template capability list of one built-in preset.
      *
      * @return list<string>
@@ -618,7 +655,10 @@ final class RoleCapabilitiesPage
                     // B0-PR2-H2 — a reset restores the template, which can WIDEN a
                     // currently narrowed preset; refused under the same condition.
                     self::assert_widening_has_no_patient_holder( $role, $template, $before );
-                    RolesAndCapabilities::setRoleCaps( $role, $template );
+                    // R1 — the reset removes ONLY this role's entry from the locked map.
+                    $map = $snapshot;
+                    unset( $map[ $role ] );
+                    self::persist_override_map( $map );
                     App::audit()->log(
                         'ROLE_PERMISSION_RESET',
                         [ 'wp_user_id' => (int) get_current_user_id(), 'role' => 'administrator' ],

@@ -1742,6 +1742,320 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
     }
 
     /**
+     * Rewrite the TARGET membership row exactly AT its strict locking read, once.
+     *
+     * The harness runs every test inside one transaction (service START TRANSACTION is
+     * rewritten to SAVEPOINT), so a second session cannot exist: this filter simulates
+     * the concurrent change at the one point where the write boundary observes the row.
+     *
+     * @return array{0: callable, 1: object} the filter (to remove) and the counter holder
+     */
+    private function moveTargetAtLockingRead( int $membership_id, string $sql, array $params ): array {
+        $state  = (object) [ 'fired' => 0, 'done' => false ];
+        $filter = static function ( $query ) use ( $state, $membership_id, $sql, $params ) {
+            $current = (string) $query;
+            if ( false === strpos( $current, 'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode' ) ) {
+                return $query;
+            }
+            if ( 1 !== preg_match( '/\bWHERE id = ' . (int) $membership_id . '\b/', $current ) ) {
+                return $query;
+            }
+            ++$state->fired;
+            if ( $state->done ) {
+                return $query;
+            }
+            $state->done = true;
+            App::db()->query( $sql, $params );
+
+            return $query;
+        };
+        add_filter( 'query', $filter, 7 );
+
+        return [ $filter, $state ];
+    }
+
+    /**
+     * R2: the target key is ABSENT from the locked override row and a stale, wider copy
+     * sits in the cache. The before-state must be the template, so the widening is
+     * refused and nothing is persisted.
+     *
+     * MUTATION THAT TURNS THIS RED: restoring capsMap() in the absent-key branch of
+     * caps_from_snapshot() — the helper then returns the cached wider set instead of the
+     * template (asserted directly below through the helper's own contract), and the
+     * public path persists the very widening this arm requests.
+     */
+    public function test_preset_before_state_with_an_absent_override_ignores_a_stale_cache(): void
+    {
+        $admin   = $this->makeAdmin();
+        $patient = $this->makeUser( 'subscriber', 'pb_r2_patient' );
+        $this->insertPatientLink( $patient );
+        cpms_test_seed_membership( $patient, $this->clinicId, RolesAndCapabilities::ROLE_ACCOUNTANT );
+
+        self::assertArrayNotHasKey(
+            RolesAndCapabilities::ROLE_ACCOUNTANT,
+            (array) get_option( RolesAndCapabilities::OPTION_OVERRIDE, [] ),
+            'fixture: the accountant preset must have NO durable override'
+        );
+
+        $input = $this->matrixWithCurrentCaps();
+        $extra = $this->capabilityOutside( RolesAndCapabilities::ROLE_ACCOUNTANT );
+        $wide  = array_values( array_unique( array_merge( RolesAndCapabilities::ACCOUNTANT_CAPS, [ $extra ] ) ) );
+
+        // The stale, WIDER copy exists only in the object cache.
+        $cached = [ RolesAndCapabilities::ROLE_ACCOUNTANT => $wide ];
+        wp_cache_set( RolesAndCapabilities::OPTION_OVERRIDE, $cached, 'options' );
+        $alloptions = wp_load_alloptions();
+        $alloptions[ RolesAndCapabilities::OPTION_OVERRIDE ] = $cached;
+        wp_cache_set( 'alloptions', $alloptions, 'options' );
+
+        // The helper's contract on this exact input: key ABSENT from the locked snapshot.
+        $helper = new \ReflectionMethod( RoleCapabilitiesPage::class, 'caps_from_snapshot' );
+        $helper->setAccessible( true );
+        $before_caps = (array) $helper->invoke( null, RolesAndCapabilities::ROLE_ACCOUNTANT, [] );
+        self::assertNotContains(
+            $extra,
+            $before_caps,
+            'the absent-key before-state must be the TEMPLATE, never the stale cached set'
+        );
+
+        $input[ RolesAndCapabilities::ROLE_ACCOUNTANT ] = $wide;
+
+        try {
+            RoleCapabilitiesPage::apply_capability_matrix( $input, $admin );
+            self::fail( 'widening a preset held by a patient must be refused' );
+        } catch ( \RuntimeException $e ) {
+            self::assertNotSame( '', $e->getMessage() );
+        }
+
+        self::assertArrayNotHasKey(
+            RolesAndCapabilities::ROLE_ACCOUNTANT,
+            (array) get_option( RolesAndCapabilities::OPTION_OVERRIDE, [] ),
+            'no override may be persisted for the refused widening'
+        );
+    }
+
+    /**
+     * R1: a preset write must be built from the LOCKED row, so a stale wider override of
+     * a role this request never touched is never written back.
+     *
+     * MUTATION THAT TURNS THIS RED: persisting through RolesAndCapabilities::setRoleCaps()
+     * (which rebuilds the option from get_option()) AFTER removing the cache flush in
+     * locked_override_snapshot() — the cached wider MANAGER entry is then written back and
+     * CONFIG reappears in the persisted map. With the flush in place the snapshot itself
+     * already protects this, so the property is guarded twice and the comment says so.
+     */
+    public function test_preset_write_never_restores_another_roles_stale_override(): void
+    {
+        $admin = $this->makeAdmin();
+
+        $manager_caps = array_values(
+            array_diff(
+                array_keys( array_filter( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_MANAGER ) ) ),
+                [ RolesAndCapabilities::CONFIG ]
+            )
+        );
+        self::assertTrue( RolesAndCapabilities::setRoleCaps( RolesAndCapabilities::ROLE_MANAGER, $manager_caps ) );
+
+        // The request is built from DURABLE state, before any stale cache exists.
+        $input = $this->matrixWithCurrentCaps();
+        $input[ RolesAndCapabilities::ROLE_DOCTOR ] = array_values(
+            array_unique( array_merge( RolesAndCapabilities::DOCTOR_CAPS, [ RolesAndCapabilities::EXPORT ] ) )
+        );
+
+        // A stale WIDER copy of the MANAGER preset (which this request never touches).
+        $cached = [ RolesAndCapabilities::ROLE_MANAGER => array_values( array_unique( array_merge( $manager_caps, [ RolesAndCapabilities::CONFIG ] ) ) ) ];
+        wp_cache_set( RolesAndCapabilities::OPTION_OVERRIDE, $cached, 'options' );
+        $alloptions = wp_load_alloptions();
+        $alloptions[ RolesAndCapabilities::OPTION_OVERRIDE ] = $cached;
+        wp_cache_set( 'alloptions', $alloptions, 'options' );
+
+        RoleCapabilitiesPage::apply_capability_matrix( $input, $admin );
+
+        $persisted = (array) get_option( RolesAndCapabilities::OPTION_OVERRIDE, [] );
+        $manager   = (array) ( $persisted[ RolesAndCapabilities::ROLE_MANAGER ] ?? [] );
+        self::assertNotContains(
+            RolesAndCapabilities::CONFIG,
+            $manager,
+            'the stale wider manager override must not be written back'
+        );
+        self::assertContains(
+            RolesAndCapabilities::EXPORT,
+            (array) ( $persisted[ RolesAndCapabilities::ROLE_DOCTOR ] ?? [] ),
+            'the requested doctor change must be persisted'
+        );
+    }
+
+    /**
+     * R3 (portal scope): the membership row changes AT its locking read, so the identity
+     * check refuses and nothing is written.
+     *
+     * MUTATION THAT TURNS THIS RED: dropping the clinic/user/role comparison (or the
+     * locking strict read) from set_staff_locations() — the scope write then proceeds on
+     * the pre-lock view and succeeds.
+     */
+    public function test_portal_scope_refuses_a_membership_that_moved_at_the_lock(): void
+    {
+        $manager    = $this->makeClinicManager( 'pb_r3_scope' );
+        $staff      = $this->makeUser( 'subscriber', 'pb_r3_scope_staff' );
+        $membership = cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        [ $filter, $state ] = $this->moveTargetAtLockingRead(
+            $membership,
+            'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET role_key = %s WHERE id = %d',
+            [ RolesAndCapabilities::ROLE_DOCTOR, $membership ]
+        );
+
+        $result = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_locations',
+            [ 'clinic_id' => (string) $this->clinicId, 'membership_id' => (string) $membership, 'location_ids' => '' ]
+        );
+
+        remove_filter( 'query', $filter, 7 );
+
+        self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
+        self::assertFalse( $result['ok'], 'a membership that moved at the lock must be refused' );
+    }
+
+    /**
+     * R3 (portal capability): the same moved-target refusal on the capability path.
+     *
+     * MUTATION THAT TURNS THIS RED: dropping the identity comparison in
+     * set_staff_capability() — the DENY is written for the moved row.
+     */
+    public function test_portal_capability_refuses_a_membership_that_moved_at_the_lock(): void
+    {
+        $manager    = $this->makeClinicManager( 'pb_r3_cap' );
+        $staff      = $this->makeUser( 'subscriber', 'pb_r3_cap_staff' );
+        $membership = cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        [ $filter, $state ] = $this->moveTargetAtLockingRead(
+            $membership,
+            'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET wp_user_id = %d WHERE id = %d',
+            [ $this->makeUser( 'subscriber', 'pb_r3_cap_other' ), $membership ]
+        );
+
+        $result = ManagementPortalController::dispatch(
+            $manager,
+            'clinic_staff_capability',
+            [
+                'clinic_id'     => (string) $this->clinicId,
+                'membership_id' => (string) $membership,
+                'capability'    => RolesAndCapabilities::CONFIG,
+                'effect'        => 'deny',
+            ]
+        );
+
+        remove_filter( 'query', $filter, 7 );
+
+        self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
+        self::assertFalse( $result['ok'], 'a membership that moved at the lock must be refused' );
+        self::assertSame( [], $this->capabilityOverrides( $membership ), 'nothing may be written for the moved row' );
+    }
+
+    /**
+     * R3 (finance delegate): the target moves at the locking read → controlled refusal.
+     *
+     * MUTATION THAT TURNS THIS RED: dropping the identity comparison in
+     * FinanceDelegationService::locked_target_membership() — the GRANT is written.
+     */
+    public function test_finance_delegate_refuses_a_membership_that_moved_at_the_lock(): void
+    {
+        $manager    = $this->makeClinicManager( 'pb_r3_fin' );
+        $staff      = $this->makeUser( 'subscriber', 'pb_r3_fin_staff' );
+        $membership = cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        [ $filter, $state ] = $this->moveTargetAtLockingRead(
+            $membership,
+            'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET role_key = %s WHERE id = %d',
+            [ RolesAndCapabilities::ROLE_ACCOUNTANT, $membership ]
+        );
+
+        $denied = false;
+        try {
+            App::finance_delegation_service()->delegate( $manager, $this->clinicId, $membership, RolesAndCapabilities::PAYMENT_REFUND );
+        } catch ( FinanceException $e ) {
+            $denied = 'CLINIC_DELEGATION_DENIED' === $e->getErrorCode();
+        }
+
+        remove_filter( 'query', $filter, 7 );
+
+        self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
+        self::assertTrue( $denied, 'a moved target must be refused with the controlled error' );
+        self::assertSame( [], $this->capabilityOverrides( $membership ), 'nothing may be granted to the moved row' );
+    }
+
+    /**
+     * R3 (finance revoke): the same rule on the revocation path.
+     *
+     * MUTATION THAT TURNS THIS RED: dropping the identity comparison in revoke() — the
+     * GRANT is removed for a row the caller never verified.
+     */
+    public function test_finance_revoke_refuses_a_membership_that_moved_at_the_lock(): void
+    {
+        $manager    = $this->makeClinicManager( 'pb_r3_rev' );
+        $staff      = $this->makeUser( 'subscriber', 'pb_r3_rev_staff' );
+        $membership = cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        App::finance_delegation_service()->delegate( $manager, $this->clinicId, $membership, RolesAndCapabilities::PAYMENT_REFUND );
+
+        [ $filter, $state ] = $this->moveTargetAtLockingRead(
+            $membership,
+            'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET role_key = %s WHERE id = %d',
+            [ RolesAndCapabilities::ROLE_ACCOUNTANT, $membership ]
+        );
+
+        $denied = false;
+        try {
+            App::finance_delegation_service()->revoke( $manager, $this->clinicId, $membership, RolesAndCapabilities::PAYMENT_REFUND );
+        } catch ( FinanceException $e ) {
+            $denied = 'CLINIC_DELEGATION_DENIED' === $e->getErrorCode();
+        }
+
+        remove_filter( 'query', $filter, 7 );
+
+        self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
+        self::assertTrue( $denied, 'a moved target must be refused with the controlled error' );
+        self::assertSame(
+            [ [ 'capability' => RolesAndCapabilities::PAYMENT_REFUND, 'effect' => 'grant' ] ],
+            $this->capabilityOverrides( $membership ),
+            'the grant must survive the refused revocation'
+        );
+    }
+
+    /**
+     * R4: a failed strict read inside the finance boundary must surface as the page's
+     * controlled FinanceException, never as a bare RuntimeException.
+     *
+     * MUTATION THAT TURNS THIS RED: removing the try/catch in
+     * locked_target_membership() — the RuntimeException escapes and the FinanceException
+     * assertion fails with an error instead of a refusal.
+     */
+    public function test_finance_delegate_converts_a_failed_locking_read_into_the_controlled_error(): void
+    {
+        $manager    = $this->makeClinicManager( 'pb_r4_fin' );
+        $staff      = $this->makeUser( 'subscriber', 'pb_r4_fin_staff' );
+        $membership = cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $this->failReadsMatching( 'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode' );
+
+        $controlled = false;
+        $escaped    = false;
+        try {
+            App::finance_delegation_service()->delegate( $manager, $this->clinicId, $membership, RolesAndCapabilities::PAYMENT_REFUND );
+        } catch ( FinanceException $e ) {
+            $controlled = 'CLINIC_DELEGATION_DENIED' === $e->getErrorCode();
+        } catch ( \Throwable $e ) {
+            $escaped = true;
+        }
+        $this->restoreReads();
+
+        self::assertFalse( $escaped, 'no bare RuntimeException may escape the finance boundary' );
+        self::assertTrue( $controlled, 'a failed locking read must become the controlled FinanceException' );
+        self::assertSame( [], $this->capabilityOverrides( $membership ), 'nothing may be written when the read fails' );
+    }
+
+    /**
      * R1: the preset before-state comes from the LOCKED override row, never from a
      * cached (consistent-read) copy that can be wider than the durable state.
      *

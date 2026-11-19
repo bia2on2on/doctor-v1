@@ -209,7 +209,10 @@ final class MembershipRepository {
     }
 
     /**
-     * STRICT read of one membership row for a decision taken under the row lock (R2).
+     * STRICT LOCKING read of one membership row for a decision taken under the lock
+     * (R2/R3): the SELECT ... FOR UPDATE makes the row unchangeable for the rest of the
+     * caller's transaction, and the identity columns are returned so the caller can
+     * prove the row is still the one it decided about.
      *
      * `fetch_all_strict` throws on a failed read, so "unreadable" can never be
      * mistaken for "unchanged"; `null` means the row really is gone.
@@ -219,7 +222,7 @@ final class MembershipRepository {
     public function read_membership_strict( int $membership_id ): ?array {
         $rows = $this->db->fetch_all_strict(
             'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode FROM ' . $this->db->table( 'cpms_clinic_memberships' )
-                . ' WHERE id = %d LIMIT 1',
+                . ' WHERE id = %d LIMIT 1 FOR UPDATE',
             array( $membership_id )
         );
 

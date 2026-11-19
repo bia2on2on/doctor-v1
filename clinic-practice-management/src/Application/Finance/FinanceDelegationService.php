@@ -131,17 +131,10 @@ final class FinanceDelegationService {
 						array( 'clinic_id' => $clinic_id )
 					);
 				}
-				// R2 — the membership is re-read strictly under the lock: suspended or
-				// vanished refuses, and any moved effect refuses before the write.
-				$locked = $this->memberships->read_membership_strict( $target_membership_id );
-				if ( null === $locked || 'active' !== (string) ( $locked['status'] ?? '' ) ) {
-					throw FinanceException::of(
-						'CLINIC_DELEGATION_DENIED',
-						'این عضویت هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
-						409,
-						array( 'clinic_id' => $clinic_id )
-					);
-				}
+				// R2/R3 — the membership is re-read strictly under the lock and its
+				// identity is proved before any decision or write.
+				$locked_role = (string) ( $membership['role_key'] ?? '' );
+				$this->locked_target_membership( $clinic_id, $target_membership_id, $target_user_id, $locked_role );
 				try {
 					$current = $this->explicit_effect_strict( $target_membership_id, $capability );
 				} catch ( \Throwable $e ) {
@@ -163,15 +156,6 @@ final class FinanceDelegationService {
 						[ 'capability' => $capability, 'membership_id' => $target_membership_id ]
 					);
 				}
-				if ( PatientAccountPolicy::is_patient_account( $target_user_id ) ) {
-					throw FinanceException::of(
-						'CLINIC_DELEGATION_DENIED',
-						'واگذاری مجوز به این عضویت مجاز نیست.',
-						403,
-						[ 'clinic_id' => $clinic_id ]
-					);
-				}
-
 				$this->membership_service->set_capability( $target_membership_id, $capability, 'grant' );
 
 				$meta = [ 'clinic_id' => $clinic_id, 'target_wp_user_id' => $target_user_id ];
@@ -253,16 +237,9 @@ final class FinanceDelegationService {
 						array( 'clinic_id' => $clinic_id )
 					);
 				}
-				// R2 — strict membership re-read under the same lock as delegate().
-				$locked = $this->memberships->read_membership_strict( $target_membership_id );
-				if ( null === $locked || 'active' !== (string) ( $locked['status'] ?? '' ) ) {
-					throw FinanceException::of(
-						'CLINIC_DELEGATION_DENIED',
-						'این عضویت هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
-						409,
-						array( 'clinic_id' => $clinic_id )
-					);
-				}
+				// R2/R3 — strict membership re-read under the same lock as delegate().
+				$locked_role = (string) ( $membership['role_key'] ?? '' );
+				$this->locked_target_membership( $clinic_id, $target_membership_id, $target_user_id, $locked_role );
 				try {
 					$current_now = $this->explicit_effect_strict( $target_membership_id, $capability );
 				} catch ( \Throwable $e ) {
@@ -351,6 +328,45 @@ final class FinanceDelegationService {
 		}
 
 		return null;
+	}
+
+	/**
+	 * Locking, strict re-read of the target membership inside the write boundary
+	 * (R3/R4): a failed read and a row that is gone or suspended become the page's
+	 * controlled FinanceException, never a RuntimeException escaping to the caller.
+	 *
+	 * @return array<string, mixed>
+	 *
+	 * @throws FinanceException
+	 */
+	private function locked_target_membership( int $clinic_id, int $target_membership_id, int $target_user_id, string $role_key ): array {
+		try {
+			$locked = $this->memberships->read_membership_strict( $target_membership_id );
+		} catch ( \Throwable $e ) {
+			throw FinanceException::of(
+				'CLINIC_DELEGATION_DENIED',
+				'وضعیت فعلی واگذاری خوانده نشد؛ عملیات انجام نشد.',
+				409,
+				array( 'clinic_id' => $clinic_id )
+			);
+		}
+
+		// R3 — the row must still be the one the caller decided about.
+		if ( null === $locked
+			|| 'active' !== (string) ( $locked['status'] ?? '' )
+			|| (int) $locked['clinic_id'] !== $clinic_id
+			|| (int) $locked['wp_user_id'] !== $target_user_id
+			|| (string) $locked['role_key'] !== $role_key
+		) {
+			throw FinanceException::of(
+				'CLINIC_DELEGATION_DENIED',
+				'این عضویت هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
+				409,
+				array( 'clinic_id' => $clinic_id )
+			);
+		}
+
+		return $locked;
 	}
 
 	private function assert_bounded( string $capability ): void {

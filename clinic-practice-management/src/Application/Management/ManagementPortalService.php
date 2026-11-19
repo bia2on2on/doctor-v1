@@ -1147,9 +1147,18 @@ final class ManagementPortalService {
 					// is no longer active refuses the write instead of trusting the
 					// pre-lock view.
 					$locked = $this->memberships->read_membership_strict( $membership_id );
-					if ( null === $locked || 'active' !== (string) ( $locked['status'] ?? '' ) ) {
-						throw new \RuntimeException( 'membership row is unreadable or no longer active' );
+					// R3 — the row must still be the one this request decided about: any
+					// moved clinic, user or role refuses, and the classification below uses
+					// the LOCKED row's user id, never the pre-lock view.
+					if ( null === $locked
+						|| 'active' !== (string) ( $locked['status'] ?? '' )
+						|| (int) $locked['clinic_id'] !== $trusted
+						|| (int) $locked['wp_user_id'] !== (int) ( $membership['wp_user_id'] ?? 0 )
+						|| (string) $locked['role_key'] !== (string) ( $membership['role_key'] ?? '' )
+					) {
+						throw new \RuntimeException( 'membership row moved or is unreadable' );
 					}
+					$target_user_id = (int) $locked['wp_user_id'];
 					$current_mode = (string) ( $locked['scope_mode'] ?? '' );
 					$current_locs = $this->memberships->location_ids_for_strict( $membership_id );
 					if ( (string) ( $before['scope_mode'] ?? '' ) !== $current_mode || $before['location_ids'] !== $current_locs ) {
@@ -1158,7 +1167,7 @@ final class ManagementPortalService {
 					$widens_now = 'clinic' === $current_mode
 						? false
 						: ( array() === $location_ids || array() !== array_diff( $location_ids, $current_locs ) );
-					if ( $widens_now && PatientAccountPolicy::is_patient_account( (int) ( $membership['wp_user_id'] ?? 0 ) ) ) {
+					if ( $widens_now && PatientAccountPolicy::is_patient_account( $target_user_id ) ) {
 						throw new \RuntimeException( 'scope widening refused inside the write boundary' );
 					}
 
@@ -1178,7 +1187,7 @@ final class ManagementPortalService {
 							'scope_mode'        => array() === $location_ids ? 'clinic' : 'location',
 							'location_ids'      => $location_ids,
 							'clinic_id'         => $trusted,
-							'target_wp_user_id' => (int) ( $membership['wp_user_id'] ?? 0 ),
+							'target_wp_user_id' => $target_user_id,
 						),
 						$trusted
 					);
@@ -1260,14 +1269,22 @@ final class ManagementPortalService {
 					// R2 — the membership itself is re-read strictly too: a suspended or
 					// vanished row must refuse the override, not take it.
 					$locked = $this->memberships->read_membership_strict( $membership_id );
-					if ( null === $locked || 'active' !== (string) ( $locked['status'] ?? '' ) ) {
-						throw new \RuntimeException( 'membership row is unreadable or no longer active' );
+					// R3 — identity is proved from the LOCKED row, and the widening
+					// classification below uses that row's user id.
+					if ( null === $locked
+						|| 'active' !== (string) ( $locked['status'] ?? '' )
+						|| (int) $locked['clinic_id'] !== $trusted
+						|| (int) $locked['wp_user_id'] !== (int) ( $membership['wp_user_id'] ?? 0 )
+						|| (string) $locked['role_key'] !== (string) ( $membership['role_key'] ?? '' )
+					) {
+						throw new \RuntimeException( 'membership row moved or is unreadable' );
 					}
-					$prior_now  = $this->capability_effect_strict( $membership_id, $capability );
+					$target_user_id = (int) $locked['wp_user_id'];
+					$prior_now      = $this->capability_effect_strict( $membership_id, $capability );
 					$state_held = (string) ( $before['effect'] ?? '' ) === $prior_now;
 					$widens_now = 'grant' === $effect || ( 'clear' === $effect && 'deny' === $prior_now );
 					if ( ! $state_held
-						|| ( $widens_now && PatientAccountPolicy::is_patient_account( (int) ( $membership['wp_user_id'] ?? 0 ) ) )
+						|| ( $widens_now && PatientAccountPolicy::is_patient_account( $target_user_id ) )
 					) {
 						throw new \RuntimeException( 'concurrent capability change refused inside the write boundary' );
 					}
@@ -1288,7 +1305,7 @@ final class ManagementPortalService {
 							'capability'        => $capability,
 							'effect'            => 'clear' === $effect ? '' : $effect,
 							'clinic_id'         => $trusted,
-							'target_wp_user_id' => (int) ( $membership['wp_user_id'] ?? 0 ),
+							'target_wp_user_id' => $target_user_id,
 						),
 						$trusted
 					);
