@@ -1994,7 +1994,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         try {
             App::finance_delegation_service()->delegate( $manager, $this->clinicId, $membership, RolesAndCapabilities::PAYMENT_REFUND );
         } catch ( FinanceException $e ) {
-            $denied = 'CLINIC_DELEGATION_DENIED' === $e->getErrorCode();
+            $denied = 'CLINIC_DELEGATION_DENIED' === $e->errorCode;
         }
 
         remove_filter( 'query', $inject, 7 );
@@ -2045,7 +2045,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         try {
             App::finance_delegation_service()->revoke( $manager, $this->clinicId, $membership, RolesAndCapabilities::PAYMENT_REFUND );
         } catch ( FinanceException $e ) {
-            $denied = 'CLINIC_DELEGATION_DENIED' === $e->getErrorCode();
+            $denied = 'CLINIC_DELEGATION_DENIED' === $e->errorCode;
         }
 
         remove_filter( 'query', $inject, 7 );
@@ -2080,7 +2080,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         try {
             App::finance_delegation_service()->delegate( $manager, $this->clinicId, $membership, RolesAndCapabilities::PAYMENT_REFUND );
         } catch ( FinanceException $e ) {
-            $controlled = 'CLINIC_DELEGATION_DENIED' === $e->getErrorCode();
+            $controlled = 'CLINIC_DELEGATION_DENIED' === $e->errorCode;
         } catch ( \Throwable $e ) {
             $escaped = true;
         }
