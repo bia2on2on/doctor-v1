@@ -7337,3 +7337,47 @@ Integration assertion counts differ between pushes (76873/76877/76874) with no t
 - **Protection comparison:** compared all 25 revision-12 T-R12 rows against the current T-R12-01..32 set. IDs 01–25 remain; current 26–32 are additional coverage. The 13 revised older row descriptions are 01, 03, 04, 05, 06, 08, 13, 14, 17, 20, 23, 24, 25; their refinements track exact wired/outage coverage or final Q1(a), Q2(a), Q3(a), Q4a(a), Q4b(b), and R4 policy. Q4b's restore exception is paired with the verified-new-empty-target and lock protections in 29–32. The old T-R12-24's generic terminal-transition-race phrase was absent from its narrowed current admission test; that is the sole uncarried test protection found and is restored more fully by T-R12-33. Its exact-boundary/UTC admission case remains. No other protection was dropped.
 - **Scope and removals:** Q1–Q4b and the approved three-stage policy were not changed; Q4b lock storage remains UNKNOWN/open. The design patch adds two lines only: no existing design line was removed or shortened, and pre-R15 T-R12-01..32 rows are byte-identical. No `src/`, `tests/`, `.github/`, code, workflow, version, or release changes.
 - **Hostile audit / validation:** re-read §7.2 item 8 and T-R12-33 after editing. Static checks confirmed the design differs from pre-R15 HEAD only by those two additions, T-R12-01..33 occur once in order, all 175 pipe-starting Markdown rows close, and `git diff --check` passes. No tests, PHP runtime, build, CI rerun, or implementation was performed.
+
+### [2026-11-17 UTC] — LICENSE-FIX-R16 — rev-12 outbound/privacy test audit (docs-only; PR #1 stays draft)
+
+- **Workspace/A0 [OBSERVED]:** fresh clone `/tmp/doctor-v1-r16-YIDJcN`, branch `arena/976ea0d8-doctor-v1`; `git rev-parse HEAD` was expected `c616d2e5b37a2002c2bc50afde6353933d443108`. Fetch found the same remote branch head and `origin/main` still exactly `ed88a851d67ced6c8504ae6428a30a4ca915c879`; no main merge was needed and no conflict occurred.
+- **B1 — CONFIRMED [OBSERVED]:** rev 12 (`3b7df6e`) T-R12-14 line 354 said deny SMS “after T1”; pre-R16 head line 376 only said “at exactly T1.” `SmsService.php:91-98,186-190` invokes the license gate and returns before the `cpms_sms_messages` insert at `:254`. **Minimal fix:** current design line 376 now tests the real `SmsService::sendEvent()`/wired-gate path with mock transport at T1, T1+1s and T1+24h for both appointment- and eligible-Visit-linked contexts, with no provider send or persisted SMS row at each Stage-3 point.
+- **B2 — CONFIRMED [OBSERVED]:** rev 12 T-R12-20 line 360 required that no licensing request contain patient data; pre-R16 head line 382 captured URL/headers/body but deferred value/provenance assertions to owner-approved T-R12-28. T-R12-14 only named the SMS recipient/message values. Source paths are `LicenseService.php:224-232,270-276`, `HttpVendorGateway.php:63-71,116-136`, and `HttpUpdateMetadataGateway.php:42-49`. **Minimal fix:** current line 382 unconditionally seeds synthetic patient-field canaries, captures activation/refresh/update-manifest URL/query, supplied headers and body, checks the documented request-field allowlists and asserts no canary appears in any captured request. It is independent of T-R12-28 approval; that row’s proposed value/provenance contract remains a separate conditional test.
+- **Phase B hostile audit [INFERENCE]:** B1 and B2 were the two lost test protections, now restored additively. The SMS test is not a gate-only/state-label test; it exercises the service path and observable no-send/no-row outcome. The outbound capture is not a blanket proof that arbitrary allowlisted values are PHI-free. No further blocker or owner-policy violation was found in the 01..33 test-row comparison.
+- **Other row re-compare — one result per row:**
+  - T-R12-01 — exact UTC boundary points retained and expanded to real wired gate/service/outage coverage; no weakening.
+  - T-R12-02 — unchanged from rev 12.
+  - T-R12-03 — final Q1(a) adds reception and Stage 2/3 coverage; privacy/no-row assertions retained.
+  - T-R12-04 — final Q2(a) resolves the former conditional Stage-2 walk-in choice; denial coverage is stronger.
+  - T-R12-05 — persisted pre-T0 creation/linkage is stricter; pending continuity is separately covered by T-R12-26.
+  - T-R12-06 — final Q3(a), real gate, both appointment states and no-mutation/no-audit assertions strengthen the old row.
+  - T-R12-07 — unchanged from rev 12.
+  - T-R12-08 — active pre-T1 Visit eligibility and terminal denial retained; final Q2/Q3 and Q4b-lock scope made explicit.
+  - T-R12-09 — unchanged from rev 12.
+  - T-R12-10 — unchanged from rev 12.
+  - T-R12-11 — unchanged from rev 12.
+  - T-R12-12 — unchanged from rev 12.
+  - T-R12-13 — final Q4a(a) denies all historical refunds at/after T1; stronger than the former conditional wording.
+  - T-R12-14 — B1 confirmed and fixed; pre-T1 continuity and no-copy assertion retained.
+  - T-R12-15 — unchanged from rev 12.
+  - T-R12-16 — unchanged from rev 12.
+  - T-R12-17 — Q4b’s approved verified-new-empty-target restore exception replaces blanket T1 denial; target, identity and read-only lock protections are specified in T-R12-29..32.
+  - T-R12-18 — unchanged from rev 12.
+  - T-R12-19 — unchanged from rev 12.
+  - T-R12-20 — B2 confirmed and fixed with unconditional allowlist/canary capture; outage, cache and authorization assertions retained.
+  - T-R12-21 — unchanged from rev 12.
+  - T-R12-22 — unchanged from rev 12.
+  - T-R12-23 — adverse-state distinctions retained; cached age-derived `UNREACHABLE` explicitly follows T-R12-20 rather than a synthetic no-license rule.
+  - T-R12-24 — post-lock T1 admission denial and exact `T1−1s` durable provenance retained; terminal-transition race coverage is restored in T-R12-33.
+  - T-R12-25 — final Q4a/Q4b and R4 manual-only no-show policy supersede the prior conditional wording; reason/actor audit retained.
+  - T-R12-26 — added since rev 12; no prior row to weaken.
+  - T-R12-27 — added since rev 12; no prior row to weaken.
+  - T-R12-28 — added since rev 12; remains owner-approval-gated for candidate value/provenance grammar.
+  - T-R12-29 — added since rev 12; Q4b source verification/new-empty-target coverage.
+  - T-R12-30 — added since rev 12; reject-before-mutation coverage.
+  - T-R12-31 — added since rev 12; source license identity/authority exclusion.
+  - T-R12-32 — added since rev 12; target-bound lock coverage, storage remains UNKNOWN/open.
+  - T-R12-33 — added in R15; both lock orders for safe-finish writers versus terminal Visit transitions.
+- **Changed/removed lines:** only design lines 376 and 382 changed; prior assertions remain verbatim and new assertions are appended. No assertion or policy text was removed or shortened. The single R16 entry is appended at EOF; no earlier log text changed.
+- **LIMITATION / UNKNOWN:** the canary test does not establish arbitrary values in `license_key`/`license_id` or other allowlisted fields as PHI-free; the B4 gap/online-OFF limitation remains. The proposed T-R12-28 grammar remains owner-approval-gated. Q4b lock storage remains UNKNOWN/open; approved three-stage/Q1–Q4b policy was not reopened.
+- **Validation/scope:** `git diff --check` passed; static comparison found exactly 33 unique ordered T-R12 rows, only lines 376/382 changed, all earlier row assertions preserved, and no non-doc paths modified. No PHP, tests or build run; CI will be polled via GitHub GET after push.
