@@ -2053,6 +2053,9 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
                 [ RolesAndCapabilities::CONFIG ]
             )
         );
+        // sanitizeCapList() SORTS what it stores, so the expected value must be sorted too
+        // (array equality compares position by position).
+        sort( $manager_caps );
         self::assertTrue( RolesAndCapabilities::setRoleCaps( RolesAndCapabilities::ROLE_MANAGER, $manager_caps ) );
         $durable = [ RolesAndCapabilities::ROLE_MANAGER => $manager_caps ];
 
