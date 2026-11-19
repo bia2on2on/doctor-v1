@@ -1928,6 +1928,155 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
     }
 
     /**
+     * B1: with an EMPTY intended map a blocked write leaves NO row behind, and the strict
+     * read-back must treat the missing row as a failure instead of "the empty map".
+     *
+     * MUTATION THAT TURNS THIS RED: replacing strict_override_read() with get_option(),
+     * which answers array() for a missing row — equal to the intended empty map, so the
+     * refusal disappears and a success audit commits.
+     */
+    public function test_preset_write_refuses_when_an_empty_map_does_not_persist(): void
+    {
+        $admin = $this->makeAdmin();
+
+        delete_option( RolesAndCapabilities::OPTION_OVERRIDE );
+        self::assertFalse( get_option( RolesAndCapabilities::OPTION_OVERRIDE ), 'fixture: no durable override row' );
+
+        $audit_before = $this->auditCount( 'ROLE_PERMISSION_CHANGED' );
+
+        // With no override row every preset equals its template, so the intended COMPLETE
+        // map of this request is the empty map.
+        $input = $this->matrixWithCurrentCaps();
+
+        // The write silently does nothing: update_option() is handed the OLD value (false),
+        // so no row is ever created.
+        $block = static function ( $value, $old_value ) {
+            return $old_value;
+        };
+        $hook = 'pre_update_option_' . RolesAndCapabilities::OPTION_OVERRIDE;
+        add_filter( $hook, $block, 10, 2 );
+
+        $refused = false;
+        try {
+            RoleCapabilitiesPage::apply_capability_matrix( $input, $admin );
+        } catch ( \RuntimeException $e ) {
+            $refused = '' !== $e->getMessage();
+        }
+        remove_filter( $hook, $block, 10 );
+
+        self::assertTrue( $refused, 'a missing row after the write must refuse, never read back as the empty map' );
+        self::assertFalse( get_option( RolesAndCapabilities::OPTION_OVERRIDE ), 'no override row may exist after the refused write' );
+        self::assertSame( $audit_before, $this->auditCount( 'ROLE_PERMISSION_CHANGED' ), 'no success audit may be committed' );
+    }
+
+    /**
+     * B1: a read-back that FAILS (database error) must refuse even though the write itself
+     * may have landed — the transaction rolls the write and the audits back.
+     *
+     * MUTATION THAT TURNS THIS RED: replacing strict_override_read() with get_option(),
+     * which swallows the failed read and returns array().
+     */
+    public function test_preset_write_refuses_when_the_read_back_fails(): void
+    {
+        $admin = $this->makeAdmin();
+
+        $doctor_before = array_keys( array_filter( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_DOCTOR ) ) );
+        $audit_before  = $this->auditCount( 'ROLE_PERMISSION_CHANGED' );
+
+        $input = $this->matrixWithCurrentCaps();
+        $dropped = RolesAndCapabilities::SEARCH;
+        self::assertContains( $dropped, $input[ RolesAndCapabilities::ROLE_DOCTOR ], 'fixture: the narrowing must remove something' );
+        $input[ RolesAndCapabilities::ROLE_DOCTOR ] = array_values( array_diff( $input[ RolesAndCapabilities::ROLE_DOCTOR ], [ $dropped ] ) );
+
+        // Fault the READ-BACK only: the filter is armed from pre_update_option, i.e. after
+        // update_option() has read the old value and before the read-back runs, so no other
+        // option read is touched and the fault fires exactly once.
+        $state = (object) [ 'fired' => 0 ];
+        $fault = static function ( $query ) use ( $state ) {
+            $current = (string) $query;
+            if ( false === strpos( $current, 'SELECT option_value FROM' ) ) {
+                return $query;
+            }
+            if ( false !== strpos( $current, 'FOR UPDATE' ) ) {
+                return $query;
+            }
+            if ( false === strpos( $current, RolesAndCapabilities::OPTION_OVERRIDE ) ) {
+                return $query;
+            }
+            if ( $state->fired > 0 ) {
+                return $query;
+            }
+            ++$state->fired;
+            global $wpdb;
+
+            return 'SELECT option_value FROM ' . $wpdb->prefix . 'cpms_missing_read_back LIMIT 1';
+        };
+        $arm = static function ( $value ) use ( $fault ) {
+            add_filter( 'query', $fault, 7 );
+
+            return $value;
+        };
+        $hook = 'pre_update_option_' . RolesAndCapabilities::OPTION_OVERRIDE;
+        add_filter( $hook, $arm, 20, 1 );
+
+        $refused = false;
+        try {
+            RoleCapabilitiesPage::apply_capability_matrix( $input, $admin );
+        } catch ( \RuntimeException $e ) {
+            $refused = '' !== $e->getMessage();
+        }
+        remove_filter( 'query', $fault, 7 );
+        remove_filter( $hook, $arm, 20 );
+
+        self::assertSame( 1, $state->fired, 'the read-back must be faulted exactly once' );
+        self::assertTrue( $refused, 'a failed read-back must refuse instead of trusting the write' );
+        self::assertSame( $audit_before, $this->auditCount( 'ROLE_PERMISSION_CHANGED' ), 'no success audit may be committed' );
+        self::assertSame(
+            $doctor_before,
+            array_keys( array_filter( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_DOCTOR ) ) ),
+            'permissions must be unchanged after the refused write'
+        );
+    }
+
+    /**
+     * B2: locked_override_snapshot() evicts a stale cached copy of the override option, so
+     * the writers that follow cannot read the stale (consistent-read) state.
+     *
+     * MUTATION THAT TURNS THIS RED: removing the two wp_cache_delete() calls from
+     * locked_override_snapshot() — get_option() then keeps serving the stale wider copy.
+     */
+    public function test_locked_snapshot_evicts_a_stale_cached_override(): void
+    {
+        $manager_caps = array_values(
+            array_diff(
+                array_keys( array_filter( RolesAndCapabilities::capsMap( RolesAndCapabilities::ROLE_MANAGER ) ) ),
+                [ RolesAndCapabilities::CONFIG ]
+            )
+        );
+        self::assertTrue( RolesAndCapabilities::setRoleCaps( RolesAndCapabilities::ROLE_MANAGER, $manager_caps ) );
+        $durable = [ RolesAndCapabilities::ROLE_MANAGER => $manager_caps ];
+
+        $stale = [ RolesAndCapabilities::ROLE_MANAGER => array_values( array_unique( array_merge( $manager_caps, [ RolesAndCapabilities::CONFIG ] ) ) ) ];
+        wp_cache_set( RolesAndCapabilities::OPTION_OVERRIDE, $stale, 'options' );
+        $alloptions = wp_load_alloptions();
+        $alloptions[ RolesAndCapabilities::OPTION_OVERRIDE ] = $stale;
+        wp_cache_set( 'alloptions', $alloptions, 'options' );
+        self::assertEquals( $stale, get_option( RolesAndCapabilities::OPTION_OVERRIDE ), 'fixture: the cache serves the stale wider copy' );
+
+        $method = new \ReflectionMethod( RoleCapabilitiesPage::class, 'locked_override_snapshot' );
+        $method->setAccessible( true );
+        $snapshot = (array) $method->invoke( null );
+
+        self::assertEquals( $durable, $snapshot, 'the snapshot must be the durable row' );
+        self::assertEquals( $durable, get_option( RolesAndCapabilities::OPTION_OVERRIDE ), 'the stale cached copy must be evicted' );
+        self::assertNotEquals(
+            $stale,
+            wp_cache_get( RolesAndCapabilities::OPTION_OVERRIDE, 'options' ),
+            'the stale cached copy must no longer be served'
+        );
+    }
+
+    /**
      * R3 (portal scope): the membership row changes AT its locking read, so the identity
      * check refuses and nothing is written.
      *
@@ -1943,7 +2092,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         $audit_before = $this->auditCount( 'MEMBERSHIP_SCOPE_CHANGED' );
         $mode_before  = (string) ( $this->membershipRow( $membership )['scope_mode'] ?? '' );
 
-        $state = (object) [ 'fired' => 0, 'done' => false ];
+        $state = (object) [ 'fired' => 0, 'done' => false, 'moved' => false ];
         $inject = static function ( $query ) use ( $state, $membership ) {
             $current = (string) $query;
             if ( false === strpos( $current, 'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode' ) ) {
@@ -1957,10 +2106,16 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
                 return $query;
             }
             $state->done = true;
-            App::db()->query(
-                'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET role_key = %s WHERE id = %d',
-                [ RolesAndCapabilities::ROLE_DOCTOR, $membership ]
+            global $wpdb;
+            // B3 - the evidence is RECORDED, never thrown: an exception raised by the
+            // injection could be mistaken for the identity-guard refusal under test.
+            $rows = $wpdb->query(
+                $wpdb->prepare(
+                    'UPDATE ' . $wpdb->prefix . 'cpms_clinic_memberships SET role_key = %s WHERE id = %d',
+                    [ RolesAndCapabilities::ROLE_DOCTOR, $membership ]
+                )
             );
+            $state->moved = 1 === (int) $rows;
 
             return $query;
         };
@@ -1975,6 +2130,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         remove_filter( 'query', $inject, 7 );
 
         self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
+        self::assertTrue( $state->moved, 'the injected move must have applied exactly one row' );
         self::assertFalse( $result['ok'], 'a membership that moved at the lock must be refused' );
         self::assertSame( $mode_before, (string) ( $this->membershipRow( $membership )['scope_mode'] ?? '' ), 'the scope must not change on a refused write' );
         self::assertSame( $audit_before, $this->auditCount( 'MEMBERSHIP_SCOPE_CHANGED' ), 'no success audit may be committed' );
@@ -1994,7 +2150,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
 
         $other = $this->makeUser( 'subscriber', 'pb_r3_cap_other' );
         $audit_before = $this->auditCount( 'MEMBERSHIP_CAPABILITY_CHANGED' );
-        $state = (object) [ 'fired' => 0, 'done' => false ];
+        $state = (object) [ 'fired' => 0, 'done' => false, 'moved' => false ];
         // R4 — $other is captured: without it the closure raises an undefined-variable
         // warning (an exception in this harness) that looks like a refusal even when the
         // identity guard is gone.
@@ -2011,10 +2167,16 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
                 return $query;
             }
             $state->done = true;
-            App::db()->query(
-                'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET wp_user_id = %d WHERE id = %d',
-                [ $other, $membership ]
+            global $wpdb;
+            // B3 - the evidence is RECORDED, never thrown: an exception raised by the
+            // injection could be mistaken for the identity-guard refusal under test.
+            $rows = $wpdb->query(
+                $wpdb->prepare(
+                    'UPDATE ' . $wpdb->prefix . 'cpms_clinic_memberships SET wp_user_id = %d WHERE id = %d',
+                    [ $other, $membership ]
+                )
             );
+            $state->moved = 1 === (int) $rows;
 
             return $query;
         };
@@ -2034,6 +2196,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         remove_filter( 'query', $inject, 7 );
 
         self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
+        self::assertTrue( $state->moved, 'the injected move must have applied exactly one row' );
         self::assertFalse( $result['ok'], 'a membership that moved at the lock must be refused' );
         self::assertSame( [], $this->capabilityOverrides( $membership ), 'nothing may be written for the moved row' );
         self::assertSame( $audit_before, $this->auditCount( 'MEMBERSHIP_CAPABILITY_CHANGED' ), 'no success audit may be committed' );
@@ -2066,7 +2229,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         $staff      = $this->makeUser( 'subscriber', 'pb_r3_fin_staff' );
         $membership = cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
 
-        $state = (object) [ 'fired' => 0, 'done' => false ];
+        $state = (object) [ 'fired' => 0, 'done' => false, 'moved' => false ];
         $inject = static function ( $query ) use ( $state, $membership ) {
             $current = (string) $query;
             if ( false === strpos( $current, 'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode' ) ) {
@@ -2080,10 +2243,16 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
                 return $query;
             }
             $state->done = true;
-            App::db()->query(
-                'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET role_key = %s WHERE id = %d',
-                [ RolesAndCapabilities::ROLE_ACCOUNTANT, $membership ]
+            global $wpdb;
+            // B3 - the evidence is RECORDED, never thrown: an exception raised by the
+            // injection could be mistaken for the identity-guard refusal under test.
+            $rows = $wpdb->query(
+                $wpdb->prepare(
+                    'UPDATE ' . $wpdb->prefix . 'cpms_clinic_memberships SET role_key = %s WHERE id = %d',
+                    [ RolesAndCapabilities::ROLE_ACCOUNTANT, $membership ]
+                )
             );
+            $state->moved = 1 === (int) $rows;
 
             return $query;
         };
@@ -2099,6 +2268,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         remove_filter( 'query', $inject, 7 );
 
         self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
+        self::assertTrue( $state->moved, 'the injected move must have applied exactly one row' );
         self::assertTrue( $denied, 'a moved target must be refused with the controlled error' );
         self::assertSame( [], $this->capabilityOverrides( $membership ), 'nothing may be granted to the moved row' );
     }
@@ -2118,7 +2288,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         $membership = cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
         $audit_before = $this->auditCount( 'FINANCE_DELEGATION_GRANTED' );
 
-        $state = (object) [ 'fired' => 0, 'done' => false ];
+        $state = (object) [ 'fired' => 0, 'done' => false, 'moved' => false ];
         $inject = function ( $query ) use ( $state, $membership, $staff ) {
             $current = (string) $query;
             if ( false === strpos( $current, 'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode' ) ) {
@@ -2132,7 +2302,17 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
                 return $query;
             }
             $state->done = true;
-            $this->insertPatientLink( $staff );
+            try {
+                $this->insertPatientLink( $staff );
+                // B3 — recorded, never thrown: the evidence must exist before the refusal
+                // is asserted, otherwise the refusal could be an injection error in disguise.
+                $state->moved = array() !== App::db()->fetch_all_strict(
+                    'SELECT id FROM ' . App::db()->table( 'cpms_patient_user_links' ) . ' WHERE wp_user_id = %d LIMIT 1',
+                    [ $staff ]
+                );
+            } catch ( \Throwable $e ) {
+                $state->moved = false;
+            }
 
             return $query;
         };
@@ -2147,6 +2327,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         remove_filter( 'query', $inject, 7 );
 
         self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
+        self::assertTrue( $state->moved, 'the injected move must have applied exactly one row' );
         self::assertNotNull( $refused, 'patient evidence at the lock must refuse the grant' );
         self::assertSame( 403, $refused->httpStatus, 'the refusal must be the patient-evidence one (identity refusals are 409)' );
         self::assertSame( [], $this->capabilityOverrides( $membership ), 'no grant may be written' );
@@ -2167,7 +2348,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
 
         App::finance_delegation_service()->delegate( $manager, $this->clinicId, $membership, RolesAndCapabilities::PAYMENT_REFUND );
 
-        $state = (object) [ 'fired' => 0, 'done' => false ];
+        $state = (object) [ 'fired' => 0, 'done' => false, 'moved' => false ];
         $inject = static function ( $query ) use ( $state, $membership ) {
             $current = (string) $query;
             if ( false === strpos( $current, 'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode' ) ) {
@@ -2181,10 +2362,16 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
                 return $query;
             }
             $state->done = true;
-            App::db()->query(
-                'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET role_key = %s WHERE id = %d',
-                [ RolesAndCapabilities::ROLE_ACCOUNTANT, $membership ]
+            global $wpdb;
+            // B3 - the evidence is RECORDED, never thrown: an exception raised by the
+            // injection could be mistaken for the identity-guard refusal under test.
+            $rows = $wpdb->query(
+                $wpdb->prepare(
+                    'UPDATE ' . $wpdb->prefix . 'cpms_clinic_memberships SET role_key = %s WHERE id = %d',
+                    [ RolesAndCapabilities::ROLE_ACCOUNTANT, $membership ]
+                )
             );
+            $state->moved = 1 === (int) $rows;
 
             return $query;
         };
@@ -2200,6 +2387,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         remove_filter( 'query', $inject, 7 );
 
         self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
+        self::assertTrue( $state->moved, 'the injected move must have applied exactly one row' );
         self::assertTrue( $denied, 'a moved target must be refused with the controlled error' );
         self::assertSame(
             [ [ 'capability' => RolesAndCapabilities::PAYMENT_REFUND, 'effect' => 'grant' ] ],

@@ -595,18 +595,46 @@ final class RoleCapabilitiesPage
      */
     private static function persist_override_map( array $map ): void {
         update_option( RolesAndCapabilities::OPTION_OVERRIDE, $map, true );
-        // R1 — `update_option()` also returns false for an unchanged value, so a failed
-        // write is detected by READING the map back from the database, never by the
-        // return value: a narrowing that did not persist must not commit a success audit.
+        // B1 — `update_option()` also returns false for an unchanged value, so a failed
+        // write is detected by READING the ROW back STRICTLY, never by the return value
+        // and never through `get_option()`: that reader answers `array()` for a cached
+        // absence as well as for a failed read, so a blocked write whose intended end
+        // state is the empty map would read back equal and commit a success audit.
         wp_cache_delete( RolesAndCapabilities::OPTION_OVERRIDE, 'options' );
         wp_cache_delete( 'alloptions', 'options' );
-        $read_back = get_option( RolesAndCapabilities::OPTION_OVERRIDE, array() );
-        if ( ! is_array( $read_back )
-            || self::normalize_override_map( $read_back ) !== self::normalize_override_map( $map )
-        ) {
+        $read_back = self::strict_override_read();
+        if ( self::normalize_override_map( $read_back ) !== self::normalize_override_map( $map ) ) {
             throw new \RuntimeException( 'the capability override write did not persist' );
         }
         RolesAndCapabilities::register();
+    }
+
+    /**
+     * STRICT read of the durable override map (B1).
+     *
+     * A successful `update_option()` always leaves exactly one row for this option, so a
+     * missing row or a database error is a FAILURE, never "the empty map". The stored
+     * value is unserialized with `maybe_unserialize()` and a non-array payload is a
+     * failure too — the caller compares the normalized result with the map it intended.
+     *
+     * @return array<string, mixed>
+     */
+    private static function strict_override_read(): array {
+        $wpdb = App::db()->wpdb();
+        $rows = App::db()->fetch_all_strict(
+            'SELECT option_value FROM ' . $wpdb->options . ' WHERE option_name = %s LIMIT 1',
+            [ RolesAndCapabilities::OPTION_OVERRIDE ]
+        );
+        if ( array() === $rows ) {
+            throw new \RuntimeException( 'the capability override row is missing' );
+        }
+
+        $stored = maybe_unserialize( (string) ( $rows[0]['option_value'] ?? '' ) );
+        if ( ! is_array( $stored ) ) {
+            throw new \RuntimeException( 'the capability override row is unreadable' );
+        }
+
+        return $stored;
     }
 
     /**
