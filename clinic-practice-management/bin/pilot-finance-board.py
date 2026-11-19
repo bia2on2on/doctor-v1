@@ -217,7 +217,8 @@ def accountant_finance_journey(browser):
         headers = {key.lower(): value for key, value in request.headers.items()}
         if request.method == "GET" and route == "/clinic/v1/finance/summary":
             observed_nonces["summary"].append(headers.get("x-wp-nonce", ""))
-        if request.method == "GET" and route == "/clinic/v1/staff/portal/reception/patients/search":
+        # B0-PR1: the reception patient search is a body-only POST read.
+        if request.method == "POST" and route == "/clinic/v1/staff/portal/reception/patients/search":
             observed_nonces["reception"].append(headers.get("x-wp-nonce", ""))
 
     def prove(condition, message):
@@ -365,11 +366,12 @@ def accountant_finance_journey(browser):
                 } else {
                     url.pathname = url.pathname.replace(/\\/+$/, '') + '/' + route;
                 }
-                url.searchParams.set('q', 'SYN-PILOT-ACCOUNTANT-DENIAL');
+                // B0-PR1: the search term travels in the POST body, never the URL.
                 const response = await fetch(url.toString(), {
-                    method: 'GET',
+                    method: 'POST',
                     credentials: 'same-origin',
-                    headers: { 'X-WP-Nonce': cfg.nonce }
+                    headers: { 'X-WP-Nonce': cfg.nonce, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ q: 'SYN-PILOT-ACCOUNTANT-DENIAL' })
                 });
                 const body = await response.json().catch(() => null);
                 return { status: response.status, body: body };

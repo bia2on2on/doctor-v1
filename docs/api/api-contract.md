@@ -98,7 +98,7 @@
 | # | Method/Path | Cap | توضیح |
 |---|---|---|---|
 | D1 | `GET /secretary/today` | `cpms_queue_read` | داشبورد امروز (همه ستون‌های صف + آمار) — یک Query بهینه |
-| D2 | `GET /patients/search?q=&fields=` | `cpms_patient_read` | جستجو (نام/موبایل/کدملی/MRN) |
+| D2 | `POST /patients/search` (بدنهٔ JSON: `q`، `limit`) | `cpms_patient_read` | جستجو (نام/موبایل/کدملی/MRN). **B0-PR1:** عبارت جستجو فقط در بدنهٔ POST؛ ارسال در URL/query با ۴۰۰ `CLINIC_VALIDATION_FAILED` رد می‌شود. پاسخ کد ملی را (حتی masked) برنمی‌گرداند. |
 | D3 | `GET /patients/{id}` | `cpms_patient_read` + Data-Access | پروفایل کامل |
 | D4 | `POST /patients` | `cpms_patient_create` | Patient جدید (MRN خودکار) |
 | D5 | `PUT /patients/{id}` | `cpms_patient_update` | ویرایش فیلدهای مجاز ویرایشی منشی (`STAFF_EDITABLE`) با all-or-nothing. برای نام: سمنتیک **Option B** — «نام در ویرایش مشخصات بیمار» (پایین همین سند): خالی صریح ⇒ خطای اعتبارسنجی روشن؛ کلید غایب ⇒ حفظ. |
@@ -203,7 +203,7 @@ Anything else fails closed with **409 `CLINIC_RECEIPT_NOT_ELIGIBLE`** and a boun
 | E15 | `POST /visits/{id}/reopen` | `cpms_consult_reopen` | Correction (مجوز بالا) `{reason}` |
 | E16 | `POST /files` | `cpms_file_upload` | آپلود (patient_id/visit_id) |
 | E17 | `GET /files/{id}/stream` | `cpms_file_read` + Data-Access | Stream مجاز (Audit برای private). شاخهٔ بیمار پیش از خواندن دیسک، active/Clinic-consistent link و برای رکورد identity-backed همان Organization Identity link را بررسی می‌کند؛ booking-only dependent با 404 امن + Audit رد می‌شود. |
-| E18 | `GET /search?q=&type=patient|note|rx&from&to` | `cpms_search` | جستجوی جامع Role-Aware |
+| E18 | `POST /search` (بدنهٔ JSON: `q`، `type=patient|note|rx|all`، `from`، `to`) | `cpms_search` | جستجوی جامع Role-Aware. **B0-PR1:** عبارت جستجو فقط در بدنهٔ POST؛ ارسال در URL رد می‌شود و در پاسخ/audit تکرار نمی‌شود. |
 
 ## 6. Handwriting (Doctor)
 

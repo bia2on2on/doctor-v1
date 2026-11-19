@@ -877,7 +877,7 @@ final class Phase11ReceptionAppointmentCreateRedTest extends WP_UnitTestCase
         self::assertSame('waiting', (string) ($this->payload($arr)['visit']['status'] ?? ''), 'A12: arrival reaches waiting');
 
         // Slice 2 — read-only Clinic patient search.
-        $search = $this->dispatch('GET', self::SEARCH, ['q' => 'a12board'], $headers);
+        $search = $this->dispatch('POST', self::SEARCH, ['q' => 'a12board'], $headers);
         self::assertSame(200, $search->get_status(), 'A12: the Slice 2 search answers');
         self::assertContains($p1, array_map(static fn($r): int => (int) ($r['id'] ?? 0), (array) $this->payload($search)), 'A12: Slice 2 finds the Clinic patient');
 
