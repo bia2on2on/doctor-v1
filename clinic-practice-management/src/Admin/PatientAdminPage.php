@@ -19,8 +19,8 @@ use ClinicCore\Domain\Booking\BookingException;
  *  - در IA فعلی، «بیماران» به‌عنوان منوی Top-Level نقش‌محور ثبت می‌شود (همان الگوی
  *    «صف امروز»، «امروز پزشک») تا منشی/پزشک/مدیرِ دارای `cpms_patient_read` به آن برسند.
  *    (اگر PO بعداً با Refactor §1.5 همه را زیر «مدیریت مطب» ادغام کند، این entry به آن‌جا می‌رود.)
- *  - جستجو: GET server-side (فرم GET → بازرندر)، bounded (SEARCH_LIMIT)؛ از
- *    `PatientService::search()` (searchView = بدون فیلدهای بالینی/خصوصی؛ کد ملی masked).
+ *  - جستجو: POST server-side (فرم POST با Nonce → بازرندر)، bounded (SEARCH_LIMIT)؛ از
+ *    `PatientService::search()` (searchView = بدون فیلدهای بالینی/خصوصی؛ بدون کد ملی).
  *  - ایجاد: فقط در صورت `cpms_patient_create`؛ POST به admin-post با **Nonce (CSRF)** +
  *    Capability + Sanitize؛ از `PatientService::create()` (audit `PATIENT_CREATED` + اضافهٔ
  *    OpLog/audit با mobile mask؛ بدون ثبت PHI اضافه).
@@ -37,6 +37,7 @@ final class PatientAdminPage
     public const PAGE_SLUG = 'cpms-patients';
 
     private const NONCE_ACTION = 'cpms_patient_create';
+    private const SEARCH_NONCE_ACTION = 'cpms_patient_search';
     private const NOTICE_KEY = 'cpms_patient_notice';
     private const SEARCH_LIMIT = 10;
 
@@ -77,7 +78,18 @@ final class PatientAdminPage
             delete_transient(self::NOTICE_KEY);
         }
 
-        $q = isset($_GET['q']) ? sanitize_text_field(wp_unslash($_GET['q'])) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- فقط خواندن/نمایش جستجو (GET خواندنی)
+        // B0-PR1: the search term (which may be a patient national ID) is accepted
+        // ONLY in the POST body — never in the URL/query string, where it would be
+        // written to web-server access logs and browser history. A POST without a
+        // valid nonce is refused outright (fail closed); the search stays read-only.
+        $q = '';
+        if ( isset( $_SERVER['REQUEST_METHOD'] ) && sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) === 'POST' ) {
+            $nonce = isset( $_POST['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ) ) : '';
+            if ( ! wp_verify_nonce( $nonce, self::SEARCH_NONCE_ACTION ) ) {
+                wp_die( 'دسترسی ندارید', 403 );
+            }
+            $q = isset( $_POST['q'] ) ? sanitize_text_field( wp_unslash( $_POST['q'] ) ) : '';
+        }
         $results = [];
         $searchError = '';
         $searched = false;
@@ -105,13 +117,14 @@ final class PatientAdminPage
                 <div class="notice <?php echo str_starts_with($notice, 'خطا') ? 'notice-error' : 'notice-success'; ?> is-dismissible"><p><?php echo esc_html($notice); ?></p></div>
             <?php endif; ?>
 
-            <form method="get" action="<?php echo esc_url(admin_url('admin.php')); ?>" class="cpms-autofocus">
+            <form method="post" action="<?php echo esc_url( admin_url( 'admin.php?page=' . self::PAGE_SLUG ) ); ?>" class="cpms-autofocus">
                 <input type="hidden" name="page" value="<?php echo esc_attr(self::PAGE_SLUG); ?>">
+                <?php wp_nonce_field( self::SEARCH_NONCE_ACTION ); // B0-PR1: body-only search needs the CSRF token. ?>
                 <table class="form-table" role="presentation">
                     <tr>
                         <th><label for="cpms_pat_q">جستجوی بیمار</label></th>
                         <td>
-                            <input type="search" id="cpms_pat_q" name="q" class="regular-text" value="<?php echo esc_attr($q); ?>"
+                            <input type="search" id="cpms_pat_q" name="q" class="regular-text"
                                    placeholder="نام، نام خانوادگی، موبایل، کد ملی یا کد پرونده (MRN)" autocomplete="off">
                         </td>
                     </tr>
@@ -131,7 +144,7 @@ final class PatientAdminPage
 				<h2>نتایج (تا <?php echo esc_html( $limit_fa ); ?> مورد)</h2>
                 <table class="widefat striped" role="presentation">
                     <thead>
-                        <tr><th>کد پرونده</th><th>نام و نام خانوادگی</th><th>موبایل</th><th>کد ملی</th><th>وضعیت</th></tr>
+                        <tr><th>کد پرونده</th><th>نام و نام خانوادگی</th><th>موبایل</th><th>وضعیت</th></tr>
                     </thead>
                     <tbody>
                     <?php foreach ($results as $p) : ?>
@@ -139,7 +152,6 @@ final class PatientAdminPage
                             <td><?php echo esc_html((string) $p['mrn']); ?></td>
                             <td><?php echo esc_html(trim((string) $p['first_name'] . ' ' . (string) $p['last_name'])); ?></td>
                             <td><?php echo esc_html((string) $p['mobile']); ?></td>
-                            <td><?php echo $p['national_id'] !== null && $p['national_id'] !== '' ? esc_html((string) $p['national_id']) : '—'; ?></td>
                             <td><?php echo $p['status'] === 'active' ? '<span style="color:#00a32a;">فعال</span>' : '<span style="color:#d63638;">' . esc_html((string) $p['status']) . '</span>'; ?></td>
                         </tr>
                     <?php endforeach; ?>

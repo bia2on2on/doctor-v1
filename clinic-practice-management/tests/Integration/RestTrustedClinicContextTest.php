@@ -1344,7 +1344,7 @@ final class RestTrustedClinicContextTest extends WP_UnitTestCase
         $this->assertSame(200, $shared->get_status(), (string) json_encode($shared->get_data(), JSON_UNESCAPED_UNICODE));
 
         wp_set_current_user($peer);
-        $peerSearch = $this->dispatch('GET', self::NS . '/search', ['q' => 'phase1bsearch', 'type' => 'note'], $headers);
+        $peerSearch = $this->dispatch('POST', self::NS . '/search', ['q' => 'phase1bsearch', 'type' => 'note'], $headers);
         $this->assertSame(200, $peerSearch->get_status(), (string) json_encode($peerSearch->get_data(), JSON_UNESCAPED_UNICODE));
         $peerSnippets = array_column($this->payload($peerSearch)['results']['notes'] ?? [], 'snippet');
         $this->assertStringNotContainsString(
@@ -1355,7 +1355,7 @@ final class RestTrustedClinicContextTest extends WP_UnitTestCase
         $this->assertContains('phase1bsearchsharednote', $peerSnippets, 'patient-visible notes stay searchable for authorized same-Clinic readers');
 
         wp_set_current_user($secretary);
-        $secretarySearch = $this->dispatch('GET', self::NS . '/search', ['q' => 'phase1bsearch', 'type' => 'note'], $headers);
+        $secretarySearch = $this->dispatch('POST', self::NS . '/search', ['q' => 'phase1bsearch', 'type' => 'note'], $headers);
         $this->assertSame(200, $secretarySearch->get_status(), (string) json_encode($secretarySearch->get_data(), JSON_UNESCAPED_UNICODE));
         $this->assertSame([], $this->payload($secretarySearch)['results']['notes'] ?? [], 'secretary note results must stay empty (role-aware boundary not widened)');
     }
@@ -1388,7 +1388,7 @@ final class RestTrustedClinicContextTest extends WP_UnitTestCase
         $this->assertSame(200, $created->get_status(), (string) json_encode($created->get_data(), JSON_UNESCAPED_UNICODE));
 
         wp_set_current_user($reader);
-        $search = $this->dispatch('GET', self::NS . '/search', ['q' => 'phase1bsearchcap', 'type' => 'note'], $headers);
+        $search = $this->dispatch('POST', self::NS . '/search', ['q' => 'phase1bsearchcap', 'type' => 'note'], $headers);
         $this->assertSame(200, $search->get_status(), 'denying private-note access must not disable search itself');
         $this->assertStringNotContainsString(
             'phase1bsearchcapsecret',
@@ -1438,7 +1438,7 @@ final class RestTrustedClinicContextTest extends WP_UnitTestCase
         $this->assertNotContains('phase1bdeniedownerprivatecomplaint', $recordContents);
         $this->assertContains('phase1bdeniedownersharednote', $recordContents);
 
-        $search = $this->dispatch('GET', self::NS . '/search', ['q' => 'phase1bdeniedowner', 'type' => 'note'], $headers);
+        $search = $this->dispatch('POST', self::NS . '/search', ['q' => 'phase1bdeniedowner', 'type' => 'note'], $headers);
         $this->assertSame(200, $search->get_status(), (string) json_encode($search->get_data(), JSON_UNESCAPED_UNICODE));
         $this->assertStringNotContainsString(
             'phase1bdeniedownerprivatecomplaint',
@@ -1488,7 +1488,7 @@ final class RestTrustedClinicContextTest extends WP_UnitTestCase
             'owning clinician with both permissions keeps E7 private-note access'
         );
 
-        $search = $this->dispatch('GET', self::NS . '/search', ['q' => 'phase1ballowedowner', 'type' => 'note'], $headers);
+        $search = $this->dispatch('POST', self::NS . '/search', ['q' => 'phase1ballowedowner', 'type' => 'note'], $headers);
         $this->assertStringContainsString(
             'phase1ballowedownerprivatecomplaint',
             (string) json_encode($search->get_data(), JSON_UNESCAPED_UNICODE),

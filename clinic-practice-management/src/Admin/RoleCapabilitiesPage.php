@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace ClinicCore\Admin;
 
 use ClinicCore\Auth\RolesAndCapabilities;
+use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Time\PersianDigits;
+use ClinicCore\Infrastructure\Repository\MembershipRepository;
 
 /**
  * صفحه «CPMS (دسترسی‌ها)» — مدیریت Capabilities نقش‌های CPMS (ADR-0030 / Part 1).
@@ -458,13 +460,21 @@ final class RoleCapabilitiesPage
         try {
             App::db()->transactional(
                 function () use ( $input, $actor_wp_user_id, &$report ) {
+                    // B0-PR2-B3 — one locking read of the durable override row: it
+                    // both serializes the preset writers and gives the real before-state.
+                    $snapshot = self::locked_override_snapshot();
+                    // R1 — the write is built from the LOCKED snapshot, role by role, and
+                    // persisted once at the end: no other role's consistent-read entry
+                    // can be written back over the state this request locked.
+                    $map = $snapshot;
                     foreach ( self::ROLE_PRESETS as $role ) {
                         $requested = isset( $input[ $role ] ) && is_array( $input[ $role ] ) ? $input[ $role ] : [];
-                        $before    = array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
-                        if ( ! RolesAndCapabilities::setRoleCaps( $role, $requested ) ) {
-                            continue;
-                        }
-                        $after   = array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
+                        $before    = self::caps_from_snapshot( $role, $snapshot );
+                        // B0-PR2-H2 — widening a BUILT-IN preset is refused while any
+                        // active holder of that role is a patient/mixed/unknown account,
+                        // because the preset applies to those members immediately.
+                        self::assert_widening_has_no_patient_holder( $role, $requested, $before );
+                        $after   = self::apply_to_locked_map( $map, $role, $requested );
                         $added   = array_values( array_diff( $after, $before ) );
                         $removed = array_values( array_diff( $before, $after ) );
                         if ( $added !== [] || $removed !== [] ) {
@@ -481,6 +491,7 @@ final class RoleCapabilitiesPage
                             $report[] = $role . ': +' . count( $added ) . '/-' . count( $removed );
                         }
                     }
+                    self::persist_override_map( $map );
                 }
             );
         } catch ( \Throwable $e ) {
@@ -496,6 +507,205 @@ final class RoleCapabilitiesPage
     }
 
     /**
+     * Lock-protected, STRICT snapshot of the durable capability overrides (B3).
+     *
+     * `capsMap()` falls back to the template when the override option cannot be
+     * read, so a narrowed preset looked like its template and could be "widened"
+     * past the guard, and a stale before-state could restore a capability after a
+     * concurrent narrowing. This reads the option ROW itself, inside the caller's
+     * transaction, with `FOR UPDATE` so the two preset writers serialize on it
+     * (https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html), and
+     * refuses on a malformed value instead of guessing.
+     *
+     * @return array<string, mixed>
+     */
+    private static function locked_override_snapshot(): array {
+        $wpdb = App::db()->wpdb();
+        $rows = App::db()->fetch_all_strict(
+            'SELECT option_value FROM ' . $wpdb->options . ' WHERE option_name = %s LIMIT 1 FOR UPDATE',
+            [ RolesAndCapabilities::OPTION_OVERRIDE ]
+        );
+
+        $snapshot = array();
+        if ( array() !== $rows ) {
+            $stored = maybe_unserialize( (string) ( $rows[0]['option_value'] ?? '' ) );
+            if ( ! is_array( $stored ) ) {
+                throw new \RuntimeException( 'the capability override option is unreadable' );
+            }
+            $snapshot = $stored;
+        }
+
+        // The row was just read from the database, so drop any cached copy: the
+        // writers below build their new value from this durable state.
+        wp_cache_delete( RolesAndCapabilities::OPTION_OVERRIDE, 'options' );
+        wp_cache_delete( 'alloptions', 'options' );
+
+        return $snapshot;
+    }
+
+    /**
+     * Current capabilities of one preset, from the locked snapshot (never a guess).
+     *
+     * @param array<string, mixed> $snapshot
+     * @return list<string>
+     */
+    private static function caps_from_snapshot( string $role, array $snapshot ): array {
+        if ( ! array_key_exists( $role, $snapshot ) ) {
+            // R1 — the built-in TEMPLATE, never capsMap(): that reader can serve a
+            // cached (consistent-read) copy that differs from the row this snapshot
+            // locked, which would let a stale wider set look like "no change".
+            return RolesAndCapabilities::sanitizeCapList( self::template_caps( $role ) );
+        }
+        if ( ! is_array( $snapshot[ $role ] ) ) {
+            throw new \RuntimeException( 'the capability override option is malformed' );
+        }
+
+        return RolesAndCapabilities::sanitizeCapList( $snapshot[ $role ] );
+    }
+
+    /**
+     * Write one role's requested set into the LOCKED map (R1): stored when it differs
+     * from the built-in template, removed when it equals it — the same rule
+     * `RolesAndCapabilities::setRoleCaps()` applies, without its `get_option()` read.
+     *
+     * @param array<string, mixed>     $map
+     * @param array<int|string, mixed> $requested
+     * @return list<string> the persisted (sanitized) capability list
+     */
+    private static function apply_to_locked_map( array &$map, string $role, array $requested ): array {
+        $clean = RolesAndCapabilities::sanitizeCapList( $requested );
+        if ( $clean === RolesAndCapabilities::sanitizeCapList( self::template_caps( $role ) ) ) {
+            unset( $map[ $role ] );
+        } else {
+            $map[ $role ] = $clean;
+        }
+
+        return $clean;
+    }
+
+    /**
+     * Persist the COMPLETE override map that was built from the locked snapshot (R1).
+     *
+     * `setRoleCaps()` rebuilds the option from `get_option()` — a consistent read that
+     * can carry a stale, wider entry for a role this request never touched, writing it
+     * back over durable state. The map written here starts from the row the writer
+     * locked, so only the roles this request changed can differ from durable state.
+     *
+     * @param array<string, mixed> $map
+     */
+    private static function persist_override_map( array $map ): void {
+        update_option( RolesAndCapabilities::OPTION_OVERRIDE, $map, true );
+        // B1 — `update_option()` also returns false for an unchanged value, so a failed
+        // write is detected by READING the ROW back STRICTLY, never by the return value
+        // and never through `get_option()`: that reader answers `array()` for a cached
+        // absence as well as for a failed read, so a blocked write whose intended end
+        // state is the empty map would read back equal and commit a success audit.
+        wp_cache_delete( RolesAndCapabilities::OPTION_OVERRIDE, 'options' );
+        wp_cache_delete( 'alloptions', 'options' );
+        $read_back = self::strict_override_read();
+        if ( self::normalize_override_map( $read_back ) !== self::normalize_override_map( $map ) ) {
+            throw new \RuntimeException( 'the capability override write did not persist' );
+        }
+        RolesAndCapabilities::register();
+    }
+
+    /**
+     * STRICT read of the durable override map (B1).
+     *
+     * A successful `update_option()` always leaves exactly one row for this option, so a
+     * missing row or a database error is a FAILURE, never "the empty map". The stored
+     * value is unserialized with `maybe_unserialize()` and a non-array payload is a
+     * failure too — the caller compares the normalized result with the map it intended.
+     *
+     * The SELECT is a LOCKING read (`FOR UPDATE`). A plain SELECT would be a consistent
+     * read: inside a transaction whose snapshot was established before this write it can
+     * answer with the pre-write version of the row, which would mis-report the write this
+     * request just made — https://dev.mysql.com/doc/refman/8.0/en/innodb-consistent-read.html
+     * and https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html. A locking read
+     * always returns the latest committed version of the row the writer already holds.
+     *
+     * @return array<string, mixed>
+     */
+    private static function strict_override_read(): array {
+        $wpdb = App::db()->wpdb();
+        $rows = App::db()->fetch_all_strict(
+            'SELECT option_value FROM ' . $wpdb->options . ' WHERE option_name = %s LIMIT 1 FOR UPDATE',
+            [ RolesAndCapabilities::OPTION_OVERRIDE ]
+        );
+        if ( array() === $rows ) {
+            throw new \RuntimeException( 'the capability override row is missing' );
+        }
+
+        $stored = maybe_unserialize( (string) ( $rows[0]['option_value'] ?? '' ) );
+        if ( ! is_array( $stored ) ) {
+            throw new \RuntimeException( 'the capability override row is unreadable' );
+        }
+
+        return $stored;
+    }
+
+    /**
+     * Order-independent form of an override map, for the read-back comparison (R1).
+     *
+     * @param array<string, mixed> $map
+     * @return array<string, list<string>|null> null marks a malformed entry
+     */
+    private static function normalize_override_map( array $map ): array {
+        $normal = array();
+        foreach ( $map as $role => $caps ) {
+            if ( ! is_array( $caps ) ) {
+                $normal[ (string) $role ] = null;
+                continue;
+            }
+            $list = RolesAndCapabilities::sanitizeCapList( $caps );
+            sort( $list );
+            $normal[ (string) $role ] = $list;
+        }
+        ksort( $normal );
+
+        return $normal;
+    }
+
+    /**
+     * Template capability list of one built-in preset.
+     *
+     * @return list<string>
+     */
+    private static function template_caps( string $role ): array {
+        return match ( $role ) {
+            RolesAndCapabilities::ROLE_DOCTOR => RolesAndCapabilities::DOCTOR_CAPS,
+            RolesAndCapabilities::ROLE_ACCOUNTANT => RolesAndCapabilities::ACCOUNTANT_CAPS,
+            RolesAndCapabilities::ROLE_MANAGER => RolesAndCapabilities::MANAGER_CAPS,
+            default => RolesAndCapabilities::SECRETARY_CAPS,
+        };
+    }
+
+    /**
+     * Refuse a widening of one built-in preset while any ACTIVE holder of that role
+     * is a patient / mixed / unknown account (B0-PR2-H2).
+     *
+     * A widening is any capability present in the requested set but absent from the
+     * current preset. Reductions are always allowed. The check runs before the write
+     * and throws, so the caller's transaction writes nothing.
+     *
+     * @param array<int|string, mixed> $requested
+     * @param list<string>             $before
+     */
+    private static function assert_widening_has_no_patient_holder( string $role, array $requested, array $before ): void {
+        $added = array_values( array_diff( RolesAndCapabilities::sanitizeCapList( $requested ), $before ) );
+        if ( [] === $added ) {
+            return;
+        }
+
+        $repository = new MembershipRepository( App::db() );
+        foreach ( $repository->member_user_ids_for_role( $role ) as $user_id ) {
+            if ( PatientAccountPolicy::is_patient_account( $user_id ) ) {
+                throw new \RuntimeException( 'widening a role preset held by a patient account is refused' );
+            }
+        }
+    }
+
+    /**
      * Pure single-role template-reset boundary (no redirect/exit). Throws on audit
      * failure after the option/role changes have rolled back.
      */
@@ -506,16 +716,17 @@ final class RoleCapabilitiesPage
         try {
             App::db()->transactional(
                 function () use ( $role ) {
-                    $before = array_keys( array_filter( RolesAndCapabilities::capsMap( $role ) ) );
-                    RolesAndCapabilities::setRoleCaps(
-                        $role,
-                        match ( $role ) {
-                            RolesAndCapabilities::ROLE_DOCTOR => RolesAndCapabilities::DOCTOR_CAPS,
-                            RolesAndCapabilities::ROLE_ACCOUNTANT => RolesAndCapabilities::ACCOUNTANT_CAPS,
-                            RolesAndCapabilities::ROLE_MANAGER => RolesAndCapabilities::MANAGER_CAPS,
-                            default => RolesAndCapabilities::SECRETARY_CAPS,
-                        }
-                    );
+                    // B0-PR2-B3 — the same locking, strict read as the matrix editor.
+                    $snapshot = self::locked_override_snapshot();
+                    $before   = self::caps_from_snapshot( $role, $snapshot );
+                    $template = self::template_caps( $role );
+                    // B0-PR2-H2 — a reset restores the template, which can WIDEN a
+                    // currently narrowed preset; refused under the same condition.
+                    self::assert_widening_has_no_patient_holder( $role, $template, $before );
+                    // R1 — the reset removes ONLY this role's entry from the locked map.
+                    $map = $snapshot;
+                    unset( $map[ $role ] );
+                    self::persist_override_map( $map );
                     App::audit()->log(
                         'ROLE_PERMISSION_RESET',
                         [ 'wp_user_id' => (int) get_current_user_id(), 'role' => 'administrator' ],

@@ -6,11 +6,12 @@ namespace ClinicCore\Application\Finance;
 
 use ClinicCore\Application\Authorization\AuthorizationException;
 use ClinicCore\Application\Membership\MembershipService;
+use ClinicCore\Application\Patients\PatientAccountPolicy;
+use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
-use ClinicCore\Infrastructure\Repository\MembershipRepository;
 
 /**
  * 2026-10-15 — واگذاری صریح و محدود مجوزهای مالی حساس توسط مدیر کلینیک.
@@ -84,7 +85,18 @@ final class FinanceDelegationService {
 		$this->assert_bounded( $capability );
 		$membership = $this->authorized_target( $actor_user_id, $clinic_id, $target_membership_id );
 
-		$before = $this->explicit_effect( $target_membership_id, $capability );
+		// R2 — the pre-flight observation is STRICT: an unreadable state must refuse,
+		// and the same value must still hold inside the write boundary.
+		try {
+			$before = $this->explicit_effect_strict( $target_membership_id, $capability );
+		} catch ( \Throwable $e ) {
+			throw FinanceException::of(
+				'CLINIC_DELEGATION_DENIED',
+				'وضعیت فعلی واگذاری خوانده نشد؛ عملیات انجام نشد.',
+				409,
+				array( 'clinic_id' => $clinic_id )
+			);
+		}
 		if ( $before === 'deny' ) {
 			throw FinanceException::of(
 				'CLINIC_DELEGATION_DENY_PRECEDENCE',
@@ -95,8 +107,70 @@ final class FinanceDelegationService {
 		}
 
 		$target_user_id = (int) ( $membership['wp_user_id'] ?? 0 );
+		// B0-PR2 — a sensitive financial capability is never granted to a patient
+		// account. Revocation (revoke()) is unaffected and stays allowed.
+		if ( PatientAccountPolicy::is_patient_account( $target_user_id ) ) {
+			throw FinanceException::of(
+				'CLINIC_DELEGATION_DENIED',
+				'واگذاری مجوز به این عضویت مجاز نیست.',
+				403,
+				[ 'clinic_id' => $clinic_id ]
+			);
+		}
+
+		$target_role = (string) ( $membership['role_key'] ?? '' );
 		$this->db->transactional(
-			function () use ( $actor_user_id, $clinic_id, $target_membership_id, $capability, $before, $target_user_id ): void {
+			function () use ( $actor_user_id, $clinic_id, $target_membership_id, $capability, $before, $target_user_id, $target_role ): void {
+				// B0-PR2-B4 — the decision is re-made INSIDE the write boundary on a
+				// locked membership row: a DENY that committed after the pre-flight
+				// read must win over this GRANT, never be overwritten by it.
+				if ( ! $this->memberships->lock_row_for_update( $target_membership_id ) ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'این عضویت هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
+						409,
+						array( 'clinic_id' => $clinic_id )
+					);
+				}
+				// R2/R3 — the membership is re-read strictly under the lock and its
+				// identity is proved before any decision or write.
+				$locked = $this->locked_target_membership(
+					$clinic_id,
+					$target_membership_id,
+					$target_user_id,
+					$target_role
+				);
+				// R3 — the patient/mixed classification is re-made on the LOCKED user id:
+				// evidence that appeared after the pre-flight read must refuse the GRANT.
+				if ( PatientAccountPolicy::is_patient_account( (int) $locked['wp_user_id'] ) ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'واگذاری مجوز به این عضویت مجاز نیست.',
+						403,
+						array( 'clinic_id' => $clinic_id )
+					);
+				}
+				try {
+					$current = $this->explicit_effect_strict( $target_membership_id, $capability );
+				} catch ( \Throwable $e ) {
+					throw FinanceException::of( 'CLINIC_DELEGATION_DENIED', 'وضعیت فعلی واگذاری خوانده نشد؛ عملیات انجام نشد.', 409, [ 'clinic_id' => $clinic_id ] );
+				}
+				if ( $current !== $before ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'وضعیت واگذاری هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
+						409,
+						array( 'clinic_id' => $clinic_id )
+					);
+				}
+				if ( 'deny' === $current ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENY_PRECEDENCE',
+						'برای این عضو Deny صریح ثبت شده است؛ واگذاری نمی‌تواند آن را نقض کند.',
+						409,
+						[ 'capability' => $capability, 'membership_id' => $target_membership_id ]
+					);
+				}
 				$this->membership_service->set_capability( $target_membership_id, $capability, 'grant' );
 
 				$meta = [ 'clinic_id' => $clinic_id, 'target_wp_user_id' => $target_user_id ];
@@ -131,7 +205,18 @@ final class FinanceDelegationService {
 		$this->assert_bounded( $capability );
 		$membership = $this->authorized_target( $actor_user_id, $clinic_id, $target_membership_id );
 
-		$current = $this->explicit_effect( $target_membership_id, $capability );
+		// B0-PR2-G5 — the prior override is read strictly: an unreadable state must
+		// never be treated as "nothing to remove".
+		try {
+			$current = $this->explicit_effect_strict( $target_membership_id, $capability );
+		} catch ( \Throwable $e ) {
+			throw FinanceException::of(
+				'CLINIC_DELEGATION_DENIED',
+				'وضعیت فعلی واگذاری خوانده نشد؛ عملیات انجام نشد.',
+				409,
+				[ 'clinic_id' => $clinic_id ]
+			);
+		}
 		if ( $current === null ) {
 			throw FinanceException::of(
 				'CLINIC_DELEGATION_NOT_FOUND',
@@ -142,8 +227,64 @@ final class FinanceDelegationService {
 		}
 
 		$target_user_id = (int) ( $membership['wp_user_id'] ?? 0 );
+		// B0-PR2-G5 — removing an explicit DENY WIDENS the member, so it is refused
+		// for a patient/mixed/unknown account. A real GRANT revocation only narrows
+		// and stays allowed.
+		if ( 'deny' === $current && PatientAccountPolicy::is_patient_account( $target_user_id ) ) {
+			throw FinanceException::of(
+				'CLINIC_DELEGATION_DENIED',
+				'واگذاری مجوز به این عضویت مجاز نیست.',
+				403,
+				[ 'clinic_id' => $clinic_id ]
+			);
+		}
+
+		$target_role = (string) ( $membership['role_key'] ?? '' );
 		$this->db->transactional(
-			function () use ( $actor_user_id, $clinic_id, $target_membership_id, $capability, $current, $target_user_id ): void {
+			function () use ( $actor_user_id, $clinic_id, $target_membership_id, $capability, $current, $target_user_id, $target_role ): void {
+				// B0-PR2-B4 — re-read on a locked row: a DENY that arrived after the
+				// pre-flight read must not be removed by a stale revocation, and a
+				// GRANT that was already withdrawn is not "revoked" twice.
+				if ( ! $this->memberships->lock_row_for_update( $target_membership_id ) ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'این عضویت هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
+						409,
+						array( 'clinic_id' => $clinic_id )
+					);
+				}
+				// R2/R3 — strict membership re-read under the same lock as delegate().
+				$this->locked_target_membership( $clinic_id, $target_membership_id, $target_user_id, $target_role );
+				try {
+					$current_now = $this->explicit_effect_strict( $target_membership_id, $capability );
+				} catch ( \Throwable $e ) {
+					throw FinanceException::of( 'CLINIC_DELEGATION_DENIED', 'وضعیت فعلی واگذاری خوانده نشد؛ عملیات انجام نشد.', 409, [ 'clinic_id' => $clinic_id ] );
+				}
+				if ( null === $current_now ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_NOT_FOUND',
+						'واگذاری فعالی برای این Capability وجود ندارد.',
+						404,
+						[ 'capability' => $capability, 'membership_id' => $target_membership_id ]
+					);
+				}
+				if ( $current_now !== $current ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'وضعیت واگذاری هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
+						409,
+						[ 'clinic_id' => $clinic_id ]
+					);
+				}
+				if ( 'deny' === $current_now && PatientAccountPolicy::is_patient_account( $target_user_id ) ) {
+					throw FinanceException::of(
+						'CLINIC_DELEGATION_DENIED',
+						'واگذاری مجوز به این عضویت مجاز نیست.',
+						403,
+						[ 'clinic_id' => $clinic_id ]
+					);
+				}
+
 				$this->membership_service->remove_capability( $target_membership_id, $capability );
 
 				$meta = [ 'clinic_id' => $clinic_id, 'target_wp_user_id' => $target_user_id ];
@@ -182,6 +323,65 @@ final class FinanceDelegationService {
 		}
 
 		return null;
+	}
+
+	/**
+	 * STRICT variant of explicit_effect(): throws when the override rows cannot be
+	 * read, so a mutation never decides on an unknown prior state.
+	 */
+	private function explicit_effect_strict( int $membership_id, string $capability ): ?string {
+		$rows = $this->db->fetch_all_strict(
+			'SELECT capability, effect FROM ' . $this->db->table( 'cpms_membership_capabilities' )
+			. ' WHERE membership_id = %d',
+			[ $membership_id ]
+		);
+
+		foreach ( $rows as $row ) {
+			if ( (string) ( $row['capability'] ?? '' ) === $capability ) {
+				return (string) ( $row['effect'] ?? '' );
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Locking, strict re-read of the target membership inside the write boundary
+	 * (R3/R4): a failed read and a row that is gone or suspended become the page's
+	 * controlled FinanceException, never a RuntimeException escaping to the caller.
+	 *
+	 * @return array<string, mixed>
+	 *
+	 * @throws FinanceException
+	 */
+	private function locked_target_membership( int $clinic_id, int $target_membership_id, int $target_user_id, string $role_key ): array {
+		try {
+			$locked = $this->memberships->read_membership_strict( $target_membership_id );
+		} catch ( \Throwable $e ) {
+			throw FinanceException::of(
+				'CLINIC_DELEGATION_DENIED',
+				'وضعیت فعلی واگذاری خوانده نشد؛ عملیات انجام نشد.',
+				409,
+				array( 'clinic_id' => $clinic_id )
+			);
+		}
+
+		// R3 — the row must still be the one the caller decided about.
+		if ( null === $locked
+			|| 'active' !== (string) ( $locked['status'] ?? '' )
+			|| (int) $locked['clinic_id'] !== $clinic_id
+			|| (int) $locked['wp_user_id'] !== $target_user_id
+			|| (string) $locked['role_key'] !== $role_key
+		) {
+			throw FinanceException::of(
+				'CLINIC_DELEGATION_DENIED',
+				'این عضویت هم‌زمان تغییر کرد؛ عملیات انجام نشد.',
+				409,
+				array( 'clinic_id' => $clinic_id )
+			);
+		}
+
+		return $locked;
 	}
 
 	private function assert_bounded( string $capability ): void {

@@ -41,6 +41,7 @@ namespace ClinicCore\Application\Management;
 
 use ClinicCore\Application\Authorization\AuthorizationException;
 use ClinicCore\Application\Authorization\AuthorizationService;
+use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Application\Location\LocationException;
 use ClinicCore\Application\Onboarding\FacilitySetupException;
 use ClinicCore\Application\Onboarding\OrganizationClinicProvisioningService;
@@ -86,13 +87,17 @@ final class ManagementPortalService {
 	 * path ever touches cpms_organization_memberships, so no Organization
 	 * Manager delegation can happen here.
 	 *
+	 * B0-PR2 — the PATIENT role (`cpms_patient`) is deliberately absent as well:
+	 * no staff path may mint a patient account, hand out patient binding, or set a
+	 * patient credential. may_assign_role() refuses that key explicitly too, so
+	 * editing this list alone cannot re-open the path.
+	 *
 	 * @var list<string>
 	 */
 	public const ASSIGNABLE_BUILT_IN_ROLES = array(
 		RolesAndCapabilities::ROLE_DOCTOR,
 		RolesAndCapabilities::ROLE_SECRETARY,
 		RolesAndCapabilities::ROLE_ACCOUNTANT,
-		RolesAndCapabilities::ROLE_PATIENT,
 	);
 
 	/**
@@ -842,6 +847,12 @@ final class ManagementPortalService {
 			return self::failure();
 		}
 
+		// B0-PR2 — a patient account never receives staff capability from this
+		// staff surface (refused before any role/capability/audit write).
+		if ( PatientAccountPolicy::is_patient_account( $target_wp_user_id ) ) {
+			return self::failure();
+		}
+
 		try {
 			// D6 audit atomicity: the assignment service is atomic itself (role
 			// write + its own audit on a SAVEPOINT); this outer boundary also
@@ -881,8 +892,8 @@ final class ManagementPortalService {
 	 *  - trusted Clinic scope + scoped staff-management capability are authorized
 	 *    BEFORE the target account is resolved or provisioned;
 	 *  - delegation follows may_assign_role(): the approved operational roles
-	 *    (doctor, secretary/receptionist, accountant) and the patient membership
-	 *    role are assignable on staff-management authority ALONE — the Clinic
+	 *    (doctor, secretary/receptionist, accountant) are assignable on
+	 *    staff-management authority ALONE — the Clinic
 	 *    Manager does not need to hold the clinical/financial capabilities being
 	 *    delegated (they come from the role preset, never an arbitrary set);
 	 *  - manager/manager designation is never assignable here (explicit
@@ -911,6 +922,17 @@ final class ManagementPortalService {
 			return self::failure();
 		}
 
+		// B0-PR2 — resolve an EXISTING target before the boundary opens, so a
+		// refused target is refused before anything is provisioned. Provisioning
+		// (only for an e-mail that resolves to nothing) stays inside the boundary
+		// and is rolled back if the re-check below refuses it.
+		$existing_target = $this->resolve_existing_subscriber( $identifier );
+		if ( $existing_target > 0
+			&& $existing_target !== $actor_wp_user_id
+			&& ! $this->staff_target_is_eligible( $existing_target ) ) {
+			return self::failure();
+		}
+
 		$membership_id = 0;
 		$target        = 0;
 		// Descriptor of a subscriber provisioned inside the boundary; populated
@@ -932,7 +954,11 @@ final class ManagementPortalService {
 						return self::invalid( 'افزودن خودتان به کارکنان این درمانگاه مجاز نیست.' );
 					}
 					if ( ! $this->staff_target_is_eligible( $target ) ) {
-						return self::failure();
+						// A fresh account can only reach this line through a failed
+						// evidence read; THROW so the boundary rolls the provisioned
+						// subscriber (and anything else) back instead of committing a
+						// refusal that silently created an account.
+						throw new \RuntimeException( 'staff target refused inside the boundary' );
 					}
 					if ( $this->memberships->find( $trusted, $target ) !== null ) {
 						return self::prerequisite(
@@ -1009,6 +1035,14 @@ final class ManagementPortalService {
 			}
 			$membership = $found;
 
+			// B0-PR2 — revocation is the safe direction: SUSPENDING a patient or
+			// mixed account stays allowed (it only withdraws access), while
+			// REACTIVATING one re-opens participation and is refused here with the
+			// uniform portal failure, before any membership or audit write.
+			if ( $active && PatientAccountPolicy::is_patient_account( (int) ( $membership['wp_user_id'] ?? 0 ) ) ) {
+				return self::failure();
+			}
+
 			// D6 audit atomicity: the lifecycle transition and its mandatory
 			// audit event commit or roll back together. A failed audit rolls
 			// the suspension/reactivation back — no un-audited membership
@@ -1079,6 +1113,17 @@ final class ManagementPortalService {
 				'location_ids' => array_values( array_map( 'intval', $this->memberships->location_ids_for( $membership_id ) ) ),
 			);
 
+			// B0-PR2-G6 — a patient/mixed/unknown member is never WIDENED here:
+			// clinic-wide from a Location-scoped membership, or any added Location,
+			// is refused. Narrowing (fewer Locations, or clinic → Location subset)
+			// stays allowed, and the comparison is made before the write boundary.
+			$widens = 'clinic' === (string) $before['scope_mode']
+				? false
+				: ( array() === $location_ids || array() !== array_diff( $location_ids, $before['location_ids'] ) );
+			if ( $widens && PatientAccountPolicy::is_patient_account( (int) ( $membership['wp_user_id'] ?? 0 ) ) ) {
+				return self::failure();
+			}
+
 			// Every Location must be real, ACTIVE and owned by this Clinic.
 			foreach ( $location_ids as $location_id ) {
 				if ( $this->locations->findActiveForClinic( $trusted, $location_id ) === null ) {
@@ -1090,6 +1135,42 @@ final class ManagementPortalService {
 			// one boundary (the membership service runs on a nested SAVEPOINT).
 			$this->db()->transactional(
 				function () use ( $location_ids, $membership_id, $actor_wp_user_id, $before, $membership, $trusted ) {
+					// B0-PR2-B4 — lock this membership row and RE-DECIDE inside the
+					// write boundary: a narrowing that commits after the pre-flight read
+					// must be what this write is judged against. Widening a
+					// patient/mixed/unknown member is refused before any write.
+					if ( ! $this->memberships->lock_row_for_update( $membership_id ) ) {
+						throw new \RuntimeException( 'membership row could not be locked' );
+					}
+					// R2 — every input of this decision is re-read STRICTLY under the
+					// lock: a failed read throws (fail closed), and a row that moved or
+					// is no longer active refuses the write instead of trusting the
+					// pre-lock view.
+					$locked = $this->memberships->read_membership_strict( $membership_id );
+					// R3 — the row must still be the one this request decided about: any
+					// moved clinic, user or role refuses, and the classification below uses
+					// the LOCKED row's user id, never the pre-lock view.
+					if ( null === $locked
+						|| 'active' !== (string) ( $locked['status'] ?? '' )
+						|| (int) $locked['clinic_id'] !== $trusted
+						|| (int) $locked['wp_user_id'] !== (int) ( $membership['wp_user_id'] ?? 0 )
+						|| (string) $locked['role_key'] !== (string) ( $membership['role_key'] ?? '' )
+					) {
+						throw new \RuntimeException( 'membership row moved or is unreadable' );
+					}
+					$target_user_id = (int) $locked['wp_user_id'];
+					$current_mode = (string) ( $locked['scope_mode'] ?? '' );
+					$current_locs = $this->memberships->location_ids_for_strict( $membership_id );
+					if ( (string) ( $before['scope_mode'] ?? '' ) !== $current_mode || $before['location_ids'] !== $current_locs ) {
+						throw new \RuntimeException( 'scope changed inside the write boundary' );
+					}
+					$widens_now = 'clinic' === $current_mode
+						? false
+						: ( array() === $location_ids || array() !== array_diff( $location_ids, $current_locs ) );
+					if ( $widens_now && PatientAccountPolicy::is_patient_account( $target_user_id ) ) {
+						throw new \RuntimeException( 'scope widening refused inside the write boundary' );
+					}
+
 					if ( array() === $location_ids ) {
 						App::membership_service()->set_scope_mode( $membership_id, 'clinic' );
 					} else {
@@ -1106,7 +1187,7 @@ final class ManagementPortalService {
 							'scope_mode'        => array() === $location_ids ? 'clinic' : 'location',
 							'location_ids'      => $location_ids,
 							'clinic_id'         => $trusted,
-							'target_wp_user_id' => (int) ( $membership['wp_user_id'] ?? 0 ),
+							'target_wp_user_id' => $target_user_id,
 						),
 						$trusted
 					);
@@ -1155,17 +1236,59 @@ final class ManagementPortalService {
 			if ( $found === null || (string) ( $found['status'] ?? '' ) !== 'active' ) {
 				return self::failure();
 			}
-			$membership = $found;
-			$before     = array(
-				'effect'       => $this->capability_effect( $membership_id, $capability ),
-				'target_user'  => (int) ( $membership['wp_user_id'] ?? 0 ),
+			// B0-PR2-G5 — the prior override is read STRICTLY: a failed read must
+			// never look like "no DENY" (that is what let CLEAR widen access). An
+			// unreadable prior state refuses the mutation outright.
+			$prior_effect = $this->capability_effect_strict( $membership_id, $capability );
+			$membership   = $found;
+			$before       = array(
+				'effect'      => $prior_effect,
+				'target_user' => (int) ( $membership['wp_user_id'] ?? 0 ),
 			);
+
+			// B0-PR2 — a patient account never gains access here: a GRANT, or a CLEAR
+			// that removes an explicit DENY, would widen it and is refused with the
+			// stable denial. Adding a DENY, or clearing a GRANT, only narrows access
+			// and stays allowed.
+			$widens = 'grant' === $effect || ( 'clear' === $effect && 'deny' === (string) $before['effect'] );
+			if ( $widens && PatientAccountPolicy::is_patient_account( (int) ( $membership['wp_user_id'] ?? 0 ) ) ) {
+				return self::failure();
+			}
 
 			// D6 audit atomicity: the GRANT/DENY/clear override and its
 			// mandatory audit event share one boundary (DENY > GRANT policy is
 			// resolved by the authorization checks above and stays unchanged).
 			$this->db()->transactional(
 				function () use ( $effect, $membership_id, $capability, $actor_wp_user_id, $before, $membership, $trusted ) {
+					// B0-PR2-B4 — lock the membership and re-read the prior effect here:
+					// a DENY that committed after the pre-flight read must not be cleared
+					// by a stale CLEAR, and a moved state refuses the write outright.
+					if ( ! $this->memberships->lock_row_for_update( $membership_id ) ) {
+						throw new \RuntimeException( 'membership row could not be locked' );
+					}
+					// R2 — the membership itself is re-read strictly too: a suspended or
+					// vanished row must refuse the override, not take it.
+					$locked = $this->memberships->read_membership_strict( $membership_id );
+					// R3 — identity is proved from the LOCKED row, and the widening
+					// classification below uses that row's user id.
+					if ( null === $locked
+						|| 'active' !== (string) ( $locked['status'] ?? '' )
+						|| (int) $locked['clinic_id'] !== $trusted
+						|| (int) $locked['wp_user_id'] !== (int) ( $membership['wp_user_id'] ?? 0 )
+						|| (string) $locked['role_key'] !== (string) ( $membership['role_key'] ?? '' )
+					) {
+						throw new \RuntimeException( 'membership row moved or is unreadable' );
+					}
+					$target_user_id = (int) $locked['wp_user_id'];
+					$prior_now      = $this->capability_effect_strict( $membership_id, $capability );
+					$state_held = (string) ( $before['effect'] ?? '' ) === $prior_now;
+					$widens_now = 'grant' === $effect || ( 'clear' === $effect && 'deny' === $prior_now );
+					if ( ! $state_held
+						|| ( $widens_now && PatientAccountPolicy::is_patient_account( $target_user_id ) )
+					) {
+						throw new \RuntimeException( 'concurrent capability change refused inside the write boundary' );
+					}
+
 					if ( 'clear' === $effect ) {
 						App::membership_service()->remove_capability( $membership_id, $capability );
 					} else {
@@ -1182,7 +1305,7 @@ final class ManagementPortalService {
 							'capability'        => $capability,
 							'effect'            => 'clear' === $effect ? '' : $effect,
 							'clinic_id'         => $trusted,
-							'target_wp_user_id' => (int) ( $membership['wp_user_id'] ?? 0 ),
+							'target_wp_user_id' => $target_user_id,
 						),
 						$trusted
 					);
@@ -1241,6 +1364,11 @@ final class ManagementPortalService {
 					if ( $wp_user_id > 0 ) {
 						$membership = $this->memberships->find( $trusted, $wp_user_id );
 						if ( $membership === null || (string) ( $membership['status'] ?? '' ) !== 'active' ) {
+							return self::failure();
+						}
+						// B0-PR2-G7 — a patient/mixed/unknown account is never linked to a
+						// clinician profile from here (it would hand out a clinician identity).
+						if ( PatientAccountPolicy::is_patient_account( $wp_user_id ) ) {
 							return self::failure();
 						}
 						// Existing profile: adopt it only inside the same Organization so a
@@ -1419,6 +1547,12 @@ final class ManagementPortalService {
 	 */
 
 	private function may_assign_role( string $role_key ): bool {
+		// B0-PR2 — the patient role is never assignable from a staff surface,
+		// whatever the constants say (defence in depth, not the only gate).
+		if ( PatientAccountPolicy::is_patient_role_key( $role_key ) ) {
+			return false;
+		}
+
 		return in_array( $role_key, self::ASSIGNABLE_BUILT_IN_ROLES, true );
 	}
 
@@ -1437,14 +1571,30 @@ final class ManagementPortalService {
 			return false;
 		}
 
+		// B0-PR2 — a patient account (patient role, patient-role membership or a
+		// durable patient link) is never a staff target, and mixed accounts fail
+		// closed. Checked before any membership/role/audit write.
+		if ( PatientAccountPolicy::is_patient_account( $target_wp_user_id ) ) {
+			return false;
+		}
+
 		return ! in_array( 'administrator', (array) $user->roles, true );
 	}
 
 	/**
-	 * Current explicit override effect for one capability ('' when none).
+	 * Strict variant: throws when the override rows cannot be read, so callers can
+	 * refuse instead of treating an unknown state as "no override".
+	 *
+	 * @throws \RuntimeException
 	 */
-	private function capability_effect( int $membership_id, string $capability ): string {
-		foreach ( $this->memberships->capabilities_for( $membership_id ) as $row ) {
+	private function capability_effect_strict( int $membership_id, string $capability ): string {
+		$rows = $this->db()->fetch_all_strict(
+			'SELECT capability, effect FROM ' . $this->db()->table( 'cpms_membership_capabilities' )
+			. ' WHERE membership_id = %d',
+			array( $membership_id )
+		);
+
+		foreach ( $rows as $row ) {
 			if ( (string) ( $row['capability'] ?? '' ) === $capability ) {
 				return (string) ( $row['effect'] ?? '' );
 			}
@@ -1510,6 +1660,24 @@ final class ManagementPortalService {
 		}
 
 		return $membership;
+	}
+
+	/**
+	 * Read-only resolution of an EXISTING account by e-mail/login (0 when the
+	 * identifier matches no account). Used before the enrollment boundary opens,
+	 * so an existing refused target is refused before anything can be written;
+	 * provisioning itself stays inside the boundary (see below).
+	 */
+	private function resolve_existing_subscriber( string $identifier ): int {
+		if ( ! is_email( $identifier ) ) {
+			$by_login = get_user_by( 'login', $identifier );
+
+			return $by_login instanceof WP_User ? (int) $by_login->ID : 0;
+		}
+
+		$existing = get_user_by( 'email', $identifier );
+
+		return $existing instanceof WP_User ? (int) $existing->ID : 0;
 	}
 
 	/**

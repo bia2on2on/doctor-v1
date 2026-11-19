@@ -579,7 +579,7 @@ final class Phase11ReceptionWalkInRedTest extends WP_UnitTestCase
         $board = $this->dispatch('GET', self::BOARD, [], $headers);
         self::assertSame(200, $board->get_status(), 'W11: Slice 1 board answers');
         $pid = $this->insertPatient($fx['clinic'], 'w11');
-        $search = $this->dispatch('GET', self::SEARCH, ['q' => 'Walkin'], $headers);
+        $search = $this->dispatch('POST', self::SEARCH, ['q' => 'Walkin'], $headers);
         self::assertSame(200, $search->get_status(), 'W11: Slice 2 search answers');
         $found = array_map(static fn($r): int => (int) ($r['id'] ?? 0), (array) $this->payload($search));
         self::assertContains($pid, $found, 'W11: Slice 2 search finds the Clinic patient');

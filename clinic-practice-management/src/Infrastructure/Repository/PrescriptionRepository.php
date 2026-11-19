@@ -255,7 +255,7 @@ final class PrescriptionRepository
      */
     public function searchByDrug(int $clinicId, string $q, string $from, string $to, int $limit = 25): array
     {
-        $like = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q) . '%';
+        $like = '%' . $this->db->esc_like( $q ) . '%';
 
         return $this->db->fetchAll(
             'SELECT DISTINCT rx.* FROM ' . $this->db->table('cpms_prescriptions') . ' rx' .

@@ -124,19 +124,28 @@ final class JobQueueTest extends WP_UnitTestCase
      */
     public function testRecurringJobsAreRescheduledIdempotently(): void
     {
-        // اولین زمان‌بندی: هر سه جاب تکرارشونده در صف
+        // R4 (1.0): `visits.no_show` is no longer scheduled, so the recurring-lane
+        // contract is exercised with a lane that is still scheduled (`notif.dispatch`).
         App::scheduleRecurringJobs();
         $queuedCount = static fn (): int => (int) App::db()->fetchValue(
             'SELECT COUNT(*) FROM ' . App::db()->table('cpms_jobs') . ' WHERE type = %s AND status = %s',
-            ['visits.no_show', \ClinicCore\Infrastructure\Queue\JobQueue::QUEUED]
+            ['notif.dispatch', \ClinicCore\Infrastructure\Queue\JobQueue::QUEUED]
         );
         $this->assertSame(1, $queuedCount());
+        $this->assertSame(
+            0,
+            (int) App::db()->fetchValue(
+                'SELECT COUNT(*) FROM ' . App::db()->table('cpms_jobs') . ' WHERE type = %s',
+                ['visits.no_show']
+            ),
+            'R4: the retired no-show sweep must not be scheduled at all'
+        );
 
         // دوباره صدا زدن → هیچ نسخه جدیدی (dedup)
         App::scheduleRecurringJobs();
         $this->assertSame(1, $queuedCount());
 
-        // اجرای tick واقعی → جاب پردازش شد → صف خالی از no_show
+        // اجرای tick واقعی → جاب پردازش شد → صفِ همان lane خالی
         $processed = App::dispatcher()->tick(20);
         $this->assertGreaterThanOrEqual(1, $processed);
         $this->assertSame(0, $queuedCount());
@@ -155,9 +164,10 @@ final class JobQueueTest extends WP_UnitTestCase
      */
     public function testRunTickReschedulesAndProcessesRecurringJobs(): void
     {
+        // R4 (1.0): the recurring exemplar is a lane that is still scheduled.
         $successCount = static fn (): int => (int) App::db()->fetchValue(
             'SELECT COUNT(*) FROM ' . App::db()->table('cpms_jobs') . ' WHERE type = %s AND status = %s',
-            ['visits.no_show', \ClinicCore\Infrastructure\Queue\JobQueue::SUCCESS]
+            ['notif.dispatch', \ClinicCore\Infrastructure\Queue\JobQueue::SUCCESS]
         );
 
         // خالی کردن صف (Tick قبل از تست — بدون re-schedule)
@@ -178,7 +188,7 @@ final class JobQueueTest extends WP_UnitTestCase
         $this->assertSame(
             $before + 1,
             $successCount(),
-            'جاب دوره‌ای باید در همان runTick دوباره زمان‌بندی و اجرا شود (FR-5.5)'
+            'جاب دوره‌ای باید در همان runTick دوباره زمان‌بندی و اجرا شود (R4: lane فعال)'
         );
 
         // چرخه دوم هم باید دوباره اجرا کند (پیوستگی زمان‌بندی دوره‌ای)

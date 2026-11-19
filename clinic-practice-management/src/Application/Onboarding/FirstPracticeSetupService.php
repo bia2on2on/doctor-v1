@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Application\Onboarding;
 
+use ClinicCore\Application\Patients\PatientAccountPolicy;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
@@ -142,6 +143,13 @@ final class FirstPracticeSetupService {
         }
         $actor = get_userdata( $actor_wp_user_id );
         if ( $actor === false || ! user_can( $actor, 'manage_options' ) ) {
+            throw FirstPracticeSetupException::not_administrator();
+        }
+        // B0-PR2-G8 — here the ACTOR is the target of the manager-membership
+        // write. A patient/mixed/unknown account never claims staff authority,
+        // even holding `manage_options`; the refusal reuses the existing neutral
+        // exception so the account type stays unobservable.
+        if ( PatientAccountPolicy::is_patient_account( $actor_wp_user_id ) ) {
             throw FirstPracticeSetupException::not_administrator();
         }
 
@@ -421,6 +429,13 @@ final class FirstPracticeSetupService {
         }
         $actor = get_userdata( $actor_wp_user_id );
         if ( $actor === false || ! user_can( $actor, 'manage_options' ) ) {
+            throw FirstPracticeSetupException::not_administrator();
+        }
+        // B0-PR2-G8 — here the ACTOR is the target of the manager-membership
+        // write. A patient/mixed/unknown account never claims staff authority,
+        // even holding `manage_options`; the refusal reuses the existing neutral
+        // exception so the account type stays unobservable.
+        if ( PatientAccountPolicy::is_patient_account( $actor_wp_user_id ) ) {
             throw FirstPracticeSetupException::not_administrator();
         }
         if ( $clinic_id <= 0 ) {

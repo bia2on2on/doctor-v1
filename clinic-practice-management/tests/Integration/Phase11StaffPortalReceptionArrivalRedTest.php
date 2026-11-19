@@ -299,7 +299,7 @@ final class Phase11StaffPortalReceptionArrivalRedTest extends WP_UnitTestCase
         self::assertSame('CLINIC_SCOPE_REQUIRED', $this->errCode($noClinicBoard), 'G3A: missing Clinic is explicit');
         self::assertSame('clinic_id', (string) ($this->errorData($noClinicBoard)['field'] ?? ''), 'G3A: Clinic selection is required');
 
-        $noClinicSearch = $this->dispatch('GET', $prefix . 'patients/search', ['q' => 'Test']);
+        $noClinicSearch = $this->dispatch('POST', $prefix . 'patients/search', ['q' => 'Test']);
         self::assertSame(400, $noClinicSearch->get_status(), 'G3A: no Clinic selection blocks patient search');
         self::assertArrayNotHasKey('first_name', $this->payload($noClinicSearch), 'G3A: no patient presentation is returned without Clinic selection');
         self::assertStringNotContainsString('Patient', (string) wp_json_encode($noClinicSearch->get_data()), 'G3A: no PHI in unscoped search denial');
@@ -322,7 +322,7 @@ final class Phase11StaffPortalReceptionArrivalRedTest extends WP_UnitTestCase
         $noLocationBoard = $this->dispatch('GET', $prefix . 'board', [], $this->scopeHeaders($fx['clinic']));
         self::assertSame(400, $noLocationBoard->get_status(), 'G3A: Clinic-only selection blocks Location-scoped board read');
         self::assertSame('location_required', (string) ($this->errorData($noLocationBoard)['reason'] ?? ''), 'G3A: singleton Location selection is mandatory');
-        $noLocationSearch = $this->dispatch('GET', $prefix . 'patients/search', ['q' => 'Test'], $this->scopeHeaders($fx['clinic']));
+        $noLocationSearch = $this->dispatch('POST', $prefix . 'patients/search', ['q' => 'Test'], $this->scopeHeaders($fx['clinic']));
         self::assertSame(400, $noLocationSearch->get_status(), 'G3A: tenant-specific Reception patient search requires explicit Location too');
         self::assertStringNotContainsString('Patient', (string) wp_json_encode($noLocationSearch->get_data()), 'G3A: no PHI before Location selection');
         $noLocationCreate = $this->dispatch('POST', $prefix . 'patients', [
@@ -350,7 +350,7 @@ final class Phase11StaffPortalReceptionArrivalRedTest extends WP_UnitTestCase
         $board = $this->dispatch('GET', $prefix . 'board', [], $explicitHeaders);
         self::assertSame(200, $board->get_status(), 'G3A: explicit singleton selections authorize the board');
         self::assertSame($fx['loc_tehran'], (int) ($this->payload($board)['location_id'] ?? 0), 'G3A: board data is bound to the selected Location');
-        $search = $this->dispatch('GET', $prefix . 'patients/search', ['q' => 'Test'], $explicitHeaders);
+        $search = $this->dispatch('POST', $prefix . 'patients/search', ['q' => 'Test'], $explicitHeaders);
         self::assertSame(200, $search->get_status(), 'G3A: explicit singleton selections authorize Clinic patient search');
         self::assertContains($patientId, array_map(static fn($row) => (int) ($row['id'] ?? 0), $this->payload($search)), 'G3A: patient PHI is returned only after explicit selections');
         $created = $this->dispatch('POST', $prefix . 'patients', [
