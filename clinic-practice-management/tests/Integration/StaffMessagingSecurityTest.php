@@ -114,9 +114,9 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
             'patient_id'           => (int) $world['patient'],
             'visit_id'             => (int) $world['visit'],
         ]);
-        self::assertGreaterThan(0, (int) $thread['id']);
-        self::assertSame((int) $world['visit'], (int) $thread['visit_id']);
-        self::assertSame((int) $world['location'], (int) $thread['location_id']);
+        self::assertGreaterThan(0, (int) $thread['id'], 'the created thread must have a positive id, got ' . (int) $thread['id']);
+        self::assertSame((int) $world['visit'], (int) $thread['visit_id'], 'expected visit_id ' . (int) $world['visit'] . ', got ' . (int) $thread['visit_id']);
+        self::assertSame((int) $world['location'], (int) $thread['location_id'], 'expected location_id ' . (int) $world['location'] . ', got ' . (int) $thread['location_id']);
 
         $service = App::staff_messaging_service();
         $sent = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->send(
@@ -124,10 +124,10 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
             (int) $thread['id'],
             '<script>alert(1)</script>سلام، بیمار آماده پذیرش است.'
         ));
-        self::assertStringNotContainsString('<script', (string) $sent['body']);
-        self::assertStringContainsString('بیمار آماده پذیرش', (string) $sent['body']);
-        self::assertNotSame('', (string) $sent['created_at']);
-        self::assertNotSame('', (string) $sent['jalali_time']);
+        self::assertStringNotContainsString('<script', (string) $sent['body'], 'the stored body must be sanitized; got body length ' . strlen((string) $sent['body']));
+        self::assertStringContainsString('بیمار آماده پذیرش', (string) $sent['body'], 'the stored body must keep its text; got body length ' . strlen((string) $sent['body']));
+        self::assertNotSame('', (string) $sent['created_at'], 'created_at must not be empty, got "' . (string) $sent['created_at'] . '"');
+        self::assertNotSame('', (string) $sent['jalali_time'], 'jalali_time must not be empty, got "' . (string) $sent['jalali_time'] . '"');
 
         $secretary_threads = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->threads((int) $world['secretary']));
         self::assertCount(1, $secretary_threads['threads'], 'this secretary must see exactly one thread, got ' . count((array) $secretary_threads['threads']));
@@ -136,9 +136,10 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
 
         $inbox = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->messages((int) $world['secretary'], (int) $thread['id'], 0, 50));
         self::assertCount(1, $inbox['messages'], 'this thread holds exactly one message, got ' . count((array) $inbox['messages']));
-        self::assertFalse($inbox['messages'][0]['mine'], 'the doctor\'s message must not be reported as the secretary\'s own');
-        self::assertArrayNotHasKey('clinical_note', $inbox['messages'][0]);
-        self::assertArrayNotHasKey('medical_record', $inbox['messages'][0]);
+        self::assertArrayHasKey(0, $inbox['messages'], 'diagnostic: the thread must hold at least one message; message count = ' . count((array) $inbox['messages']));
+        self::assertFalse($inbox['messages'][0]['mine'], 'the doctor\'s message must not be reported as the secretary\'s own; mine = ' . var_export($inbox['messages'][0]['mine'] ?? null, true));
+        self::assertArrayNotHasKey('clinical_note', $inbox['messages'][0], 'a message row must not expose clinical_note; keys = ' . implode(',', array_keys((array) $inbox['messages'][0])));
+        self::assertArrayNotHasKey('medical_record', $inbox['messages'][0], 'a message row must not expose medical_record; keys = ' . implode(',', array_keys((array) $inbox['messages'][0])));
 
         $read = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->mark_read((int) $world['secretary'], (int) $thread['id']));
         self::assertSame(0, (int) $read['unread_count'], 'mark_read clears the counter, got ' . (int) $read['unread_count']);
@@ -148,14 +149,14 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
             (int) $thread['id'],
             'پذیرش انجام شد.'
         ));
-        self::assertTrue($reply['mine']);
+        self::assertTrue($reply['mine'], 'the secretary\'s own reply must report mine = true, got ' . var_export($reply['mine'] ?? null, true));
         $incremental = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->messages((int) $world['doctor'], (int) $thread['id'], (int) $sent['id'], 50));
-        self::assertCount(1, $incremental['messages'], 'incremental polling returns only new messages');
-        self::assertSame((int) $reply['id'], (int) $incremental['messages'][0]['id']);
+        self::assertCount(1, $incremental['messages'], 'incremental polling returns only new messages; got ' . count((array) $incremental['messages']) . ' with ids [' . implode(',', array_column((array) $incremental['messages'], 'id')) . ']');
+        self::assertSame((int) $reply['id'], (int) ($incremental['messages'][0]['id'] ?? 0), 'expected only the reply id ' . (int) $reply['id'] . ', got ' . (int) ($incremental['messages'][0]['id'] ?? 0));
 
         $context = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->context((int) $world['secretary']));
-        self::assertSame(StaffMessagingService::RETENTION_POLICY, $context['retention_policy']);
-        self::assertContains((int) $world['doctor'], array_column($context['counterparts'], 'wp_user_id'));
+        self::assertSame(StaffMessagingService::RETENTION_POLICY, $context['retention_policy'], 'expected retention ' . StaffMessagingService::RETENTION_POLICY . ', got ' . (string) $context['retention_policy']);
+        self::assertContains((int) $world['doctor'], array_column((array) $context['counterparts'], 'wp_user_id'), 'the doctor must be an eligible counterpart; counterparts = [' . implode(',', array_column((array) $context['counterparts'], 'wp_user_id')) . ']');
 
         // Audit records the send without ever storing the message body.
         $audit = App::db()->fetchValue(
