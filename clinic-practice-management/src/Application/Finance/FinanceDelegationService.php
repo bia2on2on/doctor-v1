@@ -118,8 +118,9 @@ final class FinanceDelegationService {
 			);
 		}
 
+		$target_role = (string) ( $membership['role_key'] ?? '' );
 		$this->db->transactional(
-			function () use ( $actor_user_id, $clinic_id, $target_membership_id, $capability, $before, $target_user_id ): void {
+			function () use ( $actor_user_id, $clinic_id, $target_membership_id, $capability, $before, $target_user_id, $target_role ): void {
 				// B0-PR2-B4 — the decision is re-made INSIDE the write boundary on a
 				// locked membership row: a DENY that committed after the pre-flight
 				// read must win over this GRANT, never be overwritten by it.
@@ -133,8 +134,7 @@ final class FinanceDelegationService {
 				}
 				// R2/R3 — the membership is re-read strictly under the lock and its
 				// identity is proved before any decision or write.
-				$locked_role = (string) ( $membership['role_key'] ?? '' );
-				$this->locked_target_membership( $clinic_id, $target_membership_id, $target_user_id, $locked_role );
+				$this->locked_target_membership( $clinic_id, $target_membership_id, $target_user_id, $target_role );
 				try {
 					$current = $this->explicit_effect_strict( $target_membership_id, $capability );
 				} catch ( \Throwable $e ) {
@@ -224,8 +224,9 @@ final class FinanceDelegationService {
 			);
 		}
 
+		$target_role = (string) ( $membership['role_key'] ?? '' );
 		$this->db->transactional(
-			function () use ( $actor_user_id, $clinic_id, $target_membership_id, $capability, $current, $target_user_id ): void {
+			function () use ( $actor_user_id, $clinic_id, $target_membership_id, $capability, $current, $target_user_id, $target_role ): void {
 				// B0-PR2-B4 — re-read on a locked row: a DENY that arrived after the
 				// pre-flight read must not be removed by a stale revocation, and a
 				// GRANT that was already withdrawn is not "revoked" twice.
@@ -238,8 +239,7 @@ final class FinanceDelegationService {
 					);
 				}
 				// R2/R3 — strict membership re-read under the same lock as delegate().
-				$locked_role = (string) ( $membership['role_key'] ?? '' );
-				$this->locked_target_membership( $clinic_id, $target_membership_id, $target_user_id, $locked_role );
+				$this->locked_target_membership( $clinic_id, $target_membership_id, $target_user_id, $target_role );
 				try {
 					$current_now = $this->explicit_effect_strict( $target_membership_id, $capability );
 				} catch ( \Throwable $e ) {

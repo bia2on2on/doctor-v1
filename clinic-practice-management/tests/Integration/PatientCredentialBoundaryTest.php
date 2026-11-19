@@ -1742,39 +1742,6 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
     }
 
     /**
-     * Rewrite the TARGET membership row exactly AT its strict locking read, once.
-     *
-     * The harness runs every test inside one transaction (service START TRANSACTION is
-     * rewritten to SAVEPOINT), so a second session cannot exist: this filter simulates
-     * the concurrent change at the one point where the write boundary observes the row.
-     *
-     * @return array{0: callable, 1: object} the filter (to remove) and the counter holder
-     */
-    private function moveTargetAtLockingRead( int $membership_id, string $sql, array $params ): array {
-        $state  = (object) [ 'fired' => 0, 'done' => false ];
-        $filter = static function ( $query ) use ( $state, $membership_id, $sql, $params ) {
-            $current = (string) $query;
-            if ( false === strpos( $current, 'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode' ) ) {
-                return $query;
-            }
-            if ( 1 !== preg_match( '/\bWHERE id = ' . (int) $membership_id . '\b/', $current ) ) {
-                return $query;
-            }
-            ++$state->fired;
-            if ( $state->done ) {
-                return $query;
-            }
-            $state->done = true;
-            App::db()->query( $sql, $params );
-
-            return $query;
-        };
-        add_filter( 'query', $filter, 7 );
-
-        return [ $filter, $state ];
-    }
-
-    /**
      * R2: the target key is ABSENT from the locked override row and a stale, wider copy
      * sits in the cache. The before-state must be the template, so the widening is
      * refused and nothing is persisted.
@@ -1899,11 +1866,28 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         $staff      = $this->makeUser( 'subscriber', 'pb_r3_scope_staff' );
         $membership = cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
 
-        [ $filter, $state ] = $this->moveTargetAtLockingRead(
-            $membership,
-            'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET role_key = %s WHERE id = %d',
-            [ RolesAndCapabilities::ROLE_DOCTOR, $membership ]
-        );
+        $state = (object) [ 'fired' => 0, 'done' => false ];
+        $inject = static function ( $query ) use ( $state, $membership ) {
+            $current = (string) $query;
+            if ( false === strpos( $current, 'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode' ) ) {
+                return $query;
+            }
+            if ( 1 !== preg_match( '/\\bWHERE id = ' . $membership . '\\b/', $current ) ) {
+                return $query;
+            }
+            ++$state->fired;
+            if ( $state->done ) {
+                return $query;
+            }
+            $state->done = true;
+            App::db()->query(
+                'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET role_key = %s WHERE id = %d',
+                [ RolesAndCapabilities::ROLE_DOCTOR, $membership ]
+            );
+
+            return $query;
+        };
+        add_filter( 'query', $inject, 7 );
 
         $result = ManagementPortalController::dispatch(
             $manager,
@@ -1911,7 +1895,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             [ 'clinic_id' => (string) $this->clinicId, 'membership_id' => (string) $membership, 'location_ids' => '' ]
         );
 
-        remove_filter( 'query', $filter, 7 );
+        remove_filter( 'query', $inject, 7 );
 
         self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
         self::assertFalse( $result['ok'], 'a membership that moved at the lock must be refused' );
@@ -1929,11 +1913,29 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         $staff      = $this->makeUser( 'subscriber', 'pb_r3_cap_staff' );
         $membership = cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
 
-        [ $filter, $state ] = $this->moveTargetAtLockingRead(
-            $membership,
-            'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET wp_user_id = %d WHERE id = %d',
-            [ $this->makeUser( 'subscriber', 'pb_r3_cap_other' ), $membership ]
-        );
+        $other = $this->makeUser( 'subscriber', 'pb_r3_cap_other' );
+        $state = (object) [ 'fired' => 0, 'done' => false ];
+        $inject = static function ( $query ) use ( $state, $membership ) {
+            $current = (string) $query;
+            if ( false === strpos( $current, 'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode' ) ) {
+                return $query;
+            }
+            if ( 1 !== preg_match( '/\\bWHERE id = ' . $membership . '\\b/', $current ) ) {
+                return $query;
+            }
+            ++$state->fired;
+            if ( $state->done ) {
+                return $query;
+            }
+            $state->done = true;
+            App::db()->query(
+                'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET wp_user_id = %d WHERE id = %d',
+                [ $other, $membership ]
+            );
+
+            return $query;
+        };
+        add_filter( 'query', $inject, 7 );
 
         $result = ManagementPortalController::dispatch(
             $manager,
@@ -1946,7 +1948,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             ]
         );
 
-        remove_filter( 'query', $filter, 7 );
+        remove_filter( 'query', $inject, 7 );
 
         self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
         self::assertFalse( $result['ok'], 'a membership that moved at the lock must be refused' );
@@ -1965,11 +1967,28 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
         $staff      = $this->makeUser( 'subscriber', 'pb_r3_fin_staff' );
         $membership = cpms_test_seed_membership( $staff, $this->clinicId, RolesAndCapabilities::ROLE_SECRETARY );
 
-        [ $filter, $state ] = $this->moveTargetAtLockingRead(
-            $membership,
-            'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET role_key = %s WHERE id = %d',
-            [ RolesAndCapabilities::ROLE_ACCOUNTANT, $membership ]
-        );
+        $state = (object) [ 'fired' => 0, 'done' => false ];
+        $inject = static function ( $query ) use ( $state, $membership ) {
+            $current = (string) $query;
+            if ( false === strpos( $current, 'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode' ) ) {
+                return $query;
+            }
+            if ( 1 !== preg_match( '/\\bWHERE id = ' . $membership . '\\b/', $current ) ) {
+                return $query;
+            }
+            ++$state->fired;
+            if ( $state->done ) {
+                return $query;
+            }
+            $state->done = true;
+            App::db()->query(
+                'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET role_key = %s WHERE id = %d',
+                [ RolesAndCapabilities::ROLE_ACCOUNTANT, $membership ]
+            );
+
+            return $query;
+        };
+        add_filter( 'query', $inject, 7 );
 
         $denied = false;
         try {
@@ -1978,7 +1997,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             $denied = 'CLINIC_DELEGATION_DENIED' === $e->getErrorCode();
         }
 
-        remove_filter( 'query', $filter, 7 );
+        remove_filter( 'query', $inject, 7 );
 
         self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
         self::assertTrue( $denied, 'a moved target must be refused with the controlled error' );
@@ -1999,11 +2018,28 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
 
         App::finance_delegation_service()->delegate( $manager, $this->clinicId, $membership, RolesAndCapabilities::PAYMENT_REFUND );
 
-        [ $filter, $state ] = $this->moveTargetAtLockingRead(
-            $membership,
-            'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET role_key = %s WHERE id = %d',
-            [ RolesAndCapabilities::ROLE_ACCOUNTANT, $membership ]
-        );
+        $state = (object) [ 'fired' => 0, 'done' => false ];
+        $inject = static function ( $query ) use ( $state, $membership ) {
+            $current = (string) $query;
+            if ( false === strpos( $current, 'SELECT id, clinic_id, wp_user_id, role_key, status, scope_mode' ) ) {
+                return $query;
+            }
+            if ( 1 !== preg_match( '/\\bWHERE id = ' . $membership . '\\b/', $current ) ) {
+                return $query;
+            }
+            ++$state->fired;
+            if ( $state->done ) {
+                return $query;
+            }
+            $state->done = true;
+            App::db()->query(
+                'UPDATE ' . App::db()->table( 'cpms_clinic_memberships' ) . ' SET role_key = %s WHERE id = %d',
+                [ RolesAndCapabilities::ROLE_ACCOUNTANT, $membership ]
+            );
+
+            return $query;
+        };
+        add_filter( 'query', $inject, 7 );
 
         $denied = false;
         try {
@@ -2012,7 +2048,7 @@ final class PatientCredentialBoundaryTest extends WP_UnitTestCase
             $denied = 'CLINIC_DELEGATION_DENIED' === $e->getErrorCode();
         }
 
-        remove_filter( 'query', $filter, 7 );
+        remove_filter( 'query', $inject, 7 );
 
         self::assertSame( 1, $state->fired, 'the locking read must be observed exactly once' );
         self::assertTrue( $denied, 'a moved target must be refused with the controlled error' );
