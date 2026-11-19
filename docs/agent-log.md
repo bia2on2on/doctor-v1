@@ -7318,3 +7318,13 @@ Integration assertion counts differ between pushes (76873/76877/76874) with no t
 - **Outbound privacy wording:** arbitrary activation `license_key` and stored `license_id` values remain unproven PHI-free; online licensing remains OFF by deployment policy pending approval and reject-before-HTTP tests. `wp_mail()` account data is personal/authentication data with PHI status UNKNOWN/unproven, not claimed “not PHI.”
 - **Removed/shortened-line review:** checked every design diff hunk. Superseded Q3 exception shorthand now distinguishes first admission from safe-finish; removed the approved-new-option wording from §10 while retaining Q4b requirements, rollback/retry behavior, Stage 1/2 restore scope, and destination identity preservation. The old scheduled-no-show test-lifetime wording was corrected, not dropped; unrelated TTL, backup/export, audit, privacy, source-evidence and test-migration scope remains. Restored trailing Markdown delimiters on T-R12-29..32.
 - **Validation/scope:** `git diff --check` passed. Static checks found 174 pipe-starting Markdown table rows, all ending with `|`; T-R12-29..32 are four intact rows. R14 design remains the only code-review path changed; this single agent-log entry is the second documentation path. No tests, build, PHP/WordPress runtime or implementation change was made. Existing PR checks are to be polled after commit/push; no CI result is asserted here.
+
+### [2026-11-18 UTC] — doctor-v1 Phase 2 origin and Release 1.0 decisions
+- OBSERVED: The imported main snapshot matched the expected baseline. The live workflow inventory contained only CI and Closure Gate active; the other 15 workflows were manually disabled.
+- OBSERVED: Added `docs/ORIGIN.md` and appended the Release 1.0 owner decisions, migration rule, and License decision A to `docs/status/ledger.md`. Recorded the older technical design separately from the 1.0 target. This change is documentation only; no build, implementation, or merge is authorized here.
+- LIMITATION: Both Actions permissions reads returned HTTP 403 (UNKNOWN). Release acceptance is NOT verified; the exact-head CI census is separate from this entry.
+
+### [2026-11-18 UTC] — PR #4 docs sync after PR #5
+- OBSERVED: Synced the docs branch with main. The only conflict was in this log; kept the 7,006 shared lines, 115 lines appended on main, and 5 lines appended by PR #4, byte-for-byte.
+- OBSERVED: PR #5 removed recurring no-show scheduling and made the sweep inert. The Release 1.0 manual-only decision aligns with staff recording a reason and actor. The older ledger references to automatic D10 describe the pre-R4 policy.
+- LIMITATION: The PR diff against main remains documentation only. No local PHP or release acceptance was run.
