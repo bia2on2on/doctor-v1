@@ -59,7 +59,7 @@ final class CustomRoleArchivalMigrationTest extends WP_UnitTestCase
             $applied = App::migrations()->migrate();
             // Roll all later independent migrations back in reverse order so
             // rollbackOne() targets 0027. tearDown re-applies them all.
-            foreach (['2026_10_31_0031', '2026_10_27_0030', '2026_10_18_0029', '2026_10_18_0028'] as $later_version) {
+            foreach (['2026_11_20_0032', '2026_10_31_0031', '2026_10_27_0030', '2026_10_18_0029', '2026_10_18_0028'] as $later_version) {
                 if (App::migrations()->currentVersion() === $later_version) {
                     App::migrations()->rollbackOne();
                     $applied = array_values(array_diff($applied, [$later_version]));
