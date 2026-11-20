@@ -344,8 +344,8 @@ final class BackupService
         $this->require_restore_schema( $raw['db']['migration_version'] ?? null );
         $this->require_restore_host();
 
-        $safetyDestination = $this->safetyDestinationStore();
-        $safety = $this->createBackupTo($safetyDestination, 'pre-restore-safety-' . $backupId);
+        $safety_destination = $this->safetyDestinationStore();
+        $safety             = $this->createBackupTo( $safety_destination, 'pre-restore-safety-' . $backupId );
 
         $applied = 0;
         $dropped = 0;
@@ -373,7 +373,7 @@ final class BackupService
         $this->audit->log('RESTORE_APPLIED', null, 'backup', null, null, null, null, [
             'backup_id' => $backupId,
             'safety_backup' => (string) ($safety['backup_id'] ?? ''),
-            'safety_destination' => $safetyDestination->basePath(),
+            'safety_destination' => $safety_destination->basePath(),
             'source' => $sourceLabel,
             'legacy_unverified' => (bool) $pre['legacy_unverified'],
             'statements' => $applied,
@@ -383,12 +383,12 @@ final class BackupService
         $this->op->info('RESTORE_APPLIED', [
             'backup_id' => $backupId,
             'safety_backup' => (string) ($safety['backup_id'] ?? ''),
-            'safety_destination' => $safetyDestination->basePath(),
+            'safety_destination' => $safety_destination->basePath(),
             'source' => $sourceLabel,
         ]);
 
         $pre['safety_backup'] = (string) ($safety['backup_id'] ?? '');
-        $pre['safety_backup_destination'] = $safetyDestination->basePath();
+        $pre['safety_backup_destination'] = $safety_destination->basePath();
 
         return $pre;
     }
@@ -408,7 +408,7 @@ final class BackupService
             if ( 1 !== preg_match( '/\A[A-Za-z0-9_]+\z/', $table ) ) {
                 throw BackupException::of( 'RESTORE_TARGET_NOT_PREPARED', 'Unsupported target table name.' );
             }
-            if ( [] !== $this->db->fetch_all_strict( 'SELECT 1 FROM `' . $table . '` LIMIT 1' ) ) {
+            if ( [] !== $this->db->fetch_all_strict( 'SELECT 1 FROM %i LIMIT 1', [ $table ] ) ) {
                 throw BackupException::of( 'RESTORE_TARGET_NOT_EMPTY', 'Restore requires a prepared empty target.' );
             }
         }
@@ -423,7 +423,7 @@ final class BackupService
         if ( 1 !== preg_match( '/\A[A-Za-z0-9_]+\z/', $ledger ) ) {
             throw BackupException::of( 'RESTORE_TARGET_NOT_PREPARED', 'Unsupported migration ledger name.' );
         }
-        $rows = $this->db->fetch_all_strict( 'SELECT MAX(version) AS version FROM `' . $ledger . '`' );
+        $rows = $this->db->fetch_all_strict( 'SELECT MAX(version) AS version FROM %i', [ $ledger ] );
         if ( $source_version !== ( $rows[0]['version'] ?? null ) ) {
             throw BackupException::of( 'RESTORE_SCHEMA_MISMATCH', 'Backup and target DB migration versions differ.' );
         }
