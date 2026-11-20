@@ -1119,7 +1119,7 @@ final class PatientPortalPage
             $html .= '<span class="cpms-empty-desc">ابتدا پروندهٔ مجاز خود را در بخش ثبت پرونده فعال کنید یا با مرکز درمانی تماس بگیرید.</span></div>';
         } else {
             foreach ( $clinics as $clinic ) {
-                $html .= PublicBookingShortcode::render( [ 'clinic_id' => (string) $clinic['id'] ] );
+                $html .= PublicBookingShortcode::render_for_patient_portal( (int) $clinic['id'] );
             }
         }
 

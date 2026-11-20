@@ -6,6 +6,7 @@ namespace ClinicCore\Rest;
 
 use ClinicCore\Application\Auth\OtpException;
 use ClinicCore\Application\Auth\OtpService;
+use ClinicCore\Application\Clinic\PublicClinicDirectory;
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Bootstrap\RuntimeSchemaGate;
@@ -221,7 +222,7 @@ final class OtpController extends RestBase
             [ $clinician_id ]
         );
         if ($clinician === null || (int) $clinician['is_active'] !== 1) {
-            throw BookingException::of('CLINIC_NOT_FOUND', 'پزشک انتخابی یافت نشد', 404);
+            throw BookingException::of( 'CLINIC_NOT_FOUND', 'اسلات انتخابی یافت نشد', 404 );
         }
         $clinic_id = (int) $clinician['clinic_id'];
 
@@ -248,6 +249,11 @@ final class OtpController extends RestBase
                 throw BookingException::of( 'CLINIC_NOT_FOUND', 'اسلات انتخابی یافت نشد', 404 );
             }
             $clinic_id = $slot_clinic_id;
+        }
+
+        // A selected public booking must not confirm the existence of a private slot.
+        if ( ! ( new PublicClinicDirectory() )->may_see_clinic( $clinic_id, $request->get_header( 'X-WP-Nonce' ) ) ) {
+            throw BookingException::of( 'CLINIC_NOT_FOUND', 'اسلات انتخابی یافت نشد', 404 );
         }
 
         // ۴) اثباتِ رابطهٔ slot/clinician/date/time (نرمال‌سازی H:i ↔ H:i:s —

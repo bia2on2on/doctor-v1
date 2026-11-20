@@ -359,6 +359,51 @@ final class Phase8Slice1PublicBookingBrowseRedTest extends WP_UnitTestCase
 
     // ================= T1 — the surface is a real WordPress shortcode =================
 
+    public function test_unlisted_fixture_hides_browse_and_empty_states_and_rest_reads(): void {
+        $visible = $this->renderSurface( [ self::CLINIC_ATTR => (string) $this->clinicA ] );
+        self::assertStringContainsString( 'Clinic A P8S1', $visible );
+        self::assertStringContainsString( 'data-clinic-id="' . $this->clinicA . '"', $visible );
+        self::assertStringContainsString( 'data-clinician-id="' . $this->clinicianA . '"', $visible );
+        $public_empty = $this->renderSurface( [ self::CLINIC_ATTR => (string) $this->clinicEmpty ] );
+        self::assertStringContainsString( 'data-state="empty"', $public_empty );
+        self::assertStringContainsString( 'data-clinic-id="' . $this->clinicEmpty . '"', $public_empty );
+        $slot_date = $this->freeSlot['date'];
+        $public_slots = $this->a1( $this->clinicianA, $slot_date, $slot_date );
+        self::assertSame( 200, $public_slots->get_status() );
+        $days = $public_slots->get_data()['data']['days'];
+        $slots = array_merge( ...array_column( $days, 'slots' ) );
+        self::assertContains( $this->freeSlot['slot_id'], array_column( $slots, 'slot_id' ) );
+        $public_quote = $this->a4( $this->clinicianA, $slot_date, $this->freeSlot['time'], $this->freeSlot['slot_id'] );
+        self::assertSame( 200, $public_quote->get_status() );
+        self::assertTrue( $public_quote->get_data()['data']['available'] );
+        self::assertSame( $this->freeSlot['slot_id'], $public_quote->get_data()['data']['slot_id'] );
+
+        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
+        App::settingsFactory()->forClinic( $this->clinicEmpty )->set( 'public.listing_opt_in', false );
+        $hidden  = $this->renderSurface( [ self::CLINIC_ATTR => (string) $this->clinicA ] );
+        $unknown = $this->renderSurface( [ self::CLINIC_ATTR => (string) PHP_INT_MAX ] );
+        $normalize = static fn ( string $html ): string => (string) preg_replace( '/id="cpms-public-booking-[0-9]+"/', 'id="fixture"', $html );
+        self::assertSame( $normalize( $unknown ), $normalize( $hidden ) );
+        self::assertStringContainsString( 'data-state="error"', $hidden );
+        foreach ( [ 'Clinic A P8S1', 'data-clinic-id=', 'data-clinician-id=', 'data-location-id=', 'locations_by_clinic' ] as $witness ) {
+            self::assertStringNotContainsString( $witness, $hidden );
+        }
+
+        $empty = $this->renderSurface( [ self::CLINIC_ATTR => (string) $this->clinicEmpty ] );
+        self::assertSame( $normalize( $unknown ), $normalize( $empty ) );
+        $window = $this->availabilityWindow();
+        $hidden  = $this->a1( $this->clinicianA, $window['from'], $window['to'] );
+        $unknown = $this->a1( PHP_INT_MAX, $window['from'], $window['to'] );
+        self::assertSame( 404, $hidden->get_status() );
+        self::assertSame( $unknown->get_data(), $hidden->get_data() );
+        self::assertSame( [ 'status' => 404 ], $hidden->get_data()['data'] );
+        $hidden  = $this->a4( $this->clinicianA, $this->freeSlot['date'], $this->freeSlot['time'], $this->freeSlot['slot_id'] );
+        $unknown = $this->a4( PHP_INT_MAX, $this->freeSlot['date'], $this->freeSlot['time'], $this->freeSlot['slot_id'] );
+        self::assertSame( 404, $hidden->get_status() );
+        self::assertSame( $unknown->get_data(), $hidden->get_data() );
+        self::assertSame( [ 'status' => 404 ], $hidden->get_data()['data'] );
+    }
+
     public function testPublicBookingBrowseSurfaceIsRegisteredAsRealFrontendShortcode(): void
     {
         App::boot();
@@ -1439,6 +1484,10 @@ final class Phase8Slice1PublicBookingBrowseRedTest extends WP_UnitTestCase
         $this->clinicA = $this->insertClinic('Clinic A P8S1 ' . $uid, 'clinic-a-p8s1-' . $uid, $now);
         $this->clinicB = $this->insertClinic('Clinic B P8S1 ' . $uid, 'clinic-b-p8s1-' . $uid, $now);
         $this->clinicEmpty = $this->insertClinic('Clinic Empty P8S1 ' . $uid, 'clinic-empty-p8s1-' . $uid, $now);
+
+        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', true );
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', true );
+        App::settingsFactory()->forClinic( $this->clinicEmpty )->set( 'public.listing_opt_in', true );
 
         $this->locationA1 = $this->insertLocation($this->clinicA, 'Main Tehran P8S1', 'main-tehran-p8s1-' . $uid, self::TZ_TEHRAN, 1, $now);
         $this->locationA2 = $this->insertLocation($this->clinicA, 'Branch Berlin P8S1', 'branch-berlin-p8s1-' . $uid, self::TZ_BERLIN, 0, $now);
