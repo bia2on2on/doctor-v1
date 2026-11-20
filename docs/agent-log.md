@@ -8051,3 +8051,9 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 - OBSERVED: on head `851e43a`, `Integration (WP 7.1 + MySQL 8)` passed (9/13 green); only the 4 Closure checks failed.
 - Per explicit owner approval, updated `.github/workflows/closure-gate.yml:161` (`schema-0031` / `2026_10_31_0031` -> `schema-0032` / `2026_11_20_0032`) and `:495` (`schema:  2026_10_31_0031` / `SCHEMA NOT 0031 AFTER RESTORE` -> `schema:  2026_11_20_0032` / `SCHEMA NOT 0032 AFTER RESTORE`).
 - Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS; `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean. PHP/PHPCS/PHPUnit NOT run locally.
+
+### [2026-11-20 UTC] — PR10-FIX-7: restore 0031 assertion, add unique-key duplicate tests, record R3 debt
+- R1: Restored `2026_10_31_0031` applied-version assertion in `CustomRoleMigrationSafetyTest.php:69` alongside `self::HEAD_VERSION` (`2026_11_20_0032`). Audited all `-` lines in `tests/`: all other 12 files are pure head/rollback updates.
+- R2: Added `testUniqueKeysRejectDuplicatesAndAllowDistinctRows` in `PatientLoginsMigrationTest.php` testing duplicate rejection + positive controls for `u_pl_mobile`, `u_pl_account`, `u_pl_bind`, and `u_pl_live`.
+- R3 (debt, not executed by `ci.yml` or `closure-gate.yml`): lane rewrite must bump or keep baselines before re-enabling — `first-practice-acceptance.yml:229`, `mariadb-10.11-compat.yml:175,179,205`, `pilot-gate.yml:306`, `real-wp-acceptance.yml:425`, `tests/bin/wp-activation-schema-proof.php:44`, `tests/bin/upgrade-path-fixture.php:22`, `bin/rwp-first-practice.py:913`.
+- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (16 production files); `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean; `wpcs-changed-lines` 54 lines. PHP/PHPCS/PHPUnit NOT run locally.
