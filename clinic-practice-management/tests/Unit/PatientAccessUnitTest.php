@@ -163,11 +163,70 @@ final class PatientAccessUnitTest extends TestCase {
         self::assertFalse( $unwired->authorize_request( 1, null, null, 701 )['allowed'] );
     }
 
+    public function testMultiRoleAndStaffCapPatientUsersAreDeniedWithPositiveControl(): void {
+        $gate = $this->make_gate(
+            users: [
+                1  => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ] ],
+                11 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_DOCTOR, RolesAndCapabilities::ROLE_PATIENT ] ],
+                12 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT, RolesAndCapabilities::ROLE_SECRETARY ] ],
+                13 => [ 'exists' => true, 'roles' => [ 'administrator', RolesAndCapabilities::ROLE_PATIENT ] ],
+                14 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT, 'subscriber' ] ],
+                15 => [
+                    'exists' => true,
+                    'roles'  => [ RolesAndCapabilities::ROLE_PATIENT ],
+                    'caps'   => [ RolesAndCapabilities::MEDICAL_READ => true ],
+                ],
+                16 => [
+                    'exists' => true,
+                    'roles'  => [ RolesAndCapabilities::ROLE_PATIENT ],
+                    'caps'   => [ 'manage_options' => true ],
+                ],
+            ],
+            clinic_bindings: [
+                '1:10'  => true,
+                '11:10' => true,
+                '12:10' => true,
+                '13:10' => true,
+                '14:10' => true,
+                '15:10' => true,
+                '16:10' => true,
+            ],
+            patient_bindings: [
+                '1:10:100'  => true,
+                '11:10:100' => true,
+                '12:10:100' => true,
+                '13:10:100' => true,
+                '14:10:100' => true,
+                '15:10:100' => true,
+                '16:10:100' => true,
+            ]
+        );
+
+        foreach ( [ 11, 12, 13, 14, 15, 16 ] as $mixedUserId ) {
+            self::assertFalse( $gate->can_access_clinic( $mixedUserId, 10 ) );
+            self::assertFalse( $gate->can_access_patient( $mixedUserId, 10, 100 ) );
+            self::assertFalse( $gate->can_enroll_in_clinic( $mixedUserId, 10 ) );
+
+            foreach ( [ PatientAccess::MODE_CLINICAL, PatientAccess::MODE_RECORDS_LIST, PatientAccess::MODE_ENROLL ] as $mode ) {
+                $denied = $gate->authorize_request( $mixedUserId, 10, 100, null, $mode );
+                self::assertFalse( $denied['allowed'] );
+                self::assertSame( 403, $denied['http_status'] );
+                self::assertSame( PatientAccess::FORBIDDEN_CODE, $denied['code'] );
+                self::assertSame( PatientAccess::FORBIDDEN_MESSAGE, $denied['message'] );
+            }
+        }
+
+        // Positive control: pure patient-role user 1 with zero staff capabilities succeeds.
+        self::assertTrue( $gate->can_access_clinic( 1, 10 ) );
+        self::assertTrue( $gate->can_access_patient( 1, 10, 100 ) );
+        self::assertTrue( $gate->authorize_request( 1, 10, 100 )['allowed'] );
+    }
+
     /**
-     * @param array<int, array{exists: bool, roles: list<string>}>|null $users
-     * @param array<string, bool>|null                                  $clinic_bindings
-     * @param array<string, bool>|null                                  $patient_bindings
-     * @param (callable(array<string, mixed>): void)|null               $observer
+     * @param array<int, array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>}>|null $users
+     * @param array<string, bool>|null                                                                                      $clinic_bindings
+     * @param array<string, bool>|null                                                                                      $patient_bindings
+     * @param (callable(array<string, mixed>): void)|null                                                                   $observer
      */
     private function make_gate(
         ?array $users = null,

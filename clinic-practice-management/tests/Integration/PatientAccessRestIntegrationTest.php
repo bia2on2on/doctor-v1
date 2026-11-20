@@ -246,6 +246,49 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
         self::assertSame( $this->clinicB, (int) ( $allowedEnroll->get_data()['data']['clinic_id'] ?? 0 ) );
     }
 
+    public function testMultiRoleStaffAndPatientUserIsDeniedWithSameFixturePositiveControl(): void {
+        $mixedDoctorPatient = $this->makeUser( 'gate_mixed_doc_pat_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $mixedUserObj       = get_userdata( $mixedDoctorPatient );
+        self::assertNotFalse( $mixedUserObj );
+        $mixedUserObj->add_role( RolesAndCapabilities::ROLE_DOCTOR );
+        $this->insertPatientLink( $this->clinicA, $this->patientA, $mixedDoctorPatient, '09120010001' );
+
+        $patientWithStaffCap = $this->makeUser( 'gate_pat_staff_cap_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $capUserObj          = get_userdata( $patientWithStaffCap );
+        self::assertNotFalse( $capUserObj );
+        $capUserObj->add_cap( RolesAndCapabilities::MEDICAL_READ );
+        $this->insertPatientLink( $this->clinicA, $this->patientA, $patientWithStaffCap, '09120010001' );
+
+        $baselineDenied = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->secretaryUser );
+        self::assertSame( 403, $baselineDenied->get_status() );
+
+        foreach ( [ $mixedDoctorPatient, $patientWithStaffCap ] as $mixedId ) {
+            $deniedMe = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $mixedId );
+            self::assertSame( 403, $deniedMe->get_status() );
+            self::assertSame( $baselineDenied->get_data(), $deniedMe->get_data() );
+
+            $deniedPut = $this->dispatch( 'PUT', self::NS . '/patient/me', [ 'first_name' => 'MixedEdit', 'clinic_id' => $this->clinicA ], $mixedId );
+            self::assertSame( 403, $deniedPut->get_status() );
+            self::assertSame( $baselineDenied->get_data(), $deniedPut->get_data() );
+
+            $deniedRecords = $this->dispatch( 'GET', self::NS . '/patient/my-records', [], $mixedId );
+            self::assertSame( 403, $deniedRecords->get_status() );
+            self::assertSame( $baselineDenied->get_data(), $deniedRecords->get_data() );
+
+            $deniedEnroll = $this->dispatch( 'POST', self::NS . '/patient/enroll', [ 'clinic_id' => $this->clinicA, 'first_name' => 'M', 'last_name' => 'P', 'mobile' => '09129990002' ], $mixedId );
+            self::assertSame( 403, $deniedEnroll->get_status() );
+            self::assertSame( $baselineDenied->get_data(), $deniedEnroll->get_data() );
+        }
+
+        $firstName = App::db()->fetchValue( 'SELECT first_name FROM ' . App::db()->table( 'cpms_patients' ) . ' WHERE id = %d', [ $this->patientA ] );
+        self::assertSame( 'Alice', $firstName );
+
+        // Same-fixture positive control: pure patient user A still receives 200.
+        $allowedMe = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->patientUserA );
+        self::assertSame( 200, $allowedMe->get_status() );
+        self::assertSame( $this->patientA, (int) ( $allowedMe->get_data()['data']['id'] ?? 0 ) );
+    }
+
     private function insertPatient( int $clinicId, string $mrn, string $firstName, string $lastName, string $mobile ): int {
         $db  = App::db();
         $now = $db->nowUtcSql();

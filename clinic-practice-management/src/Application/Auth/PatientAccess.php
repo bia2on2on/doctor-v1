@@ -7,17 +7,18 @@ namespace ClinicCore\Application\Auth;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
+use WP_User;
 
 /**
  * Central, fail-closed authorization gate for patient-role access to Clinic
  * and Patient records.
  *
- * Architectural limitation (Slice A): `cpms_patient_logins` from unmerged PR #10
- * does not exist on `main` yet. This gate therefore evaluates existing durable
+ * Architectural boundary (Slice A): this gate evaluates existing durable
  * patient-user bindings (`cpms_patient_user_links`, active `cpms_patients`,
  * `cpms_clinics`, and `cpms_patient_identity_links` / `cpms_organizations`)
- * through injectable resolver seams so `cpms_patient_logins` can be integrated
- * here without changing controller callers.
+ * through injectable resolver seams. Enforcement against `cpms_patient_logins`
+ * and per-session OTP/`national_id` two-factor proofs is deferred to follow-up
+ * slices without changing controller callers.
  */
 final class PatientAccess {
 
@@ -39,7 +40,7 @@ final class PatientAccess {
     /**
      * Optional user resolver seam for pure-PHP unit tests.
      *
-     * @var (callable(int): ?array{exists: bool, roles: list<string>})|null
+     * @var (callable(int): ?array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>})|null
      */
     private $user_reader;
 
@@ -89,9 +90,9 @@ final class PatientAccess {
     /**
      * Construct the central patient access gate.
      *
-     * @param CpmsDb|null                                                       $db                      Database adapter.
-     * @param PatientRepository|null                                            $patients                Patient repository.
-     * @param (callable(int): ?array{exists: bool, roles: list<string>})|null  $user_reader             Optional user reader seam.
+     * @param CpmsDb|null                                                                                           $db                      Database adapter.
+     * @param PatientRepository|null                                                                                $patients                Patient repository.
+     * @param (callable(int): ?array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>})|null $user_reader Optional user reader seam.
      * @param (callable(int, int): bool)|null                                   $clinic_binding_checker  Optional clinic binding seam.
      * @param (callable(int, int, int): bool)|null                              $patient_binding_checker Optional patient binding seam.
      * @param (callable(int): bool)|null                                        $any_binding_checker     Optional any-binding seam.
@@ -204,7 +205,7 @@ final class PatientAccess {
 
         $roles        = $user['roles'];
         $primary_role = isset( $roles[0] ) && is_string( $roles[0] ) ? $roles[0] : 'unknown';
-        if ( ! in_array( RolesAndCapabilities::ROLE_PATIENT, $roles, true ) ) {
+        if ( ! $this->is_pure_patient_user( $user ) ) {
             return $this->observe_decision(
                 $wp_user_id,
                 $clinic_id,
@@ -382,15 +383,31 @@ final class PatientAccess {
 
     private function is_authenticated_patient( int $wp_user_id ): bool {
         $user = $this->read_user( $wp_user_id );
-        if ( null === $user || ! $user['exists'] ) {
+        if ( null === $user ) {
             return false;
         }
 
-        return in_array( RolesAndCapabilities::ROLE_PATIENT, $user['roles'], true );
+        return $this->is_pure_patient_user( $user );
     }
 
     /**
-     * @return array{exists: bool, roles: list<string>}|null
+     * Pure-patient check matching PatientPortalPage::isPatientOnly() and the
+     * identity design: reject multi-role users (staff + patient) and any user
+     * holding `manage_options` or a CPMS staff capability.
+     *
+     * @param array{exists: bool, roles: list<string>, has_staff_cap: bool} $user
+     */
+    private function is_pure_patient_user( array $user ): bool {
+        if ( ! $user['exists'] || $user['has_staff_cap'] ) {
+            return false;
+        }
+        $roles = $user['roles'];
+
+        return in_array( RolesAndCapabilities::ROLE_PATIENT, $roles, true ) && 1 === count( $roles );
+    }
+
+    /**
+     * @return array{exists: bool, roles: list<string>, has_staff_cap: bool}|null
      */
     private function read_user( int $wp_user_id ): ?array {
         if ( $wp_user_id <= 0 ) {
@@ -401,22 +418,37 @@ final class PatientAccess {
             if ( ! is_array( $resolved ) ) {
                 return null;
             }
-            $roles = array_values( array_filter( (array) ( $resolved['roles'] ?? [] ), 'is_string' ) );
+            $roles         = array_values( array_filter( (array) ( $resolved['roles'] ?? [] ), 'is_string' ) );
+            $has_staff_cap = (bool) ( $resolved['has_staff_cap'] ?? false );
+            if ( ! $has_staff_cap && isset( $resolved['caps'] ) && is_array( $resolved['caps'] ) ) {
+                if ( ! empty( $resolved['caps']['manage_options'] ) ) {
+                    $has_staff_cap = true;
+                } else {
+                    foreach ( RolesAndCapabilities::ALL_CAPS as $capability ) {
+                        if ( ! empty( $resolved['caps'][ $capability ] ) ) {
+                            $has_staff_cap = true;
+                            break;
+                        }
+                    }
+                }
+            }
 
             return [
-                'exists' => (bool) ( $resolved['exists'] ?? false ),
-                'roles'  => $roles,
+                'exists'        => (bool) ( $resolved['exists'] ?? false ),
+                'roles'         => $roles,
+                'has_staff_cap' => $has_staff_cap,
             ];
         }
         if ( function_exists( 'get_userdata' ) ) {
             $user = get_userdata( $wp_user_id );
-            if ( false === $user || ! $user->exists() ) {
+            if ( ! $user instanceof WP_User || ! $user->exists() ) {
                 return null;
             }
 
             return [
-                'exists' => true,
-                'roles'  => array_values( array_filter( (array) $user->roles, 'is_string' ) ),
+                'exists'        => true,
+                'roles'         => array_values( array_filter( (array) $user->roles, 'is_string' ) ),
+                'has_staff_cap' => self::wp_user_has_staff_capability( $user ),
             ];
         }
         if ( function_exists( 'wp_get_current_user' ) ) {
@@ -426,12 +458,29 @@ final class PatientAccess {
             }
 
             return [
-                'exists' => true,
-                'roles'  => array_values( array_filter( (array) $user->roles, 'is_string' ) ),
+                'exists'        => true,
+                'roles'         => array_values( array_filter( (array) $user->roles, 'is_string' ) ),
+                'has_staff_cap' => self::wp_user_has_staff_capability( $user ),
             ];
         }
 
         return null;
+    }
+
+    private static function wp_user_has_staff_capability( WP_User $user ): bool {
+        if ( ! function_exists( 'user_can' ) ) {
+            return false;
+        }
+        if ( user_can( $user, 'manage_options' ) ) {
+            return true;
+        }
+        foreach ( RolesAndCapabilities::ALL_CAPS as $capability ) {
+            if ( user_can( $user, $capability ) ) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function has_clinic_binding( int $wp_user_id, int $clinic_id ): bool {
