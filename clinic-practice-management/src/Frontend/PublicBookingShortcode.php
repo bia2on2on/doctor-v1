@@ -273,18 +273,7 @@ final class PublicBookingShortcode
 
             // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- established camelCase local of this method.
             $clinic_id = (int) $request['clinic_id'];
-            // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- established camelCase local of this method.
-            $clinic = self::find_clinic( $clinic_id );
-            if ($clinic === null) {
-                return self::renderClosed();
-            }
-
-            $clinicians = self::active_clinicians( $clinic_id );
-            if ($clinicians === []) {
-                return self::render_empty( (int) $clinic_id, self::clinicName( $clinic ) );
-            }
-
-            return self::render_browse( (int) $clinic_id, self::clinicName( $clinic ), $clinicians );
+            return self::render_bound_clinic( $clinic_id );
         } catch (Throwable $e) {
             // fail-closed مطلق: جزئیات خطا هرگز به بازدیدکنندهٔ آنونیم نشان
             // داده نمی‌شود (نه در markup، نه در پیام)؛ فقط در Log عملیاتی.
@@ -292,6 +281,39 @@ final class PublicBookingShortcode
 
             return self::renderClosed();
         }
+    }
+
+    /** Render a bound Clinic inside the private Patient Portal, not via shortcode attributes. */
+    public static function render_for_patient_portal( int $clinic_id ): string {
+        try {
+            if ( \ClinicCore\Bootstrap\RuntimeSchemaGate::is_blocked() ) {
+                return \ClinicCore\Bootstrap\RuntimeSchemaGate::shortcode_markup();
+            }
+
+            return self::render_bound_clinic( $clinic_id, true );
+        } catch ( Throwable $e ) {
+            self::logFailure( $e );
+
+            return self::renderClosed();
+        }
+    }
+
+    /** Authorize before publishing even the empty bound surface. */
+    private static function render_bound_clinic( int $clinic_id, bool $patient_portal = false ): string {
+        if ( ! ( new PublicClinicDirectory() )->may_see_clinic( $clinic_id, null, $patient_portal ) ) {
+            return self::renderClosed();
+        }
+        $clinic = self::find_clinic( $clinic_id );
+        if ( null === $clinic ) {
+            return self::renderClosed();
+        }
+
+        $clinicians = self::active_clinicians( $clinic_id );
+        if ( [] === $clinicians ) {
+            return self::render_empty( $clinic_id, self::clinicName( $clinic ) );
+        }
+
+        return self::render_browse( $clinic_id, self::clinicName( $clinic ), $clinicians, $patient_portal );
     }
 
     // ================= لایهٔ پیکربندی Clinic (fail-closed) =================
@@ -543,8 +565,8 @@ final class PublicBookingShortcode
      *
      * @param list<array{id: int, name: string}> $clinicians
      */
-    private static function render_browse( int $clinic_id, string $clinic_name, array $clinicians ): string {
-        return self::render_surface( $clinic_id, $clinic_name, $clinicians, null );
+    private static function render_browse( int $clinic_id, string $clinic_name, array $clinicians, bool $patient_portal ): string {
+        return self::render_surface( $clinic_id, $clinic_name, $clinicians, null, $patient_portal );
     }
 
     /**
@@ -609,7 +631,7 @@ final class PublicBookingShortcode
      * @param array{clinics: list<array<string,mixed>>, specialties: list<string>, timezones: array<int,string>}|null $discovery
      */
     // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase, Squiz.Commenting.FunctionComment.IncorrectParamVarName -- established compact render kernel.
-    private static function render_surface( int $clinic_id, string $clinic_name, array $clinicians, ?array $discovery ): string {
+    private static function render_surface( int $clinic_id, string $clinic_name, array $clinicians, ?array $discovery, bool $patient_portal = false ): string {
         PublicBookingAssets::enqueue();
 
         $surface_id   = self::surfaceId();
@@ -755,7 +777,8 @@ final class PublicBookingShortcode
             $surface_id,
             $is_discovery ? $discovery : null,
             $location_contract,
-            $session_clinic_id
+            $session_clinic_id,
+            $patient_portal
         );
         $lines[] = '</div>'; // root
 
@@ -1773,7 +1796,8 @@ final class PublicBookingShortcode
         string $surface_id,
         ?array $discovery = null,
         array $location_contract = [],
-        ?int $session_clinic_id = null
+        ?int $session_clinic_id = null,
+        bool $patient_portal = false
     ): string {
         // phpcs:disable WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- published method contract keeps its established camelCase parameters.
         $config = [
@@ -1808,10 +1832,17 @@ final class PublicBookingShortcode
             $config['otp_verify_path']  = self::OTP_VERIFY_PATH;
         } elseif ( self::CONTINUATION_PATIENT === $continuation ) {
             // فقط برای بیمارِ واردشده — CSRF با wp_rest nonce (همان مرزِ B1/B2).
-            $config['nonce']             = wp_create_nonce( 'wp_rest' );
-            $config['hold_path']         = self::HOLD_PATH;
-            $config['confirm_path']      = self::CONFIRM_PATH;
-            $config['session_clinic_id'] = $session_clinic_id;
+            $config['nonce']        = wp_create_nonce( 'wp_rest' );
+            $config['hold_path']    = self::HOLD_PATH;
+            $config['confirm_path'] = self::CONFIRM_PATH;
+            if ( $patient_portal ) {
+                $config['private_reads'] = true;
+            }
+            // A bound Clinic is already authorized and published, even without a Location picker.
+            $config['session_clinic_id'] = null !== $session_clinic_id
+                && ( $clinic_id === $session_clinic_id || array_key_exists( $session_clinic_id, $location_contract ) )
+                ? $session_clinic_id
+                : null;
             if ( null !== $discovery || $session_clinic_id !== $clinic_id ) {
                 $config['otp_request_path'] = self::OTP_REQUEST_PATH;
                 $config['otp_verify_path']  = self::OTP_VERIFY_PATH;

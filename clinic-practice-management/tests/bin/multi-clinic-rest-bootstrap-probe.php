@@ -95,6 +95,7 @@ declare(strict_types=1);
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Settings\Settings;
 
 // ============================================================================
 // 0) Fresh-process evidence + infrastructure pre-conditions
@@ -458,6 +459,7 @@ $fixture = [
     'clinicAId'  => 0,
     'clinicBId'  => 0,
     'clinicianB' => 0,
+    'locationB'  => 0,
     'slotB'      => ['slot_id' => 0, 'date' => '', 'time' => ''],
 ];
 
@@ -520,6 +522,8 @@ $run('S3', 'seed two non-trivial real Clinics + persisted Clinic B clinician + f
         throw new RuntimeException('location fixture invalid: A=' . $locationA . ' B=' . $locationB);
     }
 
+    $fixture['locationB'] = $locationB;
+
     // The clinician whose Clinic is the trusted, PERSISTED owner of the A1/A4
     // policy that must be applied.
     $fixture['clinicianB'] = $insertRow('cpms_clinicians', [
@@ -529,6 +533,25 @@ $run('S3', 'seed two non-trivial real Clinics + persisted Clinic B clinician + f
         'created_at' => $now,
         'updated_at' => $now,
     ], 'clinician B');
+
+    // Seed through the audited writer without populating App's Settings factory
+    // or resolving any ambient Clinic. Settings::set invalidates the snapshot.
+    ( new Settings(App::db(), $fixture['clinicBId'], App::audit()) )->set('public.listing_opt_in', true);
+
+    // The default A1 window requires an active schedule in this Location.
+    $insertRow('cpms_schedule', [
+        'clinic_id'                => $fixture['clinicBId'],
+        'location_id'              => $locationB,
+        'clinician_id'             => $fixture['clinicianB'],
+        'day_of_week'              => 1,
+        'start_time'               => '09:00:00',
+        'end_time'                 => '17:00:00',
+        'appointment_duration_min' => 20,
+        'slot_capacity'            => 1,
+        'is_active'                => 1,
+        'created_at'               => $now,
+        'updated_at'               => $now,
+    ], 'schedule B');
 
     // A genuinely free, genuinely future slot in Clinic B (Location-local
     // wall-clock, 5 days ahead — unambiguous under every policy this
@@ -669,6 +692,20 @@ $run('S7', 'anonymous A1 GET /clinic/v1/availability for the Clinic B clinician 
         );
     }
 
+    $matched = false;
+    foreach ($data['data']['days'] ?? [] as $day) {
+        foreach ($day['slots'] ?? [] as $slot) {
+            if (($slot['slot_id'] ?? null) === $fixture['slotB']['slot_id']
+                && ($slot['location_id'] ?? null) === $fixture['locationB']
+                && ($slot['capacity_left'] ?? null) === 1) {
+                $matched = true;
+            }
+        }
+    }
+    if ($status !== 200 || !$matched) {
+        throw new RuntimeException('A1 must list the seeded free Clinic B slot');
+    }
+
     return 'HTTP ' . (int) $status . ' · code=' . ($code === '' ? '(none — normal envelope)' : $code);
 });
 
@@ -697,6 +734,14 @@ $run('S8', 'anonymous A4 POST /clinic/v1/booking/quote for Clinic B reaches a no
         throw new RuntimeException(
             'A4 never reached the product route: REST bootstrap aborted before routing (see S5)'
         );
+    }
+
+    $quote = $data['data'] ?? [];
+    if ($status !== 200 || ($quote['available'] ?? null) !== true
+        || ($quote['slot_id'] ?? null) !== $fixture['slotB']['slot_id']
+        || ($quote['location_id'] ?? null) !== $fixture['locationB']
+        || ($quote['capacity_left'] ?? null) !== 1) {
+        throw new RuntimeException('A4 must quote the seeded free Clinic B slot');
     }
 
     return 'HTTP ' . (int) $status . ' · code=' . ($code === '' ? '(none — normal envelope)' : $code);

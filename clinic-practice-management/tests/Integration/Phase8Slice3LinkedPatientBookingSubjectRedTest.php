@@ -243,6 +243,24 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
     // T01 MULTIPLE LINKED — NO SELECTION must reject
     // =================================================================
 
+    public function test_unlisted_fixture_has_no_public_booking_markup(): void {
+        $this->buildTwoClinicFixture();
+        $visible = $this->renderSurface( $this->clinicA );
+        self::assertStringContainsString( 'Clinic A P8S3', $visible );
+        self::assertStringContainsString( 'data-clinic-id="' . $this->clinicA . '"', $visible );
+        self::assertStringContainsString( 'data-clinician-id="' . $this->clinicianA . '"', $visible );
+
+        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
+        $hidden  = $this->renderSurface( $this->clinicA );
+        $unknown = $this->renderSurface( PHP_INT_MAX );
+        $normalize = static fn ( string $html ): string => (string) preg_replace( '/id="cpms-public-booking-[0-9]+"/', 'id="fixture"', $html );
+        self::assertSame( $normalize( $unknown ), $normalize( $hidden ) );
+        self::assertStringContainsString( 'data-state="error"', $hidden );
+        foreach ( [ 'Clinic A P8S3', 'data-clinic-id=', 'data-clinician-id=', 'data-location-id=', 'locations_by_clinic' ] as $witness ) {
+            self::assertStringNotContainsString( $witness, $hidden );
+        }
+    }
+
     public function testMultipleLinkedNoSelectionIsRejectedBeforeHold(): void
     {
         $this->buildTwoClinicFixture();
@@ -1252,6 +1270,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
 
         $this->clinicA = $this->insertClinic('Clinic A P8S3 ' . $uid, 'clinic-a-p8s3-' . $uid, $now);
         $this->clinicB = $this->insertClinic('Clinic B P8S3 ' . $uid, 'clinic-b-p8s3-' . $uid, $now);
+        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', true );
 
         $this->locationA = $this->insertLocation($this->clinicA, 'Main A P8S3', 'main-a-p8s3-' . $uid, self::TZ_TEHRAN, 1);
         $this->locationB = $this->insertLocation($this->clinicB, 'Main B P8S3', 'main-b-p8s3-' . $uid, self::TZ_TEHRAN, 1);

@@ -135,11 +135,15 @@ final class BookingService
      * @return array{days: list<array<string, mixed>>}
      */
     // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- published camelCase parameter names (PHP 8 named-argument contract).
-    public function availability( int $clinicianId, ?string $fromDate = null, ?string $toDate = null, ?int $clinicId = null ): array
+    public function availability( int $clinicianId, ?string $fromDate = null, ?string $toDate = null, ?int $clinicId = null, ?callable $clinic_visible = null ): array
     {
         // Phase 8 Slice 4 — optional Clinic selector (BC: omitted ⇒ home Clinic).
         // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- established camelCase local of this method.
         $clinicId = $this->resolve_booking_clinic( $clinicianId, $clinicId );
+        // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- established Clinic local.
+        if ( null !== $clinic_visible && ! $clinic_visible( $clinicId ) ) {
+            throw BookingException::of( 'CLINIC_NOT_FOUND', 'پزشک یافت نشد', 404 );
+        }
 
         // Clinic lifecycle policy - public advertisement boundary: a suspended
         // Clinic publishes no bookable slots. Returns the established public
@@ -426,7 +430,7 @@ final class BookingService
      */
     // phpcs:ignore Squiz.Functions.FunctionDeclarationArgumentSpacing, WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase
     // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- published camelCase parameter names (PHP 8 named-argument contract).
-    public function quote( int $clinicianId, string $slotDate, string $slotTime, ?int $slotId = null, ?int $locationId = null ): array
+    public function quote( int $clinicianId, string $slotDate, string $slotTime, ?int $slotId = null, ?int $locationId = null, ?callable $clinic_visible = null ): array
     {
         // Phase 8 Slice 4 — the PERSISTED slot decides the Clinic when an exact
         // slot id is supplied (shared-clinician support). No client-supplied
@@ -435,7 +439,10 @@ final class BookingService
         // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- published camelCase parameter (PHP 8 named-argument contract).
         if ( $slotId !== null && $slotId > 0 ) {
             // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- published camelCase parameter (PHP 8 named-argument contract).
-            $clinicId = $this->clinic_for_persisted_slot( $clinicId, $clinicianId, $slotId );
+            $clinicId = $this->clinic_for_persisted_slot( $clinicId, $clinicianId, $slotId, $clinic_visible );
+            // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- established Clinic local.
+        } elseif ( null !== $clinic_visible && ! $clinic_visible( $clinicId ) ) {
+            throw BookingException::of( 'CLINIC_NOT_FOUND', 'پزشک یافت نشد', 404 );
         }
 
         // Clinic lifecycle policy - public advertisement boundary: a suspended Clinic
@@ -2845,7 +2852,7 @@ final class BookingService
      *
      * @param int $home_clinic_id Already-resolved home Clinic of an ACTIVE clinician.
      */
-    private function clinic_for_persisted_slot( int $home_clinic_id, int $clinician_id, int $slot_id ): int {
+    private function clinic_for_persisted_slot( int $home_clinic_id, int $clinician_id, int $slot_id, ?callable $clinic_visible = null ): int {
         $slot = $this->db->fetchRow(
             'SELECT id, clinic_id, clinician_id FROM ' . $this->db->table( 'cpms_schedule_slots' ) . ' WHERE id = %d LIMIT 1',
             [ $slot_id ]
@@ -2859,6 +2866,9 @@ final class BookingService
         }
 
         $slot_clinic_id = (int) $slot['clinic_id'];
+        if ( null !== $clinic_visible && ! $clinic_visible( $slot_clinic_id ) ) {
+            throw BookingException::of( 'CLINIC_NOT_FOUND', 'اسلات با شناسه داده‌شده یافت نشد', 404 );
+        }
 
         // Same-Clinic path: byte-for-byte the established behaviour. The
         // caller's existing resolve_slot_for_booking() keeps ownership of the

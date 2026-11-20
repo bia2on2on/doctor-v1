@@ -180,6 +180,31 @@ final class MultiClinicBookingSettingsScopeRedTest extends WP_UnitTestCase
 
     // ================= RED case 1 — A4 / booking.min_lead_hours =================
 
+    public function test_unlisted_clinic_never_reveals_booking_policy_or_location(): void {
+        $span = [ 'from' => $this->nearSlotB['date'], 'to' => $this->nearSlotB['date'] ];
+        $public_slots = $this->a1Availability( $this->clinicianB, $span );
+        self::assertSame( 200, $public_slots->get_status() );
+        $days = $public_slots->get_data()['data']['days'];
+        $slots = array_merge( ...array_column( $days, 'slots' ) );
+        self::assertContains( $this->nearSlotB['slot_id'], array_column( $slots, 'slot_id' ) );
+        $public_quote = $this->a4Quote( $this->clinicianB, $this->nearSlotB );
+        self::assertSame( 200, $public_quote->get_status() );
+        self::assertTrue( $public_quote->get_data()['data']['available'] );
+        self::assertSame( $this->nearSlotB['slot_id'], $public_quote->get_data()['data']['slot_id'] );
+
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
+        $hidden  = $this->a1Availability( $this->clinicianB, $span );
+        $unknown = $this->a1Availability( PHP_INT_MAX, $span );
+        self::assertSame( 404, $hidden->get_status() );
+        self::assertSame( $unknown->get_data(), $hidden->get_data() );
+        self::assertSame( [ 'status' => 404 ], $hidden->get_data()['data'] );
+        $hidden  = $this->a4Quote( $this->clinicianB, $this->nearSlotB );
+        $unknown = $this->a4Quote( PHP_INT_MAX, $this->nearSlotB );
+        self::assertSame( 404, $hidden->get_status() );
+        self::assertSame( $unknown->get_data(), $hidden->get_data() );
+        self::assertSame( [ 'status' => 404 ], $hidden->get_data()['data'] );
+    }
+
     /**
      * A4 must apply the min-lead of the PERSISTED Clinic of the requested
      * clinician — never the min-lead of an ambient / pre-primed Clinic.
@@ -477,6 +502,7 @@ final class MultiClinicBookingSettingsScopeRedTest extends WP_UnitTestCase
         $settingsB = App::settingsFactory()->forClinic($this->clinicB);
         $settingsB->set('booking.min_lead_hours', self::MIN_LEAD_HOURS_B);
         $settingsB->set('booking.max_future_days', self::MAX_FUTURE_DAYS_B);
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', true );
 
         Settings::flushCache();
 

@@ -155,6 +155,31 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
         );
     }
 
+    public function test_unlisted_clinic_availability_is_indistinguishable_from_unknown(): void {
+        $date    = ( new DateTimeImmutable( '+3 days', new DateTimeZone( self::TZ_WEST ) ) )->format( 'Y-m-d' );
+        $slot_id = $this->insertSlot( $this->clinicianWest, $this->locNiue, $date, '11:00:00' );
+        $request = new WP_REST_Request( 'GET', self::NS . '/availability' );
+        $request->set_param( 'clinician_id', $this->clinicianWest );
+        $request->set_param( 'from', $date );
+        $request->set_param( 'to', $date );
+        $public_slots = rest_do_request( $request );
+        self::assertSame( 200, $public_slots->get_status() );
+        $days = $public_slots->get_data()['data']['days'];
+        $slots = array_merge( ...array_column( $days, 'slots' ) );
+        self::assertContains( $slot_id, array_column( $slots, 'slot_id' ) );
+
+        App::settingsFactory()->forClinic( $this->clinicId )->set( 'public.listing_opt_in', false );
+        $missing = new WP_REST_Request( 'GET', self::NS . '/availability' );
+        $missing->set_param( 'clinician_id', PHP_INT_MAX );
+        $missing->set_param( 'from', $date );
+        $missing->set_param( 'to', $date );
+        $hidden  = rest_do_request( $request );
+        $unknown = rest_do_request( $missing );
+        self::assertSame( 404, $hidden->get_status() );
+        self::assertSame( $unknown->get_data(), $hidden->get_data() );
+        self::assertSame( [ 'status' => 404 ], $hidden->get_data()['data'] );
+    }
+
     public function testFixtureTopologyPreconditions(): void
     {
         // Ownership واقعی: هر Location متعلق به همان Clinic و هر طبیب به Clinic خودش.
@@ -1953,6 +1978,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
         );
         self::assertNotFalse($ok, 'fixture: clinic ساخته شود');
         $this->clinicId = (int) $wpdb->insert_id;
+        App::settingsFactory()->forClinic( $this->clinicId )->set( 'public.listing_opt_in', true );
 
         $this->locTehran = $this->insertLocation('Tehran East', 'p6s2-loc-tehran-' . $suffix, self::TZ_EAST, 1);
         $this->locKiritimati = $this->insertLocation('Kiritimati Edge', 'p6s2-loc-kiri-' . $suffix, self::TZ_EAST_EDGE, 0);

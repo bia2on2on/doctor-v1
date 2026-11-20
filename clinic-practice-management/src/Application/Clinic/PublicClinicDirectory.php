@@ -54,6 +54,7 @@ declare( strict_types=1 );
 
 namespace ClinicCore\Application\Clinic;
 
+use ClinicCore\Admin\PatientPortalPage;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use Throwable;
@@ -190,10 +191,8 @@ final class PublicClinicDirectory {
 
 	/**
 	 * Eligible active clinicians of ONE Clinic (home-Clinic or active durable
-	 * participation). NO consent gate here: an explicitly bound shortcode
-	 * (`[cpms_public_booking clinic_id="N"]`) is the publication consent for
-	 * that single Clinic, exactly as before this slice. Consent gating belongs
-	 * to the directory listing above.
+	 * participation). The renderer must authorize the Clinic before calling this
+	 * internal data lookup.
 	 *
 	 * @return list<array{id:int,name:string,specialty:string,weekdays:list<int>}>
 	 */
@@ -269,9 +268,41 @@ final class PublicClinicDirectory {
 		return $map;
 	}
 
-    /**
-     * Consent value of one Clinic (public, read-only helper for tests/admin).
-     */
+	/**
+	 * Public consent, or cookie-authenticated access to a linked booking Clinic.
+	 *
+	 * Only the server-side Patient Portal renderer may set $patient_portal for
+	 * its HTML request. REST callers must instead supply the REST nonce header.
+	 */
+	public function may_see_clinic( int $clinic_id, ?string $rest_nonce = null, bool $patient_portal = false ): bool {
+		if ( $clinic_id <= 0 ) {
+			return false;
+		}
+		if ( $this->is_listed( $clinic_id ) ) {
+			return true;
+		}
+		if ( ! $patient_portal && ( null === $rest_nonce || ! wp_verify_nonce( $rest_nonce, 'wp_rest' ) ) ) {
+			return false;
+		}
+
+		$user    = wp_get_current_user();
+		$user_id = get_current_user_id();
+		if ( $user_id <= 0 || $user_id !== wp_validate_auth_cookie( '', 'logged_in' ) || ! PatientPortalPage::isPatientOnly( $user ) ) {
+			return false;
+		}
+
+		try {
+			return in_array( $clinic_id, array_column( App::patientService()->booking_clinics( $user_id ), 'id' ), true );
+		} catch ( Throwable $e ) {
+			$this->log_failure( $e );
+
+			return false;
+		}
+	}
+
+	/**
+	 * Consent value of one Clinic (public, read-only helper for tests/admin).
+	 */
 	public function is_listed( int $clinic_id ): bool {
 		if ( $clinic_id <= 0 ) {
 			return false;
