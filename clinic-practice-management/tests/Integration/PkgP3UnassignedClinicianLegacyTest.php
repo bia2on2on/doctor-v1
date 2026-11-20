@@ -81,6 +81,23 @@ final class PkgP3UnassignedClinicianLegacyTest extends WP_UnitTestCase
     // A — no eligible Location must not be published as an empty contract
     // =====================================================================
 
+    public function test_unlisted_fixture_has_no_public_booking_markup(): void {
+        $visible = $this->render( (string) $this->clinic_id );
+        self::assertStringContainsString( 'Clinic P3UL', $visible );
+        self::assertStringContainsString( 'data-clinic-id="' . $this->clinic_id . '"', $visible );
+        self::assertStringContainsString( 'data-clinician-id="' . $this->clinician_id . '"', $visible );
+
+        App::settingsFactory()->forClinic( $this->clinic_id )->set( 'public.listing_opt_in', false );
+        $hidden  = $this->render( (string) $this->clinic_id );
+        $unknown = $this->render( (string) PHP_INT_MAX );
+        $normalize = static fn ( string $html ): string => (string) preg_replace( '/id="cpms-public-booking-[0-9]+"/', 'id="fixture"', $html );
+        self::assertSame( $normalize( $unknown ), $normalize( $hidden ) );
+        self::assertStringContainsString( 'data-state="error"', $hidden );
+        foreach ( [ 'Clinic P3UL', 'data-clinic-id=', 'data-clinician-id=', 'data-location-id=', 'locations_by_clinic' ] as $witness ) {
+            self::assertStringNotContainsString( $witness, $hidden );
+        }
+    }
+
     public function test_clinic_with_no_eligible_location_publishes_no_contract_entry(): void
     {
         $config    = $this->config( $this->render( (string) $this->clinic_id ) );
@@ -154,6 +171,128 @@ final class PkgP3UnassignedClinicianLegacyTest extends WP_UnitTestCase
         );
     }
 
+    public function test_legacy_bound_booking_holds_and_confirms_only_with_a_matching_linked_session(): void {
+        $now     = App::db()->nowUtcSql();
+        $date    = ( new \DateTimeImmutable( '+5 days', new \DateTimeZone( self::TZ_TEHRAN ) ) )->format( 'Y-m-d' );
+        $slot_id = $this->insert_row(
+            'cpms_schedule_slots',
+            [
+                'clinic_id'    => $this->clinic_id,
+                'location_id'  => $this->location_id,
+                'clinician_id' => $this->clinician_id,
+                'slot_date'    => $date,
+                'slot_time'    => '10:00:00',
+                'duration_min' => 20,
+                'capacity'     => 1,
+                'booked_count' => 0,
+                'held_count'   => 0,
+                'is_open'      => 1,
+                'created_at'   => $now,
+                'updated_at'   => $now,
+            ],
+            [ '%d', '%d', '%d', '%s', '%s', '%d', '%d', '%d', '%d', '%d', '%s', '%s' ]
+        );
+        $selection = [
+            'clinician_id' => $this->clinician_id,
+            'slot_id'      => $slot_id,
+            'slot_date'    => $date,
+            'slot_time'    => '10:00:00',
+        ];
+        $user_id = self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_PATIENT ] );
+        wp_set_current_user( $user_id );
+        $previous_cookie = $_COOKIE[ LOGGED_IN_COOKIE ] ?? null;
+
+        try {
+            $expires = time() + DAY_IN_SECONDS;
+            $token   = \WP_Session_Tokens::get_instance( $user_id )->create( $expires );
+            $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie( $user_id, $expires, 'logged_in', $token );
+            self::assertSame( $user_id, wp_validate_auth_cookie( '', 'logged_in' ) );
+            $unlinked = $this->config( $this->render( (string) $this->clinic_id ) );
+            self::assertNull( $unlinked['session_clinic_id'] );
+            self::assertArrayHasKey( 'otp_request_path', $unlinked );
+            $denied = $this->booking_post( $unlinked['hold_path'], $selection, $unlinked['nonce'] );
+            self::assertSame( 400, $denied->get_status() );
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $denied->get_data()['code'] );
+
+            $mobile     = '09121234037';
+            $patient_id = $this->insert_row(
+                'cpms_patients',
+                [
+                    'clinic_id'  => $this->clinic_id,
+                    'mrn'        => 'P3UL-' . $this->uid,
+                    'first_name' => 'Legacy',
+                    'last_name'  => 'Fixture',
+                    'mobile'     => $mobile,
+                    'status'     => 'active',
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ],
+                [ '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s' ]
+            );
+            $this->insert_row(
+                'cpms_patient_user_links',
+                [
+                    'clinic_id'      => $this->clinic_id,
+                    'patient_id'     => $patient_id,
+                    'wp_user_id'     => $user_id,
+                    'mobile_at_link' => $mobile,
+                    'is_primary'     => 1,
+                    'linked_at'      => $now,
+                ],
+                [ '%d', '%d', '%d', '%s', '%d', '%s' ]
+            );
+            cpms_test_seed_patient_session( $user_id, $this->clinic_id );
+
+            $html   = $this->render( (string) $this->clinic_id );
+            $config = $this->config( $html );
+            self::assertSame( [], $config['locations_by_clinic'] );
+            self::assertSame( $this->clinic_id, $config['session_clinic_id'] );
+            self::assertArrayNotHasKey( 'otp_request_path', $config );
+            self::assertStringNotContainsString( 'data-role="otp-step"', $html );
+            self::assertStringContainsString( 'data-role="booking-continue"', $html );
+
+            $availability = new \WP_REST_Request( 'GET', '/clinic/v1' . $config['availability_path'] );
+            $availability->set_query_params( [ 'clinician_id' => $this->clinician_id, 'from' => $date, 'to' => $date ] );
+            $slots = rest_do_request( $availability );
+            self::assertSame( 200, $slots->get_status() );
+            self::assertSame( $slot_id, $slots->get_data()['data']['days'][0]['slots'][0]['slot_id'] ?? null );
+            $quote = $this->booking_post( $config['quote_path'], $selection );
+            self::assertSame( 200, $quote->get_status() );
+            self::assertTrue( $quote->get_data()['data']['available'] );
+            self::assertSame( $this->location_id, $quote->get_data()['data']['location_id'] );
+
+            $hold = $this->booking_post(
+                $config['hold_path'],
+                $selection + [ 'location_id' => $this->location_id ],
+                $config['nonce']
+            );
+            self::assertSame( 200, $hold->get_status() );
+            $hold_token = $hold->get_data()['data']['hold_token'] ?? '';
+            self::assertNotSame( '', $hold_token );
+            $confirm = $this->booking_post( $config['confirm_path'], [ 'hold_token' => $hold_token ], $config['nonce'] );
+            self::assertSame( 200, $confirm->get_status() );
+            self::assertSame( 'confirmed', $confirm->get_data()['data']['status'] );
+        } finally {
+            if ( null === $previous_cookie ) {
+                unset( $_COOKIE[ LOGGED_IN_COOKIE ] );
+            } else {
+                $_COOKIE[ LOGGED_IN_COOKIE ] = $previous_cookie;
+            }
+            wp_set_current_user( 0 );
+        }
+    }
+
+    private function booking_post( string $path, array $params, ?string $nonce = null ): \WP_REST_Response {
+        $request = new \WP_REST_Request( 'POST', '/clinic/v1' . $path );
+        $request->set_body_params( $params );
+        $request->set_header( 'Idempotency-Key', wp_generate_uuid4() );
+        if ( null !== $nonce ) {
+            $request->set_header( 'X-WP-Nonce', $nonce );
+        }
+
+        return rest_do_request( $request );
+    }
+
     // =====================================================================
     // fixture
     // =====================================================================
@@ -187,6 +326,7 @@ final class PkgP3UnassignedClinicianLegacyTest extends WP_UnitTestCase
             ],
             [ '%d', '%s', '%s', '%s', '%s', '%s', '%s' ]
         );
+        App::settingsFactory()->forClinic( $this->clinic_id )->set( 'public.listing_opt_in', true );
 
         // One ACTIVE Location of this Clinic that nobody is assigned to yet.
         $this->location_id = $this->insert_row(

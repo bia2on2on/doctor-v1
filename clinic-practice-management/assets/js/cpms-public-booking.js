@@ -38,10 +38,8 @@
  * A1 و A4 موجودِ عمومی‌اند و از `rest_root` منتشرشده توسط سرور ساخته
  * می‌شوند (هرگز hardcode نشده‌اند).
  *
- * درخواست‌ها عمداً `credentials: 'omit'` هستند: این سطح «پیش از login» است،
- * پس نه cookie ای می‌فرستد و نه به وضعیت ورودِ کاربرِ جاری وابسته است — یعنی
- * برای همه دقیقاً یک رفتارِ آنونیم دارد و سطحِ حملهٔ CSRF هم صفر است
- * (A4 quote فقط read-only است و هیچ جهشی ایجاد نمی‌کند).
+ * درخواست‌های عمومی A1/A4 بدون کوکی و nonce هستند؛ درخواست‌های پورتال بیمار
+ * با کوکی و REST nonce ارسال می‌شوند. A4 فقط خواندنی است و رزرو ایجاد نمی‌کند.
  *
  * وابستگی: صفر. بدون framework، بدون build step، بدون CDN، بدون jQuery.
  */
@@ -1146,6 +1144,24 @@
 			return visible;
 		}
 
+		function bookingReadOptions(method, payload) {
+			var useSession = config.private_reads === true && isNonEmptyString(config.nonce);
+			var options = {
+				method: method,
+				credentials: 'omit',
+				headers: { Accept: 'application/json' }
+			};
+			if (useSession) {
+				options.credentials = 'same-origin';
+				options.headers['X-WP-Nonce'] = config.nonce;
+			}
+			if (method === 'POST') {
+				options.headers['Content-Type'] = 'application/json';
+				options.body = JSON.stringify(payload);
+			}
+			return options;
+		}
+
 		function loadAvailability(clinicianId, restoreSelection) {
 			clearDetail();
 			setText(daysHost, '');
@@ -1175,11 +1191,7 @@
 			}
 			var url = apiUrl(config.rest_root, availabilityQuery);
 
-			requestJson(url, {
-				method: 'GET',
-				credentials: 'omit',
-				headers: { Accept: 'application/json' }
-			}).then(function (result) {
+			requestJson(url, bookingReadOptions('GET')).then(function (result) {
 				setBusy(false);
 				applyLocationGate();
 
@@ -1369,12 +1381,7 @@
 			// الحاقِ ساده در هر دو حالتِ permalink درست است و route سالم می‌ماند.
 			// اگر روزی پارامترِ query به این URL اضافه شد، باید از `apiUrl()`
 			// بگذرد — دقیقاً مثل A1.
-			requestJson(config.rest_root + config.quote_path, {
-				method: 'POST',
-				credentials: 'omit',
-				headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-				body: JSON.stringify(payload)
-			}).then(function (result) {
+			requestJson(config.rest_root + config.quote_path, bookingReadOptions('POST', payload)).then(function (result) {
 				setBusy(false);
 				unfreeze();
 				applyVerdict(result);
@@ -1463,12 +1470,13 @@
 			}
 
 			setBusy(true);
-			requestJson(config.rest_root + config.otp_request_path, {
+			var otpOptions = toInt(payload.slot_id) > 0 && config.private_reads === true ? bookingReadOptions('POST', payload) : {
 				method: 'POST',
 				credentials: 'same-origin',
 				headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
 				body: JSON.stringify(payload)
-			}).then(function (result) {
+			};
+			requestJson(config.rest_root + config.otp_request_path, otpOptions).then(function (result) {
 				setBusy(false);
 				if (result.ok && result.body && result.body.data && result.body.data.sms_sent === true) {
 					setNodeMessage(status, '');
@@ -1876,12 +1884,7 @@
 			panelState(STATE_LOADING);
 			setBusy(true);
 			freeze();
-			requestJson(config.rest_root + config.quote_path, {
-				method: 'POST',
-				credentials: 'omit',
-				headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-				body: JSON.stringify(payload)
-			}).then(function (result) {
+			requestJson(config.rest_root + config.quote_path, bookingReadOptions('POST', payload)).then(function (result) {
 				setBusy(false);
 				unfreeze();
 				var p = result.body && result.body.data ? result.body.data : null;

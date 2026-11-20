@@ -35,8 +35,12 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Admin\PublicShortcodeAdminPage;
+use ClinicCore\Application\Clinic\PublicClinicDirectory;
 use ClinicCore\Application\Scope\ScopeContext;
+use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Frontend\PublicBookingShortcode;
 use ClinicCore\Settings\Settings;
 use WP_REST_Request;
 use WP_REST_Response;
@@ -539,6 +543,225 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
     // =========================================================================
     // Fixtures and helpers
     // =========================================================================
+
+    public function test_bound_and_discovery_shortcode_require_each_clinics_consent(): void {
+        $this->assign_shared_clinician_to_location_b();
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
+        $unknown = $this->render( (string) PHP_INT_MAX );
+        $hidden  = $this->render( (string) $this->clinicB );
+        self::assertSame( $this->without_surface_id( $unknown ), $this->without_surface_id( $hidden ) );
+        self::assertStringContainsString( 'data-state="error"', $hidden );
+        self::assertStringNotContainsString( 'data-clinic-id=', $hidden );
+        self::assertStringNotContainsString( 'data-clinician-id=', $hidden );
+        self::assertStringNotContainsString( 'locations_by_clinic', $hidden );
+        self::assertStringNotContainsString( 'Main B P8S4', $hidden );
+        self::assertStringNotContainsString( 'Clinic B P8S4 ' . $this->uid, $hidden );
+
+        $discovery = $this->render( 'all' );
+        self::assertStringContainsString( 'Clinic A P8S4 ' . $this->uid, $discovery );
+        self::assertStringNotContainsString( 'Clinic B P8S4 ' . $this->uid, $discovery );
+        self::assertStringNotContainsString( 'data-clinician-id="' . $this->clinicianB . '"', $discovery );
+        self::assertStringNotContainsString( 'Main B P8S4', $discovery );
+
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', true );
+        $visible = $this->render( (string) $this->clinicB );
+        self::assertStringContainsString( 'Clinic B P8S4 ' . $this->uid, $visible );
+        self::assertStringContainsString( 'data-clinician-id="' . $this->sharedClinician . '"', $visible );
+        self::assertStringContainsString( 'Main B P8S4', $visible );
+        self::assertArrayHasKey( $this->clinicB, $this->config( $visible )['locations_by_clinic'] );
+        self::assertArrayNotHasKey( 'private_reads', $this->config( $visible ) );
+    }
+
+    public function test_unlisted_booking_reads_are_indistinguishable_from_unknown_and_limited_to_linked_sessions(): void {
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
+        $this->assert_booking_reads_denied( $this->clinicB, $this->sharedSlotB );
+        // Clinic A is still public. A shared clinician's home consent cannot publish B.
+        $this->assert_booking_reads_visible( $this->clinicA, $this->sharedSlotA, $this->locationA );
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', true );
+        $this->assert_booking_reads_visible( $this->clinicB, $this->sharedSlotB, $this->locationB );
+
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
+        wp_set_current_user( $this->patientUserId );
+        $this->assert_booking_reads_denied( $this->clinicB, $this->sharedSlotB );
+        $this->assert_booking_reads_visible( $this->clinicB, $this->sharedSlotB, $this->locationB, true );
+        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
+        $this->assert_booking_reads_denied( $this->clinicA, $this->sharedSlotA, true );
+
+        $cookie = $_COOKIE[LOGGED_IN_COOKIE];
+        unset( $_COOKIE[LOGGED_IN_COOKIE] );
+        try {
+            $this->assert_booking_reads_denied( $this->clinicB, $this->sharedSlotB, true );
+        } finally {
+            $_COOKIE[LOGGED_IN_COOKIE] = $cookie;
+        }
+
+        ( new \WP_User( $this->patientUserId ) )->set_role( RolesAndCapabilities::ROLE_SECRETARY );
+        wp_set_current_user( 0 );
+        wp_set_current_user( $this->patientUserId );
+        $this->assert_booking_reads_denied( $this->clinicB, $this->sharedSlotB, true );
+    }
+
+    public function test_only_private_portal_variant_publishes_unlisted_linked_clinic(): void {
+        $this->assign_shared_clinician_to_location_b();
+        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
+        $unknown = $this->without_surface_id( $this->render( (string) PHP_INT_MAX ) );
+        wp_set_current_user( $this->patientUserId );
+        self::assertSame( $unknown, $this->without_surface_id( $this->render( (string) $this->clinicB ) ) );
+        self::assertSame( $unknown, $this->without_surface_id( PublicBookingShortcode::render_for_patient_portal( $this->clinicA ) ) );
+
+        $html = PublicBookingShortcode::render_for_patient_portal( $this->clinicB );
+        self::assertStringContainsString( 'Clinic B P8S4 ' . $this->uid, $html );
+        self::assertStringContainsString( 'data-clinician-id="' . $this->sharedClinician . '"', $html );
+        self::assertStringContainsString( 'Main B P8S4', $html );
+        $config = $this->config( $html );
+        self::assertTrue( $config['private_reads'] );
+        self::assertNotFalse( wp_verify_nonce( $config['nonce'], 'wp_rest' ) );
+    }
+
+    public function test_selected_otp_request_does_not_resolve_a_private_slot(): void {
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
+        $mobile    = '09121234001';
+        $selection = array_merge( $this->booking_quote_params( $this->sharedSlotB ), [ 'mobile' => $mobile ] );
+        $before    = $this->challengeCount( $mobile );
+        $hidden    = $this->post( self::NS . '/otp/request', $selection );
+        $unknown   = $this->post( self::NS . '/otp/request', array_replace( $selection, [ 'slot_id' => PHP_INT_MAX ] ) );
+        self::assertSame( 404, $hidden->get_status() );
+        self::assertSame( $unknown->get_data(), $hidden->get_data() );
+        self::assertSame( $before, $this->challengeCount( $mobile ) );
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', true );
+        self::assertSame( 200, $this->post( self::NS . '/otp/request', $selection )->get_status() );
+    }
+
+    public function test_selection_free_otp_responses_do_not_expose_listing_consent(): void {
+        $request = [ 'mobile' => '09121234001' ];
+        $verify  = $request + [ 'code' => '000000' ];
+        $before  = [ $this->post( self::NS . '/otp/request', $request ), $this->post( self::NS . '/otp/verify', $verify ) ];
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
+        $after = [ $this->post( self::NS . '/otp/request', $request ), $this->post( self::NS . '/otp/verify', $verify ) ];
+        foreach ( $after as $index => $response ) {
+            self::assertSame( $before[ $index ]->get_status(), $response->get_status() );
+            self::assertSame( $before[ $index ]->get_data(), $response->get_data() );
+            self::assertStringNotContainsString( 'clinic_id', wp_json_encode( $response->get_data() ) );
+        }
+    }
+
+    public function test_admin_listing_write_requires_the_clinics_config_and_nonce(): void {
+        $user_id = self::factory()->user->create( [ 'role' => 'administrator' ] );
+        App::membership_service()->create_membership( $this->clinicB, $user_id, RolesAndCapabilities::ROLE_MANAGER );
+        wp_set_current_user( $user_id );
+        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
+        App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
+        $post = [ 'cpms_public_listing_save' => '1', 'cpms_public_listing_enabled' => '1' ];
+        $this->render_admin_save( $this->clinicB, $post );
+        $directory = new PublicClinicDirectory();
+        self::assertFalse( $directory->is_listed( $this->clinicB ) );
+
+        $foreign = $post + [ 'cpms_public_listing_nonce' => wp_create_nonce( 'cpms_public_listing_' . $this->clinicA ) ];
+        self::assertStringContainsString( 'notice-error', $this->render_admin_save( $this->clinicB, $foreign ) );
+        self::assertFalse( $directory->is_listed( $this->clinicB ) );
+        self::assertStringContainsString( 'notice-error', $this->render_admin_save( $this->clinicA, $foreign ) );
+        self::assertFalse( $directory->is_listed( $this->clinicA ) );
+
+        $valid = $post + [ 'cpms_public_listing_nonce' => wp_create_nonce( 'cpms_public_listing_' . $this->clinicB ) ];
+        $html  = $this->render_admin_save( $this->clinicB, $valid );
+        self::assertTrue( $directory->is_listed( $this->clinicB ) );
+        self::assertStringContainsString( 'notice-success', $html );
+        self::assertStringContainsString( 'checked=', $html );
+        self::assertFalse( $directory->is_listed( $this->clinicA ) );
+        unset( $valid['cpms_public_listing_enabled'] );
+        self::assertStringContainsString( 'notice-success', $this->render_admin_save( $this->clinicB, $valid ) );
+        self::assertFalse( $directory->is_listed( $this->clinicB ) );
+    }
+
+    private function assign_shared_clinician_to_location_b(): void {
+        // A schedule alone is not a durable assignment for the Location picker.
+        $this->insertRow(
+            'cpms_clinician_locations',
+            [
+                'clinician_id' => $this->sharedClinician,
+                'location_id'  => $this->locationB,
+                'is_primary'   => 1,
+                'created_at'   => $this->nowUtcSql(),
+            ],
+            [ '%d', '%d', '%d', '%s' ]
+        );
+    }
+
+    private function without_surface_id( string $html ): string {
+        return (string) preg_replace( '/id="cpms-public-booking-[0-9]+"/', 'id="fixture"', $html );
+    }
+
+    private function booking_quote_params( array $slot ): array {
+        return [
+            'clinician_id' => $this->sharedClinician,
+            'slot_id'      => $slot['slot_id'],
+            'slot_date'    => $slot['date'],
+            'slot_time'    => $slot['time'],
+        ];
+    }
+
+    private function dispatch_booking_reads( int $clinic_id, array $slot, bool $with_nonce, int $clinician_id ): array {
+        $availability = new WP_REST_Request( 'GET', self::NS . '/availability' );
+        $availability->set_query_params(
+            [
+                'clinic_id'    => $clinic_id,
+                'clinician_id' => $clinician_id,
+                'from'         => $slot['date'],
+                'to'           => $slot['date'],
+            ]
+        );
+        $quote  = new WP_REST_Request( 'POST', self::NS . '/booking/quote' );
+        $params = $this->booking_quote_params( $slot );
+        $params['clinician_id'] = $clinician_id;
+        $quote->set_body_params( $params );
+        if ( $with_nonce ) {
+            $nonce = wp_create_nonce( 'wp_rest' );
+            $availability->set_header( 'X-WP-Nonce', $nonce );
+            $quote->set_header( 'X-WP-Nonce', $nonce );
+        }
+
+        return [ rest_do_request( $availability ), rest_do_request( $quote ) ];
+    }
+
+    private function assert_booking_reads_denied( int $clinic_id, array $slot, bool $with_nonce = false ): void {
+        $hidden  = $this->dispatch_booking_reads( $clinic_id, $slot, $with_nonce, $this->sharedClinician );
+        $unknown = $this->dispatch_booking_reads( PHP_INT_MAX, $slot, $with_nonce, PHP_INT_MAX );
+        foreach ( $hidden as $index => $response ) {
+            self::assertSame( 404, $response->get_status() );
+            self::assertSame( $unknown[ $index ]->get_data(), $response->get_data() );
+            self::assertSame( [ 'status' => 404 ], $response->get_data()['data'] );
+        }
+    }
+
+    private function assert_booking_reads_visible( int $clinic_id, array $slot, int $location_id, bool $with_nonce = false ): void {
+        [ $availability, $quote ] = $this->dispatch_booking_reads( $clinic_id, $slot, $with_nonce, $this->sharedClinician );
+        self::assertSame( 200, $availability->get_status() );
+        $days = $this->days( $availability );
+        self::assertNotEmpty( $days );
+        self::assertSame( $location_id, $days[0]['slots'][0]['location_id'] );
+        self::assertNotEmpty( $days[0]['slots'][0]['location_name'] );
+        self::assertSame( 200, $quote->get_status() );
+        self::assertTrue( $this->data( $quote )['available'] );
+        self::assertSame( $location_id, $this->data( $quote )['location_id'] );
+    }
+
+    private function render_admin_save( int $clinic_id, array $post ): string {
+        $previous_get  = $_GET;
+        $previous_post = $_POST;
+        $_GET          = [ 'clinic_id' => (string) $clinic_id ];
+        $_POST         = $post;
+        ob_start();
+        try {
+            PublicShortcodeAdminPage::render();
+
+            return (string) ob_get_contents();
+        } finally {
+            ob_end_clean();
+            $_GET  = $previous_get;
+            $_POST = $previous_post;
+        }
+    }
 
     private function buildFixture(): void
     {

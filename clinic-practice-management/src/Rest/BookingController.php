@@ -6,6 +6,7 @@ namespace ClinicCore\Rest;
 
 use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Application\Booking\BookingService;
+use ClinicCore\Application\Clinic\PublicClinicDirectory;
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
@@ -222,34 +223,39 @@ final class BookingController extends RestBase
 
     // ---------- Handlers ----------
 
-    private function availability(WP_REST_Request $request): WP_REST_Response|WP_Error
-    {
-        $from = $request->get_param('from');
-        $to = $request->get_param('to');
-
+    private function availability( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+        $from      = $request->get_param( 'from' );
+        $to        = $request->get_param( 'to' );
         $clinic_id = $request->get_param( 'clinic_id' );
+        $directory = new PublicClinicDirectory();
 
-        return $this->wrap(fn () => $this->booking->availability(
-            (int) $request->get_param('clinician_id'),
-            is_string($from) && $from !== '' ? $from : null,
-            is_string( $to ) && $to !== '' ? $to : null,
-            // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase
-            $clinic_id !== null && $clinic_id !== '' ? (int) $clinic_id : null
-        ));
+        return $this->wrap(
+            fn () => $this->booking->availability(
+                (int) $request->get_param( 'clinician_id' ),
+                is_string( $from ) && '' !== $from ? $from : null,
+                is_string( $to ) && '' !== $to ? $to : null,
+                null !== $clinic_id && '' !== $clinic_id ? (int) $clinic_id : null,
+                static fn ( int $id ): bool => $directory->may_see_clinic( $id, $request->get_header( 'X-WP-Nonce' ) )
+            )
+        );
     }
 
-    private function quote(WP_REST_Request $request): WP_REST_Response|WP_Error
-    {
-        $slotId = $request->get_param('slot_id');
+    private function quote( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+        $slot_id     = $request->get_param( 'slot_id' );
         $location_id = $request->get_param( 'location_id' );
-        return $this->wrap(fn () => $this->booking->quote(
-            (int) $request->get_param('clinician_id'),
-            (string) $request->get_param('slot_date'),
-            (string) $request->get_param('slot_time'),
-            // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase
-            $slotId !== null && $slotId !== '' ? (int) $slotId : null,
-            $location_id !== null && $location_id !== '' ? (int) $location_id : null
-        ));
+        $directory   = new PublicClinicDirectory();
+
+        return $this->wrap(
+            fn () => $this->booking->quote(
+                (int) $request->get_param( 'clinician_id' ),
+                (string) $request->get_param( 'slot_date' ),
+                (string) $request->get_param( 'slot_time' ),
+                null !== $slot_id && '' !== $slot_id ? (int) $slot_id : null,
+                null !== $location_id && '' !== $location_id ? (int) $location_id : null,
+                static fn ( int $id ): bool => $directory->may_see_clinic( $id, $request->get_header( 'X-WP-Nonce' ) )
+            ),
+            true
+        );
     }
 
     private function hold(WP_REST_Request $request): WP_REST_Response|WP_Error
@@ -588,14 +594,19 @@ final class BookingController extends RestBase
      * Wrap استاندارد: BookingException → WP_Error با کد CLINIC_* + HTTP.
      *
      * @template T
-     * @param callable(): T $fn
+     * @param callable(): T $operation Execute the booking operation.
+     * @param bool $uniform_not_found Use one public quote envelope for hidden and missing selections.
      * @return WP_REST_Response|WP_Error
      */
-    private function wrap(callable $fn): WP_REST_Response|WP_Error
-    {
+    private function wrap( callable $operation, bool $uniform_not_found = false ): WP_REST_Response|WP_Error {
         try {
-            return $this->success($fn(), 200);
+            return $this->success( $operation(), 200 );
         } catch (BookingException $e) {
+            // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- Published BookingException properties.
+            if ( $uniform_not_found && 'CLINIC_NOT_FOUND' === $e->errorCode && 404 === $e->httpStatus ) {
+                return $this->error( 'CLINIC_NOT_FOUND', 404, 'پزشک یافت نشد' );
+            }
+
             return $this->error($e->errorCode, $e->httpStatus, $e->getMessage(), $e->data);
         } catch ( ScopeRequiredException $e ) {
             return $this->error( $e->apiCode(), $e->httpStatus(), $e->getMessage(), $e->getData() );

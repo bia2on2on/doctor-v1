@@ -9,12 +9,13 @@ declare(strict_types=1);
 
 namespace ClinicCore\Admin;
 
+use ClinicCore\Application\Clinic\PublicClinicDirectory;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Frontend\PublicBookingShortcode;
 
 /**
- * Read-only helper for CPMS shortcodes and their safe, Clinic-scoped examples.
+ * Clinic-scoped shortcode examples and public listing consent.
  */
 final class PublicShortcodeAdminPage {
 
@@ -34,7 +35,7 @@ final class PublicShortcodeAdminPage {
 			self::PAGE_SLUG,
 			array( self::class, 'render' )
 		);
-		// صفحهٔ کمکی (read-only) در زیرمنو شلوغی نمی‌سازد؛ از ناوبری بخش‌ها و URL مستقیم در دسترس است.
+		// صفحهٔ کمکی در زیرمنو شلوغی نمی‌سازد؛ از ناوبری بخش‌ها و URL مستقیم در دسترس است.
 		CpmsAdminMenu::hide_from_submenu( self::PAGE_SLUG );
 	}
 
@@ -57,6 +58,8 @@ final class PublicShortcodeAdminPage {
 				break;
 			}
 		}
+		$save_result     = PublicListingAdminAction::maybe_save( $clinic_id, $actor_user_id );
+		$is_listed       = ( new PublicClinicDirectory() )->is_listed( $clinic_id );
 		$registered_tags = self::registered_cpms_shortcodes();
 		?>
 		<div class="wrap" dir="rtl">
@@ -84,6 +87,22 @@ final class PublicShortcodeAdminPage {
 				<div class="notice notice-info"><p>برای نمایش کد، Clinic را صریحاً انتخاب کنید؛ هیچ Clinic پیش‌فرضی حدس زده نمی‌شود.</p></div>
 			<?php endif; ?>
 
+			<?php if ( false === $save_result ) : ?>
+				<div class="notice notice-error"><p>تنظیم نمایش عمومی ذخیره نشد یا تأیید آن ممکن نبود.</p></div>
+			<?php elseif ( true === $save_result ) : ?>
+				<div class="notice notice-success"><p>تنظیم نمایش عمومی ذخیره شد.</p></div>
+			<?php endif; ?>
+
+			<?php if ( $clinic_id > 0 ) : ?>
+				<form method="post" action="<?php echo esc_url( add_query_arg( 'clinic_id', $clinic_id, admin_url( 'admin.php?page=' . self::PAGE_SLUG ) ) ); ?>">
+					<?php wp_nonce_field( 'cpms_public_listing_' . $clinic_id, 'cpms_public_listing_nonce' ); ?>
+					<input type="hidden" name="cpms_public_listing_save" value="1">
+					<label><input type="checkbox" name="cpms_public_listing_enabled" value="1" <?php checked( $is_listed ); ?>> نمایش عمومی این مرکز</label>
+					<p class="description">با فعال کردن این گزینه، نام این مرکز، پزشکان، محل‌های نوبت‌پذیر و زمان‌های آزاد برای بازدیدکنندگان سایت قابل مشاهده می‌شوند.</p>
+					<button type="submit" class="button">ذخیرهٔ تنظیم نمایش عمومی</button>
+				</form>
+			<?php endif; ?>
+
 			<?php if ( $clinic_id > 0 && $registered_tags !== array() ) : ?>
 				<h2>کدهای کوتاه ثبت‌شده</h2>
 				<?php foreach ( $registered_tags as $tag ) : ?>
@@ -99,7 +118,7 @@ final class PublicShortcodeAdminPage {
 						<label for="cpms-shortcode-discovery-<?php echo esc_attr( $tag ); ?>">کد کوتاه «انتخاب مرکز» (چند‌مرکزی)</label>
 						<textarea id="cpms-shortcode-discovery-<?php echo esc_attr( $tag ); ?>" class="large-text code" rows="2" readonly dir="ltr" data-cpms-shortcode-discovery><?php echo esc_textarea( sprintf( '[%s clinic_id="all"]', $tag ) ); ?></textarea>
 						<p><button type="button" class="button button-primary" data-cpms-copy-discovery>کپی کد</button> <span role="status" aria-live="polite" data-cpms-copy-status-discovery></span></p>
-						<p class="description">با این کد، بازدیدکننده ابتدا مرکز درمانی را انتخاب می‌کند، سپس با جست‌وجوی نام پزشک و فیلتر تخصص، پزشک و نوبت هفتگی (تقویم جلالی) را می‌بیند. <strong>هیچ مرکزی به‌صورت پیش‌فرض در این فهرست نمایش داده نمی‌شود</strong>؛ هر مرکز باید ابتدا در تنظیمات خود کلید <code>public.listing_opt_in</code> را روی مقدار true بگذارد (پیش‌فرض: false). مرکز غیرفعال، سازمان غیرفعال، یا مرکز بدون محل فعالِ دارای پزشک واجد شرایط هرگز در این فهرست دیده نمی‌شود.</p>
+						<p class="description">با این کد، بازدیدکننده ابتدا مرکز درمانی را انتخاب می‌کند، سپس با جست‌وجوی نام پزشک و فیلتر تخصص، پزشک و نوبت هفتگی (تقویم جلالی) را می‌بیند. <strong>هیچ مرکزی به‌صورت پیش‌فرض در این فهرست نمایش داده نمی‌شود</strong>؛ هر مرکز باید ابتدا گزینهٔ «نمایش عمومی این مرکز» را روشن کند (پیش‌فرض: خاموش). مرکز غیرفعال، سازمان غیرفعال، یا مرکز بدون محل فعالِ دارای پزشک واجد شرایط هرگز در این فهرست دیده نمی‌شود.</p>
 					</section>
 				<?php endforeach; ?>
 			<?php elseif ( $clinic_id > 0 ) : ?>
