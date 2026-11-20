@@ -8186,3 +8186,6 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 - EQUALITY (OBSERVED): all 7 non-log LIST-OLD paths resolve to the SAME blob at the merge head as at `98d39f97`, and the head's diff vs main is byte-for-byte LIST-OLD (8 paths, identical list). So this sync changed nothing except this log — the owner's first condition holds.
 - Hidden messaging (OBSERVED on the merge head): `STAFF_MESSAGING_AVAILABLE` still `false` (`StaffPortalShell.php:104`) and the four routes stay gated (`App.php:394`); no migration, workflow or version change came from this PR's own file list.
 - Gates (OBSERVED): `/tmp/venv` was absent in this sandbox, so a fresh venv with PyYAML 6.0.3 was created; `WORKFLOW_YAML_OK files=17`; `git diff --check` clean. LIMITATION: no PHP locally — `php -l`, PHPCS and PHPUnit were NOT run; the merge touched no PHP line of this PR.
+
+### [2026-11-20 UTC] — PR-RESTORE-BARRIER-DECIDED: fail-closed restore prerequisites
+- Empty SQL is refused before writing a safety backup; restore also refuses populated targets, unverified DB migration versions, and hosts without the required lock fence. The legacy importer is unchanged and cannot run until that fence is implemented. Teardown refuses clearance pending the legacy-link gate. No workflow or migration was edited.
