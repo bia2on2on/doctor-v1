@@ -9,6 +9,7 @@ use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Machine\VisitMachine;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Repository\HandwritingRepository;
@@ -53,11 +54,108 @@ final class HandwritingService
     ) {
     }
 
-    private function assert_licensed_new_use(): void {
-        $gate = $this->license_gate ?? \ClinicCore\Bootstrap\App::licenseGate();
-        if ( ! $gate->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_HANDWRITING_NEW )->allowed ) {
+    /**
+     * Enforce license eligibility and active Visit state for handwriting writes.
+     *
+     * @param array<string, mixed>|null $visit Persisted cpms_visits row.
+     */
+    private function assert_licensed_new_use( ?array $visit = null ): void {
+        $gate    = $this->license_gate ?? \ClinicCore\Bootstrap\App::licenseGate();
+        $context = null !== $visit ? $this->visit_license_context( $visit ) : [];
+        if ( ! $gate->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_HANDWRITING_NEW, $context )->allowed ) {
             throw HandwritingException::of( 'CLINIC_LICENSE_BLOCKED', 'استفاده جدید از دست‌خط نیازمند تمدید مجوز است', 503 );
         }
+        if ( null !== $visit && ! $this->is_visit_opened( $visit ) ) {
+            throw HandwritingException::of( 'CLINIC_INVALID_TRANSITION', 'ویزیت فعال نیست و امکان ثبت دست‌خط ندارد', 409 );
+        }
+    }
+
+    /**
+     * Whether a persisted Visit row is currently open and non-terminal.
+     *
+     * @param array<string, mixed> $visit Persisted cpms_visits row.
+     */
+    private function is_visit_opened( array $visit ): bool {
+        $status = (string) ( $visit['status'] ?? '' );
+        $active = 1 === (int) ( $visit['active'] ?? 0 );
+
+        return $active && in_array( $status, VisitMachine::ACTIVE_STATUSES, true );
+    }
+
+    /**
+     * Build server-derived Visit provenance context for the license gate.
+     *
+     * @param array<string, mixed> $visit Persisted cpms_visits row.
+     * @return array{visit_id: int, clinic_id: int, visit_opened: bool, visit_created_at: int|null}
+     */
+    private function visit_license_context( array $visit ): array {
+        $created_ts = $this->parse_utc_timestamp( (string) ( $visit['created_at'] ?? '' ) );
+
+        return [
+            'visit_id'         => (int) ( $visit['id'] ?? 0 ),
+            'clinic_id'        => (int) ( $visit['clinic_id'] ?? 0 ),
+            'visit_opened'     => $this->is_visit_opened( $visit ),
+            'visit_created_at' => $created_ts,
+        ];
+    }
+
+    /**
+     * Parse a UTC SQL datetime string into a Unix timestamp.
+     */
+    private function parse_utc_timestamp( string $utc_sql ): ?int {
+        if ( '' === $utc_sql ) {
+            return null;
+        }
+        $clean = preg_replace( '/\.\d+$/', '', $utc_sql ) ?? $utc_sql;
+        try {
+            return ( new \DateTimeImmutable( $clean, new \DateTimeZone( 'UTC' ) ) )->getTimestamp();
+        } catch ( Throwable ) {
+            return null;
+        }
+    }
+
+    /**
+     * Lock and revalidate the persisted Visit inside a write transaction.
+     *
+     * @return array<string, mixed>
+     */
+    private function lock_and_revalidate_visit( int $actor_user_id, int $trusted_clinic_id, int $visit_id, string $scope ): array {
+        $locked_visit = $this->visits->findForUpdate( $visit_id );
+        if ( null === $locked_visit ) {
+            throw HandwritingException::of( 'CLINIC_NOT_FOUND', 'ویزیت یافت نشد', 404 );
+        }
+        if ( (int) $locked_visit['clinic_id'] !== $trusted_clinic_id ) {
+            throw HandwritingException::of( 'CLINIC_NOT_FOUND', 'سند/صفحه یافت نشد', 404 );
+        }
+        $clinician_id = $this->db->fetchValue(
+            'SELECT id FROM ' . $this->db->table( 'cpms_clinicians' ) . ' WHERE wp_user_id = %d AND is_active = 1 LIMIT 1',
+            [ $actor_user_id ]
+        );
+        if ( null === $clinician_id || (int) $clinician_id !== (int) $locked_visit['clinician_id'] ) {
+            $user = get_userdata( $actor_user_id );
+            $this->audit->log(
+                'FORBIDDEN_ACCESS_ATTEMPT',
+                [
+                    'wp_user_id' => $actor_user_id,
+                    'role'       => ( $user->roles[0] ?? 'unknown' ),
+                ],
+                'handwriting',
+                $visit_id,
+                (int) $locked_visit['patient_id'],
+                null,
+                null,
+                [
+                    'reason' => 'not_own_visit',
+                    'scope'  => $scope,
+                ],
+                (int) $locked_visit['clinic_id']
+            );
+
+            throw HandwritingException::of( 'CLINIC_NOT_FOUND', 'این ویزیت به حساب شما متصل نیست', 404 );
+        }
+        $this->assert_licensed_new_use( $locked_visit );
+
+        return $locked_visit;
     }
 
     // ================= F1 — ایجاد سند =================
@@ -79,7 +177,7 @@ final class HandwritingService
         $this->authorizeClinicScoped($actorUserId, $trustedClinicId, RolesAndCapabilities::NOTE_CREATE, (int) $visit['clinic_id'], 'create_document');
 
         $visit = $this->requireOwnVisit($actorUserId, $visitId, 'create_document');
-        $this->assert_licensed_new_use();
+        $this->assert_licensed_new_use( $visit );
 
         if ($pages === []) {
             $pages = [['width' => 1240, 'height' => 1754]];
@@ -88,14 +186,24 @@ final class HandwritingService
         // Bound to a variable first so the multi-line closure keeps the
         // PEAR.Functions.FunctionCallSignature contract (open parenthesis last
         // on its line) and the legacy camelCase imports stay explicitly scoped.
-        $create_document = function () use ( $actorUserId, $trustedClinicId, $visitId, $visit, $title, $pages ): array { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy parameter naming preserved inside the transactional boundary.
-            $documentId = $this->handwriting->insertDocument($trustedClinicId, [
-                'visit_id' => $visitId,
-                'patient_id' => (int) $visit['patient_id'],
-                'clinician_id' => (int) $visit['clinician_id'],
-                'title' => $title !== null ? mb_substr(trim($title), 0, 190) : null,
-                'page_count' => 0,
-            ]);
+        $create_document = function () use ( $actorUserId, $trustedClinicId, $visitId, $title, $pages ): array { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy parameter naming preserved inside the transactional boundary.
+            $locked_visit = $this->lock_and_revalidate_visit(
+                (int) $actorUserId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                (int) $trustedClinicId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                (int) $visitId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                'create_document'
+            );
+            $document_id  = $this->handwriting->insertDocument(
+                (int) $trustedClinicId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                [
+                    'visit_id'     => $visitId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                    'patient_id'   => (int) $locked_visit['patient_id'],
+                    'clinician_id' => (int) $locked_visit['clinician_id'],
+                    'title'        => $title !== null ? mb_substr( trim( $title ), 0, 190 ) : null,
+                    'page_count'   => 0,
+                ]
+            );
+            $documentId   = $document_id; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy variable naming preserved.
 
             $created = [];
             foreach (array_values($pages) as $i => $p) {
@@ -179,18 +287,23 @@ final class HandwritingService
             throw HandwritingException::of('CLINIC_NOT_FOUND', 'ویزیت یافت نشد', 404);
         }
         $this->authorizeClinicScoped($actorUserId, $trustedClinicId, RolesAndCapabilities::NOTE_CREATE, (int) $doc['clinic_id'], 'add_page');
-        $this->requireOwnVisit($actorUserId, (int) $doc['visit_id'], 'add_page');
-        $this->assert_licensed_new_use();
-
-        $existing = $this->handwriting->pagesForDocument($documentId);
-        $index = count($existing);
+        $visit = $this->requireOwnVisit( $actorUserId, (int) $doc['visit_id'], 'add_page' ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+        $this->assert_licensed_new_use( $visit );
 
         // Bound to a variable first so the multi-line closure keeps the
         // PEAR.Functions.FunctionCallSignature contract (open parenthesis last
         // on its line) and the legacy camelCase imports stay explicitly scoped.
-        $add_page = function () use ( $actorUserId, $documentId, $page, $index, $doc ): array { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy parameter naming preserved inside the transactional boundary.
-            $rowId = $this->handwriting->insertPage($this->pageRow($page, $documentId, $index));
-            $this->handwriting->updateDocument($documentId, ['page_count' => $index + 1]);
+        $add_page = function () use ( $actorUserId, $trustedClinicId, $documentId, $page, $doc ): array { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy parameter naming preserved inside the transactional boundary.
+            $this->lock_and_revalidate_visit(
+                (int) $actorUserId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                (int) $trustedClinicId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                (int) $doc['visit_id'],
+                'add_page'
+            );
+            $existing = $this->handwriting->pagesForDocument( $documentId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+            $index    = count( $existing );
+            $rowId    = $this->handwriting->insertPage( $this->pageRow( $page, $documentId, $index ) ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+            $this->handwriting->updateDocument( $documentId, [ 'page_count' => $index + 1 ] ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
 
             $row = $this->handwriting->findPage( $rowId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
 
@@ -267,7 +380,7 @@ final class HandwritingService
         $doc = $this->requireDocument((int) $page['document_id']);
         $this->authorizeClinicScoped($actorUserId, $trustedClinicId, RolesAndCapabilities::NOTE_CREATE, (int) $doc['clinic_id'], 'save_page');
         $visit = $this->requireOwnVisit($actorUserId, (int) $doc['visit_id'], 'save_page');
-        $this->assert_licensed_new_use();
+        $this->assert_licensed_new_use( $visit );
 
         if ($idemKey !== null) {
             $check = $this->idem->check($idemKey, 'handwriting/page', $actorUserId, $pageId, $trustedClinicId);
@@ -386,26 +499,58 @@ final class HandwritingService
         }
 
         $encoded = $this->encodeStored($strokes);
-        $newVersion = (int) $page['version'] + 1;
+
+        $trusted_clinic_id = $this->requireTrustedClinicId();
 
         // Bound to a variable first so the legacy multi-line closure keeps its
         // original body bytes (PEAR.Functions.FunctionCallSignature requires the
         // open parenthesis to be the last content on a multi-line call line).
-        $save_page = function () use ( $pageId, $encoded, $strokes, $update, $source, $newVersion, $clientRevision, $actorUserId, $doc, $page, $body ): void { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy closure imports retained for pre-existing body.
-            $update['stroke_data'] = $encoded;
-            $update['stroke_count'] = count($strokes);
-            $update['client_revision'] = $clientRevision;
-            $update['version'] = $newVersion;
-            $update['last_saved_at'] = $this->db->nowUtcSql();
-            $this->handwriting->updatePage($pageId, $update);
+        $save_page = function () use ( $pageId, $encoded, $strokes, $update, $source, $clientRevision, $actorUserId, $doc, $body, $trusted_clinic_id ): int { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy closure imports retained for pre-existing body.
+            $this->lock_and_revalidate_visit(
+                (int) $actorUserId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                $trusted_clinic_id,
+                (int) $doc['visit_id'],
+                'save_page'
+            );
+            $locked_page = $this->handwriting->find_page_for_update( (int) $pageId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+            if ( null === $locked_page ) {
+                throw HandwritingException::of( 'CLINIC_NOT_FOUND', 'صفحه دست‌خط یافت نشد', 404 );
+            }
+            $locked_revision = (int) $locked_page['client_revision'];
+            $locked_version  = (int) $locked_page['version'];
+            if ( (int) $clientRevision !== $locked_revision + 1 ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                throw HandwritingException::of(
+                    'CLINIC_CONFLICT',
+                    'این صفحه روی سرور تغییر کرده است — نسخه سرور را باز کنید یا نسخه خود را بازنویسی کنید',
+                    409,
+                    [
+                        'server' => [
+                            'client_revision' => $locked_revision,
+                            'version'         => $locked_version,
+                            'last_saved_at'   => $locked_page['last_saved_at'],
+                            'strokes'         => $this->decodeStored( (string) $locked_page['stroke_data'] ),
+                        ],
+                    ]
+                );
+            }
 
-            $this->handwriting->insertVersion([
-                'page_id' => $pageId,
-                'version' => $newVersion,
-                'stroke_data' => $encoded,
-                'saved_by' => $source,
-                'created_at' => $this->db->nowUtcSql(),
-            ]);
+            $new_version               = $locked_version + 1;
+            $update['stroke_data']     = $encoded;
+            $update['stroke_count']    = count( $strokes );
+            $update['client_revision'] = (int) $clientRevision; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+            $update['version']         = $new_version;
+            $update['last_saved_at']   = $this->db->nowUtcSql();
+            $this->handwriting->update_page_or_fail( (int) $pageId, $update ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+
+            $this->handwriting->insert_version_or_fail(
+                [
+                    'page_id'     => (int) $pageId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                    'version'     => $new_version,
+                    'stroke_data' => $encoded,
+                    'saved_by'    => $source,
+                    'created_at'  => $this->db->nowUtcSql(),
+                ]
+            );
 
             // D6 audit atomicity: page update, append-only version and the
             // mandatory audit commit/roll back together. (The conflict-path
@@ -413,7 +558,6 @@ final class HandwritingService
             $actor_user_id = (int) $actorUserId; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
             $page_id       = (int) $pageId; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
             $client_rev    = (int) $clientRevision; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
-            $new_version   = (int) $newVersion; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
 
             $this->audit->log(
                 'HW_PAGE_SAVE',
@@ -421,7 +565,7 @@ final class HandwritingService
                 'handwriting_page',
                 $page_id,
                 (int) $doc['patient_id'],
-                [ 'client_revision' => (int) $page['client_revision'], 'version' => (int) $page['version'] ],
+                [ 'client_revision' => $locked_revision, 'version' => $locked_version ],
                 [ 'client_revision' => $client_rev, 'version' => $new_version ],
                 [
                     'saved_by'        => $source,
@@ -430,23 +574,51 @@ final class HandwritingService
                 ],
                 (int) $doc['clinic_id']
             );
+
+            return $new_version;
         };
 
-        $this->db->transactional( $save_page );
+        try {
+            $committed_version = $this->db->transactional( $save_page );
+        } catch ( HandwritingException $conflict_exception ) {
+            if ( 'CLINIC_CONFLICT' === $conflict_exception->errorCode ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- Established HandwritingException property.
+                $server          = is_array( $conflict_exception->data['server'] ?? null ) ? $conflict_exception->data['server'] : [];
+                $locked_revision = (int) ( $server['client_revision'] ?? $serverRevision ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                $locked_version  = (int) ( $server['version'] ?? (int) $page['version'] );
+                $this->audit->log(
+                    'HW_PAGE_SAVE',
+                    $this->actor( (int) $actorUserId ), // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                    'handwriting_page',
+                    $pageId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                    (int) $doc['patient_id'],
+                    [ 'client_revision' => $locked_revision, 'version' => $locked_version ],
+                    null,
+                    [
+                        'conflict'        => true,
+                        'client_revision' => $clientRevision, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                        'server_revision' => $locked_revision,
+                        'reason'          => 'revision_mismatch',
+                    ],
+                    (int) $doc['clinic_id']
+                );
+            }
+
+            throw $conflict_exception;
+        }
 
         // D6: success-path HW_PAGE_SAVE now commits inside the save transaction
         // above; the conflict-path audit stays outside (it writes nothing).
 
         return [
             'response' => [
-                'page_id' => $pageId,
-                'client_revision' => $clientRevision,
-                'version' => $newVersion,
-                'stroke_count' => count($strokes),
-                'saved_by' => $source,
-                'last_saved_at' => $this->db->nowUtcSql(),
+                'page_id'         => $pageId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                'client_revision' => $clientRevision, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                'version'         => $committed_version,
+                'stroke_count'    => count( $strokes ),
+                'saved_by'        => $source,
+                'last_saved_at'   => $this->db->nowUtcSql(),
             ],
-            'status' => 200,
+            'status'   => 200,
         ];
     }
 
