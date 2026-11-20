@@ -545,6 +545,7 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
     // =========================================================================
 
     public function test_bound_and_discovery_shortcode_require_each_clinics_consent(): void {
+        $this->assign_shared_clinician_to_location_b();
         App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
         $unknown = $this->render( (string) PHP_INT_MAX );
         $hidden  = $this->render( (string) $this->clinicB );
@@ -601,6 +602,7 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
     }
 
     public function test_only_private_portal_variant_publishes_unlisted_linked_clinic(): void {
+        $this->assign_shared_clinician_to_location_b();
         App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
         App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
         $unknown = $this->without_surface_id( $this->render( (string) PHP_INT_MAX ) );
@@ -670,6 +672,20 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
         unset( $valid['cpms_public_listing_enabled'] );
         self::assertStringContainsString( 'notice-success', $this->render_admin_save( $this->clinicB, $valid ) );
         self::assertFalse( $directory->is_listed( $this->clinicB ) );
+    }
+
+    private function assign_shared_clinician_to_location_b(): void {
+        // A schedule alone is not a durable assignment for the Location picker.
+        $this->insertRow(
+            'cpms_clinician_locations',
+            [
+                'clinician_id' => $this->sharedClinician,
+                'location_id'  => $this->locationB,
+                'is_primary'   => 1,
+                'created_at'   => $this->nowUtcSql(),
+            ],
+            [ '%d', '%d', '%d', '%s' ]
+        );
     }
 
     private function without_surface_id( string $html ): string {

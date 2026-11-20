@@ -594,13 +594,13 @@ final class BookingController extends RestBase
      * Wrap استاندارد: BookingException → WP_Error با کد CLINIC_* + HTTP.
      *
      * @template T
-     * @param callable(): T $fn Execute the booking operation.
+     * @param callable(): T $operation Execute the booking operation.
      * @param bool $uniform_not_found Use one public quote envelope for hidden and missing selections.
      * @return WP_REST_Response|WP_Error
      */
-    private function wrap( callable $fn, bool $uniform_not_found = false ): WP_REST_Response|WP_Error {
+    private function wrap( callable $operation, bool $uniform_not_found = false ): WP_REST_Response|WP_Error {
         try {
-            return $this->success($fn(), 200);
+            return $this->success( $operation(), 200 );
         } catch (BookingException $e) {
             // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- Published BookingException properties.
             if ( $uniform_not_found && 'CLINIC_NOT_FOUND' === $e->errorCode && 404 === $e->httpStatus ) {
