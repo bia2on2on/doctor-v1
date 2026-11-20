@@ -36,43 +36,51 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
         $this->iv1_boot();
     }
 
+    /** Previous process-wide REST server, restored by tearDown(). */
+    private $previous_rest_server = null;
+
+    /** True while this class has a swapped-in REST server installed. */
+    private bool $rest_server_swapped = false;
+
     /**
      * R1 (1.0): `StaffPortalShell::STAFF_MESSAGING_AVAILABLE` is false for the
      * 1.0 line, so the real boot does not register these routes (asserted in
-     * StaffMessagingHiddenReleaseOneTest). The four REST tests below register the
-     * controller themselves so every permission, rate-limit and XSS assertion
-     * keeps running — they are the evidence for the day the switch is flipped on.
+     * StaffMessagingHiddenReleaseOneTest). The four REST tests below install a
+     * server that carries the controller, so every permission, rate-limit and
+     * XSS assertion keeps running — they are the evidence for the day the switch
+     * is flipped on.
      *
-     * Deliberately called ONLY from those four tests, never from `setUp()`: the
-     * service-level tests in this class dispatch no REST request, and
-     * `rest_get_server()` creates the process-wide server and fires
-     * `rest_api_init` (which runs `App::ensureMigrated()`) on the first caller.
-     * Doing that in `setUp()` put that whole side effect inside the FIRST test's
-     * execution — the position where this class's one red test sits.
-     *
-     * Registered ONCE per server instance. A per-process flag silently loses the
-     * routes when the process-wide `$wp_rest_server` is replaced (test order);
-     * registering on every test is equally wrong because register_rest_route()
-     * reports `_doing_it_wrong` for an already registered route and that WP_Error
-     * then replaces the real response.
+     * Same pattern as StaffMessagingHiddenReleaseOneTest and
+     * RestPermissionCallbackTest: build a FRESH server, fire `rest_api_init` on
+     * it, then register. Firing the action first is what makes
+     * register_rest_route() legal — WordPress raises `_doing_it_wrong` when it is
+     * called after `did_action( 'rest_api_init' )` is 0, and this harness resets
+     * `$wp_actions` between tests, so a reused server's action count is 0 even
+     * though the server is populated. WP_UnitTestCase turns that unexpected
+     * `_doing_it_wrong` into a test failure, which is exactly what made the first
+     * registering test red. On a fresh server App's own `rest_api_init`
+     * callbacks run once, so no route is registered twice.
      */
     private function register_messaging_routes(): void
     {
-        $server = rest_get_server(); // fires rest_api_init, so registration is legal.
-        $already = false;
-        foreach ( array_keys( $server->get_routes() ) as $registered ) {
-            if ( false !== strpos( (string) $registered, '/staff/portal/messages/context' ) ) {
-                $already = true;
-                break;
-            }
-        }
-        if ( ! $already ) {
-            ( new MessagingController( App::staff_messaging_service() ) )->register_routes();
-        }
+        global $wp_rest_server;
+
+        $this->previous_rest_server = $wp_rest_server ?? null;
+        $wp_rest_server             = new \WP_REST_Server();
+        $this->rest_server_swapped  = true;
+
+        do_action( 'rest_api_init', $wp_rest_server );
+        ( new MessagingController( App::staff_messaging_service() ) )->register_routes();
     }
 
     protected function tearDown(): void
     {
+        if ( $this->rest_server_swapped ) {
+            global $wp_rest_server;
+            $wp_rest_server             = $this->previous_rest_server;
+            $this->previous_rest_server = null;
+            $this->rest_server_swapped  = false;
+        }
         $this->iv1_reset();
         parent::tearDown();
     }
