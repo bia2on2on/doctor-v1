@@ -1758,6 +1758,10 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
                 $this->withRealTables(static fn (): ?string => App::migrations()->rollbackOne());
                 $versionBeforeRollback = App::migrations()->currentVersion();
             }
+            if ($versionBeforeRollback === '2026_10_31_0031') {
+                $this->withRealTables(static fn (): ?string => App::migrations()->rollbackOne());
+                $versionBeforeRollback = App::migrations()->currentVersion();
+            }
             if ($versionBeforeRollback === '2026_10_27_0030') {
                 $this->withRealTables(static fn (): ?string => App::migrations()->rollbackOne());
                 $versionBeforeRollback = App::migrations()->currentVersion();

@@ -114,6 +114,7 @@ final class CustomRoleDisplayNameMigrationTest extends WP_UnitTestCase
         $this->withRealTables(function () use ($wpdb, $defs): void {
             $rolledHead = App::migrations()->rollbackOne();
             self::assertSame(self::HEAD_VERSION, $rolledHead, 'later migrations must roll back before the display-name migration');
+            self::assertSame('2026_10_31_0031', App::migrations()->rollbackOne(), 'the audit guard migration must roll back before the display-name migration');
             self::assertSame('2026_10_27_0030', App::migrations()->rollbackOne(), 'the messaging/pricing migration must roll back before the display-name migration');
             self::assertSame('2026_10_18_0029', App::migrations()->rollbackOne(), 'the Clinic-lifecycle migration must roll back before the display-name migration');
             self::assertSame('2026_10_18_0028', App::migrations()->rollbackOne(), 'the Organization-membership migration must roll back before the display-name migration');
@@ -148,6 +149,7 @@ final class CustomRoleDisplayNameMigrationTest extends WP_UnitTestCase
         try {
             $this->withRealTables(function () use ($wpdb, $defs): void {
                 self::assertSame(self::HEAD_VERSION, App::migrations()->rollbackOne());
+                self::assertSame('2026_10_31_0031', App::migrations()->rollbackOne());
                 self::assertSame('2026_10_27_0030', App::migrations()->rollbackOne());
                 self::assertSame('2026_10_18_0029', App::migrations()->rollbackOne());
                 self::assertSame('2026_10_18_0028', App::migrations()->rollbackOne());
