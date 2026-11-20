@@ -705,4 +705,107 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
         );
     }
 
+    /**
+     * Probe: the unread/timestamp service path works while the module is hidden.
+     */
+    public function testUnlinkedUnreadAndTimestampsWorkWhileModuleHidden(): void
+    {
+        $world = $this->world();
+        wp_set_current_user((int) $world['doctor']);
+        $thread = $this->call_thread($world, (int) $world['doctor'], [
+            'recipient_wp_user_id' => (int) $world['secretary'],
+        ]);
+        self::assertGreaterThan(0, (int) $thread['id']);
+        $service = App::staff_messaging_service();
+        $sent = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->send(
+            (int) $world['doctor'],
+            (int) $thread['id'],
+            'پیام آزمایشی بدون پیوند.'
+        ));
+        self::assertNotSame('', (string) $sent['created_at']);
+        self::assertNotSame('', (string) $sent['jalali_time']);
+        $listing = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->threads((int) $world['secretary']));
+        self::assertCount(1, $listing['threads']);
+        self::assertSame(1, (int) $listing['threads'][0]['unread_count']);
+        self::assertSame(1, (int) $listing['unread_total']);
+        $read = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->mark_read((int) $world['secretary'], (int) $thread['id']));
+        self::assertSame(0, (int) $read['unread_count']);
+    }
+
+    /**
+     * Probe: a patient/visit-linked thread persists while the module is hidden.
+     */
+    public function testLinkedThreadPersistsVisitAndLocationWhileModuleHidden(): void
+    {
+        $world = $this->world();
+        wp_set_current_user((int) $world['doctor']);
+        $thread = $this->call_thread($world, (int) $world['doctor'], [
+            'recipient_wp_user_id' => (int) $world['secretary'],
+            'patient_id'           => (int) $world['patient'],
+            'visit_id'             => (int) $world['visit'],
+        ]);
+        self::assertSame((int) $world['visit'], (int) $thread['visit_id']);
+        self::assertSame((int) $world['location'], (int) $thread['location_id']);
+        $service = App::staff_messaging_service();
+        $this->iv1_scope((int) $world['clinic'], fn (): array => $service->send(
+            (int) $world['doctor'],
+            (int) $thread['id'],
+            'پیام پیوندشده.'
+        ));
+        $inbox = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->messages((int) $world['secretary'], (int) $thread['id'], 0, 50));
+        self::assertCount(1, $inbox['messages']);
+        self::assertFalse($inbox['messages'][0]['mine']);
+        self::assertArrayNotHasKey('clinical_note', $inbox['messages'][0]);
+        self::assertArrayNotHasKey('medical_record', $inbox['messages'][0]);
+    }
+
+    /**
+     * Probe: XSS sanitization, incremental polling and audit work while hidden.
+     */
+    public function testXssIncrementalPollingAndAuditWorkWhileModuleHidden(): void
+    {
+        $world = $this->world();
+        wp_set_current_user((int) $world['doctor']);
+        $thread = $this->call_thread($world, (int) $world['doctor'], [
+            'recipient_wp_user_id' => (int) $world['secretary'],
+        ]);
+        $service = App::staff_messaging_service();
+        $sent = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->send(
+            (int) $world['doctor'],
+            (int) $thread['id'],
+            '<script>alert(1)</script>سلام.'
+        ));
+        self::assertStringNotContainsString('<script', (string) $sent['body']);
+        self::assertStringContainsString('سلام', (string) $sent['body']);
+        $reply = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->send(
+            (int) $world['secretary'],
+            (int) $thread['id'],
+            'پاسخ.'
+        ));
+        self::assertTrue($reply['mine']);
+        $incremental = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->messages((int) $world['doctor'], (int) $thread['id'], (int) $sent['id'], 50));
+        self::assertCount(1, $incremental['messages']);
+        self::assertSame((int) $reply['id'], (int) ($incremental['messages'][0]['id'] ?? 0));
+        $audit = App::db()->fetchValue(
+            'SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs')
+            . " WHERE action = 'MESSAGE_SEND' AND resource_id = %d AND COALESCE(meta_json, '') NOT LIKE %s",
+            [(int) $reply['id'], '%alert(1)%']
+        );
+        self::assertSame(1, (int) $audit);
+    }
+
+    /**
+     * Probe: counterparts stay eligible while the module menu is hidden.
+     */
+    public function testCounterpartsRemainEligibleWhileModuleHidden(): void
+    {
+        $world = $this->world();
+        self::assertFalse(StaffPortalShell::STAFF_MESSAGING_AVAILABLE);
+        self::assertFalse(StaffPortalShell::messages_module_eligible((int) $world['doctor']));
+        self::assertFalse(StaffPortalShell::messages_module_eligible((int) $world['secretary']));
+        $context = $this->iv1_scope((int) $world['clinic'], fn (): array => App::staff_messaging_service()->context((int) $world['secretary']));
+        self::assertSame(StaffMessagingService::RETENTION_POLICY, $context['retention_policy']);
+        self::assertContains((int) $world['doctor'], array_column((array) $context['counterparts'], 'wp_user_id'));
+    }
+
 }
