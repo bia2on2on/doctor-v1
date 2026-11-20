@@ -80,4 +80,54 @@ final class PostExpirationPolicyTest extends TestCase
         $this->assertFalse($this->gate($t0, $now)->assert(LicenseGate::OP_APPOINTMENT_BOOK)->allowed);
         $this->assertTrue($this->gate($now + 86400, $now)->assert(LicenseGate::OP_APPOINTMENT_BOOK)->allowed);
     }
+
+    public function testHandwritingForOpenedVisitExactStage2AndStage3HalfOpenBoundaries(): void
+    {
+        $t0 = strtotime('2028-01-31 12:34:56 UTC');
+        $t1 = PostExpirationPolicy::deadline($t0, 1);
+
+        // Pre-T0 opened visit works in Stage 1, Stage 2 (T0 .. T1-1), and Stage 3 (T1 onward).
+        foreach ([$t0 - 1, $t0, $t1 - 1, $t1, $t1 + 86400] as $now) {
+            $this->assertTrue(
+                $this->gate($t0, $now)->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                    'visit_opened' => true,
+                    'visit_created_at' => $t0 - 60,
+                ])->allowed,
+                "pre-T0 opened visit must allow handwriting at {$now}"
+            );
+        }
+
+        // Visit opened in Stage 2 just before T1 remains eligible at/after T1.
+        foreach ([$t1 - 1, $t1, $t1 + 86400] as $now) {
+            $this->assertTrue(
+                $this->gate($t0, $now)->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                    'visit_opened' => true,
+                    'visit_created_at' => $t1 - 1,
+                ])->allowed,
+                "Stage-2 opened visit must allow handwriting at {$now}"
+            );
+        }
+
+        // Visit created at or after T1 is not an already-opened pre-T1 visit in Stage 3.
+        foreach ([$t1, $t1 + 1] as $now) {
+            $this->assertFalse(
+                $this->gate($t0, $now)->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                    'visit_opened' => true,
+                    'visit_created_at' => $t1,
+                ])->allowed,
+                "post-T1 visit must be denied handwriting in Stage 3 at {$now}"
+            );
+        }
+
+        // Closed/terminal visit (visit_opened=false) is denied in Stage 2 and Stage 3.
+        foreach ([$t0, $t1 - 1, $t1] as $now) {
+            $this->assertFalse(
+                $this->gate($t0, $now)->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                    'visit_opened' => false,
+                    'visit_created_at' => $t0 - 60,
+                ])->allowed,
+                "closed visit must be denied handwriting after T0 at {$now}"
+            );
+        }
+    }
 }
