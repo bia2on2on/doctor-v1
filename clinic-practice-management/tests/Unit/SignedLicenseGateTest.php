@@ -399,4 +399,111 @@ final class SignedLicenseGateTest extends TestCase
             );
         }
     }
+
+    public function testNonExpiryStatusesWithExpiryReasonsStillAllowOpenedVisit(): void
+    {
+        $now = 1793448000;
+        $expiresAt = $now - 45 * 86400; // Past T1 (+1 month).
+        $t1 = \ClinicCore\Domain\Licensing\PostExpirationPolicy::deadline($expiresAt, 1);
+        $postT1VisitCreated = $now - 60;
+
+        $makeGate = static function (string $status, string $reason, int $expires) use ($now): SignedLicenseGate {
+            $provider = new class($status, $reason, $expires) implements LicenseStateProvider {
+                public function __construct(
+                    private readonly string $status,
+                    private readonly string $reason,
+                    private readonly int $expiresAt
+                ) {
+                }
+
+                public function currentState(): array
+                {
+                    return [
+                        'status' => $this->status,
+                        'reason' => $this->reason,
+                        'expires_at' => $this->expiresAt,
+                        'needs_renewal' => true,
+                    ];
+                }
+
+                public function entitlements(): EntitlementRegistry
+                {
+                    return new EntitlementRegistry();
+                }
+            };
+
+            return new SignedLicenseGate($provider, null, static fn (): int => $now);
+        };
+
+        $nonExpiryStatuses = [
+            LicenseStatus::REVOKED,
+            LicenseStatus::SUSPENDED,
+            LicenseStatus::INVALID,
+            LicenseStatus::THROTTLED,
+            LicenseStatus::NOT_CONFIGURED,
+            LicenseStatus::ACTIVATION_PENDING,
+            LicenseStatus::ACTIVATION_GRACE,
+            LicenseStatus::DEVELOPMENT,
+        ];
+        $spuriousReasons = [
+            'cached_state_stale',
+            'expired_unreachable',
+            'expired',
+            'activation_window_expired',
+            'migration_grace_expired',
+            'binding_mismatch',
+        ];
+        foreach ($nonExpiryStatuses as $status) {
+            foreach ($spuriousReasons as $reason) {
+                $decision = $makeGate($status, $reason, $expiresAt)->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                    'visit_opened' => true,
+                    'visit_created_at' => $postT1VisitCreated,
+                ]);
+                $this->assertTrue(
+                    $decision->allowed,
+                    "status={$status} with spurious reason={$reason} must still allow opened visit"
+                );
+            }
+        }
+
+        // UNREACHABLE only applies T1 cutoff for reason='cached_state_stale';
+        // RESTRICTED only applies T1 cutoff for 'expired'|'expired_unreachable' (or window cutoff for window reasons).
+        foreach ([
+            [LicenseStatus::UNREACHABLE, 'no_cached_state'],
+            [LicenseStatus::UNREACHABLE, 'expired'],
+            [LicenseStatus::UNREACHABLE, 'expired_unreachable'],
+            [LicenseStatus::RESTRICTED, 'binding_mismatch'],
+        ] as [$status, $reason]) {
+            $this->assertTrue(
+                $makeGate($status, $reason, $expiresAt)->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                    'visit_opened' => true,
+                    'visit_created_at' => $postT1VisitCreated,
+                ])->allowed,
+                "{$status}/{$reason} must allow opened visit regardless of expires_at"
+            );
+        }
+
+        // Real expiry status+reason combinations still enforce Stage 3 T1 boundary.
+        foreach ([
+            [LicenseStatus::RESTRICTED, 'expired'],
+            [LicenseStatus::RESTRICTED, 'expired_unreachable'],
+            [LicenseStatus::UNREACHABLE, 'cached_state_stale'],
+        ] as [$status, $reason]) {
+            $gate = $makeGate($status, $reason, $expiresAt);
+            $this->assertTrue(
+                $gate->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                    'visit_opened' => true,
+                    'visit_created_at' => $t1 - 1,
+                ])->allowed,
+                "{$status}/{$reason}: visit opened before T1 remains writable"
+            );
+            $this->assertFalse(
+                $gate->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                    'visit_opened' => true,
+                    'visit_created_at' => $t1,
+                ])->allowed,
+                "{$status}/{$reason}: visit created at/after T1 must be denied"
+            );
+        }
+    }
 }

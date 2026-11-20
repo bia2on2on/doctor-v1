@@ -50,7 +50,8 @@ final class SignedLicenseGate implements LicenseGate
         if ( self::OP_HANDWRITING_NEW === $operation && true === ( $context['visit_opened'] ?? false ) ) {
             $reason_str     = (string) ( $state['reason'] ?? '' );
             $expiry_bounded = $ordinary
-                || in_array( $reason_str, [ 'cached_state_stale', 'expired_unreachable' ], true );
+                || ( LicenseStatus::UNREACHABLE === $status && 'cached_state_stale' === $reason_str )
+                || ( LicenseStatus::RESTRICTED === $status && 'expired_unreachable' === $reason_str );
             if ( $expiry_bounded && is_int( $expires_at ) && $expires_at > 0 ) {
                 $t1 = PostExpirationPolicy::deadline( $expires_at, 1 );
                 if ( $now >= $t1 ) {

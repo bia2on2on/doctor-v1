@@ -540,7 +540,7 @@ final class HandwritingService
             $update['client_revision'] = (int) $clientRevision; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
             $update['version']         = $new_version;
             $update['last_saved_at']   = $this->db->nowUtcSql();
-            $this->handwriting->updatePage( (int) $pageId, $update ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+            $this->handwriting->update_page_or_fail( (int) $pageId, $update ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
 
             $this->handwriting->insert_version_or_fail(
                 [
@@ -578,7 +578,33 @@ final class HandwritingService
             return $new_version;
         };
 
-        $committed_version = $this->db->transactional( $save_page );
+        try {
+            $committed_version = $this->db->transactional( $save_page );
+        } catch ( HandwritingException $conflict_exception ) {
+            if ( 'CLINIC_CONFLICT' === $conflict_exception->errorCode ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- Established HandwritingException property.
+                $server          = is_array( $conflict_exception->data['server'] ?? null ) ? $conflict_exception->data['server'] : [];
+                $locked_revision = (int) ( $server['client_revision'] ?? $serverRevision ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                $locked_version  = (int) ( $server['version'] ?? (int) $page['version'] );
+                $this->audit->log(
+                    'HW_PAGE_SAVE',
+                    $this->actor( (int) $actorUserId ), // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                    'handwriting_page',
+                    $pageId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                    (int) $doc['patient_id'],
+                    [ 'client_revision' => $locked_revision, 'version' => $locked_version ],
+                    null,
+                    [
+                        'conflict'        => true,
+                        'client_revision' => $clientRevision, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+                        'server_revision' => $locked_revision,
+                        'reason'          => 'revision_mismatch',
+                    ],
+                    (int) $doc['clinic_id']
+                );
+            }
+
+            throw $conflict_exception;
+        }
 
         // D6: success-path HW_PAGE_SAVE now commits inside the save transaction
         // above; the conflict-path audit stays outside (it writes nothing).

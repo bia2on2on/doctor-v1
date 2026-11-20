@@ -106,6 +106,16 @@ final class HandwritingRepository
     }
 
     /**
+     * Update a handwriting page strictly, throwing on SQL failure so the transaction rolls back.
+     *
+     * @param array<string, mixed> $data
+     */
+    public function update_page_or_fail( int $id, array $data ): void {
+        $data['updated_at'] = $this->db->nowUtcSql();
+        $this->db->update( 'cpms_handwriting_pages', $data, [ 'id' => $id ], true );
+    }
+
+    /**
      * @return array<string, mixed>|null
      */
     public function findPage(int $id): ?array

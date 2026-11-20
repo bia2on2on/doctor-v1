@@ -685,16 +685,27 @@ final class HandwritingFlowTest extends WP_UnitTestCase
         $exactLockSql = 'SELECT * FROM ' . $wpdb->prefix . 'cpms_handwriting_pages WHERE id = ' . $pageId . ' LIMIT 1 FOR UPDATE';
         $hits = 0;
         $injectedUpdatedRows = null;
-        $injector = static function (string $sql) use ($exactLockSql, &$hits, &$injectedUpdatedRows, $wpdb, $competingStrokes, $pageId): string {
-            if ($sql === $exactLockSql && $hits === 0) {
+        $denialsAtInjection = null;
+        $injector = static function (string $sql) use ($exactLockSql, &$hits, &$injectedUpdatedRows, &$denialsAtInjection, $wpdb, $competingStrokes, $pageId): string {
+            if ($sql === $exactLockSql) {
                 $hits++;
-                $injectedUpdatedRows = $wpdb->query(
-                    $wpdb->prepare(
-                        'UPDATE ' . $wpdb->prefix . 'cpms_handwriting_pages SET client_revision = 1, version = 2, stroke_count = 1, stroke_data = %s WHERE id = %d',
-                        $competingStrokes,
-                        $pageId
-                    )
-                );
+                if ($hits === 1) {
+                    $denialsAtInjection = (int) $wpdb->get_var(
+                        $wpdb->prepare(
+                            'SELECT COUNT(*) FROM ' . $wpdb->prefix . 'cpms_audit_logs WHERE action = %s AND resource_type = %s AND resource_id = %d AND after_json IS NULL',
+                            'HW_PAGE_SAVE',
+                            'handwriting_page',
+                            $pageId
+                        )
+                    );
+                    $injectedUpdatedRows = $wpdb->query(
+                        $wpdb->prepare(
+                            'UPDATE ' . $wpdb->prefix . 'cpms_handwriting_pages SET client_revision = 1, version = 2, stroke_count = 1, stroke_data = %s WHERE id = %d',
+                            $competingStrokes,
+                            $pageId
+                        )
+                    );
+                }
             }
 
             return $sql;
@@ -714,7 +725,8 @@ final class HandwritingFlowTest extends WP_UnitTestCase
             remove_filter('query', $injector);
         }
 
-        $this->assertSame(1, $hits, 'exact page-lock SQL must trigger injected update once');
+        $this->assertSame(1, $hits, 'exact page-lock SQL must run exactly once');
+        $this->assertSame(0, $denialsAtInjection, 'no conflict audit exists before lock injection');
         $this->assertSame(1, $injectedUpdatedRows, 'injected UPDATE must match the target page row');
         $this->assertInstanceOf(HandwritingException::class, $conflictCaught);
         $this->assertSame('CLINIC_CONFLICT', $conflictCaught->errorCode);
@@ -727,6 +739,29 @@ final class HandwritingFlowTest extends WP_UnitTestCase
         $this->assertSame(1, (int) $afterConflict['version']);
         $this->assertSame([], $afterConflict['strokes'], 'stale save must not overwrite DB strokes');
         $this->assertSame(0, $this->versionCount($pageId));
+
+        $this->assertSame(
+            0,
+            (int) App::db()->fetchValue(
+                'SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs') . ' WHERE action = %s AND resource_type = %s AND resource_id = %d AND after_json IS NOT NULL',
+                ['HW_PAGE_SAVE', 'handwriting_page', $pageId]
+            ),
+            'moved-target conflict must write zero success audits'
+        );
+        $denialAudit = App::db()->fetchRow(
+            'SELECT before_json, after_json, meta_json FROM ' . App::db()->table('cpms_audit_logs') . ' WHERE action = %s AND resource_type = %s AND resource_id = %d AND after_json IS NULL ORDER BY id DESC LIMIT 1',
+            ['HW_PAGE_SAVE', 'handwriting_page', $pageId]
+        );
+        $this->assertNotNull($denialAudit, 'moved-target conflict must write denial audit after rollback');
+        $this->assertNull($denialAudit['after_json']);
+        $beforeJson = json_decode((string) ($denialAudit['before_json'] ?? '{}'), true);
+        $metaJson = json_decode((string) ($denialAudit['meta_json'] ?? '{}'), true);
+        $this->assertSame(1, (int) ($beforeJson['client_revision'] ?? -1));
+        $this->assertSame(2, (int) ($beforeJson['version'] ?? -1));
+        $this->assertTrue((bool) ($metaJson['conflict'] ?? false));
+        $this->assertSame(1, (int) ($metaJson['client_revision'] ?? -1));
+        $this->assertSame(1, (int) ($metaJson['server_revision'] ?? -1));
+        $this->assertSame('revision_mismatch', (string) ($metaJson['reason'] ?? ''));
 
         // Part 2: duplicate/failed version insert in soft DB mode must roll back the page update.
         $this->assertFalse(App::db()->is_strict(), 'runtime default uses soft DB mode');
@@ -761,9 +796,75 @@ final class HandwritingFlowTest extends WP_UnitTestCase
         $this->assertSame(
             0,
             (int) App::db()->fetchValue(
-                'SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs') . ' WHERE action = %s AND resource_type = %s AND resource_id = %d',
+                'SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs') . ' WHERE action = %s AND resource_type = %s AND resource_id = %d AND after_json IS NOT NULL',
                 ['HW_PAGE_SAVE', 'handwriting_page', $pageId]
             )
+        );
+        $this->assertSame(
+            1,
+            (int) App::db()->fetchValue(
+                'SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs') . ' WHERE action = %s AND resource_type = %s AND resource_id = %d AND after_json IS NULL',
+                ['HW_PAGE_SAVE', 'handwriting_page', $pageId]
+            )
+        );
+    }
+
+    public function testSavePageRollsBackWhenPageUpdateFailsAndAllowsZeroAffectedRows(): void
+    {
+        global $wpdb;
+        $this->assertFalse(App::db()->is_strict(), 'runtime default uses soft DB mode');
+        wp_set_current_user($this->doctorUserId);
+        [, $pageId] = $this->makeDocWithPage();
+
+        // 0 affected rows is NOT a SQL failure.
+        (new HandwritingRepository(App::db()))->update_page_or_fail(999999999, ['stroke_count' => 0]);
+
+        $pagesTable = $wpdb->prefix . 'cpms_handwriting_pages';
+        $pattern = '/\A\s*UPDATE\s+(`?' . preg_quote($pagesTable, '/') . '`?)\s+SET\b.*\bWHERE\s+`?id`?\s*=\s*\'?' . $pageId . '\'?\s*\z/is';
+        $updateHits = 0;
+        $matchedSql = '';
+        $prevSuppress = (bool) $wpdb->suppress_errors(true);
+        $fault = static function ($sql) use ($pattern, &$updateHits, &$matchedSql, $pageId) {
+            $query = (string) $sql;
+            if (preg_match($pattern, $query, $m) === 1) {
+                $updateHits++;
+                $matchedSql = $query;
+
+                return 'UPDATE ' . $m[1] . ' SET `cpms_fault_injection_no_such_column` = 1 WHERE id = ' . $pageId;
+            }
+
+            return $sql;
+        };
+        add_filter('query', $fault, 5);
+        try {
+            $res = $this->dispatch('PUT', self::NS . '/handwriting/pages/' . $pageId, [
+                'client_revision' => 1,
+                'stroke_data' => $this->strokeData(),
+                'saved_by' => 'manual',
+            ], ['Idempotency-Key' => $this->uuid()]);
+        } finally {
+            remove_filter('query', $fault, 5);
+            $wpdb->suppress_errors($prevSuppress);
+        }
+
+        $this->assertSame(1, $updateHits, 'exact page UPDATE SQL must match once');
+        $this->assertNotSame('', $matchedSql);
+        $this->assertSame(500, $res->get_status(), 'failed page UPDATE must return an error response');
+        $this->assertSame('CLINIC_INTERNAL_ERROR', $this->errorCode($res));
+
+        $after = App::handwritingService()->getPage($this->doctorUserId, $pageId);
+        $this->assertSame(0, (int) $after['client_revision']);
+        $this->assertSame(1, (int) $after['version']);
+        $this->assertSame(0, (int) $after['stroke_count']);
+        $this->assertSame([], $after['strokes'], 'strokes must remain unchanged after failed UPDATE');
+        $this->assertSame(0, $this->versionCount($pageId), 'failed page UPDATE must roll back version insert');
+        $this->assertSame(
+            0,
+            (int) App::db()->fetchValue(
+                'SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs') . ' WHERE action = %s AND resource_type = %s AND resource_id = %d',
+                ['HW_PAGE_SAVE', 'handwriting_page', $pageId]
+            ),
+            'failed page UPDATE must write zero HW_PAGE_SAVE audits'
         );
     }
 
