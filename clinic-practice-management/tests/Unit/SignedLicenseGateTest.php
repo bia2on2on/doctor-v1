@@ -335,4 +335,68 @@ final class SignedLicenseGateTest extends TestCase
             );
         }
     }
+
+    public function testHandwritingActivationWindowRestrictedBoundaries(): void
+    {
+        $now = 1793448000;
+        $windowEnd = $now - 60;
+        foreach (['activation_window_expired', 'migration_grace_expired'] as $reason) {
+            $provider = new class($reason, $windowEnd) implements LicenseStateProvider {
+                public function __construct(
+                    private readonly string $reason,
+                    private readonly int $windowEnd
+                ) {
+                }
+
+                public function currentState(): array
+                {
+                    return [
+                        'status' => LicenseStatus::RESTRICTED,
+                        'reason' => $this->reason,
+                        'expires_at' => $this->windowEnd,
+                        'needs_renewal' => true,
+                    ];
+                }
+
+                public function entitlements(): EntitlementRegistry
+                {
+                    return new EntitlementRegistry();
+                }
+            };
+            $gate = new SignedLicenseGate($provider, null, static fn (): int => $now);
+
+            $this->assertTrue(
+                $gate->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                    'visit_opened' => true,
+                    'visit_created_at' => $windowEnd,
+                ])->allowed,
+                "{$reason}: visit opened at last allowed instant of window must remain writable"
+            );
+            $afterDecision = $gate->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                'visit_opened' => true,
+                'visit_created_at' => $windowEnd + 1,
+            ]);
+            $this->assertFalse($afterDecision->allowed, "{$reason}: visit created after window cutoff must be denied");
+            $this->assertSame('license:' . LicenseStatus::RESTRICTED, $afterDecision->reason);
+
+            foreach ([0, null] as $badCreated) {
+                $this->assertFalse(
+                    $gate->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                        'visit_opened' => true,
+                        'visit_created_at' => $badCreated,
+                    ])->allowed,
+                    "{$reason}: missing/invalid visit_created_at must fail closed"
+                );
+            }
+
+            $noExpiryGate = new SignedLicenseGate($this->providerWithReason(LicenseStatus::RESTRICTED, $reason), null, static fn (): int => $now);
+            $this->assertFalse(
+                $noExpiryGate->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                    'visit_opened' => true,
+                    'visit_created_at' => $windowEnd,
+                ])->allowed,
+                "{$reason} without window cutoff timestamp must fail closed"
+            );
+        }
+    }
 }

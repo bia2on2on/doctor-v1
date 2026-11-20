@@ -267,19 +267,39 @@ final class HandwritingFlowTest extends WP_UnitTestCase
         ], null)['status']);
         $this->assertCount(1, $svc->getPage($this->doctorUserId, (int) $pagePending['id'])['strokes']);
 
-        // RESTRICTED via activation_window_expired (no license document ever activated)
+        // RESTRICTED via activation_window_expired (no license document ever activated):
+        // docs/architecture/license-activation-design.md:318 permits safe-finish only for a
+        // Visit already open at/before the window cutoff; $visitId was created after the cutoff,
+        // so creating/adding/saving handwriting on it must be denied once the window expires.
         App::db()->update('cpms_license_install', [
             'activation_window_started_at' => gmdate('Y-m-d H:i:s', time() - 10 * 86400) . '.000',
         ], ['activation_window_type' => 'fresh']);
         $winExpired = App::licenseService()->currentState();
         $this->assertSame(LicenseStatus::RESTRICTED, $winExpired['status']);
         $this->assertSame('activation_window_expired', $winExpired['reason']);
-        $docWinExp = $svc->createDocument($this->doctorUserId, $visitId, 'Window Expired', []);
-        $this->assertSame(200, $svc->savePage($this->doctorUserId, (int) $docWinExp['pages'][0]['id'], [
-            'client_revision' => 1,
-            'stroke_data' => $this->strokeData(),
-        ], null)['status']);
-        $this->assertCount(1, $svc->getPage($this->doctorUserId, (int) $docWinExp['pages'][0]['id'])['strokes']);
+        $docsBeforeExp = (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . App::db()->table('cpms_handwriting_documents'));
+        try {
+            $svc->createDocument($this->doctorUserId, $visitId, 'Window Expired', []);
+            $this->fail('post-cutoff visit must be denied once activation_window_expired takes effect');
+        } catch (HandwritingException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+        }
+        try {
+            $svc->addPage($this->doctorUserId, (int) $docPending['id'], []);
+            $this->fail('post-cutoff addPage must be denied once activation_window_expired takes effect');
+        } catch (HandwritingException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+        }
+        try {
+            $svc->savePage($this->doctorUserId, (int) $pagePending['id'], [
+                'client_revision' => 2,
+                'stroke_data' => $this->strokeData(),
+            ], null);
+            $this->fail('post-cutoff savePage must be denied once activation_window_expired takes effect');
+        } catch (HandwritingException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+        }
+        $this->assertSame($docsBeforeExp, (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . App::db()->table('cpms_handwriting_documents')));
 
         // REVOKED signed document
         $this->installSignedDocumentWith(['revoked' => true, 'reason' => 'revoked']);
@@ -444,6 +464,307 @@ final class HandwritingFlowTest extends WP_UnitTestCase
             $this->assertSame($pagesBefore, (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . App::db()->table('cpms_handwriting_pages')));
             $this->assertSame($versionsBefore, $this->versionCount($pageId));
         }
+    }
+
+    public function testActivationWindowRestrictedAllowsPreCutoffVisitAndDeniesPostCutoffVisit(): void
+    {
+        global $wpdb;
+        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_license_state'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_license_install'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+
+        $now = time();
+        $nowSql = gmdate('Y-m-d H:i:s', $now) . '.000';
+        $wpdb->insert($wpdb->prefix . 'cpms_license_install', [
+            'install_id' => bin2hex(random_bytes(16)),
+            'environment' => 'production',
+            'activation_window_started_at' => $nowSql,
+            'activation_window_type' => 'fresh',
+            'created_at' => $nowSql,
+            'updated_at' => $nowSql,
+        ]);
+
+        // Create both persisted visits and an initial doc/page on each while the window is pending.
+        $atCutoffVisitId = $this->makeConsultation();
+        $afterCutoffVisitId = $this->makeConsultation();
+        $svc = App::handwritingService();
+        $atCutoffDoc = $svc->createDocument($this->doctorUserId, $atCutoffVisitId, 'At Window Cutoff', []);
+        $atCutoffPageId = (int) $atCutoffDoc['pages'][0]['id'];
+        $afterCutoffDoc = $svc->createDocument($this->doctorUserId, $afterCutoffVisitId, 'After Window Cutoff', []);
+        $afterCutoffPageId = (int) $afterCutoffDoc['pages'][0]['id'];
+
+        foreach ([
+            ['fresh', 7, 'activation_window_expired', 10],
+            ['migration', 30, 'migration_grace_expired', 35],
+        ] as [$windowType, $windowDays, $expectedReason, $startedDaysAgo]) {
+            $startedAt = $now - $startedDaysAgo * 86400;
+            $windowEnd = $startedAt + $windowDays * 86400;
+            App::db()->update('cpms_license_install', [
+                'activation_window_type' => $windowType,
+                'activation_window_started_at' => gmdate('Y-m-d H:i:s', $startedAt) . '.000',
+            ], ['id' => (int) App::db()->fetchValue('SELECT id FROM ' . $wpdb->prefix . 'cpms_license_install LIMIT 1')]);
+
+            $state = App::licenseService()->currentState();
+            $this->assertSame(LicenseStatus::RESTRICTED, $state['status']);
+            $this->assertSame($expectedReason, $state['reason']);
+
+            App::db()->update('cpms_visits', ['created_at' => gmdate('Y-m-d H:i:s', $windowEnd) . '.000'], ['id' => $atCutoffVisitId]);
+            App::db()->update('cpms_visits', ['created_at' => gmdate('Y-m-d H:i:s', $windowEnd + 1) . '.000'], ['id' => $afterCutoffVisitId]);
+
+            // At the last allowed instant of the window (design §7.4 :318): create/add/save succeed.
+            $docAllowed = $svc->createDocument($this->doctorUserId, $atCutoffVisitId, 'Allowed ' . $windowType, []);
+            $pageAllowed = $svc->addPage($this->doctorUserId, (int) $docAllowed['id'], []);
+            $saveAllowed = $svc->savePage($this->doctorUserId, (int) $pageAllowed['id'], [
+                'client_revision' => 1,
+                'stroke_data' => $this->strokeData(),
+                'saved_by' => 'manual',
+            ], null);
+            $this->assertSame(200, $saveAllowed['status']);
+            $this->assertCount(1, $svc->getPage($this->doctorUserId, (int) $pageAllowed['id'])['strokes']);
+            $this->assertGreaterThan(0, $atCutoffPageId);
+
+            // One second after the window cutoff: create/add/save are denied and write nothing.
+            $docsBefore = (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . $wpdb->prefix . 'cpms_handwriting_documents');
+            $pagesBefore = (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . $wpdb->prefix . 'cpms_handwriting_pages');
+            $versionsBefore = $this->versionCount($afterCutoffPageId);
+
+            foreach (['document', 'page', 'save'] as $operation) {
+                try {
+                    if ($operation === 'document') {
+                        $svc->createDocument($this->doctorUserId, $afterCutoffVisitId, null, []);
+                    } elseif ($operation === 'page') {
+                        $svc->addPage($this->doctorUserId, (int) $afterCutoffDoc['id'], []);
+                    } else {
+                        $svc->savePage($this->doctorUserId, $afterCutoffPageId, [
+                            'client_revision' => 1,
+                            'stroke_data' => $this->strokeData(),
+                        ], null);
+                    }
+                    $this->fail("{$expectedReason}: post-cutoff {$operation} must be denied");
+                } catch (HandwritingException $e) {
+                    $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+                }
+            }
+            $this->assertSame($docsBefore, (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . $wpdb->prefix . 'cpms_handwriting_documents'));
+            $this->assertSame($pagesBefore, (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . $wpdb->prefix . 'cpms_handwriting_pages'));
+            $this->assertSame($versionsBefore, $this->versionCount($afterCutoffPageId));
+        }
+    }
+
+    public function testPersistedNonOpenedAndCompletedVisitsAreDeniedAcrossValidStage2AndStage3(): void
+    {
+        global $wpdb;
+        $now = time();
+        $this->installSignedExpiration($now + 86400);
+
+        $svc = App::handwritingService();
+
+        // 1. Persisted non-opened visit: skipped (terminal, active = 0).
+        $skippedSeq = random_int(1000, 999999);
+        $nowSql = App::db()->nowUtcSql();
+        $wpdb->insert($wpdb->prefix . 'cpms_patients', [
+            'clinic_id' => 1,
+            'mrn' => 'MR-HWSK-' . $skippedSeq,
+            'first_name' => 'Skip',
+            'last_name' => 'Visit',
+            'mobile' => '0915' . sprintf('%07d', $skippedSeq),
+            'status' => 'active',
+            'created_at' => $nowSql,
+            'updated_at' => $nowSql,
+        ]);
+        $skippedVisit = App::visitService()->walkIn($this->secretaryUserId, (int) $wpdb->insert_id, $this->clinicianId);
+        $skippedVisitId = (int) $skippedVisit['id'];
+        $skippedDoc = $svc->createDocument($this->doctorUserId, $skippedVisitId, 'Pre-skip', []);
+        $skippedPageId = (int) $skippedDoc['pages'][0]['id'];
+        App::visitService()->transition($this->doctorUserId, $skippedVisitId, 'skip', ['reason' => 'patient absent']);
+
+        // 2. Persisted non-opened visit: cancelled (terminal, active = 0).
+        $cancelledSeq = random_int(1000, 999999);
+        $wpdb->insert($wpdb->prefix . 'cpms_patients', [
+            'clinic_id' => 1,
+            'mrn' => 'MR-HWCN-' . $cancelledSeq,
+            'first_name' => 'Cancel',
+            'last_name' => 'Visit',
+            'mobile' => '0916' . sprintf('%07d', $cancelledSeq),
+            'status' => 'active',
+            'created_at' => $nowSql,
+            'updated_at' => $nowSql,
+        ]);
+        $cancelledVisit = App::visitService()->walkIn($this->secretaryUserId, (int) $wpdb->insert_id, $this->clinicianId);
+        $cancelledVisitId = (int) $cancelledVisit['id'];
+        $cancelledDoc = $svc->createDocument($this->doctorUserId, $cancelledVisitId, 'Pre-cancel', []);
+        $cancelledPageId = (int) $cancelledDoc['pages'][0]['id'];
+        App::visitService()->transition($this->secretaryUserId, $cancelledVisitId, 'cancel', ['reason' => 'cancelled']);
+
+        // 3. Persisted non-opened visit: non-terminal status but active = 0.
+        $inactiveVisitId = $this->makeConsultation();
+        $inactiveDoc = $svc->createDocument($this->doctorUserId, $inactiveVisitId, 'Pre-inactive', []);
+        $inactivePageId = (int) $inactiveDoc['pages'][0]['id'];
+        App::db()->update('cpms_visits', ['active' => 0], ['id' => $inactiveVisitId]);
+
+        // 4. Persisted completed visit: checked_out (active = 0).
+        $completedVisitId = $this->makeConsultation();
+        $completedDoc = $svc->createDocument($this->doctorUserId, $completedVisitId, 'Pre-complete', []);
+        $completedPageId = (int) $completedDoc['pages'][0]['id'];
+        App::visitService()->transition($this->doctorUserId, $completedVisitId, 'complete');
+        App::visitService()->transition($this->secretaryUserId, $completedVisitId, 'invoice_ready');
+        App::visitService()->transition($this->doctorUserId, $completedVisitId, 'waive');
+
+        $stage3T0 = $now - 40 * 86400;
+        $stage3T1 = PostExpirationPolicy::deadline($stage3T0, 1);
+        foreach ([$skippedVisitId, $cancelledVisitId, $inactiveVisitId, $completedVisitId] as $vid) {
+            App::db()->update('cpms_visits', ['created_at' => gmdate('Y-m-d H:i:s', $stage3T1 - 60) . '.000'], ['id' => $vid]);
+        }
+
+        $cases = [
+            ['skipped', $skippedVisitId, (int) $skippedDoc['id'], $skippedPageId],
+            ['cancelled', $cancelledVisitId, (int) $cancelledDoc['id'], $cancelledPageId],
+            ['inactive', $inactiveVisitId, (int) $inactiveDoc['id'], $inactivePageId],
+            ['checked_out', $completedVisitId, (int) $completedDoc['id'], $completedPageId],
+        ];
+        $stages = [
+            ['valid', $now + 86400, 'CLINIC_INVALID_TRANSITION', 409],
+            ['stage2', $now - 1, 'CLINIC_LICENSE_BLOCKED', 503],
+            ['stage3', $stage3T0, 'CLINIC_LICENSE_BLOCKED', 503],
+        ];
+
+        foreach ($stages as [$stageLabel, $expiresAt, $expectedCode, $expectedHttp]) {
+            $this->installSignedExpiration($expiresAt);
+            $clockSvc = $this->serviceAtClock($now);
+
+            foreach ($cases as [$visitLabel, $visitId, $docId, $pageId]) {
+                $docsBefore = (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . $wpdb->prefix . 'cpms_handwriting_documents');
+                $pagesBefore = (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . $wpdb->prefix . 'cpms_handwriting_pages');
+                $versionsBefore = $this->versionCount($pageId);
+
+                foreach (['document', 'page', 'save'] as $op) {
+                    try {
+                        if ($op === 'document') {
+                            $clockSvc->createDocument($this->doctorUserId, $visitId, null, []);
+                        } elseif ($op === 'page') {
+                            $clockSvc->addPage($this->doctorUserId, $docId, []);
+                        } else {
+                            $clockSvc->savePage($this->doctorUserId, $pageId, [
+                                'client_revision' => 1,
+                                'stroke_data' => $this->strokeData(),
+                            ], null);
+                        }
+                        $this->fail("{$stageLabel}/{$visitLabel}/{$op} must be denied");
+                    } catch (HandwritingException $e) {
+                        $this->assertSame($expectedCode, $e->errorCode, "{$stageLabel}/{$visitLabel}/{$op}");
+                        $this->assertSame($expectedHttp, $e->httpStatus, "{$stageLabel}/{$visitLabel}/{$op}");
+                    }
+                }
+
+                $this->assertSame($docsBefore, (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . $wpdb->prefix . 'cpms_handwriting_documents'));
+                $this->assertSame($pagesBefore, (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . $wpdb->prefix . 'cpms_handwriting_pages'));
+                $this->assertSame($versionsBefore, $this->versionCount($pageId));
+            }
+        }
+    }
+
+    public function testSavePageRechecksLockedRevisionAndRollsBackOnVersionInsertFailure(): void
+    {
+        global $wpdb;
+        $visitId = $this->makeConsultation();
+        $svc = App::handwritingService();
+        $doc = $svc->createDocument($this->doctorUserId, $visitId, 'Concurrency Guard', []);
+        $pageId = (int) $doc['pages'][0]['id'];
+
+        $competingStrokes = $this->strokeData();
+        $staleStrokes = base64_encode(gzencode(json_encode([[
+            'id' => 's-stale',
+            'tool' => 'pen',
+            'color' => '#ff0000',
+            'size' => 6,
+            'points' => [[5, 5, 0.4, 1690000100]],
+        ]], JSON_UNESCAPED_UNICODE) ?: '[]') ?: '[]');
+
+        // Part 1: moved-target race — inject a revision update when the page lock runs.
+        // Accepted LIMITATION: WP_UnitTestCase shares a single DB connection, so we simulate
+        // a concurrent commit via a counted exact-SQL query filter rather than two connections.
+        $exactLockSql = 'SELECT * FROM ' . $wpdb->prefix . 'cpms_handwriting_pages WHERE id = ' . $pageId . ' LIMIT 1 FOR UPDATE';
+        $hits = 0;
+        $injectedUpdatedRows = null;
+        $injector = static function (string $sql) use ($exactLockSql, &$hits, &$injectedUpdatedRows, $wpdb, $competingStrokes, $pageId): string {
+            if ($sql === $exactLockSql && $hits === 0) {
+                $hits++;
+                $injectedUpdatedRows = $wpdb->query(
+                    $wpdb->prepare(
+                        'UPDATE ' . $wpdb->prefix . 'cpms_handwriting_pages SET client_revision = 1, version = 2, stroke_count = 1, stroke_data = %s WHERE id = %d',
+                        $competingStrokes,
+                        $pageId
+                    )
+                );
+            }
+
+            return $sql;
+        };
+        add_filter('query', $injector);
+        $conflictCaught = null;
+        try {
+            $svc->savePage($this->doctorUserId, $pageId, [
+                'client_revision' => 1,
+                'stroke_data' => $staleStrokes,
+                'saved_by' => 'manual',
+            ], null);
+            $this->fail('expected CLINIC_CONFLICT when revision moved before lock');
+        } catch (HandwritingException $e) {
+            $conflictCaught = $e;
+        } finally {
+            remove_filter('query', $injector);
+        }
+
+        $this->assertSame(1, $hits, 'exact page-lock SQL must trigger injected update once');
+        $this->assertSame(1, $injectedUpdatedRows, 'injected UPDATE must match the target page row');
+        $this->assertInstanceOf(HandwritingException::class, $conflictCaught);
+        $this->assertSame('CLINIC_CONFLICT', $conflictCaught->errorCode);
+        $this->assertSame(409, $conflictCaught->httpStatus);
+        $this->assertSame(1, (int) ($conflictCaught->data['server']['client_revision'] ?? -1));
+        $this->assertSame(2, (int) ($conflictCaught->data['server']['version'] ?? -1));
+
+        $afterConflict = $svc->getPage($this->doctorUserId, $pageId);
+        $this->assertSame(0, (int) $afterConflict['client_revision']);
+        $this->assertSame(1, (int) $afterConflict['version']);
+        $this->assertSame([], $afterConflict['strokes'], 'stale save must not overwrite DB strokes');
+        $this->assertSame(0, $this->versionCount($pageId));
+
+        // Part 2: duplicate/failed version insert in soft DB mode must roll back the page update.
+        $this->assertFalse(App::db()->is_strict(), 'runtime default uses soft DB mode');
+        $wpdb->insert($wpdb->prefix . 'cpms_handwriting_page_versions', [
+            'page_id' => $pageId,
+            'version' => 2,
+            'stroke_data' => $competingStrokes,
+            'saved_by' => 'manual',
+            'created_at' => App::db()->nowUtcSql(),
+        ]);
+        $this->assertSame(1, $this->versionCount($pageId));
+
+        $versionFailure = null;
+        try {
+            $svc->savePage($this->doctorUserId, $pageId, [
+                'client_revision' => 1,
+                'stroke_data' => $staleStrokes,
+                'saved_by' => 'manual',
+            ], null);
+            $this->fail('expected RuntimeException when version insert fails');
+        } catch (\RuntimeException $e) {
+            $versionFailure = $e;
+        }
+        $this->assertInstanceOf(\RuntimeException::class, $versionFailure);
+
+        $afterRollback = $svc->getPage($this->doctorUserId, $pageId);
+        $this->assertSame(0, (int) $afterRollback['client_revision'], 'page revision must roll back');
+        $this->assertSame(1, (int) $afterRollback['version'], 'page version must roll back');
+        $this->assertSame(0, (int) $afterRollback['stroke_count'], 'page stroke_count must roll back');
+        $this->assertSame([], $afterRollback['strokes'], 'page strokes must roll back');
+        $this->assertSame(1, $this->versionCount($pageId), 'only pre-seeded version row remains');
+        $this->assertSame(
+            0,
+            (int) App::db()->fetchValue(
+                'SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs') . ' WHERE action = %s AND resource_type = %s AND resource_id = %d',
+                ['HW_PAGE_SAVE', 'handwriting_page', $pageId]
+            )
+        );
     }
 
     // ================= F1 — ایجاد سند =================
@@ -965,9 +1286,10 @@ final class HandwritingFlowTest extends WP_UnitTestCase
      */
     private function installSignedDocumentWith(array $overrides): void
     {
-        if (!LicenseSignature::available()) {
-            $this->markTestSkipped('sodium required');
-        }
+        $this->assertTrue(
+            extension_loaded('sodium') && LicenseSignature::available(),
+            'ext/sodium is required for signed license tests'
+        );
         $pair = sodium_crypto_sign_keypair();
         $public = base64_encode(sodium_crypto_sign_publickey($pair));
         remove_all_filters('cpms_license_public_key');
