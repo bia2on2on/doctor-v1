@@ -106,6 +106,16 @@ final class HandwritingRepository
     }
 
     /**
+     * Update a handwriting page strictly, throwing on SQL failure so the transaction rolls back.
+     *
+     * @param array<string, mixed> $data
+     */
+    public function update_page_or_fail( int $id, array $data ): void {
+        $data['updated_at'] = $this->db->nowUtcSql();
+        $this->db->update( 'cpms_handwriting_pages', $data, [ 'id' => $id ], true );
+    }
+
+    /**
      * @return array<string, mixed>|null
      */
     public function findPage(int $id): ?array
@@ -113,6 +123,18 @@ final class HandwritingRepository
         return $this->db->fetchRow(
             'SELECT * FROM ' . $this->db->table('cpms_handwriting_pages') . ' WHERE id = %d LIMIT 1',
             [$id]
+        );
+    }
+
+    /**
+     * Locking read for a single handwriting page inside a transaction.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function find_page_for_update( int $id ): ?array {
+        return $this->db->fetchRow(
+            'SELECT * FROM ' . $this->db->table( 'cpms_handwriting_pages' ) . ' WHERE id = %d LIMIT 1 FOR UPDATE',
+            [ $id ]
         );
     }
 
@@ -137,6 +159,18 @@ final class HandwritingRepository
     {
         $row += ['created_at' => $this->db->nowUtcSql()];
         $this->db->insert('cpms_handwriting_page_versions', $row);
+    }
+
+    /**
+     * Insert an append-only page version and throw on failure so the caller's transaction rolls back.
+     *
+     * @param array<string, mixed> $row
+     */
+    public function insert_version_or_fail( array $row ): void {
+        $row += [ 'created_at' => $this->db->nowUtcSql() ];
+        if ( ! $this->db->insert( 'cpms_handwriting_page_versions', $row ) ) {
+            throw new \RuntimeException( 'cpms_handwriting_page_versions insert failed' );
+        }
     }
 
     /**

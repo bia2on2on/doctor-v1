@@ -361,6 +361,58 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
     // AREA 1 — PRE-AUTH CAPACITY (guards)
     // =================================================================
 
+    public function test_unlisted_fixture_has_no_public_booking_markup(): void {
+        $this->buildTwoClinicFixture();
+        $visible = $this->renderSurface( $this->clinicA );
+        self::assertStringContainsString( 'Clinic A P8S2', $visible );
+        self::assertStringContainsString( 'data-clinic-id="' . $this->clinicA . '"', $visible );
+        self::assertStringContainsString( 'data-clinician-id="' . $this->clinicianA . '"', $visible );
+
+        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
+        $hidden  = $this->renderSurface( $this->clinicA );
+        $unknown = $this->renderSurface( PHP_INT_MAX );
+        $normalize = static fn ( string $html ): string => (string) preg_replace( '/id="cpms-public-booking-[0-9]+"/', 'id="fixture"', $html );
+        self::assertSame( $normalize( $unknown ), $normalize( $hidden ) );
+        self::assertStringContainsString( 'data-state="error"', $hidden );
+        foreach ( [ 'Clinic A P8S2', 'data-clinic-id=', 'data-clinician-id=', 'data-location-id=', 'locations_by_clinic' ] as $witness ) {
+            self::assertStringNotContainsString( $witness, $hidden );
+        }
+    }
+
+    public function test_unlisted_fixture_quote_and_selected_otp_refuse_before_side_effects(): void {
+        $this->buildTwoClinicFixture();
+        $slot = $this->seedSlot( $this->clinicA, $this->locationA, $this->clinicianA, $this->ymdDaysAhead( 5 ), '10:00:00', 1 );
+        $body = [
+            'clinician_id' => $this->clinicianA,
+            'slot_id'      => $slot['slot_id'],
+            'slot_date'    => $slot['date'],
+            'slot_time'    => $slot['time'],
+        ];
+        $requests = [
+            '/booking/quote'       => $body,
+            self::OTP_REQUEST_PATH => $body + [ 'mobile' => self::MOBILE_T01 ],
+        ];
+        $public_quote = $this->restPost( self::NS . '/booking/quote', $body );
+        self::assertSame( 200, $public_quote->get_status() );
+        self::assertTrue( $public_quote->get_data()['data']['available'] );
+        self::assertSame( $slot['slot_id'], $public_quote->get_data()['data']['slot_id'] );
+        $public_otp = $this->restPost( self::NS . self::OTP_REQUEST_PATH, $requests[ self::OTP_REQUEST_PATH ] );
+        self::assertSame( 200, $public_otp->get_status() );
+        self::assertSame( $this->clinicA, (int) ( $this->latestOtpTokenRow( self::MOBILE_T01 )['clinic_id'] ?? 0 ) );
+
+        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
+        $challenges = $this->countRows( 'cpms_otp_tokens' );
+        foreach ( $requests as $route => $params ) {
+            $hidden  = $this->restPost( self::NS . $route, $params );
+            $unknown = $this->restPost( self::NS . $route, array_replace( $params, [ 'clinician_id' => PHP_INT_MAX ] ) );
+            self::assertSame( 404, $hidden->get_status() );
+            self::assertSame( $unknown->get_data(), $hidden->get_data() );
+            self::assertSame( [ 'status' => 404 ], $hidden->get_data()['data'] );
+        }
+        self::assertSame( $challenges, $this->countRows( 'cpms_otp_tokens' ) );
+        self::assertSame( 0, $this->heldCountOf( $slot['slot_id'] ) );
+    }
+
     /**
      * T01 — anonymous quote + OTP request must create NO cpms_slot_holds row
      * and must not move held_count: anonymous users NEVER consume capacity
@@ -1902,6 +1954,7 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
         foreach ([$this->clinicA, $this->clinicB] as $clinicId) {
             $settings = new Settings(App::db(), $clinicId, App::audit());
             $settings->set('otp.cooldown_sec', 0);
+            App::settingsFactory()->forClinic( $clinicId )->set( 'public.listing_opt_in', true );
         }
         Settings::flushCache();
 

@@ -44,6 +44,40 @@ final class SignedLicenseGate implements LicenseGate
             default => false,
         };
 
+        // Owner rule (three-stage license): handwriting for an already-opened visit
+        // is allowed in every license state (in Stage 3 only for visits opened before T1,
+        // and in activation-window RESTRICTED only for visits opened on/before window end).
+        if ( self::OP_HANDWRITING_NEW === $operation && true === ( $context['visit_opened'] ?? false ) ) {
+            $reason_str     = (string) ( $state['reason'] ?? '' );
+            $expiry_bounded = $ordinary
+                || ( LicenseStatus::UNREACHABLE === $status && 'cached_state_stale' === $reason_str )
+                || ( LicenseStatus::RESTRICTED === $status && 'expired_unreachable' === $reason_str );
+            if ( $expiry_bounded && is_int( $expires_at ) && $expires_at > 0 ) {
+                $t1 = PostExpirationPolicy::deadline( $expires_at, 1 );
+                if ( $now >= $t1 ) {
+                    $visit_created_at = $context['visit_created_at'] ?? null;
+                    if ( ! is_int( $visit_created_at ) || $visit_created_at <= 0 || $visit_created_at >= $t1 ) {
+                        return LicenseDecision::deny( 'license:expired' );
+                    }
+                }
+            }
+            if ( LicenseStatus::RESTRICTED === $status
+                && in_array( $reason_str, [ 'activation_window_expired', 'migration_grace_expired' ], true )
+            ) {
+                if ( ! is_int( $expires_at ) || $expires_at <= 0 ) {
+                    return LicenseDecision::deny( 'license:' . LicenseStatus::RESTRICTED );
+                }
+                // computeActivationWindow() allows now <= end (design §7.4 :318); half-open cutoff is end + 1.
+                $window_cutoff    = $expires_at + 1;
+                $visit_created_at = $context['visit_created_at'] ?? null;
+                if ( ! is_int( $visit_created_at ) || $visit_created_at <= 0 || $visit_created_at >= $window_cutoff ) {
+                    return LicenseDecision::deny( 'license:' . LicenseStatus::RESTRICTED );
+                }
+            }
+
+            return LicenseDecision::allow();
+        }
+
         // Check signed T0 BEFORE allowsNewBusiness: neither grace nor skew moves T0.
         if ( $ordinary && is_int( $expires_at ) && $expires_at > 0 && $now >= $expires_at ) {
             if ( in_array( $operation, [ self::OP_APPOINTMENT_BOOK, self::OP_APPOINTMENT_RESCHEDULE, self::OP_SMS_COMMERCIAL, self::OP_HANDWRITING_NEW ], true ) ) {
