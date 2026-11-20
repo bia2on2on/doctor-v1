@@ -389,8 +389,12 @@ final class App
 				( new FinanceController( self::financeService() ) )->register_routes();
 				( new HandwritingController( self::handwritingService() ) )->register_routes();
 				( new NotificationsController( self::notificationService() ) )->register_routes();
-				// Iran V1 — internal staff messaging + doctor-managed visit pricing.
-				( new MessagingController( self::staff_messaging_service() ) )->register_routes();
+				// Iran V1 — doctor-managed visit pricing.
+				// R1 (1.0): staff messaging REST is NOT registered while the line hides
+				// the module, so every role (administrator included) gets rest_no_route.
+				if ( StaffPortalShell::STAFF_MESSAGING_AVAILABLE ) {
+					( new MessagingController( self::staff_messaging_service() ) )->register_routes();
+				}
 				( new VisitPricingController( self::visit_pricing_service() ) )->register_routes();
 				( new ReportsController( self::reportService(), self::exportService() ) )->register_routes();
 				( new DoctorPortalController( new \ClinicCore\Infrastructure\Repository\MembershipRepository( self::db() ) ) )->register_routes();

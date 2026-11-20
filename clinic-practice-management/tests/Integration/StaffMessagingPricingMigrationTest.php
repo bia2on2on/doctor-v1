@@ -21,7 +21,7 @@ final class StaffMessagingPricingMigrationTest extends WP_UnitTestCase
     use RealTableMigrations;
 
     private const VERSION = '2026_10_27_0030';
-    private const HEAD_VERSION = '2026_10_31_0031';
+    private const HEAD_VERSION = '2026_11_20_0032';
 
     private const TABLES = [
         'cpms_message_threads',
@@ -160,9 +160,10 @@ final class StaffMessagingPricingMigrationTest extends WP_UnitTestCase
         ];
 
         $this->withRealTables(function () use ($db): void {
-            // Roll back the later guard before simulating the exact 0029
-            // baseline. This test only drops the disposable guard, not history.
+            // Roll back later independent migrations before simulating the exact 0029
+            // baseline. This test only drops disposable later schemas, not history.
             self::assertSame(self::HEAD_VERSION, App::migrations()->rollbackOne());
+            self::assertSame('2026_10_31_0031', App::migrations()->rollbackOne());
             $db->query('DELETE FROM ' . $db->table('cpms_schema_migrations') . ' WHERE version = %s', [self::VERSION]);
             foreach (array_reverse(self::TABLES) as $short) {
                 $db->query('DROP TABLE IF EXISTS ' . $db->table($short));
