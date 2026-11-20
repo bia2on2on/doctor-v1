@@ -1936,8 +1936,8 @@ final class App
      * Resolves the central fail-closed patient access gate.
      */
     public static function patient_access(): PatientAccess {
-        static $gate = null;
-        static $deps = null;
+        static $gate  = null;
+        static $deps  = null;
         $current_deps = [ self::db() ];
         if ( null === $gate || $deps !== $current_deps ) {
             $deps = $current_deps;

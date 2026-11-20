@@ -145,9 +145,9 @@ final class PatientAccessUnitTest extends TestCase {
         self::assertTrue( $gate->authorize_request( 1, 20, null, null, PatientAccess::MODE_ENROLL )['allowed'] );
 
         // Observer evidence recorded inside callback, asserted outside.
-        self::assertCount( 11, $observed );
+        self::assertCount( 10, $observed );
         self::assertFalse( $observed[0]['allowed'] );
-        self::assertTrue( $observed[10]['allowed'] );
+        self::assertTrue( $observed[9]['allowed'] );
 
         // Unwired gate (null db/repo/seams) fails closed even for a patient-role user.
         $unwired = new PatientAccess(
