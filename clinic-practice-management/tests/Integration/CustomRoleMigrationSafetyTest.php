@@ -37,7 +37,7 @@ final class CustomRoleMigrationSafetyTest extends WP_UnitTestCase
      * assertions below still target 0024 explicitly; "head" assertions target
      * this version.
      */
-    private const HEAD_VERSION = '2026_10_31_0031';
+    private const HEAD_VERSION = '2026_11_20_0032';
 
     protected function setUp(): void
     {

@@ -21,7 +21,7 @@ final class StaffMessagingPricingMigrationTest extends WP_UnitTestCase
     use RealTableMigrations;
 
     private const VERSION = '2026_10_27_0030';
-    private const HEAD_VERSION = '2026_10_31_0031';
+    private const HEAD_VERSION = '2026_11_20_0032';
 
     private const TABLES = [
         'cpms_message_threads',
