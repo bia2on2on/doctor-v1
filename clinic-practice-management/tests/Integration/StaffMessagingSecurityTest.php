@@ -34,18 +34,30 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
     {
         parent::setUp();
         $this->iv1_boot();
+    }
 
-        // R1 (1.0): `StaffPortalShell::STAFF_MESSAGING_AVAILABLE` is false for the
-        // 1.0 line, so the real boot does not register these routes (asserted in
-        // StaffMessagingHiddenReleaseOneTest). This suite registers the controller
-        // itself so every permission, rate-limit, retention and XSS assertion below
-        // keeps running — it is the evidence for the day the switch is flipped on.
-        //
-        // Registered ONCE per server instance. A per-process flag silently loses
-        // the routes when the process-wide `$wp_rest_server` is replaced (test
-        // order); registering on every test is equally wrong because
-        // register_rest_route() reports `_doing_it_wrong` for an already
-        // registered route and that WP_Error then replaces the real response.
+    /**
+     * R1 (1.0): `StaffPortalShell::STAFF_MESSAGING_AVAILABLE` is false for the
+     * 1.0 line, so the real boot does not register these routes (asserted in
+     * StaffMessagingHiddenReleaseOneTest). The four REST tests below register the
+     * controller themselves so every permission, rate-limit and XSS assertion
+     * keeps running — they are the evidence for the day the switch is flipped on.
+     *
+     * Deliberately called ONLY from those four tests, never from `setUp()`: the
+     * service-level tests in this class dispatch no REST request, and
+     * `rest_get_server()` creates the process-wide server and fires
+     * `rest_api_init` (which runs `App::ensureMigrated()`) on the first caller.
+     * Doing that in `setUp()` put that whole side effect inside the FIRST test's
+     * execution — the position where this class's one red test sits.
+     *
+     * Registered ONCE per server instance. A per-process flag silently loses the
+     * routes when the process-wide `$wp_rest_server` is replaced (test order);
+     * registering on every test is equally wrong because register_rest_route()
+     * reports `_doing_it_wrong` for an already registered route and that WP_Error
+     * then replaces the real response.
+     */
+    private function register_messaging_routes(): void
+    {
         $server = rest_get_server(); // fires rest_api_init, so registration is legal.
         $already = false;
         foreach ( array_keys( $server->get_routes() ) as $registered ) {
@@ -169,6 +181,7 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
 
     public function testCrossClinicAndCrossOrganizationThreadsAreDenied(): void
     {
+        $this->register_messaging_routes();
         $world = $this->world();
         $other_org = $this->iv1_org('other');
         $other_clinic = $this->iv1_clinic($other_org);
@@ -320,6 +333,7 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
 
     public function testRestRejectsMissingNonceXssAndAppliesSendRateLimit(): void
     {
+        $this->register_messaging_routes();
         $world = $this->world();
         wp_set_current_user((int) $world['doctor']);
         $service = App::staff_messaging_service();
@@ -388,6 +402,7 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
      */
     public function testAuthorizedStaffRolesAreEligibleAsExplicitOneToOneCounterparts(): void
     {
+        $this->register_messaging_routes();
         $world = $this->world();
         $doctor2 = $this->iv1_user(RolesAndCapabilities::ROLE_DOCTOR, 'doc2');
         $this->iv1_membership($doctor2, (int) $world['clinic'], RolesAndCapabilities::ROLE_DOCTOR);
@@ -566,6 +581,7 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
 
     public function testThirdClinicMemberCannotEnumerateOrUseKnownPrivateThreadIdThroughRest(): void
     {
+        $this->register_messaging_routes();
         $world = $this->world();
         $doctor2 = $this->iv1_user(RolesAndCapabilities::ROLE_DOCTOR, 'doc2');
         $this->iv1_membership($doctor2, (int) $world['clinic'], RolesAndCapabilities::ROLE_DOCTOR);
