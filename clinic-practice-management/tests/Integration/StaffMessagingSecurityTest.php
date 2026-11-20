@@ -9,6 +9,7 @@ use ClinicCore\Application\Messaging\StaffMessagingService;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Frontend\StaffPortalShell;
+use ClinicCore\Rest\MessagingController;
 use ClinicCore\Tests\Integration\Fixtures\IranV1Fixture;
 use WP_UnitTestCase;
 
@@ -35,8 +36,51 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
         $this->iv1_boot();
     }
 
+    /** Previous process-wide REST server, restored by tearDown(). */
+    private $previous_rest_server = null;
+
+    /** True while this class has a swapped-in REST server installed. */
+    private bool $rest_server_swapped = false;
+
+    /**
+     * R1 (1.0): `StaffPortalShell::STAFF_MESSAGING_AVAILABLE` is false for the
+     * 1.0 line, so the real boot does not register these routes (asserted in
+     * StaffMessagingHiddenReleaseOneTest). The four REST tests below install a
+     * server that carries the controller, so every permission, rate-limit and
+     * XSS assertion keeps running — they are the evidence for the day the switch
+     * is flipped on.
+     *
+     * Same pattern as StaffMessagingHiddenReleaseOneTest and
+     * RestPermissionCallbackTest: build a FRESH server, fire `rest_api_init` on
+     * it, then register. Firing the action first is what makes
+     * register_rest_route() legal — WordPress raises `_doing_it_wrong` when it is
+     * called after `did_action( 'rest_api_init' )` is 0, and this harness resets
+     * `$wp_actions` between tests, so a reused server's action count is 0 even
+     * though the server is populated. WP_UnitTestCase turns that unexpected
+     * `_doing_it_wrong` into a test failure, which is exactly what made the first
+     * registering test red. On a fresh server App's own `rest_api_init`
+     * callbacks run once, so no route is registered twice.
+     */
+    private function register_messaging_routes(): void
+    {
+        global $wp_rest_server;
+
+        $this->previous_rest_server = $wp_rest_server ?? null;
+        $wp_rest_server             = new \WP_REST_Server();
+        $this->rest_server_swapped  = true;
+
+        do_action( 'rest_api_init', $wp_rest_server );
+        ( new MessagingController( App::staff_messaging_service() ) )->register_routes();
+    }
+
     protected function tearDown(): void
     {
+        if ( $this->rest_server_swapped ) {
+            global $wp_rest_server;
+            $wp_rest_server             = $this->previous_rest_server;
+            $this->previous_rest_server = null;
+            $this->rest_server_swapped  = false;
+        }
         $this->iv1_reset();
         parent::tearDown();
     }
@@ -90,9 +134,9 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
             'patient_id'           => (int) $world['patient'],
             'visit_id'             => (int) $world['visit'],
         ]);
-        self::assertGreaterThan(0, (int) $thread['id']);
-        self::assertSame((int) $world['visit'], (int) $thread['visit_id']);
-        self::assertSame((int) $world['location'], (int) $thread['location_id']);
+        self::assertGreaterThan(0, (int) $thread['id'], 'the created thread must have a positive id, got ' . (int) $thread['id']);
+        self::assertSame((int) $world['visit'], (int) $thread['visit_id'], 'expected visit_id ' . (int) $world['visit'] . ', got ' . (int) $thread['visit_id']);
+        self::assertSame((int) $world['location'], (int) $thread['location_id'], 'expected location_id ' . (int) $world['location'] . ', got ' . (int) $thread['location_id']);
 
         $service = App::staff_messaging_service();
         $sent = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->send(
@@ -100,38 +144,39 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
             (int) $thread['id'],
             '<script>alert(1)</script>سلام، بیمار آماده پذیرش است.'
         ));
-        self::assertStringNotContainsString('<script', (string) $sent['body']);
-        self::assertStringContainsString('بیمار آماده پذیرش', (string) $sent['body']);
-        self::assertNotSame('', (string) $sent['created_at']);
-        self::assertNotSame('', (string) $sent['jalali_time']);
+        self::assertStringNotContainsString('<script', (string) $sent['body'], 'the stored body must be sanitized; got body length ' . strlen((string) $sent['body']));
+        self::assertStringContainsString('بیمار آماده پذیرش', (string) $sent['body'], 'the stored body must keep its text; got body length ' . strlen((string) $sent['body']));
+        self::assertNotSame('', (string) $sent['created_at'], 'created_at must not be empty, got "' . (string) $sent['created_at'] . '"');
+        self::assertNotSame('', (string) $sent['jalali_time'], 'jalali_time must not be empty, got "' . (string) $sent['jalali_time'] . '"');
 
         $secretary_threads = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->threads((int) $world['secretary']));
-        self::assertCount(1, $secretary_threads['threads']);
-        self::assertSame(1, (int) $secretary_threads['threads'][0]['unread_count']);
-        self::assertSame(1, (int) $secretary_threads['unread_total']);
+        self::assertCount(1, $secretary_threads['threads'], 'this secretary must see exactly one thread, got ' . count((array) $secretary_threads['threads']));
+        self::assertSame(1, (int) $secretary_threads['threads'][0]['unread_count'], 'unread_count carries the one unread message, got ' . (int) $secretary_threads['threads'][0]['unread_count']);
+        self::assertSame(1, (int) $secretary_threads['unread_total'], 'unread_total sums the same one message, got ' . (int) $secretary_threads['unread_total']);
 
         $inbox = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->messages((int) $world['secretary'], (int) $thread['id'], 0, 50));
-        self::assertCount(1, $inbox['messages']);
-        self::assertFalse($inbox['messages'][0]['mine']);
-        self::assertArrayNotHasKey('clinical_note', $inbox['messages'][0]);
-        self::assertArrayNotHasKey('medical_record', $inbox['messages'][0]);
+        self::assertCount(1, $inbox['messages'], 'this thread holds exactly one message, got ' . count((array) $inbox['messages']));
+        self::assertArrayHasKey(0, $inbox['messages'], 'diagnostic: the thread must hold at least one message; message count = ' . count((array) $inbox['messages']));
+        self::assertFalse($inbox['messages'][0]['mine'], 'the doctor\'s message must not be reported as the secretary\'s own; mine = ' . var_export($inbox['messages'][0]['mine'] ?? null, true));
+        self::assertArrayNotHasKey('clinical_note', $inbox['messages'][0], 'a message row must not expose clinical_note; keys = ' . implode(',', array_keys((array) $inbox['messages'][0])));
+        self::assertArrayNotHasKey('medical_record', $inbox['messages'][0], 'a message row must not expose medical_record; keys = ' . implode(',', array_keys((array) $inbox['messages'][0])));
 
         $read = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->mark_read((int) $world['secretary'], (int) $thread['id']));
-        self::assertSame(0, (int) $read['unread_count']);
+        self::assertSame(0, (int) $read['unread_count'], 'mark_read clears the counter, got ' . (int) $read['unread_count']);
 
         $reply = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->send(
             (int) $world['secretary'],
             (int) $thread['id'],
             'پذیرش انجام شد.'
         ));
-        self::assertTrue($reply['mine']);
+        self::assertTrue($reply['mine'], 'the secretary\'s own reply must report mine = true, got ' . var_export($reply['mine'] ?? null, true));
         $incremental = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->messages((int) $world['doctor'], (int) $thread['id'], (int) $sent['id'], 50));
-        self::assertCount(1, $incremental['messages'], 'incremental polling returns only new messages');
-        self::assertSame((int) $reply['id'], (int) $incremental['messages'][0]['id']);
+        self::assertCount(1, $incremental['messages'], 'incremental polling returns only new messages; got ' . count((array) $incremental['messages']) . ' with ids [' . implode(',', array_column((array) $incremental['messages'], 'id')) . ']');
+        self::assertSame((int) $reply['id'], (int) ($incremental['messages'][0]['id'] ?? 0), 'expected only the reply id ' . (int) $reply['id'] . ', got ' . (int) ($incremental['messages'][0]['id'] ?? 0));
 
         $context = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->context((int) $world['secretary']));
-        self::assertSame(StaffMessagingService::RETENTION_POLICY, $context['retention_policy']);
-        self::assertContains((int) $world['doctor'], array_column($context['counterparts'], 'wp_user_id'));
+        self::assertSame(StaffMessagingService::RETENTION_POLICY, $context['retention_policy'], 'expected retention ' . StaffMessagingService::RETENTION_POLICY . ', got ' . (string) $context['retention_policy']);
+        self::assertContains((int) $world['doctor'], array_column((array) $context['counterparts'], 'wp_user_id'), 'the doctor must be an eligible counterpart; counterparts = [' . implode(',', array_column((array) $context['counterparts'], 'wp_user_id')) . ']');
 
         // Audit records the send without ever storing the message body.
         $audit = App::db()->fetchValue(
@@ -139,11 +184,12 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
             . " WHERE action = 'MESSAGE_SEND' AND resource_id = %d AND COALESCE(meta_json, '') NOT LIKE %s",
             [(int) $reply['id'], '%alert(1)%']
         );
-        self::assertSame(1, (int) $audit);
+        self::assertSame(1, (int) $audit, 'exactly one MESSAGE_SEND audit must exist for the reply, body never stored; got ' . (int) $audit);
     }
 
     public function testCrossClinicAndCrossOrganizationThreadsAreDenied(): void
     {
+        $this->register_messaging_routes();
         $world = $this->world();
         $other_org = $this->iv1_org('other');
         $other_clinic = $this->iv1_clinic($other_org);
@@ -295,6 +341,7 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
 
     public function testRestRejectsMissingNonceXssAndAppliesSendRateLimit(): void
     {
+        $this->register_messaging_routes();
         $world = $this->world();
         wp_set_current_user((int) $world['doctor']);
         $service = App::staff_messaging_service();
@@ -363,6 +410,7 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
      */
     public function testAuthorizedStaffRolesAreEligibleAsExplicitOneToOneCounterparts(): void
     {
+        $this->register_messaging_routes();
         $world = $this->world();
         $doctor2 = $this->iv1_user(RolesAndCapabilities::ROLE_DOCTOR, 'doc2');
         $this->iv1_membership($doctor2, (int) $world['clinic'], RolesAndCapabilities::ROLE_DOCTOR);
@@ -372,9 +420,14 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
         $this->iv1_membership($finance1, (int) $world['clinic'], RolesAndCapabilities::ROLE_ACCOUNTANT);
         $finance2 = $this->iv1_user(RolesAndCapabilities::ROLE_ACCOUNTANT, 'cash2');
         $this->iv1_membership($finance2, (int) $world['clinic'], RolesAndCapabilities::ROLE_ACCOUNTANT);
-        self::assertTrue(StaffPortalShell::messages_module_eligible((int) $world['doctor']));
-        self::assertTrue(StaffPortalShell::messages_module_eligible((int) $world['secretary']));
-        self::assertTrue(StaffPortalShell::messages_module_eligible($finance1));
+        // R1 (1.0): the module is hidden for the 1.0 line, so module VISIBILITY must be
+        // false for every role that used to see it (administrator is checked below).
+        // The capability truth those roles rely on is still exercised by this same
+        // class: the service-level send/read/cross-Clinic denials above stay as they are.
+        self::assertFalse(StaffPortalShell::STAFF_MESSAGING_AVAILABLE, 'R1: the 1.0 switch must be off');
+        self::assertFalse(StaffPortalShell::messages_module_eligible((int) $world['doctor']), 'R1: hidden for a doctor');
+        self::assertFalse(StaffPortalShell::messages_module_eligible((int) $world['secretary']), 'R1: hidden for reception');
+        self::assertFalse(StaffPortalShell::messages_module_eligible($finance1), 'R1: hidden for finance');
         $admin = self::factory()->user->create(['role' => 'administrator']);
         self::assertFalse(StaffPortalShell::messages_module_eligible($admin), 'WordPress admin status alone is not sufficient');
 
@@ -536,6 +589,7 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
 
     public function testThirdClinicMemberCannotEnumerateOrUseKnownPrivateThreadIdThroughRest(): void
     {
+        $this->register_messaging_routes();
         $world = $this->world();
         $doctor2 = $this->iv1_user(RolesAndCapabilities::ROLE_DOCTOR, 'doc2');
         $this->iv1_membership($doctor2, (int) $world['clinic'], RolesAndCapabilities::ROLE_DOCTOR);
@@ -673,6 +727,109 @@ final class StaffMessagingSecurityTest extends WP_UnitTestCase
             'CLINIC_PERMISSION_DENIED',
             403
         );
+    }
+
+    /**
+     * Probe: the unread/timestamp service path works while the module is hidden.
+     */
+    public function testUnlinkedUnreadAndTimestampsWorkWhileModuleHidden(): void
+    {
+        $world = $this->world();
+        wp_set_current_user((int) $world['doctor']);
+        $thread = $this->call_thread($world, (int) $world['doctor'], [
+            'recipient_wp_user_id' => (int) $world['secretary'],
+        ]);
+        self::assertGreaterThan(0, (int) $thread['id']);
+        $service = App::staff_messaging_service();
+        $sent = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->send(
+            (int) $world['doctor'],
+            (int) $thread['id'],
+            'پیام آزمایشی بدون پیوند.'
+        ));
+        self::assertNotSame('', (string) $sent['created_at']);
+        self::assertNotSame('', (string) $sent['jalali_time']);
+        $listing = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->threads((int) $world['secretary']));
+        self::assertCount(1, $listing['threads']);
+        self::assertSame(1, (int) $listing['threads'][0]['unread_count']);
+        self::assertSame(1, (int) $listing['unread_total']);
+        $read = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->mark_read((int) $world['secretary'], (int) $thread['id']));
+        self::assertSame(0, (int) $read['unread_count']);
+    }
+
+    /**
+     * Probe: a patient/visit-linked thread persists while the module is hidden.
+     */
+    public function testLinkedThreadPersistsVisitAndLocationWhileModuleHidden(): void
+    {
+        $world = $this->world();
+        wp_set_current_user((int) $world['doctor']);
+        $thread = $this->call_thread($world, (int) $world['doctor'], [
+            'recipient_wp_user_id' => (int) $world['secretary'],
+            'patient_id'           => (int) $world['patient'],
+            'visit_id'             => (int) $world['visit'],
+        ]);
+        self::assertSame((int) $world['visit'], (int) $thread['visit_id']);
+        self::assertSame((int) $world['location'], (int) $thread['location_id']);
+        $service = App::staff_messaging_service();
+        $this->iv1_scope((int) $world['clinic'], fn (): array => $service->send(
+            (int) $world['doctor'],
+            (int) $thread['id'],
+            'پیام پیوندشده.'
+        ));
+        $inbox = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->messages((int) $world['secretary'], (int) $thread['id'], 0, 50));
+        self::assertCount(1, $inbox['messages']);
+        self::assertFalse($inbox['messages'][0]['mine']);
+        self::assertArrayNotHasKey('clinical_note', $inbox['messages'][0]);
+        self::assertArrayNotHasKey('medical_record', $inbox['messages'][0]);
+    }
+
+    /**
+     * Probe: XSS sanitization, incremental polling and audit work while hidden.
+     */
+    public function testXssIncrementalPollingAndAuditWorkWhileModuleHidden(): void
+    {
+        $world = $this->world();
+        wp_set_current_user((int) $world['doctor']);
+        $thread = $this->call_thread($world, (int) $world['doctor'], [
+            'recipient_wp_user_id' => (int) $world['secretary'],
+        ]);
+        $service = App::staff_messaging_service();
+        $sent = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->send(
+            (int) $world['doctor'],
+            (int) $thread['id'],
+            '<script>alert(1)</script>سلام.'
+        ));
+        self::assertStringNotContainsString('<script', (string) $sent['body']);
+        self::assertStringContainsString('سلام', (string) $sent['body']);
+        $reply = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->send(
+            (int) $world['secretary'],
+            (int) $thread['id'],
+            'پاسخ.'
+        ));
+        self::assertTrue($reply['mine']);
+        $incremental = $this->iv1_scope((int) $world['clinic'], fn (): array => $service->messages((int) $world['doctor'], (int) $thread['id'], (int) $sent['id'], 50));
+        self::assertCount(1, $incremental['messages']);
+        self::assertSame((int) $reply['id'], (int) ($incremental['messages'][0]['id'] ?? 0));
+        $audit = App::db()->fetchValue(
+            'SELECT COUNT(*) FROM ' . App::db()->table('cpms_audit_logs')
+            . " WHERE action = 'MESSAGE_SEND' AND resource_id = %d AND COALESCE(meta_json, '') NOT LIKE %s",
+            [(int) $reply['id'], '%alert(1)%']
+        );
+        self::assertSame(1, (int) $audit);
+    }
+
+    /**
+     * Probe: counterparts stay eligible while the module menu is hidden.
+     */
+    public function testCounterpartsRemainEligibleWhileModuleHidden(): void
+    {
+        $world = $this->world();
+        self::assertFalse(StaffPortalShell::STAFF_MESSAGING_AVAILABLE);
+        self::assertFalse(StaffPortalShell::messages_module_eligible((int) $world['doctor']));
+        self::assertFalse(StaffPortalShell::messages_module_eligible((int) $world['secretary']));
+        $context = $this->iv1_scope((int) $world['clinic'], fn (): array => App::staff_messaging_service()->context((int) $world['secretary']));
+        self::assertSame(StaffMessagingService::RETENTION_POLICY, $context['retention_policy']);
+        self::assertContains((int) $world['doctor'], array_column((array) $context['counterparts'], 'wp_user_id'));
     }
 
 }

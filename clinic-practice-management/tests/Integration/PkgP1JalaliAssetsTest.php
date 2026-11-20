@@ -268,7 +268,8 @@ final class PkgP1JalaliAssetsTest extends WP_UnitTestCase {
 			'PublicBookingShortcode must not enqueue cpms-jalali-date script.'
 		);
 
-		// 3) Anonymous login views and StaffPortalShell messages module have no input[type="date"].
+		// 3) Anonymous login views have no input[type="date"]; the messaging module is
+		//    rendered directly below (R1 hides it from the portal for the 1.0 line).
 		$patient_page_id = PatientPortalShell::ensure_portal_page();
 		$doctor_page_id  = DoctorPortalShell::ensure_portal_page();
 		$staff_page_id   = StaffPortalShell::ensure_portal_page();
@@ -280,11 +281,6 @@ final class PkgP1JalaliAssetsTest extends WP_UnitTestCase {
 			'patient_anon'   => [ 0, home_url( '/?page_id=' . $patient_page_id ), [] ],
 			'doctor_anon'    => [ 0, home_url( '/?page_id=' . $doctor_page_id ), [] ],
 			'staff_anon'     => [ 0, home_url( '/?page_id=' . $staff_page_id ), [] ],
-			'staff_messages' => [
-				$fx['secretary_id'],
-				home_url( '/?page_id=' . $staff_page_id ),
-				[ StaffPortalShell::MODULE_PARAM => StaffPortalShell::MODULE_MESSAGES ],
-			],
 		];
 
 		foreach ( $non_date_views as $label => $view ) {
@@ -309,6 +305,42 @@ final class PkgP1JalaliAssetsTest extends WP_UnitTestCase {
 				"{$label}: must not print cpms-jalali-date.js when no date input exists."
 			);
 		}
+
+		// 3b) R1 (1.0): the messaging module is hidden from the portal, so its markup is
+		//     rendered from the SAME template the shell mounts when the switch is on, and
+		//     the original no-date / no-Jalali-asset assertions are kept verbatim.
+		$this->reset_asset_state();
+		wp_set_current_user( $fx['secretary_id'] );
+		$cpms_staff_embed = true;
+		ob_start();
+		include StaffPortalShell::messages_module_template_path();
+		$messages_html = (string) ob_get_clean();
+		self::assertStringNotContainsString(
+			'type="date"',
+			$messages_html,
+			'staff_messages: the messaging module renders no input[type="date"].'
+		);
+		self::assertFalse(
+			wp_style_is( StaffPortalShell::JALALI_HANDLE, 'enqueued' ),
+			'staff_messages: must not enqueue cpms-jalali-date style when no date input exists.'
+		);
+		self::assertFalse(
+			wp_script_is( StaffPortalShell::JALALI_HANDLE, 'enqueued' ),
+			'staff_messages: must not enqueue cpms-jalali-date script when no date input exists.'
+		);
+		self::assertStringNotContainsString(
+			'cpms-jalali-date.js',
+			$messages_html,
+			'staff_messages: must not print cpms-jalali-date.js when no date input exists.'
+		);
+
+		// 3c) R1 (1.0): the module is not offered to that same actor any more.
+		self::assertNotContains(
+			StaffPortalShell::MODULE_MESSAGES,
+			array_column( StaffPortalShell::eligible_modules( (int) $fx['secretary_id'] ), 'id' ),
+			'R1: the messaging module must not appear in the portal menu.'
+		);
+		wp_set_current_user( 0 );
 	}
 
 	public function test_dynamic_jalali_date_js_spec_passes(): void {
