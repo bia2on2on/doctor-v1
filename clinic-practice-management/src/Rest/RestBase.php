@@ -297,9 +297,9 @@ abstract class RestBase
 
         $patient_id = array_key_exists( 'patient_id', $options ) ? $options['patient_id'] : null;
         $mode       = is_string( $options['mode'] ?? null ) ? (string) $options['mode'] : PatientAccess::MODE_CLINICAL;
-        $user       = wp_get_current_user();
+        $user_id    = (int) get_current_user_id();
         $decision   = $this->patient_access()->authorize_request(
-            $user->exists() ? (int) $user->ID : 0,
+            $user_id,
             $clinic_id,
             $patient_id,
             $link_id,
@@ -314,7 +314,7 @@ abstract class RestBase
         if ( 403 === $decision['http_status'] ) {
             App::audit()->log(
                 'FORBIDDEN_ACCESS_ATTEMPT',
-                [ 'wp_user_id' => $user->exists() ? (int) $user->ID : 0, 'role' => $decision['role'] ],
+                [ 'wp_user_id' => $user_id, 'role' => $decision['role'] ],
                 'patient',
                 null,
                 null,

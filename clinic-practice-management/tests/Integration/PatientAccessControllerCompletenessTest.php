@@ -17,9 +17,10 @@ use WP_UnitTestCase;
 
 /**
  * Route-completeness proof for PatientController:
- *  - enumerates PatientController's registered patient-facing routes on WP_REST_Server;
- *  - proves every enumerated route+method executes the central PatientAccess gate
- *    and denies unlinked/cross-clinic callers before any handler runs;
+ *  - enumerates PatientController's registered routes on WP_REST_Server;
+ *  - proves every enumerated patient-facing route+method executes the central
+ *    PatientAccess gate and denies unlinked/cross-clinic callers before any
+ *    handler runs;
  *  - proves non-vacuity by asserting the exact completeness verifier fails against
  *    a deliberately ungated fixture route.
  */
@@ -33,6 +34,15 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
         'POST /clinic/v1/patient/me',
         'PUT /clinic/v1/patient/me',
         'PATCH /clinic/v1/patient/me',
+    ];
+
+    private const EXPECTED_STAFF_ENDPOINTS = [
+        'POST /clinic/v1/patients/search',
+        'GET /clinic/v1/patients/(?P<id>\\d+)',
+        'POST /clinic/v1/patients/(?P<id>\\d+)',
+        'PUT /clinic/v1/patients/(?P<id>\\d+)',
+        'PATCH /clinic/v1/patients/(?P<id>\\d+)',
+        'POST /clinic/v1/patients',
     ];
 
     private int $orgId;
@@ -114,7 +124,7 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
     }
 
     public function testLiveRestServerEnumeratesExactPatientControllerRoutes(): void {
-        $enumerated = $this->enumeratePatientRouteMethods( rest_get_server()->get_routes() );
+        $enumerated = $this->enumerateRouteMethods( rest_get_server()->get_routes(), '/clinic/v1/patient/' );
         self::assertGreaterThan( 0, count( $enumerated ) );
 
         $expected = self::EXPECTED_PATIENT_ENDPOINTS;
@@ -136,7 +146,8 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
         $this->withIsolatedControllerServer(
             $gate,
             function ( WP_REST_Server $server ) use ( &$gateEvents ): void {
-                $this->assertAllPatientRoutesPassGate( $server, $gateEvents );
+                $this->assertExpectedPatientControllerRouteSet( $server->get_routes() );
+                $this->assertEveryPatientRouteExecutesGate( $server, $gateEvents );
             }
         );
     }
@@ -174,14 +185,14 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
 
                 $failed = false;
                 try {
-                    $this->assertAllPatientRoutesPassGate( $server, $gateEvents );
+                    $this->assertEveryPatientRouteExecutesGate( $server, $gateEvents );
                 } catch ( AssertionFailedError $e ) {
                     $failed = true;
                 }
 
                 // Asserted outside callbacks: the verifier MUST fail and the ungated handler ran.
                 self::assertTrue( $failed, 'Completeness verifier must fail when any patient route bypasses PatientAccess.' );
-                self::assertTrue( $handlerRan, 'Deliberately ungated fixture route should have reached its handler without hitting the gate.' );
+                self::assertTrue( $handlerRan, 'Deliberately ungated fixture route must reach its handler without hitting the gate.' );
             }
         );
     }
@@ -190,6 +201,9 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
      * @param callable(WP_REST_Server): void $fn
      */
     private function withIsolatedControllerServer( PatientAccess $gate, callable $fn ): void {
+        // Ensure `rest_api_init` has fired once before registering isolated test routes.
+        rest_get_server();
+
         global $wp_rest_server;
         $previous       = $wp_rest_server;
         $isolated       = new WP_REST_Server();
@@ -204,6 +218,23 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
     }
 
     /**
+     * Asserts that EVERY route registered by `PatientController` is accounted
+     * for by the known patient-facing or staff-facing endpoint sets.
+     *
+     * @param array<string, mixed> $routes
+     */
+    private function assertExpectedPatientControllerRouteSet( array $routes ): void {
+        $all = $this->enumerateRouteMethods( $routes, '/clinic/v1/' );
+        self::assertGreaterThan( 0, count( $all ) );
+
+        $expected = array_merge( self::EXPECTED_PATIENT_ENDPOINTS, self::EXPECTED_STAFF_ENDPOINTS );
+        sort( $expected );
+        $actual = $all;
+        sort( $actual );
+        self::assertSame( $expected, $actual, 'Registered PatientController routes drifted from expected set.' );
+    }
+
+    /**
      * Enumerates every registered patient-facing route+method on `$server`
      * and proves each one executes `PatientAccess` (recorded inside `$gateEvents`
      * by the observer callback, asserted here outside the callback) and denies
@@ -211,16 +242,10 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
      *
      * @param list<array<string, mixed>> $gateEvents
      */
-    private function assertAllPatientRoutesPassGate( WP_REST_Server $server, array &$gateEvents ): void {
+    private function assertEveryPatientRouteExecutesGate( WP_REST_Server $server, array &$gateEvents ): void {
         $routes     = $server->get_routes();
-        $enumerated = $this->enumeratePatientRouteMethods( $routes );
+        $enumerated = $this->enumerateRouteMethods( $routes, '/clinic/v1/patient/' );
         self::assertGreaterThan( 0, count( $enumerated ) );
-
-        $expected = self::EXPECTED_PATIENT_ENDPOINTS;
-        sort( $expected );
-        $actual = $enumerated;
-        sort( $actual );
-        self::assertSame( $expected, $actual, 'Registered patient routes drifted from expected set.' );
 
         foreach ( $routes as $route => $endpoints ) {
             if ( ! str_starts_with( $route, '/clinic/v1/patient/' ) || ! is_array( $endpoints ) ) {
@@ -295,10 +320,10 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
      * @param array<string, mixed> $routes
      * @return list<string>
      */
-    private function enumeratePatientRouteMethods( array $routes ): array {
+    private function enumerateRouteMethods( array $routes, string $prefix ): array {
         $found = [];
         foreach ( $routes as $route => $endpoints ) {
-            if ( ! str_starts_with( $route, '/clinic/v1/patient/' ) || ! is_array( $endpoints ) ) {
+            if ( ! str_starts_with( $route, $prefix ) || ! is_array( $endpoints ) ) {
                 continue;
             }
             foreach ( $endpoints as $endpoint ) {

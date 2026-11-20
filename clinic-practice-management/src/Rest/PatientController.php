@@ -240,6 +240,7 @@ final class PatientController extends RestBase
         return $this->patient_access ?? parent::patient_access();
     }
 
+    // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- Established private helper name.
     private function requirePatient( WP_REST_Request $request, string $mode = PatientAccess::MODE_CLINICAL ): bool|WP_Error {
         return $this->require_patient_access( $request, [ 'mode' => $mode ] );
     }

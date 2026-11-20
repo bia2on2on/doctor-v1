@@ -567,7 +567,7 @@ final class PatientAccess {
      *     message: string,
      *     reason: string,
      *     role: string
-     * } $decision
+     * } $decision Decision payload.
      * @return array{
      *     allowed: bool,
      *     http_status: int,
