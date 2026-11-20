@@ -360,6 +360,24 @@ final class Phase8Slice1PublicBookingBrowseRedTest extends WP_UnitTestCase
     // ================= T1 — the surface is a real WordPress shortcode =================
 
     public function test_unlisted_fixture_hides_browse_and_empty_states_and_rest_reads(): void {
+        $visible = $this->renderSurface( [ self::CLINIC_ATTR => (string) $this->clinicA ] );
+        self::assertStringContainsString( 'Clinic A P8S1', $visible );
+        self::assertStringContainsString( 'data-clinic-id="' . $this->clinicA . '"', $visible );
+        self::assertStringContainsString( 'data-clinician-id="' . $this->clinicianA . '"', $visible );
+        $public_empty = $this->renderSurface( [ self::CLINIC_ATTR => (string) $this->clinicEmpty ] );
+        self::assertStringContainsString( 'data-state="empty"', $public_empty );
+        self::assertStringContainsString( 'data-clinic-id="' . $this->clinicEmpty . '"', $public_empty );
+        $slot_date = $this->freeSlot['date'];
+        $public_slots = $this->a1( $this->clinicianA, $slot_date, $slot_date );
+        self::assertSame( 200, $public_slots->get_status() );
+        $days = $public_slots->get_data()['data']['days'];
+        $slots = array_merge( ...array_column( $days, 'slots' ) );
+        self::assertContains( $this->freeSlot['slot_id'], array_column( $slots, 'slot_id' ) );
+        $public_quote = $this->a4( $this->clinicianA, $slot_date, $this->freeSlot['time'], $this->freeSlot['slot_id'] );
+        self::assertSame( 200, $public_quote->get_status() );
+        self::assertTrue( $public_quote->get_data()['data']['available'] );
+        self::assertSame( $this->freeSlot['slot_id'], $public_quote->get_data()['data']['slot_id'] );
+
         App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
         App::settingsFactory()->forClinic( $this->clinicEmpty )->set( 'public.listing_opt_in', false );
         $hidden  = $this->renderSurface( [ self::CLINIC_ATTR => (string) $this->clinicA ] );

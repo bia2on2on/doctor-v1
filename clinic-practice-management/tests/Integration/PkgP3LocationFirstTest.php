@@ -101,6 +101,12 @@ final class PkgP3LocationFirstTest extends WP_UnitTestCase
     // =====================================================================
 
     public function test_unlisted_fixture_has_no_public_booking_markup(): void {
+        $visible = $this->render( (string) $this->clinic_a );
+        self::assertStringContainsString( 'Clinic A P3LF', $visible );
+        self::assertStringContainsString( 'data-clinic-id="' . $this->clinic_a . '"', $visible );
+        self::assertStringContainsString( 'data-clinician-id="' . $this->clinician_eligible_a1 . '"', $visible );
+        self::assertContains( $this->location_a1, $this->locations_of( $visible, $this->clinician_eligible_a1 ) );
+
         App::settingsFactory()->forClinic( $this->clinic_a )->set( 'public.listing_opt_in', false );
         $hidden  = $this->render( (string) $this->clinic_a );
         $unknown = $this->render( (string) PHP_INT_MAX );

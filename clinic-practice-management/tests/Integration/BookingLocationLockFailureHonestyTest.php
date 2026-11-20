@@ -116,9 +116,14 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
     }
 
     public function test_unlisted_clinic_quote_is_indistinguishable_from_unknown(): void {
-        App::settingsFactory()->forClinic( 1 )->set( 'public.listing_opt_in', false );
         $slot = $this->makeSlot( '19:00' );
         $params = [ 'clinician_id' => $this->clinicianId, 'slot_id' => $slot['id'], 'slot_date' => $slot['date'], 'slot_time' => $slot['time'] ];
+        $public_quote = $this->dispatchQuote( $params );
+        self::assertSame( 200, $public_quote->get_status() );
+        self::assertTrue( $public_quote->get_data()['data']['available'] );
+        self::assertSame( $slot['id'], $public_quote->get_data()['data']['slot_id'] );
+
+        App::settingsFactory()->forClinic( 1 )->set( 'public.listing_opt_in', false );
         $hidden  = $this->dispatchQuote( $params );
         $unknown = $this->dispatchQuote( array_replace( $params, [ 'clinician_id' => PHP_INT_MAX ] ) );
         self::assertSame( 404, $hidden->get_status() );

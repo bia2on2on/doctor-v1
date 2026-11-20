@@ -245,6 +245,11 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
 
     public function test_unlisted_fixture_has_no_public_booking_markup(): void {
         $this->buildTwoClinicFixture();
+        $visible = $this->renderSurface( $this->clinicA );
+        self::assertStringContainsString( 'Clinic A P8S3', $visible );
+        self::assertStringContainsString( 'data-clinic-id="' . $this->clinicA . '"', $visible );
+        self::assertStringContainsString( 'data-clinician-id="' . $this->clinicianA . '"', $visible );
+
         App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
         $hidden  = $this->renderSurface( $this->clinicA );
         $unknown = $this->renderSurface( PHP_INT_MAX );

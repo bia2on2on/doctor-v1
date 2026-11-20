@@ -88,11 +88,26 @@ final class Phase3Slice6BStaffClinicAuthorizationTest extends WP_UnitTestCase
     // ================================================================
 
     public function test_unlisted_clinic_availability_is_indistinguishable_from_unknown(): void {
-        App::settingsFactory()->forClinic( $this->clinics['A'] )->set( 'public.listing_opt_in', false );
+        App::settingsFactory()->forClinic( $this->clinics['A'] )->set( 'public.listing_opt_in', true );
+        $clinic_id = $this->clinics['A'];
+        $doctor_id = $this->insertClinician( $clinic_id, 0, 'Unlisted fixture doctor' );
+        $slot      = $this->insertSlot( $clinic_id, $this->locations[ $clinic_id ], $doctor_id, 3, '11:00:00' );
+        $date      = $slot['date'];
         $request = new WP_REST_Request( 'GET', self::NS . '/availability' );
-        $request->set_param( 'clinician_id', $this->insertClinician( $this->clinics['A'], 0, 'Unlisted fixture doctor' ) );
+        $request->set_param( 'clinician_id', $doctor_id );
+        $request->set_param( 'from', $date );
+        $request->set_param( 'to', $date );
+        $public_slots = rest_do_request( $request );
+        self::assertSame( 200, $public_slots->get_status() );
+        $days = $public_slots->get_data()['data']['days'];
+        $slots = array_merge( ...array_column( $days, 'slots' ) );
+        self::assertContains( $slot['id'], array_column( $slots, 'slot_id' ) );
+
+        App::settingsFactory()->forClinic( $this->clinics['A'] )->set( 'public.listing_opt_in', false );
         $missing = new WP_REST_Request( 'GET', self::NS . '/availability' );
         $missing->set_param( 'clinician_id', PHP_INT_MAX );
+        $missing->set_param( 'from', $date );
+        $missing->set_param( 'to', $date );
         $hidden  = rest_do_request( $request );
         $unknown = rest_do_request( $missing );
         self::assertSame( 404, $hidden->get_status() );

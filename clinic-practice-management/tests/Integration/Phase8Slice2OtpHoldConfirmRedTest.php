@@ -363,6 +363,11 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
 
     public function test_unlisted_fixture_has_no_public_booking_markup(): void {
         $this->buildTwoClinicFixture();
+        $visible = $this->renderSurface( $this->clinicA );
+        self::assertStringContainsString( 'Clinic A P8S2', $visible );
+        self::assertStringContainsString( 'data-clinic-id="' . $this->clinicA . '"', $visible );
+        self::assertStringContainsString( 'data-clinician-id="' . $this->clinicianA . '"', $visible );
+
         App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
         $hidden  = $this->renderSurface( $this->clinicA );
         $unknown = $this->renderSurface( PHP_INT_MAX );
@@ -376,7 +381,6 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
 
     public function test_unlisted_fixture_quote_and_selected_otp_refuse_before_side_effects(): void {
         $this->buildTwoClinicFixture();
-        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
         $slot = $this->seedSlot( $this->clinicA, $this->locationA, $this->clinicianA, $this->ymdDaysAhead( 5 ), '10:00:00', 1 );
         $body = [
             'clinician_id' => $this->clinicianA,
@@ -388,6 +392,15 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             '/booking/quote'       => $body,
             self::OTP_REQUEST_PATH => $body + [ 'mobile' => self::MOBILE_T01 ],
         ];
+        $public_quote = $this->restPost( self::NS . '/booking/quote', $body );
+        self::assertSame( 200, $public_quote->get_status() );
+        self::assertTrue( $public_quote->get_data()['data']['available'] );
+        self::assertSame( $slot['slot_id'], $public_quote->get_data()['data']['slot_id'] );
+        $public_otp = $this->restPost( self::NS . self::OTP_REQUEST_PATH, $requests[ self::OTP_REQUEST_PATH ] );
+        self::assertSame( 200, $public_otp->get_status() );
+        self::assertSame( $this->clinicA, (int) ( $this->latestOtpTokenRow( self::MOBILE_T01 )['clinic_id'] ?? 0 ) );
+
+        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
         $challenges = $this->countRows( 'cpms_otp_tokens' );
         foreach ( $requests as $route => $params ) {
             $hidden  = $this->restPost( self::NS . $route, $params );

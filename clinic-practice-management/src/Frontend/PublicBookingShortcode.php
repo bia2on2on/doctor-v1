@@ -1838,8 +1838,9 @@ final class PublicBookingShortcode
             if ( $patient_portal ) {
                 $config['private_reads'] = true;
             }
-            // A session Clinic outside this surface is unnecessary for the browser's scope check.
-            $config['session_clinic_id'] = null !== $session_clinic_id && array_key_exists( $session_clinic_id, $location_contract )
+            // A bound Clinic is already authorized and published, even without a Location picker.
+            $config['session_clinic_id'] = null !== $session_clinic_id
+                && ( $clinic_id === $session_clinic_id || array_key_exists( $session_clinic_id, $location_contract ) )
                 ? $session_clinic_id
                 : null;
             if ( null !== $discovery || $session_clinic_id !== $clinic_id ) {
