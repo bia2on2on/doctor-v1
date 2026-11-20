@@ -8046,3 +8046,8 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 - Updated `CustomRoleDisplayNameMigrationTest.php:117,151` to roll back `'2026_10_31_0031'` after `HEAD_VERSION` (`0032`), and `Phase8Slice2OtpHoldConfirmRedTest.php:1757` to roll back `'2026_10_31_0031'` after `'2026_11_20_0032'`.
 - Verified `.github/workflows/test_workflow_contracts.py` and `bin/` have 0 references to `2026_10_31_0031` or `0031`.
 - Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (16 production files); `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean; `wpcs-changed-lines` 54 lines. PHP/PHPCS/PHPUnit NOT run locally.
+
+### [2026-11-20 UTC] — PR10-FIX-6: update closure-gate.yml schema head pins to 0032
+- OBSERVED: on head `851e43a`, `Integration (WP 7.1 + MySQL 8)` passed (9/13 green); only the 4 Closure checks failed.
+- Per explicit owner approval, updated `.github/workflows/closure-gate.yml:161` (`schema-0031` / `2026_10_31_0031` -> `schema-0032` / `2026_11_20_0032`) and `:495` (`schema:  2026_10_31_0031` / `SCHEMA NOT 0031 AFTER RESTORE` -> `schema:  2026_11_20_0032` / `SCHEMA NOT 0032 AFTER RESTORE`).
+- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS; `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean. PHP/PHPCS/PHPUnit NOT run locally.
