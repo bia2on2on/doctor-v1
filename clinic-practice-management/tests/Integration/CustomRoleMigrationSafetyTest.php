@@ -66,7 +66,8 @@ final class CustomRoleMigrationSafetyTest extends WP_UnitTestCase
         self::assertStringContainsString(self::NEW_VERSION, $applied_versions, 'migration 2026_10_10_0024 must be applied');
         self::assertStringContainsString(self::DISPLAY_VERSION, $applied_versions, 'the display-name migration must be applied');
         self::assertStringContainsString(self::ARCHIVAL_VERSION, $applied_versions, 'the archival migration must be applied');
-        self::assertStringContainsString(self::HEAD_VERSION, $applied_versions, 'migration 2026_10_31_0031 must be applied');
+        self::assertStringContainsString('2026_10_31_0031', $applied_versions, 'migration 2026_10_31_0031 must be applied');
+        self::assertStringContainsString(self::HEAD_VERSION, $applied_versions, 'migration 2026_11_20_0032 must be applied');
         self::assertSame(self::HEAD_VERSION, App::migrations()->currentVersion(), 'all migrations must advance to the current head');
 
         foreach (['cpms_custom_role_defs', 'cpms_custom_role_capabilities'] as $short) {

@@ -165,4 +165,103 @@ final class PatientLoginsMigrationTest extends WP_UnitTestCase
         self::assertSame( self::HEAD_VERSION, App::migrations()->currentVersion() );
         self::assertSame( $clinicsBefore, (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $db->table( 'cpms_clinics' ) ) );
     }
+
+    public function testUniqueKeysRejectDuplicatesAndAllowDistinctRows(): void
+    {
+        global $wpdb;
+
+        $table = App::db()->table( self::TABLE );
+        $now   = '2026-11-20 00:00:00.000';
+
+        $countRows = static function () use ( $wpdb, $table ): int {
+            return (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table}" ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+        };
+
+        $assertDuplicateRejected = static function ( array $row, string $label ) use ( $wpdb, $table, $countRows ): void {
+            $before = $countRows();
+            $prev   = $wpdb->suppress_errors( true );
+            try {
+                $res = $wpdb->insert( $table, $row );
+                self::assertFalse( $res, $label . ': duplicate insert must fail' );
+                self::assertNotSame( '', (string) $wpdb->last_error, $label . ': DB error must be recorded' );
+            } finally {
+                $wpdb->suppress_errors( $prev );
+            }
+            self::assertSame( $before, $countRows(), $label . ': row count must be unchanged' );
+        };
+
+        // 1) u_pl_mobile (mobile) & u_pl_account (account_key) on account rows.
+        $baseAccount = [
+            'kind'                => 'account',
+            'wp_user_id'          => 910001,
+            'mobile'              => '09000000001',
+            'state'               => 'active',
+            'clinic_id'           => null,
+            'patient_id'          => null,
+            'verified_at'         => null,
+            'verification_method' => null,
+            'live_key'            => null,
+            'account_key'         => 910001,
+            'given_name'          => null,
+            'family_name'         => null,
+            'created_at'          => $now,
+            'updated_at'          => $now,
+        ];
+        self::assertSame( 1, $wpdb->insert( $table, $baseAccount ) );
+
+        // Duplicate u_pl_mobile only (different account_key).
+        $dupMobile                = $baseAccount;
+        $dupMobile['wp_user_id']  = 910002;
+        $dupMobile['account_key'] = 910002;
+        $assertDuplicateRejected( $dupMobile, 'u_pl_mobile' );
+
+        // Duplicate u_pl_account only (different mobile).
+        $dupAccount           = $baseAccount;
+        $dupAccount['mobile'] = '09000000002';
+        $assertDuplicateRejected( $dupAccount, 'u_pl_account' );
+
+        // Positive control: distinct mobile and distinct account_key succeeds.
+        $okAccount                = $baseAccount;
+        $okAccount['wp_user_id']  = 910002;
+        $okAccount['mobile']      = '09000000002';
+        $okAccount['account_key'] = 910002;
+        self::assertSame( 1, $wpdb->insert( $table, $okAccount ) );
+
+        // 2) u_pl_bind (wp_user_id, clinic_id, patient_id) & u_pl_live (live_key) on binding rows.
+        $baseBinding = [
+            'kind'                => 'binding',
+            'wp_user_id'          => 910001,
+            'mobile'              => null,
+            'state'               => 'active',
+            'clinic_id'           => 1,
+            'patient_id'          => 70001,
+            'verified_at'         => $now,
+            'verification_method' => 'two_factor',
+            'live_key'            => '1:70001',
+            'account_key'         => null,
+            'given_name'          => null,
+            'family_name'         => null,
+            'created_at'          => $now,
+            'updated_at'          => $now,
+        ];
+        self::assertSame( 1, $wpdb->insert( $table, $baseBinding ) );
+
+        // Duplicate u_pl_bind only (closed row with live_key = NULL).
+        $dupBind             = $baseBinding;
+        $dupBind['state']    = 'closed';
+        $dupBind['live_key'] = null;
+        $assertDuplicateRejected( $dupBind, 'u_pl_bind' );
+
+        // Duplicate u_pl_live only (different wp_user_id, same clinic_id:patient_id).
+        $dupLive               = $baseBinding;
+        $dupLive['wp_user_id'] = 910002;
+        $assertDuplicateRejected( $dupLive, 'u_pl_live' );
+
+        // Positive control: distinct (wp_user_id, clinic_id, patient_id) and live_key succeeds.
+        $okBinding               = $baseBinding;
+        $okBinding['wp_user_id'] = 910002;
+        $okBinding['patient_id'] = 70002;
+        $okBinding['live_key']   = '1:70002';
+        self::assertSame( 1, $wpdb->insert( $table, $okBinding ) );
+    }
 }
