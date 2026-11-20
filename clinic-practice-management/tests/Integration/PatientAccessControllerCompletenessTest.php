@@ -144,8 +144,10 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
             }
         );
 
-        $this->withIsolatedControllerServer(
-            $gate,
+        $this->withIsolatedServer(
+            static function () use ( $gate ): void {
+                ( new PatientController( App::patientService(), $gate ) )->register_routes();
+            },
             function ( WP_REST_Server $server ) use ( &$gateEvents ): void {
                 $this->assertExpectedPatientControllerRouteSet( $server->get_routes() );
                 $this->assertEveryPatientRouteExecutesGate( $server, $gateEvents );
@@ -163,68 +165,81 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
             }
         );
 
-        // Ensure `rest_api_init` has fired once before registering isolated test routes.
-        rest_get_server();
-
-        global $wp_rest_server;
-        $previous       = $wp_rest_server;
-        $isolated       = new WP_REST_Server();
-        $wp_rest_server = $isolated;
-
-        try {
-            // Register a deliberately ungated fixture route on `/clinic/v1/patient/me`
-            // (which RestClinicContext skips as patient-self) without PatientAccess.
-            $handlerRan = false;
-            register_rest_route(
-                'clinic/v1',
-                '/patient/me',
-                [
+        // Register a deliberately ungated fixture route on `/clinic/v1/patient/me`
+        // (which RestClinicContext skips as patient-self) without PatientAccess.
+        $handlerRan = false;
+        $this->withIsolatedServer(
+            static function () use ( &$handlerRan ): void {
+                register_rest_route(
+                    'clinic/v1',
+                    '/patient/me',
                     [
-                        'methods'             => WP_REST_Server::READABLE,
-                        'callback'            => static function () use ( &$handlerRan ): array {
-                            $handlerRan = true;
+                        [
+                            'methods'             => WP_REST_Server::READABLE,
+                            'callback'            => static function () use ( &$handlerRan ): array {
+                                $handlerRan = true;
 
-                            return [ 'ok' => true ];
-                        },
-                        'permission_callback' => '__return_true',
-                    ],
-                ]
-            );
+                                return [ 'ok' => true ];
+                            },
+                            'permission_callback' => '__return_true',
+                        ],
+                    ]
+                );
+            },
+            function ( WP_REST_Server $server ) use ( &$gateEvents ): void {
+                $failed = false;
+                try {
+                    $this->assertEveryPatientRouteExecutesGate( $server, $gateEvents );
+                } catch ( AssertionFailedError $e ) {
+                    $failed = true;
+                }
 
-            $failed = false;
-            try {
-                $this->assertEveryPatientRouteExecutesGate( $isolated, $gateEvents );
-            } catch ( AssertionFailedError $e ) {
-                $failed = true;
+                // Asserted outside callbacks: the verifier MUST fail.
+                self::assertTrue( $failed, 'Completeness verifier must fail when any patient route bypasses PatientAccess.' );
             }
+        );
 
-            // Asserted outside callbacks: the verifier MUST fail and the ungated handler ran.
-            self::assertTrue( $failed, 'Completeness verifier must fail when any patient route bypasses PatientAccess.' );
-            self::assertTrue( $handlerRan, 'Deliberately ungated fixture route must reach its handler without hitting the gate.' );
-            self::assertSame( [], $gateEvents );
-            unset( $gate );
-        } finally {
-            $wp_rest_server = $previous;
-        }
+        // Asserted outside callbacks: the ungated handler ran without hitting the gate.
+        self::assertTrue( $handlerRan, 'Deliberately ungated fixture route must reach its handler without hitting the gate.' );
+        self::assertSame( [], $gateEvents );
+        unset( $gate );
     }
 
     /**
+     * Runs `$register` inside a genuine `rest_api_init` action scoped to an
+     * isolated `WP_REST_Server` so `doing_action( 'rest_api_init' )` is true
+     * and WordPress does not emit `_doing_it_wrong` notices.
+     *
+     * @param callable(): void               $register
      * @param callable(WP_REST_Server): void $fn
      */
-    private function withIsolatedControllerServer( PatientAccess $gate, callable $fn ): void {
-        // Ensure `rest_api_init` has fired once before registering isolated test routes.
+    private function withIsolatedServer( callable $register, callable $fn ): void {
+        // Ensure the main REST server has initialized once before isolating.
         rest_get_server();
 
-        global $wp_rest_server;
-        $previous       = $wp_rest_server;
+        global $wp_rest_server, $wp_filter;
+        $previousServer = $wp_rest_server;
+        $previousHooks  = $wp_filter['rest_api_init'] ?? null;
         $isolated       = new WP_REST_Server();
         $wp_rest_server = $isolated;
+        unset( $wp_filter['rest_api_init'] );
+
+        $hook = static function () use ( $register ): void {
+            $register();
+        };
+        add_action( 'rest_api_init', $hook );
 
         try {
-            ( new PatientController( App::patientService(), $gate ) )->register_routes();
+            do_action( 'rest_api_init', $isolated );
             $fn( $isolated );
         } finally {
-            $wp_rest_server = $previous;
+            remove_action( 'rest_api_init', $hook );
+            if ( null !== $previousHooks ) {
+                $wp_filter['rest_api_init'] = $previousHooks;
+            } else {
+                unset( $wp_filter['rest_api_init'] );
+            }
+            $wp_rest_server = $previousServer;
         }
     }
 
