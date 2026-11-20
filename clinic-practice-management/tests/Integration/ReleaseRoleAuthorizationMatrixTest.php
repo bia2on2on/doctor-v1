@@ -763,7 +763,13 @@ final class ReleaseRoleAuthorizationMatrixTest extends WP_UnitTestCase
             self::fail("user {$userId} not found");
         }
         $user->add_role($role);
-        self::assertTrue($user->has_role($role), "fixture: user must hold the second global role {$role}");
+        // `$user->roles` (not WP_User::has_role(), which WP 7.1 no longer defines —
+        // an unknown method falls through __call() to false) is the durable proof
+        // that the account really carries two global roles.
+        self::assertTrue(
+            in_array($role, (array) $user->roles, true),
+            "fixture: user must hold the second global role {$role}"
+        );
     }
 
     private function grantGlobalCap(int $userId, string $capability): void
