@@ -541,6 +541,21 @@ final class ReleaseRoleAuthorizationMatrixTest extends WP_UnitTestCase
             $authz->can($accountant, $this->clinicId, RolesAndCapabilities::EXPORT),
             'control: the accountant preset still applies'
         );
+
+        // scoped_decision() is deliberately a different contract, described here
+        // rather than invented: with NO membership row it returns null so the
+        // legacy WordPress-capability path may still answer, and once a membership
+        // exists it is the scoped engine's verdict only — a global capability can
+        // never turn it true (AuthorizationService.php:186-209).
+        $nonMember = $this->makeUser('rm_global_nomember', RolesAndCapabilities::ROLE_DOCTOR);
+        self::assertNull(
+            $authz->scoped_decision($nonMember, $this->clinicId, RolesAndCapabilities::EXPORT),
+            'no membership: scoped_decision stays null (legacy path)'
+        );
+        self::assertFalse(
+            $authz->scoped_decision($doctor, $this->clinicId, RolesAndCapabilities::EXPORT),
+            'membership without the capability: scoped_decision is the scoped verdict'
+        );
     }
 
     // ================= TP-33 — doctor sensitive payment needs ownership =================
@@ -587,7 +602,8 @@ final class ReleaseRoleAuthorizationMatrixTest extends WP_UnitTestCase
             'an explicit membership GRANT must not bypass the doctor ownership conjunct'
         );
 
-        // A non-doctor actor with an explicit grant is not ownership-bound (policy §3).
+        // A non-doctor actor is not ownership-bound (policy §3): the accountant
+        // preset authorizes the sensitive payment capability unconditionally.
         $accountant = $this->staff($this->clinicId, RolesAndCapabilities::ROLE_ACCOUNTANT, 'rm_own_acc');
         self::assertTrue(
             $authz->can_with_ownership($accountant, $this->clinicId, RolesAndCapabilities::PAYMENT_VOID, false),
