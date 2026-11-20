@@ -120,6 +120,7 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
     protected function tearDown(): void {
         remove_all_filters( 'cpms_license_public_key' );
         wp_set_current_user( 0 );
+        App::resetScope();
         parent::tearDown();
     }
 
@@ -162,39 +163,49 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
             }
         );
 
-        $this->withIsolatedControllerServer(
-            $gate,
-            function ( WP_REST_Server $server ) use ( &$gateEvents ): void {
-                // Inject a deliberately ungated fixture route under /clinic/v1/patient/.
-                $handlerRan = false;
-                register_rest_route(
-                    'clinic/v1',
-                    '/patient/ungated-fixture',
+        // Ensure `rest_api_init` has fired once before registering isolated test routes.
+        rest_get_server();
+
+        global $wp_rest_server;
+        $previous       = $wp_rest_server;
+        $isolated       = new WP_REST_Server();
+        $wp_rest_server = $isolated;
+
+        try {
+            // Register a deliberately ungated fixture route on `/clinic/v1/patient/me`
+            // (which RestClinicContext skips as patient-self) without PatientAccess.
+            $handlerRan = false;
+            register_rest_route(
+                'clinic/v1',
+                '/patient/me',
+                [
                     [
-                        [
-                            'methods'             => WP_REST_Server::READABLE,
-                            'callback'            => static function () use ( &$handlerRan ): array {
-                                $handlerRan = true;
+                        'methods'             => WP_REST_Server::READABLE,
+                        'callback'            => static function () use ( &$handlerRan ): array {
+                            $handlerRan = true;
 
-                                return [ 'ok' => true ];
-                            },
-                            'permission_callback' => '__return_true',
-                        ],
-                    ]
-                );
+                            return [ 'ok' => true ];
+                        },
+                        'permission_callback' => '__return_true',
+                    ],
+                ]
+            );
 
-                $failed = false;
-                try {
-                    $this->assertEveryPatientRouteExecutesGate( $server, $gateEvents );
-                } catch ( AssertionFailedError $e ) {
-                    $failed = true;
-                }
-
-                // Asserted outside callbacks: the verifier MUST fail and the ungated handler ran.
-                self::assertTrue( $failed, 'Completeness verifier must fail when any patient route bypasses PatientAccess.' );
-                self::assertTrue( $handlerRan, 'Deliberately ungated fixture route must reach its handler without hitting the gate.' );
+            $failed = false;
+            try {
+                $this->assertEveryPatientRouteExecutesGate( $isolated, $gateEvents );
+            } catch ( AssertionFailedError $e ) {
+                $failed = true;
             }
-        );
+
+            // Asserted outside callbacks: the verifier MUST fail and the ungated handler ran.
+            self::assertTrue( $failed, 'Completeness verifier must fail when any patient route bypasses PatientAccess.' );
+            self::assertTrue( $handlerRan, 'Deliberately ungated fixture route must reach its handler without hitting the gate.' );
+            self::assertSame( [], $gateEvents );
+            unset( $gate );
+        } finally {
+            $wp_rest_server = $previous;
+        }
     }
 
     /**
@@ -299,7 +310,7 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
                         }
                     }
                     if ( in_array( $method, [ 'POST', 'PUT', 'PATCH' ], true ) && '/clinic/v1/patient/me' === $route ) {
-                        $allowReq->set_param( 'first_name', 'AllowedEdit' );
+                        $allowReq->set_param( 'first_name', 'AllowedEdit' . $method );
                     }
 
                     $allowRes = $server->dispatch( $allowReq );
@@ -309,8 +320,8 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
                         $method . ' ' . $route . ' bypassed PatientAccess on positive control.'
                     );
                     $lastAllowEvent = $gateEvents[ count( $gateEvents ) - 1 ];
-                    self::assertTrue( $lastAllowEvent['allowed'] );
-                    self::assertSame( 200, $allowRes->get_status(), $method . ' ' . $route . ' positive control failed.' );
+                    self::assertTrue( $lastAllowEvent['allowed'], $method . ' ' . $route . ' gate denied positive control: ' . wp_json_encode( $lastAllowEvent ) );
+                    self::assertSame( 200, $allowRes->get_status(), $method . ' ' . $route . ' positive control failed: ' . wp_json_encode( $allowRes->get_data() ) );
                 }
             }
         }
