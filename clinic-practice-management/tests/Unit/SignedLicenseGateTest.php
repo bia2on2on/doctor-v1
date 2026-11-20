@@ -254,4 +254,85 @@ final class SignedLicenseGateTest extends TestCase
             );
         }
     }
+
+    public function testHandwritingForOpenedVisitAllowedAcrossAllLicenseStates(): void
+    {
+        $now = 1793448000;
+        $cases = [
+            [LicenseStatus::ACTIVE, ''],
+            [LicenseStatus::EXPIRING, 'near_expiry'],
+            [LicenseStatus::GRACE, 'grace'],
+            [LicenseStatus::GRACE, 'unreachable_grace'],
+            [LicenseStatus::RESTRICTED, 'expired'],
+            [LicenseStatus::RESTRICTED, 'activation_window_expired'],
+            [LicenseStatus::RESTRICTED, 'migration_grace_expired'],
+            [LicenseStatus::RESTRICTED, 'binding_mismatch'],
+            [LicenseStatus::RESTRICTED, 'expired_unreachable'],
+            [LicenseStatus::SUSPENDED, 'suspended'],
+            [LicenseStatus::REVOKED, 'revoked'],
+            [LicenseStatus::INVALID, 'signature_invalid'],
+            [LicenseStatus::UNREACHABLE, 'no_cached_state'],
+            [LicenseStatus::UNREACHABLE, 'cached_state_stale'],
+            [LicenseStatus::THROTTLED, 'throttled'],
+            [LicenseStatus::NOT_CONFIGURED, 'not_configured'],
+            [LicenseStatus::ACTIVATION_PENDING, 'activation_pending'],
+            [LicenseStatus::ACTIVATION_GRACE, 'migration_grace'],
+            [LicenseStatus::DEVELOPMENT, 'dev_mode'],
+        ];
+
+        foreach ($cases as [$status, $reason]) {
+            $provider = new class($status, $reason, $now - 60) implements LicenseStateProvider {
+                public function __construct(
+                    private readonly string $status,
+                    private readonly string $reason,
+                    private readonly int $expiresAt
+                ) {
+                }
+
+                public function currentState(): array
+                {
+                    return [
+                        'status' => $this->status,
+                        'reason' => $this->reason,
+                        'expires_at' => $this->expiresAt,
+                        'needs_renewal' => true,
+                    ];
+                }
+
+                public function entitlements(): EntitlementRegistry
+                {
+                    return new EntitlementRegistry();
+                }
+            };
+            $gate = new SignedLicenseGate($provider, null, static fn (): int => $now);
+            $decision = $gate->assert(LicenseGate::OP_HANDWRITING_NEW, [
+                'visit_opened' => true,
+                'visit_created_at' => $now - 120,
+            ]);
+            $this->assertTrue($decision->allowed, "{$status}/{$reason} must allow handwriting on already-opened visit");
+        }
+    }
+
+    public function testHandwritingForClosedOrUnopenedVisitDeniedInRestrictedStates(): void
+    {
+        foreach ([
+            [LicenseStatus::RESTRICTED, 'expired'],
+            [LicenseStatus::RESTRICTED, 'activation_window_expired'],
+            [LicenseStatus::SUSPENDED, 'suspended'],
+            [LicenseStatus::REVOKED, 'revoked'],
+            [LicenseStatus::INVALID, 'signature_invalid'],
+            [LicenseStatus::UNREACHABLE, 'no_cached_state'],
+            [LicenseStatus::THROTTLED, 'throttled'],
+        ] as [$status, $reason]) {
+            $gate = new SignedLicenseGate($this->providerWithReason($status, $reason));
+            $this->assertFalse(
+                $gate->assert(LicenseGate::OP_HANDWRITING_NEW, ['visit_opened' => false])->allowed,
+                "{$status}/{$reason} must deny closed/unopened visit"
+            );
+            $this->assertFalse(
+                $gate->assert(LicenseGate::OP_HANDWRITING_NEW)->allowed,
+                "{$status}/{$reason} must deny uncontextualized handwriting"
+            );
+        }
+    }
 }
