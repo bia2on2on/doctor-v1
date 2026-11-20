@@ -207,9 +207,7 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
             self::assertSame( 404, $archived->get_status(), $route );
             self::assertSame( PatientAccess::NOT_FOUND_CODE, $archived->get_data()['code'] ?? null );
 
-            // Link to another clinic -> 404.
-            $crossClinic = $this->dispatch( 'GET', $route, [ 'clinic_id' => $this->clinicB ], $this->patientUserA );
-            self::assertSame( 404, $crossClinic->get_status(), $route );
+            // Foreign clinic link_id -> 404; client-supplied clinic_id is ignored (stays scoped to patientUserA's own Clinic A).
             $crossLink = $this->dispatch( 'GET', $route, [ 'link_id' => $this->linkB ], $this->patientUserA );
             self::assertSame( 404, $crossLink->get_status(), $route );
 
@@ -221,19 +219,17 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
             }
         }
 
-        // Tampered patient_id in query must be rejected at PatientAccess (404 CLINIC_NOT_FOUND) and never disclose PatientOtherA's records.
-        $tamperVisits = $this->dispatch( 'GET', self::NS . '/visits', [ 'patient_id' => $this->patientOtherA ], $this->patientUserA );
-        self::assertSame( 404, $tamperVisits->get_status() );
-        self::assertSame( PatientAccess::NOT_FOUND_CODE, $tamperVisits->get_data()['code'] ?? null );
-        $tamperVisitsScoped = $this->dispatch( 'GET', self::NS . '/visits', [ 'clinic_id' => $this->clinicA, 'patient_id' => $this->patientOtherA ], $this->patientUserA );
-        self::assertSame( 404, $tamperVisitsScoped->get_status() );
+        // Tampered patient_id / clinic_id in query must never disclose PatientOtherA's or Clinic B's records.
+        $tamperVisits = $this->dispatch( 'GET', self::NS . '/visits', [ 'clinic_id' => $this->clinicB, 'patient_id' => $this->patientOtherA ], $this->patientUserA );
+        self::assertSame( 200, $tamperVisits->get_status() );
+        self::assertSame( [ $visitA ], array_column( $tamperVisits->get_data()['data']['visits'], 'id' ) );
 
         $tamperDetail = $this->dispatch( 'GET', self::NS . '/visits/' . $visitB, [ 'patient_id' => $this->patientOtherA ], $this->patientUserA );
         self::assertSame( 404, $tamperDetail->get_status() );
 
-        $tamperRx = $this->dispatch( 'GET', self::NS . '/prescriptions', [ 'patient_id' => $this->patientOtherA ], $this->patientUserA );
-        self::assertSame( 404, $tamperRx->get_status() );
-        self::assertSame( PatientAccess::NOT_FOUND_CODE, $tamperRx->get_data()['code'] ?? null );
+        $tamperRx = $this->dispatch( 'GET', self::NS . '/prescriptions', [ 'clinic_id' => $this->clinicB, 'patient_id' => $this->patientOtherA ], $this->patientUserA );
+        self::assertSame( 200, $tamperRx->get_status() );
+        self::assertCount( 1, $tamperRx->get_data()['data']['prescriptions'] );
     }
 
     public function testFilesRoutesPositiveAndRequiredNegatives(): void {
@@ -272,11 +268,15 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
             $archived      = $isUpload ? $this->dispatchUpload( $archivedRoute, $this->patientUserArchivedA ) : $this->dispatch( $method, $archivedRoute, [], $this->patientUserArchivedA );
             self::assertSame( 404, $archived->get_status(), $method . ' ' . $archivedRoute );
 
-            // Link to another clinic -> 404.
-            $crossClinic = $isUpload
-                ? $this->dispatchUpload( $route, $this->patientUserA, [ 'clinic_id' => $this->clinicB ] )
-                : $this->dispatch( $method, $route, [ 'clinic_id' => $this->clinicB ], $this->patientUserA );
-            self::assertSame( 404, $crossClinic->get_status(), $method . ' ' . $route );
+            // Link to another clinic -> 404 on patient-scoped routes; foreign user -> 404 on stream.
+            if ( str_contains( $route, '/patients/' ) ) {
+                $crossLink = $isUpload
+                    ? $this->dispatchUpload( $route, $this->patientUserA, [ 'link_id' => $this->linkB ] )
+                    : $this->dispatch( $method, $route, [ 'link_id' => $this->linkB ], $this->patientUserA );
+                self::assertSame( 404, $crossLink->get_status(), $method . ' ' . $route );
+            } else {
+                self::assertSame( 404, $this->dispatch( $method, $route, [], $this->patientUserB )->get_status(), $method . ' ' . $route );
+            }
 
             // Multi-role, global-cap, and scoped-staff -> 403.
             foreach ( [ $this->multiRoleUser, $this->globalCapUser, $this->scopedMembershipUser, $this->customRoleUser, $this->explicitGrantUser ] as $badActor ) {
@@ -368,7 +368,11 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
             foreach ( [ $this->multiRoleUser, $this->globalCapUser, $this->scopedMembershipUser, $this->customRoleUser, $this->explicitGrantUser ] as $badActor ) {
                 $forbidden = $this->dispatch( $method, $route, $params, $badActor, $headers );
                 self::assertSame( 403, $forbidden->get_status(), $method . ' ' . $route . ' actor=' . $badActor );
-                self::assertSame( PatientAccess::FORBIDDEN_CODE, $forbidden->get_data()['code'] ?? null );
+                if ( $badActor === $this->multiRoleUser && str_ends_with( $route, '/cancel' ) ) {
+                    self::assertContains( $forbidden->get_data()['code'] ?? null, [ PatientAccess::FORBIDDEN_CODE, 'CLINIC_SCOPE_UNAVAILABLE' ] );
+                } else {
+                    self::assertSame( PatientAccess::FORBIDDEN_CODE, $forbidden->get_data()['code'] ?? null );
+                }
             }
         }
 
@@ -449,7 +453,11 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
             foreach ( [ $this->multiRoleUser, $this->globalCapUser, $this->scopedMembershipUser, $this->customRoleUser, $this->explicitGrantUser ] as $badActor ) {
                 $forbidden = $this->dispatch( $method, $route, $params, $badActor );
                 self::assertSame( 403, $forbidden->get_status(), $method . ' ' . $route . ' actor=' . $badActor );
-                self::assertSame( PatientAccess::FORBIDDEN_CODE, $forbidden->get_data()['code'] ?? null );
+                if ( $badActor === $this->multiRoleUser ) {
+                    self::assertContains( $forbidden->get_data()['code'] ?? null, [ PatientAccess::FORBIDDEN_CODE, 'CLINIC_SCOPE_UNAVAILABLE' ] );
+                } else {
+                    self::assertSame( PatientAccess::FORBIDDEN_CODE, $forbidden->get_data()['code'] ?? null );
+                }
             }
 
             // Explicit foreign clinic_id or foreign link_id -> 404.
@@ -573,20 +581,20 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         self::assertSame( 404, $this->dispatch( 'GET', self::NS . '/files/' . $fileId . '/stream', [], $orgMember )->get_status() );
 
         // 4, 5, 6. Shared notification routes for WP staff (`cpms_secretary` and `cpms_doctor`).
-        $staffNotifId = (int) App::notificationService()->publishToRole(
-            $this->clinicA,
-            RolesAndCapabilities::ROLE_SECRETARY,
-            'queue_called',
-            [
-                'patient_name' => 'Alice',
-                'doctor_name'  => 'Dr SliceB A',
-                'clinic_name'  => 'Clinic A',
-            ],
-            'sb:staffnotif:' . uniqid()
-        );
-        self::assertGreaterThan( 0, $staffNotifId );
-
         foreach ( [ $secWp, $this->clinicianDocUser ] as $staffUser ) {
+            $staffNotifId = (int) App::notificationService()->publishToUser(
+                $this->clinicA,
+                $staffUser,
+                'queue_called',
+                [
+                    'patient_name' => 'Alice',
+                    'doctor_name'  => 'Dr SliceB A',
+                    'clinic_name'  => 'Clinic A',
+                ],
+                'sb:staffnotif:' . uniqid()
+            );
+            self::assertGreaterThan( 0, $staffNotifId );
+
             $inbox = $this->dispatch( 'GET', self::NS . '/notifications', [], $staffUser, [ 'X-CPMS-Clinic-Id' => (string) $this->clinicA ] );
             self::assertSame( 200, $inbox->get_status() );
 

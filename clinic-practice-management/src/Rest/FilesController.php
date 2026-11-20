@@ -90,6 +90,7 @@ final class FilesController extends RestBase
                         $r,
                         [
                             'mode'       => PatientAccess::MODE_PATIENT_RESOURCE,
+                            'clinic_id'  => null,
                             'patient_id' => $this->path_patient_id( $r ),
                         ]
                     ),
@@ -106,6 +107,7 @@ final class FilesController extends RestBase
                         $r,
                         [
                             'mode'       => PatientAccess::MODE_PATIENT_RESOURCE,
+                            'clinic_id'  => null,
                             'patient_id' => $this->path_patient_id( $r ),
                         ]
                     ),
@@ -175,7 +177,15 @@ final class FilesController extends RestBase
             return true;
         }
 
-        return $this->require_patient_access( $request, [ 'mode' => PatientAccess::MODE_CLINICAL ] );
+        return $this->require_patient_access(
+            $request,
+            [
+                'mode'       => PatientAccess::MODE_CLINICAL,
+                'clinic_id'  => null,
+                'patient_id' => null,
+                'link_id'    => null,
+            ]
+        );
     }
 
     /**

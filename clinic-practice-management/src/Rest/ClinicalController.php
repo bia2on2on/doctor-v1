@@ -180,7 +180,11 @@ final class ClinicalController extends RestBase
                 ),
                 'permission_callback' => fn ( WP_REST_Request $r ) => $this->require_patient_access(
                     $r,
-                    [ 'mode' => PatientAccess::MODE_CLINICAL ]
+                    [
+                        'mode'       => PatientAccess::MODE_CLINICAL,
+                        'clinic_id'  => null,
+                        'patient_id' => null,
+                    ]
                 ),
                 'args' => [
                     'link_id' => ['required' => false, 'type' => 'integer'],
@@ -200,7 +204,11 @@ final class ClinicalController extends RestBase
                 ),
                 'permission_callback' => fn ( WP_REST_Request $r ) => $this->require_patient_access(
                     $r,
-                    [ 'mode' => PatientAccess::MODE_CLINICAL ]
+                    [
+                        'mode'       => PatientAccess::MODE_CLINICAL,
+                        'clinic_id'  => null,
+                        'patient_id' => null,
+                    ]
                 ),
                 'args'                => ['link_id' => ['required' => false, 'type' => 'integer']],
             ],
@@ -216,7 +224,11 @@ final class ClinicalController extends RestBase
                 ),
                 'permission_callback' => fn ( WP_REST_Request $r ) => $this->require_patient_access(
                     $r,
-                    [ 'mode' => PatientAccess::MODE_CLINICAL ]
+                    [
+                        'mode'       => PatientAccess::MODE_CLINICAL,
+                        'clinic_id'  => null,
+                        'patient_id' => null,
+                    ]
                 ),
                 'args'                => [
                     'link_id' => ['required' => false, 'type' => 'integer'],

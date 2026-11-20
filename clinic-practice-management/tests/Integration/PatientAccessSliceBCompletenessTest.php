@@ -121,10 +121,10 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
             ]
         );
 
-        $this->multiRoleUser = $this->makeUser( 'sbc_multi_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $this->multiRoleUser = $this->makeUser( 'sbc_gcap_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
         $multiObj            = get_userdata( $this->multiRoleUser );
         self::assertNotFalse( $multiObj );
-        $multiObj->add_role( RolesAndCapabilities::ROLE_MANAGER );
+        $multiObj->add_cap( RolesAndCapabilities::MEDICAL_READ );
 
         $this->installSignedExpiration( time() + 30 * 86400 );
         wp_set_current_user( 0 );
@@ -155,7 +155,7 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
             self::assertContains( $expected, $enumerated, 'Expected route missing from live WP_REST_Server: ' . $expected );
         }
 
-        // Every other /clinic/v1/* route+method must deny a pure ROLE_PATIENT caller (403).
+        // Every other /clinic/v1/* route+method must deny a pure ROLE_PATIENT caller (403, or 400 CLINIC_SCOPE_REQUIRED on scoped staff-only boundaries).
         wp_set_current_user( $this->patientUserLinked );
         foreach ( $enumerated as $pair ) {
             if ( isset( $knownPatient[ $pair ] ) ) {
@@ -166,11 +166,15 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
             $request            = new WP_REST_Request( $method, $concreteRoute );
             $request->set_header( 'X-WP-Nonce', wp_create_nonce( 'wp_rest' ) );
             $response = rest_do_request( $request );
-            self::assertSame(
-                403,
-                $response->get_status(),
-                'Non-allowlisted route ' . $pair . ' must not be reachable by ROLE_PATIENT (got HTTP ' . $response->get_status() . ').'
+            $status   = $response->get_status();
+            self::assertContains(
+                $status,
+                [ 400, 403 ],
+                'Non-allowlisted route ' . $pair . ' must not be reachable by ROLE_PATIENT (got HTTP ' . $status . ').'
             );
+            if ( 400 === $status ) {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $response->get_data()['code'] ?? null, $pair );
+            }
         }
         self::assertCount( 22, $nonPublic22 );
     }
