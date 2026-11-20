@@ -332,24 +332,70 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
             self::assertSame( $baselineDenied->get_data(), $deniedEnroll->get_data() );
         }
 
-        // Fail-closed proof: when the membership authority query errors, even pure patientUserA is denied identically.
+        // Fail-closed proof keyed ONLY on MembershipRepository::active_clinic_ids_for_user() SQL shape
+        // (distinct from RestClinicContext::has_active_staff_membership_in_request() / find_active()).
         global $wpdb;
-        $corruptMemberships = static function ( string $sql ): string {
-            if ( str_contains( $sql, 'cpms_clinic_memberships' ) ) {
+        $membershipTable = preg_quote( App::db()->table( 'cpms_clinic_memberships' ), '/' );
+        $exactLookupSql  = '/^\s*SELECT\s+clinic_id\s+FROM\s+' . $membershipTable . '\s+WHERE\s+wp_user_id\s*=\s*' . $this->patientUserA . '\s+AND\s+status\s*=\s*\'active\'\s+ORDER\s+BY\s+clinic_id\s*$/';
+
+        // 1. Witness run (observe-only): prove the exact filter hits the gate's active-clinic lookup once on 200.
+        $witnessMatches = 0;
+        $witnessSeen    = [];
+        $witnessFilter  = static function ( string $sql ) use ( $exactLookupSql, &$witnessMatches, &$witnessSeen ): string {
+            if ( 1 === preg_match( $exactLookupSql, $sql ) ) {
+                ++$witnessMatches;
+                $witnessSeen[] = $sql;
+            }
+
+            return $sql;
+        };
+        add_filter( 'query', $witnessFilter, 5 );
+        try {
+            $witnessResponse = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->patientUserA );
+        } finally {
+            remove_filter( 'query', $witnessFilter, 5 );
+        }
+        self::assertSame( 1, $witnessMatches );
+        self::assertCount( 1, $witnessSeen );
+        self::assertSame( 200, $witnessResponse->get_status() );
+        self::assertSame( $this->patientA, (int) ( $witnessResponse->get_data()['data']['id'] ?? 0 ) );
+
+        // 2. Failing run: corrupt ONLY that exact lookup query, verify 403 fail-closed and strict-mode restoration.
+        $strictBefore        = App::db()->is_strict();
+        $failMatches         = 0;
+        $failSeen            = [];
+        $corruptMemberships  = static function ( string $sql ) use ( $exactLookupSql, &$failMatches, &$failSeen ): string {
+            if ( 1 === preg_match( $exactLookupSql, $sql ) ) {
+                ++$failMatches;
+                $failSeen[] = $sql;
+
                 return 'SELECT nonexistent_col_for_fail_closed_test FROM wp_nonexistent_cpms_table';
             }
 
             return $sql;
         };
+        self::assertFalse( $strictBefore );
         $previousSuppression = (bool) $wpdb->suppress_errors( true );
         add_filter( 'query', $corruptMemberships, 5 );
         try {
             $deniedOnDbError = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->patientUserA );
-            self::assertSame( 403, $deniedOnDbError->get_status() );
-            self::assertSame( $baselineDenied->get_data(), $deniedOnDbError->get_data() );
         } finally {
             remove_filter( 'query', $corruptMemberships, 5 );
             $wpdb->suppress_errors( $previousSuppression );
+        }
+        self::assertSame( 1, $failMatches );
+        self::assertCount( 1, $failSeen );
+        self::assertSame( $witnessSeen, $failSeen );
+        self::assertSame( 403, $deniedOnDbError->get_status() );
+        self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedOnDbError->get_data()['code'] ?? null );
+        self::assertSame( $baselineDenied->get_data(), $deniedOnDbError->get_data() );
+        self::assertSame( $strictBefore, App::db()->is_strict() );
+
+        $softReadSuppression = (bool) $wpdb->suppress_errors( true );
+        try {
+            self::assertSame( [], App::db()->fetchAll( 'SELECT nonexistent_col_for_soft_check FROM wp_nonexistent_cpms_table' ) );
+        } finally {
+            $wpdb->suppress_errors( $softReadSuppression );
         }
 
         $firstName = App::db()->fetchValue( 'SELECT first_name FROM ' . App::db()->table( 'cpms_patients' ) . ' WHERE id = %d', [ $this->patientA ] );
