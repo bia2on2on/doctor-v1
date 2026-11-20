@@ -4,13 +4,17 @@ declare(strict_types=1);
 
 namespace ClinicCore\Rest;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Clinical\ClinicalException;
 use ClinicCore\Application\Clinical\MedicalFileService;
 use ClinicCore\Auth\RolesAndCapabilities;
+use ClinicCore\Bootstrap\App;
+use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use WP_Error;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_REST_Server;
+use WP_User;
 
 /**
  * Endpointهای فایل پزشکی (F5) — E16/E17 (کارکنان) + C3/C4 (بیمار).
@@ -26,8 +30,14 @@ final class FilesController extends RestBase
     private const UPLOAD_RATE_MAX = 10;
     private const UPLOAD_RATE_WINDOW = 3600;
 
-    public function __construct(private readonly MedicalFileService $files)
-    {
+    public function __construct(
+        private readonly MedicalFileService $files,
+        private readonly ?PatientAccess $patient_access = null
+    ) {
+    }
+
+    protected function patient_access(): PatientAccess {
+        return $this->patient_access ?? parent::patient_access();
     }
 
     public function register_routes(): void
@@ -61,7 +71,7 @@ final class FilesController extends RestBase
             [
                 'methods' => WP_REST_Server::READABLE,
                 'callback' => fn (WP_REST_Request $r) => $this->stream($r),
-                'permission_callback' => fn (WP_REST_Request $r) => $this->permAuthenticated($r),
+                'permission_callback' => fn ( WP_REST_Request $r ) => $this->stream_permission( $r ),
             ],
         ]);
 
@@ -76,7 +86,13 @@ final class FilesController extends RestBase
                 [
                     'methods'             => WP_REST_Server::CREATABLE,
                     'callback'            => fn ( WP_REST_Request $r ) => $this->patient( $r, fn () => $this->patient_upload( $r ), true ),
-                    'permission_callback' => fn ( WP_REST_Request $r ) => $this->permAnyRole( $r, [ RolesAndCapabilities::ROLE_PATIENT ] ),
+                    'permission_callback' => fn ( WP_REST_Request $r ) => $this->require_patient_access(
+                        $r,
+                        [
+                            'mode'       => PatientAccess::MODE_PATIENT_RESOURCE,
+                            'patient_id' => $this->path_patient_id( $r ),
+                        ]
+                    ),
                     'args'                => [
                         'category' => [ 'required' => false, 'type' => 'string', 'default' => 'other' ],
                         'link_id'  => [ 'required' => false, 'type' => 'integer' ],
@@ -86,7 +102,13 @@ final class FilesController extends RestBase
                 [
                     'methods'             => WP_REST_Server::READABLE,
                     'callback'            => fn ( WP_REST_Request $r ) => $this->patient( $r, fn () => $this->patient_files( $r ) ),
-                    'permission_callback' => fn ( WP_REST_Request $r ) => $this->permAnyRole( $r, [ RolesAndCapabilities::ROLE_PATIENT ] ),
+                    'permission_callback' => fn ( WP_REST_Request $r ) => $this->require_patient_access(
+                        $r,
+                        [
+                            'mode'       => PatientAccess::MODE_PATIENT_RESOURCE,
+                            'patient_id' => $this->path_patient_id( $r ),
+                        ]
+                    ),
                     'args'                => [
                         'link_id' => [ 'required' => false, 'type' => 'integer' ],
                     ],
@@ -133,6 +155,90 @@ final class FilesController extends RestBase
     }
 
     // ================= Guards =================
+
+    /**
+     * Shared stream gate: keeps staff branches identical to `main` while
+     * routing patient requests through the central `PatientAccess` gate.
+     */
+    private function stream_permission( WP_REST_Request $request ): bool|WP_Error {
+        $nonce_error = $this->requireNonce( $request );
+        if ( $nonce_error instanceof WP_Error ) {
+            return $nonce_error;
+        }
+
+        $user = wp_get_current_user();
+        if ( ! $user->exists() ) {
+            return $this->error( 'CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید' );
+        }
+
+        if ( $this->is_stream_staff_actor( $user ) ) {
+            return true;
+        }
+
+        return $this->require_patient_access( $request, [ 'mode' => PatientAccess::MODE_CLINICAL ] );
+    }
+
+    /**
+     * Identifies non-patient callers authorized through a staff branch
+     * (WP staff role, global staff capability, Clinic membership/custom role/grant,
+     * active clinician identity, or active organization membership).
+     */
+    private function is_stream_staff_actor( WP_User $user ): bool {
+        $user_id = (int) $user->ID;
+        $roles   = (array) $user->roles;
+        if ( $user_id <= 0 || in_array( RolesAndCapabilities::ROLE_PATIENT, $roles, true ) ) {
+            return false;
+        }
+
+        $staff_roles = [
+            RolesAndCapabilities::ROLE_DOCTOR,
+            RolesAndCapabilities::ROLE_SECRETARY,
+            RolesAndCapabilities::ROLE_MANAGER,
+            RolesAndCapabilities::ROLE_ACCOUNTANT,
+            'administrator',
+        ];
+        if ( [] !== array_intersect( $staff_roles, $roles ) ) {
+            return true;
+        }
+        if ( user_can( $user, 'manage_options' ) ) {
+            return true;
+        }
+        foreach ( RolesAndCapabilities::ALL_CAPS as $capability ) {
+            if ( user_can( $user, $capability ) ) {
+                return true;
+            }
+        }
+
+        try {
+            $db          = App::db();
+            $memberships = ( new MembershipRepository( $db ) )->active_for_user( $user_id );
+            foreach ( $memberships as $membership ) {
+                if ( RolesAndCapabilities::ROLE_PATIENT !== (string) ( $membership['role_key'] ?? '' ) ) {
+                    return true;
+                }
+            }
+
+            $clinician_id = $db->fetchValue(
+                'SELECT id FROM ' . $db->table( 'cpms_clinicians' ) . ' WHERE wp_user_id = %d AND is_active = 1 LIMIT 1',
+                [ $user_id ]
+            );
+            if ( null !== $clinician_id ) {
+                return true;
+            }
+
+            $org_member_id = $db->fetchValue(
+                'SELECT id FROM ' . $db->table( 'cpms_organization_memberships' ) . " WHERE wp_user_id = %d AND status = 'active' LIMIT 1",
+                [ $user_id ]
+            );
+            if ( null !== $org_member_id ) {
+                return true;
+            }
+        } catch ( \Throwable ) {
+            return false;
+        }
+
+        return false;
+    }
 
     /**
      * @template T

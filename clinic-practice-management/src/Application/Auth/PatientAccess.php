@@ -26,9 +26,11 @@ use WP_User;
  */
 final class PatientAccess {
 
-    public const MODE_CLINICAL     = 'clinical';
-    public const MODE_RECORDS_LIST = 'records_list';
-    public const MODE_ENROLL       = 'enroll';
+    public const MODE_CLINICAL            = 'clinical';
+    public const MODE_PATIENT_RESOURCE    = 'patient_resource';
+    public const MODE_RECORDS_LIST        = 'records_list';
+    public const MODE_BOOKING_APPOINTMENT = 'booking_appointment';
+    public const MODE_ENROLL              = 'enroll';
 
     public const UNAUTHORIZED_CODE    = 'CLINIC_UNAUTHORIZED';
     public const UNAUTHORIZED_MESSAGE = 'وارد نشده‌اید';
@@ -102,20 +104,52 @@ final class PatientAccess {
     private $scoped_staff_checker;
 
     /**
+     * Optional any-clinic patient-binding resolver seam for pure-PHP unit tests.
+     *
+     * @var (callable(int, int): bool)|null
+     */
+    private $any_patient_binding_checker;
+
+    /**
+     * Optional booking-clinic binding resolver seam for pure-PHP unit tests.
+     *
+     * @var (callable(int, int): bool)|null
+     */
+    private $booking_clinic_binding_checker;
+
+    /**
+     * Optional any-booking binding resolver seam for pure-PHP unit tests.
+     *
+     * @var (callable(int): bool)|null
+     */
+    private $any_booking_binding_checker;
+
+    /**
+     * Optional booking link-target resolver seam for pure-PHP unit tests.
+     *
+     * @var (callable(int, int): ?array{clinic_id: int, patient_id: int})|null
+     */
+    private $booking_link_resolver;
+
+    /**
      * Construct the central patient access gate.
      *
-     * @param CpmsDb|null                                                                                                         $db                      Database adapter.
-     * @param PatientRepository|null                                                                                              $patients                Patient repository.
-     * @param (callable(int): ?array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>})|null $user_reader             Optional user reader seam.
-     * @param (callable(int, int): bool)|null                                                                                     $clinic_binding_checker  Optional clinic binding seam.
-     * @param (callable(int, int, int): bool)|null                                                                                $patient_binding_checker Optional patient binding seam.
-     * @param (callable(int): bool)|null                                                                                          $any_binding_checker     Optional any-binding seam.
-     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null                                                  $link_resolver           Optional link resolver seam.
-     * @param (callable(int, int): bool)|null                                                                                     $enroll_checker          Optional enroll eligibility seam.
-     * @param (callable(array<string, mixed>): void)|null                                                                         $decision_observer       Optional decision observer seam.
-     * @param (callable(int): bool)|null                                                                                          $scoped_staff_checker    Optional scoped staff authority seam.
-     * @param MembershipRepository|null                                                                                           $memberships             Membership repository.
-     * @param AuthorizationService|null                                                                                           $authorization           Clinic-scoped authorization service.
+     * @param CpmsDb|null                                                                                                         $db                             Database adapter.
+     * @param PatientRepository|null                                                                                              $patients                       Patient repository.
+     * @param (callable(int): ?array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>})|null $user_reader                    Optional user reader seam.
+     * @param (callable(int, int): bool)|null                                                                                     $clinic_binding_checker         Optional clinic binding seam.
+     * @param (callable(int, int, int): bool)|null                                                                                $patient_binding_checker        Optional patient binding seam.
+     * @param (callable(int): bool)|null                                                                                          $any_binding_checker            Optional any-binding seam.
+     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null                                                  $link_resolver                  Optional link resolver seam.
+     * @param (callable(int, int): bool)|null                                                                                     $enroll_checker                 Optional enroll eligibility seam.
+     * @param (callable(array<string, mixed>): void)|null                                                                         $decision_observer              Optional decision observer seam.
+     * @param (callable(int): bool)|null                                                                                          $scoped_staff_checker           Optional scoped staff authority seam.
+     * @param MembershipRepository|null                                                                                           $memberships                    Membership repository.
+     * @param AuthorizationService|null                                                                                           $authorization                  Clinic-scoped authorization service.
+     * @param (callable(int, int): bool)|null                                                                                     $any_patient_binding_checker    Optional any-clinic patient seam.
+     * @param (callable(int, int): bool)|null                                                                                     $booking_clinic_binding_checker Optional booking clinic seam.
+     * @param (callable(int): bool)|null                                                                                          $any_booking_binding_checker    Optional any-booking seam.
+     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null                                                  $booking_link_resolver          Optional booking link resolver seam.
      */
     public function __construct(
         ?CpmsDb $db = null,
@@ -129,20 +163,28 @@ final class PatientAccess {
         ?callable $decision_observer = null,
         ?callable $scoped_staff_checker = null,
         ?MembershipRepository $memberships = null,
-        ?AuthorizationService $authorization = null
+        ?AuthorizationService $authorization = null,
+        ?callable $any_patient_binding_checker = null,
+        ?callable $booking_clinic_binding_checker = null,
+        ?callable $any_booking_binding_checker = null,
+        ?callable $booking_link_resolver = null
     ) {
-        $this->db                      = $db;
-        $this->patients                = $patients ?? ( null !== $db ? new PatientRepository( $db ) : null );
-        $this->memberships             = $memberships ?? ( null !== $db ? new MembershipRepository( $db ) : null );
-        $this->authorization           = $authorization ?? ( null !== $db && null !== $this->memberships ? new AuthorizationService( $this->memberships, new CustomRoleRepository( $db ) ) : null );
-        $this->user_reader             = $user_reader;
-        $this->clinic_binding_checker  = $clinic_binding_checker;
-        $this->patient_binding_checker = $patient_binding_checker;
-        $this->any_binding_checker     = $any_binding_checker;
-        $this->link_resolver           = $link_resolver;
-        $this->enroll_checker          = $enroll_checker;
-        $this->decision_observer       = $decision_observer;
-        $this->scoped_staff_checker    = $scoped_staff_checker;
+        $this->db                             = $db;
+        $this->patients                       = $patients ?? ( null !== $db ? new PatientRepository( $db ) : null );
+        $this->memberships                    = $memberships ?? ( null !== $db ? new MembershipRepository( $db ) : null );
+        $this->authorization                  = $authorization ?? ( null !== $db && null !== $this->memberships ? new AuthorizationService( $this->memberships, new CustomRoleRepository( $db ) ) : null );
+        $this->user_reader                    = $user_reader;
+        $this->clinic_binding_checker         = $clinic_binding_checker;
+        $this->patient_binding_checker        = $patient_binding_checker;
+        $this->any_binding_checker            = $any_binding_checker;
+        $this->link_resolver                  = $link_resolver;
+        $this->enroll_checker                 = $enroll_checker;
+        $this->decision_observer              = $decision_observer;
+        $this->scoped_staff_checker           = $scoped_staff_checker;
+        $this->any_patient_binding_checker    = $any_patient_binding_checker;
+        $this->booking_clinic_binding_checker = $booking_clinic_binding_checker;
+        $this->any_booking_binding_checker    = $any_booking_binding_checker;
+        $this->booking_link_resolver          = $booking_link_resolver;
     }
 
     /**
@@ -286,6 +328,19 @@ final class PatientAccess {
         }
 
         if ( self::MODE_RECORDS_LIST === $mode ) {
+            if ( null !== $link_id ) {
+                $target = $this->resolve_link_target( $wp_user_id, $link_id );
+                if ( null === $target || ( null !== $clinic_id && $target['clinic_id'] !== $clinic_id ) ) {
+                    return $this->observe_decision(
+                        $wp_user_id,
+                        $clinic_id,
+                        $patient_id,
+                        $link_id,
+                        $mode,
+                        $this->not_found_decision( 'link_not_bound', $primary_role )
+                    );
+                }
+            }
             if ( null !== $clinic_id && ! $this->has_clinic_binding( $wp_user_id, $clinic_id ) ) {
                 return $this->observe_decision(
                     $wp_user_id,
@@ -305,6 +360,101 @@ final class PatientAccess {
                 $mode,
                 $this->allow_decision( $primary_role )
             );
+        }
+
+        if ( self::MODE_BOOKING_APPOINTMENT === $mode ) {
+            if ( null !== $link_id ) {
+                $target = $this->resolve_booking_link_target( $wp_user_id, $link_id );
+                if (
+                    null === $target
+                    || ( null !== $clinic_id && $target['clinic_id'] !== $clinic_id )
+                    || ( null !== $patient_id && $target['patient_id'] !== $patient_id )
+                    || ! $this->has_booking_clinic_binding( $wp_user_id, $target['clinic_id'] )
+                ) {
+                    return $this->observe_decision(
+                        $wp_user_id,
+                        $clinic_id,
+                        $patient_id,
+                        $link_id,
+                        $mode,
+                        $this->forbidden_decision( 'booking_link_required', $primary_role )
+                    );
+                }
+
+                return $this->observe_decision(
+                    $wp_user_id,
+                    $clinic_id,
+                    $patient_id,
+                    $link_id,
+                    $mode,
+                    $this->allow_decision( $primary_role )
+                );
+            }
+
+            if ( null !== $clinic_id ) {
+                $decision = $this->has_booking_clinic_binding( $wp_user_id, $clinic_id )
+                    ? $this->allow_decision( $primary_role )
+                    : $this->forbidden_decision( 'booking_link_required', $primary_role );
+
+                return $this->observe_decision( $wp_user_id, $clinic_id, $patient_id, $link_id, $mode, $decision );
+            }
+
+            $decision = $this->has_any_booking_binding( $wp_user_id )
+                ? $this->allow_decision( $primary_role )
+                : $this->forbidden_decision( 'booking_link_required', $primary_role );
+
+            return $this->observe_decision( $wp_user_id, $clinic_id, $patient_id, $link_id, $mode, $decision );
+        }
+
+        if ( self::MODE_PATIENT_RESOURCE === $mode ) {
+            if ( null === $patient_id || $patient_id <= 0 ) {
+                return $this->observe_decision(
+                    $wp_user_id,
+                    $clinic_id,
+                    $patient_id,
+                    $link_id,
+                    $mode,
+                    $this->not_found_decision( 'patient_required', $primary_role )
+                );
+            }
+
+            if ( null !== $link_id ) {
+                $target = $this->resolve_link_target( $wp_user_id, $link_id );
+                if (
+                    null === $target
+                    || ( null !== $clinic_id && $target['clinic_id'] !== $clinic_id )
+                    || $target['patient_id'] !== $patient_id
+                    || ! $this->has_patient_binding( $wp_user_id, $target['clinic_id'], $patient_id )
+                ) {
+                    return $this->observe_decision(
+                        $wp_user_id,
+                        $clinic_id,
+                        $patient_id,
+                        $link_id,
+                        $mode,
+                        $this->not_found_decision( 'patient_not_bound', $primary_role )
+                    );
+                }
+
+                return $this->observe_decision(
+                    $wp_user_id,
+                    $clinic_id,
+                    $patient_id,
+                    $link_id,
+                    $mode,
+                    $this->allow_decision( $primary_role )
+                );
+            }
+
+            $allowed_resource = null !== $clinic_id
+                ? $this->has_patient_binding( $wp_user_id, $clinic_id, $patient_id )
+                : $this->has_any_patient_binding( $wp_user_id, $patient_id );
+
+            $decision = $allowed_resource
+                ? $this->allow_decision( $primary_role )
+                : $this->not_found_decision( 'patient_not_bound', $primary_role );
+
+            return $this->observe_decision( $wp_user_id, $clinic_id, $patient_id, $link_id, $mode, $decision );
         }
 
         if ( self::MODE_CLINICAL !== $mode ) {
@@ -622,6 +772,78 @@ final class PatientAccess {
         ];
     }
 
+    private function has_any_patient_binding( int $wp_user_id, int $patient_id ): bool {
+        if ( null !== $this->any_patient_binding_checker ) {
+            return (bool) ( $this->any_patient_binding_checker )( $wp_user_id, $patient_id );
+        }
+        if ( null === $this->patients ) {
+            return false;
+        }
+
+        return $this->patients->user_has_clinical_access_to_patient_any_clinic( $wp_user_id, $patient_id );
+    }
+
+    private function has_booking_clinic_binding( int $wp_user_id, int $clinic_id ): bool {
+        if ( null !== $this->booking_clinic_binding_checker ) {
+            return (bool) ( $this->booking_clinic_binding_checker )( $wp_user_id, $clinic_id );
+        }
+        if ( null === $this->patients ) {
+            return false;
+        }
+
+        return $this->patients->user_has_booking_access_to_clinic( $wp_user_id, $clinic_id );
+    }
+
+    private function has_any_booking_binding( int $wp_user_id ): bool {
+        if ( null !== $this->any_booking_binding_checker ) {
+            return (bool) ( $this->any_booking_binding_checker )( $wp_user_id );
+        }
+        if ( null === $this->patients ) {
+            return false;
+        }
+
+        return $this->patients->user_has_any_booking_access( $wp_user_id );
+    }
+
+    /**
+     * @return array{clinic_id: int, patient_id: int}|null
+     */
+    private function resolve_booking_link_target( int $wp_user_id, int $link_id ): ?array {
+        if ( null !== $this->booking_link_resolver ) {
+            $target = ( $this->booking_link_resolver )( $wp_user_id, $link_id );
+            if ( ! is_array( $target ) ) {
+                return null;
+            }
+            $clinic_id  = (int) ( $target['clinic_id'] ?? 0 );
+            $patient_id = (int) ( $target['patient_id'] ?? 0 );
+            if ( $clinic_id <= 0 || $patient_id <= 0 ) {
+                return null;
+            }
+
+            return [
+                'clinic_id'  => $clinic_id,
+                'patient_id' => $patient_id,
+            ];
+        }
+        if ( null === $this->patients ) {
+            return null;
+        }
+        $row = $this->patients->find_active_booking_linked_patient_by_link( $wp_user_id, $link_id );
+        if ( null === $row ) {
+            return null;
+        }
+        $clinic_id  = (int) ( $row['clinic_id'] ?? 0 );
+        $patient_id = (int) ( $row['id'] ?? 0 );
+        if ( $clinic_id <= 0 || $patient_id <= 0 ) {
+            return null;
+        }
+
+        return [
+            'clinic_id'  => $clinic_id,
+            'patient_id' => $patient_id,
+        ];
+    }
+
     private function has_enrollment_eligibility( int $wp_user_id, int $clinic_id ): bool {
         if ( null !== $this->enroll_checker ) {
             return (bool) ( $this->enroll_checker )( $wp_user_id, $clinic_id );
@@ -650,6 +872,27 @@ final class PatientAccess {
             'code'        => '',
             'message'     => '',
             'reason'      => 'allowed',
+            'role'        => $role,
+        ];
+    }
+
+    /**
+     * @return array{
+     *     allowed: bool,
+     *     http_status: int,
+     *     code: string,
+     *     message: string,
+     *     reason: string,
+     *     role: string
+     * }
+     */
+    private function forbidden_decision( string $reason, string $role ): array {
+        return [
+            'allowed'     => false,
+            'http_status' => 403,
+            'code'        => self::FORBIDDEN_CODE,
+            'message'     => self::FORBIDDEN_MESSAGE,
+            'reason'      => $reason,
             'role'        => $role,
         ];
     }

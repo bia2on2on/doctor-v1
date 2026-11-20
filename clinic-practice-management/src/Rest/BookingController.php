@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Rest;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Application\Booking\BookingService;
 use ClinicCore\Application\Clinic\PublicClinicDirectory;
@@ -30,8 +31,13 @@ final class BookingController extends RestBase
 {
     public function __construct(
         private readonly BookingService $booking,
-        private readonly ?PatientSessionScope $session_scope = null
+        private readonly ?PatientSessionScope $session_scope = null,
+        private readonly ?PatientAccess $patient_access = null
     ) {
+    }
+
+    protected function patient_access(): PatientAccess {
+        return $this->patient_access ?? parent::patient_access();
     }
 
     private function session_scope(): PatientSessionScope {
@@ -82,7 +88,14 @@ final class BookingController extends RestBase
             [
                 'methods' => WP_REST_Server::CREATABLE,
                 'callback' => fn (WP_REST_Request $request) => $this->hold($request),
-                'permission_callback' => fn (WP_REST_Request $request) => $this->requirePatient($request),
+                'permission_callback' => fn ( WP_REST_Request $request ) => $this->require_patient_access(
+                    $request,
+                    [
+                        'mode'      => PatientAccess::MODE_RECORDS_LIST,
+                        'clinic_id' => null,
+                        'link_id'   => null,
+                    ]
+                ),
                 'args' => [
                     'clinician_id' => ['required' => true, 'type' => 'integer'],
                     'slot_date' => ['required' => true, 'type' => 'string'],
@@ -98,7 +111,14 @@ final class BookingController extends RestBase
             [
                 'methods' => WP_REST_Server::CREATABLE,
                 'callback' => fn (WP_REST_Request $request) => $this->confirm($request),
-                'permission_callback' => fn (WP_REST_Request $request) => $this->requirePatient($request),
+                'permission_callback' => fn ( WP_REST_Request $request ) => $this->require_patient_access(
+                    $request,
+                    [
+                        'mode'      => PatientAccess::MODE_RECORDS_LIST,
+                        'clinic_id' => null,
+                        'link_id'   => null,
+                    ]
+                ),
                 'args' => [
                     'hold_token' => ['required' => true, 'type' => 'string'],
                     'reason' => ['required' => false, 'type' => 'string'],
@@ -117,7 +137,10 @@ final class BookingController extends RestBase
             [
                 'methods' => WP_REST_Server::READABLE,
                 'callback' => fn (WP_REST_Request $request) => $this->resume($request),
-                'permission_callback' => fn (WP_REST_Request $request) => $this->requirePatient($request),
+                'permission_callback' => fn ( WP_REST_Request $request ) => $this->require_patient_access(
+                    $request,
+                    [ 'mode' => PatientAccess::MODE_RECORDS_LIST ]
+                ),
                 'args' => [
                     'hold_token' => ['required' => true, 'type' => 'string'],
                 ],
@@ -128,7 +151,10 @@ final class BookingController extends RestBase
             [
                 'methods' => WP_REST_Server::READABLE,
                 'callback' => fn (WP_REST_Request $request) => $this->mine($request),
-                'permission_callback' => fn (WP_REST_Request $request) => $this->requirePatient($request),
+                'permission_callback' => fn ( WP_REST_Request $request ) => $this->require_patient_access(
+                    $request,
+                    [ 'mode' => PatientAccess::MODE_RECORDS_LIST ]
+                ),
                 'args' => [
                     'from' => ['required' => false, 'type' => 'string', 'default' => gmdate('Y-m-d')],
                     'to' => ['required' => false, 'type' => 'string', 'default' => gmdate('Y-m-d', time() + 365 * 86400)],
@@ -143,7 +169,13 @@ final class BookingController extends RestBase
                 [
                     'methods'             => WP_REST_Server::READABLE,
                     'callback'            => fn ( WP_REST_Request $request ) => $this->reschedule_options( $request ),
-                    'permission_callback' => fn ( WP_REST_Request $request ) => $this->requirePatient( $request ),
+                    'permission_callback' => fn ( WP_REST_Request $request ) => $this->require_patient_access(
+                        $request,
+                        [
+                            'mode'      => PatientAccess::MODE_BOOKING_APPOINTMENT,
+                            'clinic_id' => null,
+                        ]
+                    ),
                     'args'                => [
                         'id' => [
                             'required' => true,
@@ -476,72 +508,34 @@ final class BookingController extends RestBase
     // ---------- Permission / error helpers ----------
 
     /**
-     * Patient-Endpoint: Nonce (CSRF) + وجود Session + نقش بیمار (یا Staff با Cap مربوطه).
-     *
-     * خطاها با Envelope استاندارد `CLINIC_*` (ADR-0019) — permission_callback
-     * مستقیماً WP_Error برمی‌گرداند (نه false) تا پاسخ، کد/شکل Contract §0 بگیرد.
-     */
-    private function requirePatient(WP_REST_Request $request): bool|WP_Error
-    {
-        $nonceError = $this->requireNonce($request);
-        if ($nonceError instanceof WP_Error) {
-            return $nonceError;
-        }
-        $user = wp_get_current_user();
-        if (!$user->exists()) {
-            return $this->error('CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید');
-        }
-        $isPatient = in_array(RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true);
-        if (!$isPatient) {
-            App::audit()->log(
-                'FORBIDDEN_ACCESS_ATTEMPT',
-                ['wp_user_id' => (int) $user->ID, 'role' => $user->roles[0] ?? 'unknown'],
-                'booking',
-                null,
-                null,
-                null,
-                null,
-                ['reason' => 'patient_role_required']
-            );
-
-            return $this->error('CLINIC_PERMISSION_DENIED', 403, 'دسترسی ندارید');
-        }
-
-        return true;
-    }
-
-    /**
      * B5/staff reschedule: بیمار (نقش) یا Staff با `cpms_appt_reschedule`.
      * شاخه کارکنی مجوز Clinic-scoped را در handler اعمال می‌کند (همان الگوی D11).
      */
     private function reschedulePermission(WP_REST_Request $request): bool|WP_Error
     {
-        $nonceError = $this->requireNonce($request);
-        if ($nonceError instanceof WP_Error) {
-            return $nonceError;
+        $nonce_error = $this->requireNonce( $request );
+        if ( $nonce_error instanceof WP_Error ) {
+            return $nonce_error;
         }
         $user = wp_get_current_user();
-        if (!$user->exists()) {
-            return $this->error('CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید');
+        if ( ! $user->exists() ) {
+            return $this->error( 'CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید' );
         }
 
-        $allowed = in_array(RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true)
-            || $user->has_cap(RolesAndCapabilities::APPT_RESCHEDULE);
-        if (!$allowed) {
-            App::audit()->log(
-                'FORBIDDEN_ACCESS_ATTEMPT',
-                ['wp_user_id' => (int) $user->ID, 'role' => $user->roles[0] ?? 'unknown'],
-                'capability',
-                null,
-                null,
-                null,
-                ['cap' => RolesAndCapabilities::APPT_RESCHEDULE]
-            );
-
-            return $this->error('CLINIC_PERMISSION_DENIED', 403, 'دسترسی ندارید');
+        if (
+            ! in_array( RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true )
+            && $user->has_cap( RolesAndCapabilities::APPT_RESCHEDULE )
+        ) {
+            return true;
         }
 
-        return true;
+        return $this->require_patient_access(
+            $request,
+            [
+                'mode'      => PatientAccess::MODE_BOOKING_APPOINTMENT,
+                'clinic_id' => null,
+            ]
+        );
     }
 
     /**
@@ -549,32 +543,29 @@ final class BookingController extends RestBase
      */
     private function cancelPermission(WP_REST_Request $request): bool|WP_Error
     {
-        $nonceError = $this->requireNonce($request);
-        if ($nonceError instanceof WP_Error) {
-            return $nonceError;
+        $nonce_error = $this->requireNonce( $request );
+        if ( $nonce_error instanceof WP_Error ) {
+            return $nonce_error;
         }
         $user = wp_get_current_user();
-        if (!$user->exists()) {
-            return $this->error('CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید');
+        if ( ! $user->exists() ) {
+            return $this->error( 'CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید' );
         }
 
-        $allowed = in_array(RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true)
-            || $user->has_cap(RolesAndCapabilities::APPT_CANCEL);
-        if (!$allowed) {
-            App::audit()->log(
-                'FORBIDDEN_ACCESS_ATTEMPT',
-                ['wp_user_id' => (int) $user->ID, 'role' => $user->roles[0] ?? 'unknown'],
-                'capability',
-                null,
-                null,
-                null,
-                ['cap' => RolesAndCapabilities::APPT_CANCEL]
-            );
-
-            return $this->error('CLINIC_PERMISSION_DENIED', 403, 'دسترسی ندارید');
+        if (
+            ! in_array( RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true )
+            && $user->has_cap( RolesAndCapabilities::APPT_CANCEL )
+        ) {
+            return true;
         }
 
-        return true;
+        return $this->require_patient_access(
+            $request,
+            [
+                'mode'      => PatientAccess::MODE_BOOKING_APPOINTMENT,
+                'clinic_id' => null,
+            ]
+        );
     }
 
     /**

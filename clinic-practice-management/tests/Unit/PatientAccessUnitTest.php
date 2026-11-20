@@ -268,30 +268,104 @@ final class PatientAccessUnitTest extends TestCase {
         self::assertTrue( $gate->authorize_request( 1, 10, 100 )['allowed'] );
     }
 
+    public function testSliceBModesPatientResourceBookingAppointmentAndRecordsLink(): void {
+        $gate = $this->make_gate(
+            users: [
+                1 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ] ],
+                5 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ] ],
+                6 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ] ],
+            ],
+            clinic_bindings: [
+                '1:10' => true,
+            ],
+            patient_bindings: [
+                '1:10:100' => true,
+            ],
+            booking_clinic_bindings: [
+                '1:10' => true,
+                '6:10' => true,
+            ],
+            booking_links: [
+                '1:701' => [ 'clinic_id' => 10, 'patient_id' => 100 ],
+                '6:706' => [ 'clinic_id' => 10, 'patient_id' => 600 ],
+            ]
+        );
+
+        // MODE_PATIENT_RESOURCE negatives (unauthenticated, missing/unbound patient, wrong clinic/link).
+        $resUnauth = $gate->authorize_request( 0, null, 100, null, PatientAccess::MODE_PATIENT_RESOURCE );
+        self::assertSame( 401, $resUnauth['http_status'] );
+        foreach ( [
+            $gate->authorize_request( 1, null, null, null, PatientAccess::MODE_PATIENT_RESOURCE ),
+            $gate->authorize_request( 5, null, 100, null, PatientAccess::MODE_PATIENT_RESOURCE ),
+            $gate->authorize_request( 1, null, 999, null, PatientAccess::MODE_PATIENT_RESOURCE ),
+            $gate->authorize_request( 1, 20, 100, null, PatientAccess::MODE_PATIENT_RESOURCE ),
+            $gate->authorize_request( 1, null, 100, 702, PatientAccess::MODE_PATIENT_RESOURCE ),
+            $gate->authorize_request( 1, null, 999, 701, PatientAccess::MODE_PATIENT_RESOURCE ),
+        ] as $deniedResource ) {
+            self::assertFalse( $deniedResource['allowed'] );
+            self::assertSame( 404, $deniedResource['http_status'] );
+            self::assertSame( PatientAccess::NOT_FOUND_CODE, $deniedResource['code'] );
+        }
+        // MODE_PATIENT_RESOURCE positive controls (path-only, with clinic, with link).
+        self::assertTrue( $gate->authorize_request( 1, null, 100, null, PatientAccess::MODE_PATIENT_RESOURCE )['allowed'] );
+        self::assertTrue( $gate->authorize_request( 1, 10, 100, null, PatientAccess::MODE_PATIENT_RESOURCE )['allowed'] );
+        self::assertTrue( $gate->authorize_request( 1, null, 100, 701, PatientAccess::MODE_PATIENT_RESOURCE )['allowed'] );
+
+        // MODE_BOOKING_APPOINTMENT negatives (unlinked user 5, wrong clinic, foreign link) fail closed with 403.
+        foreach ( [
+            $gate->authorize_request( 5, null, null, null, PatientAccess::MODE_BOOKING_APPOINTMENT ),
+            $gate->authorize_request( 1, 20, null, null, PatientAccess::MODE_BOOKING_APPOINTMENT ),
+            $gate->authorize_request( 1, null, null, 706, PatientAccess::MODE_BOOKING_APPOINTMENT ),
+        ] as $deniedBooking ) {
+            self::assertFalse( $deniedBooking['allowed'] );
+            self::assertSame( 403, $deniedBooking['http_status'] );
+            self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedBooking['code'] );
+        }
+        // MODE_BOOKING_APPOINTMENT positive controls (including dependent-only user 6 without clinical access).
+        self::assertTrue( $gate->authorize_request( 1, null, null, null, PatientAccess::MODE_BOOKING_APPOINTMENT )['allowed'] );
+        self::assertTrue( $gate->authorize_request( 6, null, null, 706, PatientAccess::MODE_BOOKING_APPOINTMENT )['allowed'] );
+        self::assertFalse( $gate->authorize_request( 6, null, null, null, PatientAccess::MODE_CLINICAL )['allowed'] );
+
+        // MODE_RECORDS_LIST link_id validation rejects foreign/mismatched link_id while allowing valid/absent selectors.
+        $badRecordsLink = $gate->authorize_request( 1, null, null, 702, PatientAccess::MODE_RECORDS_LIST );
+        self::assertFalse( $badRecordsLink['allowed'] );
+        self::assertSame( 404, $badRecordsLink['http_status'] );
+        $mismatchRecordsLink = $gate->authorize_request( 1, 20, null, 701, PatientAccess::MODE_RECORDS_LIST );
+        self::assertFalse( $mismatchRecordsLink['allowed'] );
+        self::assertSame( 404, $mismatchRecordsLink['http_status'] );
+        self::assertTrue( $gate->authorize_request( 1, 10, null, 701, PatientAccess::MODE_RECORDS_LIST )['allowed'] );
+    }
+
     /**
      * @param array<int, array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>}>|null $users
      * @param array<string, bool>|null                                                                                      $clinic_bindings
      * @param array<string, bool>|null                                                                                      $patient_bindings
      * @param (callable(array<string, mixed>): void)|null                                                                   $observer
      * @param (callable(int): bool)|null                                                                                    $scoped_staff_checker
+     * @param array<string, bool>|null                                                                                      $booking_clinic_bindings
+     * @param array<string, array{clinic_id: int, patient_id: int}>|null                                                    $booking_links
      */
     private function make_gate(
         ?array $users = null,
         ?array $clinic_bindings = null,
         ?array $patient_bindings = null,
         ?callable $observer = null,
-        ?callable $scoped_staff_checker = null
+        ?callable $scoped_staff_checker = null,
+        ?array $booking_clinic_bindings = null,
+        ?array $booking_links = null
     ): PatientAccess {
         $users            ??= [
             1 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ] ],
             5 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ] ],
         ];
-        $clinic_bindings  ??= [ '1:10' => true ];
-        $patient_bindings ??= [ '1:10:100' => true ];
-        $links              = [
+        $clinic_bindings         ??= [ '1:10' => true ];
+        $patient_bindings        ??= [ '1:10:100' => true ];
+        $booking_clinic_bindings ??= $clinic_bindings;
+        $links                     = [
             '1:701' => [ 'clinic_id' => 10, 'patient_id' => 100 ],
         ];
-        $enroll             = [ '1:20' => true ];
+        $booking_links           ??= $links;
+        $enroll                    = [ '1:20' => true ];
 
         return new PatientAccess(
             null,
@@ -311,7 +385,29 @@ final class PatientAccessUnitTest extends TestCase {
             static fn ( int $uid, int $lid ): ?array => $links[ $uid . ':' . $lid ] ?? null,
             static fn ( int $uid, int $cid ): bool => $enroll[ $uid . ':' . $cid ] ?? false,
             $observer,
-            $scoped_staff_checker ?? static fn ( int $uid ): bool => false
+            $scoped_staff_checker ?? static fn ( int $uid ): bool => false,
+            null,
+            null,
+            static function ( int $uid, int $pid ) use ( $patient_bindings ): bool {
+                foreach ( $patient_bindings as $key => $allowed ) {
+                    if ( $allowed && str_starts_with( $key, $uid . ':' ) && str_ends_with( $key, ':' . $pid ) ) {
+                        return true;
+                    }
+                }
+
+                return false;
+            },
+            static fn ( int $uid, int $cid ): bool => $booking_clinic_bindings[ $uid . ':' . $cid ] ?? false,
+            static function ( int $uid ) use ( $booking_clinic_bindings ): bool {
+                foreach ( $booking_clinic_bindings as $key => $allowed ) {
+                    if ( $allowed && str_starts_with( $key, $uid . ':' ) ) {
+                        return true;
+                    }
+                }
+
+                return false;
+            },
+            static fn ( int $uid, int $lid ): ?array => $booking_links[ $uid . ':' . $lid ] ?? null
         );
     }
 }
