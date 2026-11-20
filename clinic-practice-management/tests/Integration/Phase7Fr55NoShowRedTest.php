@@ -3120,6 +3120,36 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     private function nowUtcSql(): string {
         return gmdate('Y-m-d H:i:s');
     }
+
+    public function testRaceSlotAnchorKeepsEveryAttemptDistinctAndCheckInEligible(): void {
+        $method   = new \ReflectionMethod( self::class, 'eligibleRaceSlotSpec' );
+        $timezone = new DateTimeZone( self::TZ );
+        $grace    = Settings::DEFAULTS['queue.no_show_grace_minutes'] * 60;
+        $cases    = [
+            '12:00:00' => [ '12:05:00', '12:05:01', '12:05:02' ],
+            '12:00:01' => [ '12:05:01', '12:05:02', '12:05:03' ],
+            '23:54:56' => [ '23:59:56', '23:59:57', '23:59:58' ],
+            '23:54:59' => [ '23:59:57', '23:59:58', '23:59:59' ],
+            '23:59:59' => [ '23:59:57', '23:59:58', '23:59:59' ],
+            '00:00:00' => [ '00:05:00', '00:05:01', '00:05:02' ],
+        ];
+
+        foreach ( $cases as $local_time => $expected_times ) {
+            $anchor       = new DateTimeImmutable( '2026-02-15 ' . $local_time, $timezone );
+            $expected_day = $anchor->format( 'Y-m-d' );
+            $slot_times   = [];
+            for ( $attempt = 1; $attempt <= self::RACE_ATTEMPTS; ++$attempt ) {
+                $slot = $method->invoke( $this, $anchor, $attempt );
+                self::assertSame( $expected_day, $slot['date'], 'The slot must stay on the anchor day.' );
+                $start = new DateTimeImmutable( $slot['date'] . ' ' . $slot['time'], $timezone );
+                self::assertLessThan( $start->getTimestamp() + $grace, $anchor->getTimestamp(), 'Check-in must precede the grace deadline.' );
+                $slot_times[] = $slot['time'];
+            }
+            self::assertCount( self::RACE_ATTEMPTS, array_unique( $slot_times ), 'All three slot keys must differ within one race.' );
+            self::assertSame( $expected_times, $slot_times, 'The same local anchor must produce these deterministic slot times.' );
+        }
+    }
+
 }
 
 /**
