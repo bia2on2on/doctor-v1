@@ -222,17 +222,65 @@ final class PatientAccessUnitTest extends TestCase {
         self::assertTrue( $gate->authorize_request( 1, 10, 100 )['allowed'] );
     }
 
+    public function testScopedStaffAuthorityAndLookupFailureAreDeniedWithPositiveControl(): void {
+        $gate = $this->make_gate(
+            users: [
+                1  => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ] ],
+                21 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ] ],
+                22 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ] ],
+            ],
+            clinic_bindings: [
+                '1:10'  => true,
+                '21:10' => true,
+                '22:10' => true,
+            ],
+            patient_bindings: [
+                '1:10:100'  => true,
+                '21:10:100' => true,
+                '22:10:100' => true,
+            ],
+            scoped_staff_checker: static function ( int $uid ): bool {
+                if ( 22 === $uid ) {
+                    throw new \RuntimeException( 'membership read failed' );
+                }
+
+                return 21 === $uid;
+            }
+        );
+
+        foreach ( [ 21, 22 ] as $scopedOrFailedId ) {
+            self::assertFalse( $gate->can_access_clinic( $scopedOrFailedId, 10 ) );
+            self::assertFalse( $gate->can_access_patient( $scopedOrFailedId, 10, 100 ) );
+            self::assertFalse( $gate->can_enroll_in_clinic( $scopedOrFailedId, 10 ) );
+
+            foreach ( [ PatientAccess::MODE_CLINICAL, PatientAccess::MODE_RECORDS_LIST, PatientAccess::MODE_ENROLL ] as $mode ) {
+                $denied = $gate->authorize_request( $scopedOrFailedId, 10, 100, null, $mode );
+                self::assertFalse( $denied['allowed'] );
+                self::assertSame( 403, $denied['http_status'] );
+                self::assertSame( PatientAccess::FORBIDDEN_CODE, $denied['code'] );
+                self::assertSame( PatientAccess::FORBIDDEN_MESSAGE, $denied['message'] );
+            }
+        }
+
+        // Same-fixture positive control: pure patient user 1 with no scoped staff authority succeeds.
+        self::assertTrue( $gate->can_access_clinic( 1, 10 ) );
+        self::assertTrue( $gate->can_access_patient( 1, 10, 100 ) );
+        self::assertTrue( $gate->authorize_request( 1, 10, 100 )['allowed'] );
+    }
+
     /**
      * @param array<int, array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>}>|null $users
      * @param array<string, bool>|null                                                                                      $clinic_bindings
      * @param array<string, bool>|null                                                                                      $patient_bindings
      * @param (callable(array<string, mixed>): void)|null                                                                   $observer
+     * @param (callable(int): bool)|null                                                                                    $scoped_staff_checker
      */
     private function make_gate(
         ?array $users = null,
         ?array $clinic_bindings = null,
         ?array $patient_bindings = null,
-        ?callable $observer = null
+        ?callable $observer = null,
+        ?callable $scoped_staff_checker = null
     ): PatientAccess {
         $users            ??= [
             1 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ] ],
@@ -262,7 +310,8 @@ final class PatientAccessUnitTest extends TestCase {
             },
             static fn ( int $uid, int $lid ): ?array => $links[ $uid . ':' . $lid ] ?? null,
             static fn ( int $uid, int $cid ): bool => $enroll[ $uid . ':' . $cid ] ?? false,
-            $observer
+            $observer,
+            $scoped_staff_checker ?? static fn ( int $uid ): bool => false
         );
     }
 }

@@ -1942,10 +1942,16 @@ final class App
     public static function patient_access(): PatientAccess {
         static $gate  = null;
         static $deps  = null;
-        $current_deps = [ self::db() ];
+        $current_deps = [ self::db(), self::authorization_service() ];
         if ( null === $gate || $deps !== $current_deps ) {
-            $deps = $current_deps;
-            $gate = new PatientAccess( $current_deps[0], new PatientRepository( $current_deps[0] ) );
+            $deps        = $current_deps;
+            $memberships = new MembershipRepository( $current_deps[0] );
+            $gate        = new PatientAccess(
+                $current_deps[0],
+                new PatientRepository( $current_deps[0] ),
+                memberships: $memberships,
+                authorization: $current_deps[1]
+            );
         }
 
         return $gate;

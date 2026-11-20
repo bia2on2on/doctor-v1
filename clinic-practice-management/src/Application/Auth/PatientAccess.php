@@ -4,9 +4,13 @@ declare( strict_types=1 );
 
 namespace ClinicCore\Application\Auth;
 
+use ClinicCore\Application\Authorization\AuthorizationService;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Infrastructure\Db\CpmsDb;
+use ClinicCore\Infrastructure\Repository\CustomRoleRepository;
+use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
+use Throwable;
 use WP_User;
 
 /**
@@ -35,7 +39,10 @@ final class PatientAccess {
     public const NOT_FOUND_CODE    = 'CLINIC_NOT_FOUND';
     public const NOT_FOUND_MESSAGE = 'بیماری به این حساب متصل نیست';
 
+    private readonly ?CpmsDb $db;
     private readonly ?PatientRepository $patients;
+    private readonly ?MembershipRepository $memberships;
+    private readonly ?AuthorizationService $authorization;
 
     /**
      * Optional user resolver seam for pure-PHP unit tests.
@@ -88,17 +95,27 @@ final class PatientAccess {
     private $decision_observer;
 
     /**
+     * Optional clinic-scoped staff authority resolver seam for pure-PHP unit tests.
+     *
+     * @var (callable(int): bool)|null
+     */
+    private $scoped_staff_checker;
+
+    /**
      * Construct the central patient access gate.
      *
-     * @param CpmsDb|null                                                                                           $db                      Database adapter.
-     * @param PatientRepository|null                                                                                $patients                Patient repository.
-     * @param (callable(int): ?array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>})|null $user_reader Optional user reader seam.
-     * @param (callable(int, int): bool)|null                                   $clinic_binding_checker  Optional clinic binding seam.
-     * @param (callable(int, int, int): bool)|null                              $patient_binding_checker Optional patient binding seam.
-     * @param (callable(int): bool)|null                                        $any_binding_checker     Optional any-binding seam.
-     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null $link_resolver          Optional link resolver seam.
-     * @param (callable(int, int): bool)|null                                   $enroll_checker          Optional enroll eligibility seam.
-     * @param (callable(array<string, mixed>): void)|null                       $decision_observer       Optional decision observer seam.
+     * @param CpmsDb|null                                                                                                         $db                      Database adapter.
+     * @param PatientRepository|null                                                                                              $patients                Patient repository.
+     * @param (callable(int): ?array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>})|null $user_reader             Optional user reader seam.
+     * @param (callable(int, int): bool)|null                                                                                     $clinic_binding_checker  Optional clinic binding seam.
+     * @param (callable(int, int, int): bool)|null                                                                                $patient_binding_checker Optional patient binding seam.
+     * @param (callable(int): bool)|null                                                                                          $any_binding_checker     Optional any-binding seam.
+     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null                                                  $link_resolver           Optional link resolver seam.
+     * @param (callable(int, int): bool)|null                                                                                     $enroll_checker          Optional enroll eligibility seam.
+     * @param (callable(array<string, mixed>): void)|null                                                                         $decision_observer       Optional decision observer seam.
+     * @param (callable(int): bool)|null                                                                                          $scoped_staff_checker    Optional scoped staff authority seam.
+     * @param MembershipRepository|null                                                                                           $memberships             Membership repository.
+     * @param AuthorizationService|null                                                                                           $authorization           Clinic-scoped authorization service.
      */
     public function __construct(
         ?CpmsDb $db = null,
@@ -109,9 +126,15 @@ final class PatientAccess {
         ?callable $any_binding_checker = null,
         ?callable $link_resolver = null,
         ?callable $enroll_checker = null,
-        ?callable $decision_observer = null
+        ?callable $decision_observer = null,
+        ?callable $scoped_staff_checker = null,
+        ?MembershipRepository $memberships = null,
+        ?AuthorizationService $authorization = null
     ) {
+        $this->db                      = $db;
         $this->patients                = $patients ?? ( null !== $db ? new PatientRepository( $db ) : null );
+        $this->memberships             = $memberships ?? ( null !== $db ? new MembershipRepository( $db ) : null );
+        $this->authorization           = $authorization ?? ( null !== $db && null !== $this->memberships ? new AuthorizationService( $this->memberships, new CustomRoleRepository( $db ) ) : null );
         $this->user_reader             = $user_reader;
         $this->clinic_binding_checker  = $clinic_binding_checker;
         $this->patient_binding_checker = $patient_binding_checker;
@@ -119,6 +142,7 @@ final class PatientAccess {
         $this->link_resolver           = $link_resolver;
         $this->enroll_checker          = $enroll_checker;
         $this->decision_observer       = $decision_observer;
+        $this->scoped_staff_checker    = $scoped_staff_checker;
     }
 
     /**
@@ -205,7 +229,7 @@ final class PatientAccess {
 
         $roles        = $user['roles'];
         $primary_role = isset( $roles[0] ) && is_string( $roles[0] ) ? $roles[0] : 'unknown';
-        if ( ! $this->is_pure_patient_user( $user ) ) {
+        if ( ! $this->is_pure_patient_user( $user ) || $this->has_scoped_staff_authority( $wp_user_id ) ) {
             return $this->observe_decision(
                 $wp_user_id,
                 $clinic_id,
@@ -387,7 +411,50 @@ final class PatientAccess {
             return false;
         }
 
-        return $this->is_pure_patient_user( $user );
+        return $this->is_pure_patient_user( $user ) && ! $this->has_scoped_staff_authority( $wp_user_id );
+    }
+
+    /**
+     * Checks whether `$wp_user_id` holds ANY active Clinic-scoped staff authority
+     * (built-in role membership, Clinic-local custom role, or explicit grant)
+     * in ANY Clinic, failing closed on missing dependencies or lookup errors.
+     */
+    private function has_scoped_staff_authority( int $wp_user_id ): bool {
+        if ( $wp_user_id <= 0 ) {
+            return true;
+        }
+        if ( null !== $this->scoped_staff_checker ) {
+            try {
+                return (bool) ( $this->scoped_staff_checker )( $wp_user_id );
+            } catch ( Throwable ) {
+                return true;
+            }
+        }
+        if ( null === $this->db || null === $this->memberships || null === $this->authorization ) {
+            return true;
+        }
+
+        $was_strict = $this->db->is_strict();
+        $this->db->setStrict( true );
+        try {
+            $clinic_ids = $this->memberships->active_clinic_ids_for_user( $wp_user_id );
+            foreach ( $clinic_ids as $clinic_id ) {
+                if ( $clinic_id <= 0 ) {
+                    return true;
+                }
+                foreach ( RolesAndCapabilities::ALL_CAPS as $capability ) {
+                    if ( $this->authorization->can( $wp_user_id, $clinic_id, $capability ) ) {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        } catch ( Throwable ) {
+            return true;
+        } finally {
+            $this->db->setStrict( $was_strict );
+        }
     }
 
     /**

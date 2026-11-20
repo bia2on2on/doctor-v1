@@ -33,6 +33,7 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
     private int $patientUserZero;
     private int $secretaryUser;
     private int $staffWithDbLinkOnly;
+    private int $patientWithScopedMembership;
 
     protected function setUp(): void {
         parent::setUp();
@@ -70,16 +71,17 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
         $this->patientUserA         = $this->makeUser( 'gate_pat_a_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
         $this->patientUserB         = $this->makeUser( 'gate_pat_b_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
         $this->patientUserZero      = $this->makeUser( 'gate_pat_z_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
-        $this->secretaryUser        = $this->makeUser( 'gate_sec_' . uniqid(), RolesAndCapabilities::ROLE_SECRETARY );
-        $this->staffWithDbLinkOnly  = $this->makeUser( 'gate_sec_link_' . uniqid(), RolesAndCapabilities::ROLE_SECRETARY );
+        $this->secretaryUser              = $this->makeUser( 'gate_sec_' . uniqid(), RolesAndCapabilities::ROLE_SECRETARY );
+        $this->staffWithDbLinkOnly        = $this->makeUser( 'gate_sec_link_' . uniqid(), RolesAndCapabilities::ROLE_SECRETARY );
+        $this->patientWithScopedMembership = $this->makeUser( 'gate_pat_scoped_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
 
         cpms_test_seed_membership( $this->secretaryUser, $this->clinicA, RolesAndCapabilities::ROLE_SECRETARY );
         cpms_test_seed_membership( $this->staffWithDbLinkOnly, $this->clinicA, RolesAndCapabilities::ROLE_SECRETARY );
-        // Also give PatientUserA a staff membership in Clinic B to verify staff membership never grants patient access.
-        cpms_test_seed_membership( $this->patientUserA, $this->clinicB, RolesAndCapabilities::ROLE_SECRETARY );
+        cpms_test_seed_membership( $this->patientWithScopedMembership, $this->clinicB, RolesAndCapabilities::ROLE_SECRETARY );
 
         $this->linkA = $this->insertPatientLink( $this->clinicA, $this->patientA, $this->patientUserA, '09120010001' );
         $this->linkB = $this->insertPatientLink( $this->clinicB, $this->patientB, $this->patientUserB, '09120020002' );
+        $this->insertPatientLink( $this->clinicA, $this->patientA, $this->patientWithScopedMembership, '09120010001' );
         // Even if a staff-only user has a row in cpms_patient_user_links, missing ROLE_PATIENT still fails closed.
         $this->insertPatientLink( $this->clinicA, $this->patientA, $this->staffWithDbLinkOnly, '09120010001' );
 
@@ -159,10 +161,14 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
         self::assertSame( 404, $deniedPut->get_status() );
         self::assertSame( PatientAccess::NOT_FOUND_CODE, $deniedPut->get_data()['code'] ?? null );
 
-        // PatientUserA has a staff membership in Clinic B but NO patient link in Clinic B: denied on Clinic B.
-        $deniedStaffClinic = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicB ], $this->patientUserA );
-        self::assertSame( 404, $deniedStaffClinic->get_status() );
-        self::assertSame( PatientAccess::NOT_FOUND_CODE, $deniedStaffClinic->get_data()['code'] ?? null );
+        // User holds ROLE_PATIENT + patient link in Clinic A + active secretary membership in Clinic B: denied (403) in ALL clinics.
+        $deniedStaffClinic = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicB ], $this->patientWithScopedMembership );
+        self::assertSame( 403, $deniedStaffClinic->get_status() );
+        self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedStaffClinic->get_data()['code'] ?? null );
+
+        $deniedLinkedClinic = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->patientWithScopedMembership );
+        self::assertSame( 403, $deniedLinkedClinic->get_status() );
+        self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedLinkedClinic->get_data()['code'] ?? null );
 
         // Same-fixture positive control: PatientUserA succeeds in Clinic A where they hold a patient link.
         $allowed = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->patientUserA );
@@ -287,6 +293,111 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
         $allowedMe = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->patientUserA );
         self::assertSame( 200, $allowedMe->get_status() );
         self::assertSame( $this->patientA, (int) ( $allowedMe->get_data()['data']['id'] ?? 0 ) );
+    }
+
+    public function testClinicScopedStaffAuthoritiesAreDeniedWithSameFixturePositiveControl(): void {
+        // 1. Clinic-local custom role granting a staff capability in Clinic B (WP role is still ROLE_PATIENT only).
+        $patientWithCustomRole = $this->makeUser( 'gate_pat_custom_role_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $this->insertPatientLink( $this->clinicA, $this->patientA, $patientWithCustomRole, '09120010001' );
+        $this->insertActiveCustomRoleDef( $this->clinicB, 'cx_gate_intake', [ RolesAndCapabilities::QUEUE_READ ] );
+        App::membership_service()->create_membership( $this->clinicB, $patientWithCustomRole, 'cx_gate_intake' );
+
+        // 2. Explicit membership capability grant in Clinic B (empty custom role + explicit grant).
+        $patientWithExplicitGrant = $this->makeUser( 'gate_pat_explicit_grant_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $this->insertPatientLink( $this->clinicA, $this->patientA, $patientWithExplicitGrant, '09120010001' );
+        $this->insertActiveCustomRoleDef( $this->clinicB, 'cx_gate_empty', [] );
+        $grantMembershipId = App::membership_service()->create_membership( $this->clinicB, $patientWithExplicitGrant, 'cx_gate_empty' );
+        App::membership_service()->set_capability( $grantMembershipId, RolesAndCapabilities::APPT_READ, 'grant' );
+
+        $baselineDenied = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->secretaryUser );
+        self::assertSame( 403, $baselineDenied->get_status() );
+        self::assertSame( PatientAccess::FORBIDDEN_CODE, $baselineDenied->get_data()['code'] ?? null );
+
+        // All three scoped staff authority kinds (built-in membership, custom role, explicit grant) must fail closed identically.
+        foreach ( [ $this->patientWithScopedMembership, $patientWithCustomRole, $patientWithExplicitGrant ] as $scopedStaffId ) {
+            $deniedMe = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $scopedStaffId );
+            self::assertSame( 403, $deniedMe->get_status() );
+            self::assertSame( $baselineDenied->get_data(), $deniedMe->get_data() );
+
+            $deniedPut = $this->dispatch( 'PUT', self::NS . '/patient/me', [ 'first_name' => 'ScopedEdit', 'clinic_id' => $this->clinicA ], $scopedStaffId );
+            self::assertSame( 403, $deniedPut->get_status() );
+            self::assertSame( $baselineDenied->get_data(), $deniedPut->get_data() );
+
+            $deniedRecords = $this->dispatch( 'GET', self::NS . '/patient/my-records', [], $scopedStaffId );
+            self::assertSame( 403, $deniedRecords->get_status() );
+            self::assertSame( $baselineDenied->get_data(), $deniedRecords->get_data() );
+
+            $deniedEnroll = $this->dispatch( 'POST', self::NS . '/patient/enroll', [ 'clinic_id' => $this->clinicA, 'first_name' => 'S', 'last_name' => 'C', 'mobile' => '09129990003' ], $scopedStaffId );
+            self::assertSame( 403, $deniedEnroll->get_status() );
+            self::assertSame( $baselineDenied->get_data(), $deniedEnroll->get_data() );
+        }
+
+        // Fail-closed proof: when the membership authority query errors, even pure patientUserA is denied identically.
+        global $wpdb;
+        $corruptMemberships = static function ( string $sql ): string {
+            if ( str_contains( $sql, 'cpms_clinic_memberships' ) ) {
+                return 'SELECT nonexistent_col_for_fail_closed_test FROM wp_nonexistent_cpms_table';
+            }
+
+            return $sql;
+        };
+        $previousSuppression = (bool) $wpdb->suppress_errors( true );
+        add_filter( 'query', $corruptMemberships, 5 );
+        try {
+            $deniedOnDbError = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->patientUserA );
+            self::assertSame( 403, $deniedOnDbError->get_status() );
+            self::assertSame( $baselineDenied->get_data(), $deniedOnDbError->get_data() );
+        } finally {
+            remove_filter( 'query', $corruptMemberships, 5 );
+            $wpdb->suppress_errors( $previousSuppression );
+        }
+
+        $firstName = App::db()->fetchValue( 'SELECT first_name FROM ' . App::db()->table( 'cpms_patients' ) . ' WHERE id = %d', [ $this->patientA ] );
+        self::assertSame( 'Alice', $firstName );
+
+        // Same-fixture positive control: genuinely patient-only user A succeeds on /patient/me and /patient/my-records.
+        $allowedMe = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->patientUserA );
+        self::assertSame( 200, $allowedMe->get_status() );
+        self::assertSame( $this->patientA, (int) ( $allowedMe->get_data()['data']['id'] ?? 0 ) );
+
+        $allowedRecords = $this->dispatch( 'GET', self::NS . '/patient/my-records', [], $this->patientUserA );
+        self::assertSame( 200, $allowedRecords->get_status() );
+        self::assertNotEmpty( $allowedRecords->get_data()['data'] ?? [] );
+    }
+
+    /**
+     * @param list<string> $capabilities
+     */
+    private function insertActiveCustomRoleDef( int $clinicId, string $roleKey, array $capabilities ): void {
+        global $wpdb;
+        $now    = App::db()->nowUtcSql();
+        $defs   = $wpdb->prefix . 'cpms_custom_role_defs';
+        $defCap = $wpdb->prefix . 'cpms_custom_role_capabilities';
+
+        $wpdb->query(
+            $wpdb->prepare(
+                "INSERT INTO {$defs} (clinic_id, role_key, status, version, created_at, updated_at) VALUES (%d, %s, %s, %d, %s, %s)", // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                $clinicId,
+                $roleKey,
+                'active',
+                1,
+                $now,
+                $now
+            )
+        );
+        $defId = (int) $wpdb->insert_id;
+        self::assertGreaterThan( 0, $defId );
+
+        foreach ( $capabilities as $capability ) {
+            $wpdb->query(
+                $wpdb->prepare(
+                    "INSERT INTO {$defCap} (role_def_id, capability, created_at) VALUES (%d, %s, %s)", // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                    $defId,
+                    $capability,
+                    $now
+                )
+            );
+        }
     }
 
     private function insertPatient( int $clinicId, string $mrn, string $firstName, string $lastName, string $mobile ): int {
