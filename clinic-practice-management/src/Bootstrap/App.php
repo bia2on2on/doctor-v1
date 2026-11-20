@@ -28,6 +28,7 @@ use ClinicCore\Admin\SecretaryFinancePage;
 use ClinicCore\Admin\SecretaryQueuePage;
 use ClinicCore\Admin\SmsSettingsPage;
 use ClinicCore\Application\Auth\OtpService;
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Application\Backup\BackupService;
 use ClinicCore\Application\Booking\BookingService;
@@ -380,7 +381,7 @@ final class App
 				( new OtpController( self::otpService() ) )->register_routes();
 				( new SmsController( self::smsService() ) )->register_routes();
 				( new BookingController( self::bookingService(), self::patient_session_scope() ) )->register_routes();
-				( new PatientController( self::patientService() ) )->register_routes();
+				( new PatientController( self::patientService(), self::patient_access() ) )->register_routes();
 				( new QueueController( self::visitService() ) )->register_routes();
 				( new ScheduleController( self::scheduleService() ) )->register_routes();
 				( new ClinicalController( self::clinicalService() ) )->register_routes();
@@ -1929,6 +1930,21 @@ final class App
         self::$patient_session_scope->register_hooks();
 
         return self::$patient_session_scope;
+    }
+
+    /**
+     * Resolves the central fail-closed patient access gate.
+     */
+    public static function patient_access(): PatientAccess {
+        static $gate = null;
+        static $deps = null;
+        $current_deps = [ self::db() ];
+        if ( null === $gate || $deps !== $current_deps ) {
+            $deps = $current_deps;
+            $gate = new PatientAccess( $current_deps[0], new PatientRepository( $current_deps[0] ) );
+        }
+
+        return $gate;
     }
 
     /**

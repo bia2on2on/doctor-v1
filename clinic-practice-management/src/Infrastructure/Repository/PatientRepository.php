@@ -158,6 +158,74 @@ final class PatientRepository
     }
 
     /**
+     * Checks whether the user holds at least one active clinical patient link
+     * inside the given Clinic.
+     */
+    public function user_has_clinical_access_to_clinic( int $wp_user_id, int $clinic_id ): bool {
+        if ( $wp_user_id <= 0 || $clinic_id <= 0 ) {
+            return false;
+        }
+
+        $value = $this->db->fetchValue(
+            'SELECT 1 FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patients' ) . ' p'
+            . ' ON p.id = l.patient_id AND p.clinic_id = l.clinic_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_clinics' ) . ' c ON c.id = l.clinic_id'
+            . " WHERE l.wp_user_id = %d AND l.clinic_id = %d AND p.status = 'active'"
+            . $this->clinical_access_identity_predicate()
+            . ' LIMIT 1',
+            [ $wp_user_id, $clinic_id ]
+        );
+
+        return null !== $value;
+    }
+
+    /**
+     * Checks whether the user holds at least one active clinical patient link
+     * in any Clinic.
+     */
+    public function user_has_any_clinical_access( int $wp_user_id ): bool {
+        if ( $wp_user_id <= 0 ) {
+            return false;
+        }
+
+        $value = $this->db->fetchValue(
+            'SELECT 1 FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patients' ) . ' p'
+            . ' ON p.id = l.patient_id AND p.clinic_id = l.clinic_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_clinics' ) . ' c ON c.id = l.clinic_id'
+            . " WHERE l.wp_user_id = %d AND p.status = 'active'"
+            . $this->clinical_access_identity_predicate()
+            . ' LIMIT 1',
+            [ $wp_user_id ]
+        );
+
+        return null !== $value;
+    }
+
+    /**
+     * Checks whether the user holds an unambiguous verified Organization
+     * identity eligible to self-enroll in the given active Clinic.
+     */
+    public function user_has_enrollment_eligibility_in_clinic( int $wp_user_id, int $clinic_id ): bool {
+        if ( $wp_user_id <= 0 || $clinic_id <= 0 ) {
+            return false;
+        }
+
+        $count = $this->db->fetchValue(
+            'SELECT COUNT(*)'
+            . ' FROM ' . $this->db->table( 'cpms_clinics' ) . ' c'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patient_identity_links' ) . ' pil ON pil.organization_id = c.organization_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patient_identities' ) . ' pi ON pi.id = pil.identity_id AND pi.organization_id = pil.organization_id'
+            . " WHERE c.id = %d AND c.status = 'active' AND o.status = 'active' AND pil.wp_user_id = %d",
+            [ $clinic_id, $wp_user_id ]
+        );
+
+        return null !== $count && 1 === (int) $count;
+    }
+
+    /**
      * Active Patient candidates backed by a matching durable link and Clinic.
      *
      * @return list<array<string, mixed>>
@@ -181,6 +249,10 @@ final class PatientRepository
      * @return array<string, mixed>|null
      */
     public function find_active_linked_patient_by_link( int $wp_user_id, int $link_id ): ?array {
+        if ( $wp_user_id <= 0 || $link_id <= 0 ) {
+            return null;
+        }
+
         return $this->db->fetchRow(
             'SELECT p.*' .
             ' FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l' .

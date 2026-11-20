@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Rest;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Security\RateLimiter;
 use WP_Error;
@@ -250,6 +251,128 @@ abstract class RestBase
         }
 
         return true;
+    }
+
+    /**
+     * Resolves the central fail-closed patient access gate.
+     */
+    protected function patient_access(): PatientAccess {
+        return App::patient_access();
+    }
+
+    /**
+     * Enforces central fail-closed patient authorization for patient-facing REST
+     * routes, checking nonce, authentication, patient role, Clinic binding,
+     * and optional patient/link selectors.
+     *
+     * @param WP_REST_Request                                                          $request Incoming REST request.
+     * @param array{mode?: string, clinic_id?: ?int, patient_id?: ?int, link_id?: ?int} $options Gate options.
+     */
+    protected function require_patient_access( WP_REST_Request $request, array $options = [] ): bool|WP_Error {
+        $nonce_error = $this->requireNonce( $request );
+        if ( $nonce_error instanceof WP_Error ) {
+            return $nonce_error;
+        }
+
+        $selector_invalid = false;
+        if ( array_key_exists( 'clinic_id', $options ) ) {
+            $clinic_id = $options['clinic_id'];
+        } else {
+            $clinic_selector = $this->extract_patient_clinic_selector( $request );
+            $clinic_id       = $clinic_selector['clinic_id'];
+            if ( $clinic_selector['invalid'] ) {
+                $selector_invalid = true;
+            }
+        }
+
+        if ( array_key_exists( 'link_id', $options ) ) {
+            $link_id = $options['link_id'];
+        } else {
+            $parsed_link = $this->parse_optional_positive_selector( $request->get_param( 'link_id' ) );
+            $link_id     = $parsed_link['value'];
+            if ( $parsed_link['invalid'] ) {
+                $selector_invalid = true;
+            }
+        }
+
+        $patient_id = array_key_exists( 'patient_id', $options ) ? $options['patient_id'] : null;
+        $mode       = is_string( $options['mode'] ?? null ) ? (string) $options['mode'] : PatientAccess::MODE_CLINICAL;
+        $user       = wp_get_current_user();
+        $decision   = $this->patient_access()->authorize_request(
+            $user->exists() ? (int) $user->ID : 0,
+            $clinic_id,
+            $patient_id,
+            $link_id,
+            $mode,
+            $selector_invalid
+        );
+
+        if ( $decision['allowed'] ) {
+            return true;
+        }
+
+        if ( 403 === $decision['http_status'] ) {
+            App::audit()->log(
+                'FORBIDDEN_ACCESS_ATTEMPT',
+                [ 'wp_user_id' => $user->exists() ? (int) $user->ID : 0, 'role' => $decision['role'] ],
+                'patient',
+                null,
+                null,
+                null,
+                null,
+                [ 'reason' => $decision['reason'] ]
+            );
+        }
+
+        return $this->error( $decision['code'], $decision['http_status'], $decision['message'] );
+    }
+
+    /**
+     * Extracts an optional Clinic selector from `X-CPMS-Clinic-Id` and/or
+     * `clinic_id` without trusting browser input as authority.
+     *
+     * @return array{clinic_id: ?int, invalid: bool}
+     */
+    private function extract_patient_clinic_selector( WP_REST_Request $request ): array {
+        $header = $this->parse_optional_positive_selector( $request->get_header( 'X-CPMS-Clinic-Id' ) );
+        $param  = $this->parse_optional_positive_selector( $request->get_param( 'clinic_id' ) );
+        if ( $header['invalid'] || $param['invalid'] ) {
+            return [ 'clinic_id' => null, 'invalid' => true ];
+        }
+        if ( null !== $header['value'] && null !== $param['value'] && $header['value'] !== $param['value'] ) {
+            return [ 'clinic_id' => null, 'invalid' => true ];
+        }
+
+        return [
+            'clinic_id' => $header['value'] ?? $param['value'],
+            'invalid'   => false,
+        ];
+    }
+
+    /**
+     * Parses an optional positive integer selector, flagging malformed or
+     * non-positive values as invalid.
+     *
+     * @return array{value: ?int, invalid: bool}
+     */
+    private function parse_optional_positive_selector( mixed $raw ): array {
+        if ( null === $raw || '' === $raw ) {
+            return [ 'value' => null, 'invalid' => false ];
+        }
+        if ( is_int( $raw ) ) {
+            return $raw > 0 ? [ 'value' => $raw, 'invalid' => false ] : [ 'value' => null, 'invalid' => true ];
+        }
+        if ( is_string( $raw ) ) {
+            $trimmed = trim( $raw );
+            if ( '' === $trimmed ) {
+                return [ 'value' => null, 'invalid' => false ];
+            }
+            if ( preg_match( '/^[1-9]\d*$/', $trimmed ) === 1 ) {
+                return [ 'value' => (int) $trimmed, 'invalid' => false ];
+            }
+        }
+
+        return [ 'value' => null, 'invalid' => true ];
     }
 
     /**

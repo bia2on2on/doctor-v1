@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 namespace ClinicCore\Rest;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Application\Patients\PatientService;
-use ClinicCore\Bootstrap\App;
 use ClinicCore\Auth\RolesAndCapabilities;
 use WP_Error;
 use WP_REST_Request;
@@ -29,8 +29,10 @@ use WP_REST_Server;
  */
 final class PatientController extends RestBase
 {
-    public function __construct(private readonly PatientService $patients)
-    {
+    public function __construct(
+        private readonly PatientService $patients,
+        private readonly ?PatientAccess $patient_access = null
+    ) {
     }
 
     public function register_routes(): void
@@ -40,7 +42,7 @@ final class PatientController extends RestBase
             '/patient/enroll',
             [
                 'methods'             => WP_REST_Server::CREATABLE,
-                'permission_callback' => fn ( WP_REST_Request $request ) => $this->requirePatient( $request ),
+                'permission_callback' => fn ( WP_REST_Request $request ) => $this->requirePatient( $request, PatientAccess::MODE_ENROLL ),
                 'callback'            => fn ( WP_REST_Request $request ) => $this->wrap(
                     fn () => $this->patients->enroll_current_patient( (int) $request->get_param( 'clinic_id' ), $this->body( $request ) )
                 ),
@@ -56,7 +58,7 @@ final class PatientController extends RestBase
                 [
                     'methods'             => WP_REST_Server::READABLE,
                     'callback'            => fn ( WP_REST_Request $request ) => $this->my_records( $request ),
-                    'permission_callback' => fn ( WP_REST_Request $request ) => $this->requirePatient( $request ),
+                    'permission_callback' => fn ( WP_REST_Request $request ) => $this->requirePatient( $request, PatientAccess::MODE_RECORDS_LIST ),
                 ],
             ]
         );
@@ -159,10 +161,10 @@ final class PatientController extends RestBase
 
     private function updateMe(WP_REST_Request $request): WP_REST_Response|WP_Error
     {
-        $user = wp_get_current_user();
+        $user    = wp_get_current_user();
         $link_id = $this->link_id( $request );
         $fields  = $this->body( $request );
-        unset( $fields['link_id'] );
+        unset( $fields['link_id'], $fields['clinic_id'] );
 
         return $this->wrap( fn () => $this->patients->updateMe( (int) $user->ID, $fields, $link_id ) );
     }
@@ -234,32 +236,12 @@ final class PatientController extends RestBase
 
     // ---------- Helpers ----------
 
-    private function requirePatient(WP_REST_Request $request): bool|WP_Error
-    {
-        $nonceError = $this->requireNonce($request);
-        if ($nonceError instanceof WP_Error) {
-            return $nonceError;
-        }
-        $user = wp_get_current_user();
-        if (!$user->exists()) {
-            return $this->error('CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید');
-        }
-        if (!in_array(RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true)) {
-            App::audit()->log(
-                'FORBIDDEN_ACCESS_ATTEMPT',
-                ['wp_user_id' => (int) $user->ID, 'role' => $user->roles[0] ?? 'unknown'],
-                'patient',
-                null,
-                null,
-                null,
-                null,
-                ['reason' => 'patient_role_required']
-            );
+    protected function patient_access(): PatientAccess {
+        return $this->patient_access ?? parent::patient_access();
+    }
 
-            return $this->error('CLINIC_PERMISSION_DENIED', 403, 'دسترسی ندارید');
-        }
-
-        return true;
+    private function requirePatient( WP_REST_Request $request, string $mode = PatientAccess::MODE_CLINICAL ): bool|WP_Error {
+        return $this->require_patient_access( $request, [ 'mode' => $mode ] );
     }
 
     private function link_id( WP_REST_Request $request ): ?int {
