@@ -181,7 +181,7 @@ final class HandwritingService
                 (int) $visitId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
                 'create_document'
             );
-            $documentId   = $this->handwriting->insertDocument(
+            $document_id  = $this->handwriting->insertDocument(
                 (int) $trustedClinicId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
                 [
                     'visit_id'     => $visitId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
@@ -191,6 +191,7 @@ final class HandwritingService
                     'page_count'   => 0,
                 ]
             );
+            $documentId   = $document_id; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy variable naming preserved.
 
             $created = [];
             foreach (array_values($pages) as $i => $p) {

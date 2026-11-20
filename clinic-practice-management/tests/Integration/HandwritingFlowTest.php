@@ -8,12 +8,12 @@ use ClinicCore\Application\Handwriting\HandwritingException;
 use ClinicCore\Application\Handwriting\HandwritingService;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
-use ClinicCore\Application\Visits\VisitException;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Licensing\LicenseSignature;
 use ClinicCore\Domain\Licensing\LicenseStatus;
 use ClinicCore\Domain\Licensing\PostExpirationPolicy;
 use ClinicCore\Domain\Licensing\SignedLicenseGate;
+use ClinicCore\Domain\Visits\VisitException;
 use ClinicCore\Infrastructure\Repository\HandwritingRepository;
 use ClinicCore\Infrastructure\Repository\VisitRepository;
 use ClinicCore\Infrastructure\Security\Idempotency;
@@ -98,6 +98,7 @@ final class HandwritingFlowTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
+        wp_set_current_user(0);
         remove_all_filters('cpms_license_public_key');
         App::replaceExplicitScope($this->previousScope);
         $this->previousScope = null;
@@ -205,6 +206,7 @@ final class HandwritingFlowTest extends WP_UnitTestCase
         $this->assertCount(1, $readAtT1['strokes']);
 
         // 4. REST round-trip in wall-clock Stage 3
+        $this->installSignedExpiration(time() + 86400);
         wp_set_current_user($this->doctorUserId);
         $restVisit = $this->makeConsultation();
         $stage3T0 = time() - 40 * 86400;
