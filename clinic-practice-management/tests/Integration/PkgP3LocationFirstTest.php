@@ -100,6 +100,18 @@ final class PkgP3LocationFirstTest extends WP_UnitTestCase
     // A + C — the shared eligibility read (reception rule), fail closed
     // =====================================================================
 
+    public function test_unlisted_fixture_has_no_public_booking_markup(): void {
+        App::settingsFactory()->forClinic( $this->clinic_a )->set( 'public.listing_opt_in', false );
+        $hidden  = $this->render( (string) $this->clinic_a );
+        $unknown = $this->render( (string) PHP_INT_MAX );
+        $normalize = static fn ( string $html ): string => (string) preg_replace( '/id="cpms-public-booking-[0-9]+"/', 'id="fixture"', $html );
+        self::assertSame( $normalize( $unknown ), $normalize( $hidden ) );
+        self::assertStringContainsString( 'data-state="error"', $hidden );
+        foreach ( [ 'Clinic A P3LF', 'data-clinic-id=', 'data-clinician-id=', 'data-location-id=', 'locations_by_clinic' ] as $witness ) {
+            self::assertStringNotContainsString( $witness, $hidden );
+        }
+    }
+
     public function test_location_scoped_clinician_list_returns_only_eligible_clinicians(): void
     {
         $repo = new MembershipRepository( App::db() );
@@ -380,6 +392,7 @@ final class PkgP3LocationFirstTest extends WP_UnitTestCase
 
         $this->clinic_a = $this->insert_clinic( 'Clinic A P3LF ' . $this->uid, 'clinic-a-p3lf-' . $this->uid, $now );
         $this->clinic_b = $this->insert_clinic( 'Clinic B P3LF ' . $this->uid, 'clinic-b-p3lf-' . $this->uid, $now );
+        App::settingsFactory()->forClinic( $this->clinic_a )->set( 'public.listing_opt_in', true );
 
         $this->location_a1 = $this->insert_location( $this->clinic_a, 'Main A1 P3LF', 'main-a1-p3lf-' . $this->uid, $now );
         $this->location_a2 = $this->insert_location( $this->clinic_a, 'Branch A2 P3LF', 'branch-a2-p3lf-' . $this->uid, $now );

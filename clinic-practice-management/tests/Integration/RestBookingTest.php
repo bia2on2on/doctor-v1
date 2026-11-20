@@ -39,6 +39,7 @@ final class RestBookingTest extends WP_UnitTestCase
         App::settings()->set('booking.min_lead_hours', 2);
         App::settings()->set('booking.max_future_days', 60);
         App::settings()->set('booking.hold_ttl_sec', 600);
+        App::settingsFactory()->forClinic( 1 )->set( 'public.listing_opt_in', true );
         App::settings()->set('booking.cancel_deadline_hours', 24);
         App::settings()->set('booking.reschedule_deadline_hours', 24);
 
@@ -125,6 +126,17 @@ final class RestBookingTest extends WP_UnitTestCase
     }
 
     // ---------- TP-04: Nonce ----------
+
+    public function test_unlisted_clinic_quote_is_indistinguishable_from_unknown(): void {
+        App::settingsFactory()->forClinic( 1 )->set( 'public.listing_opt_in', false );
+        $slot = $this->makeSlot( 3, '10:00' );
+        $params = [ 'clinician_id' => $this->clinicianId, 'slot_id' => $slot['id'], 'slot_date' => $slot['date'], 'slot_time' => $slot['time'] ];
+        $hidden  = $this->dispatch( 'POST', self::NS . '/booking/quote', $params, false );
+        $unknown = $this->dispatch( 'POST', self::NS . '/booking/quote', array_replace( $params, [ 'clinician_id' => PHP_INT_MAX ] ), false );
+        self::assertSame( 404, $hidden->get_status() );
+        self::assertSame( $unknown->get_data(), $hidden->get_data() );
+        self::assertSame( [ 'status' => 404 ], $hidden->get_data()['data'] );
+    }
 
     public function testHoldWithoutNonceRejected(): void
     {

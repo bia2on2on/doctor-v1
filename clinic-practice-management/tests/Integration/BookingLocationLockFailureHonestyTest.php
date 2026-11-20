@@ -41,6 +41,7 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
         App::settings()->set('booking.min_lead_hours', 2);
         App::settings()->set('booking.max_future_days', 60);
         App::settings()->set('booking.hold_ttl_sec', 600);
+        App::settingsFactory()->forClinic( 1 )->set( 'public.listing_opt_in', true );
         wp_set_current_user(0);
 
         global $wpdb;
@@ -112,6 +113,17 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
         $this->removeFault();
         wp_set_current_user(0);
         parent::tearDown();
+    }
+
+    public function test_unlisted_clinic_quote_is_indistinguishable_from_unknown(): void {
+        App::settingsFactory()->forClinic( 1 )->set( 'public.listing_opt_in', false );
+        $slot = $this->makeSlot( '19:00' );
+        $params = [ 'clinician_id' => $this->clinicianId, 'slot_id' => $slot['id'], 'slot_date' => $slot['date'], 'slot_time' => $slot['time'] ];
+        $hidden  = $this->dispatchQuote( $params );
+        $unknown = $this->dispatchQuote( array_replace( $params, [ 'clinician_id' => PHP_INT_MAX ] ) );
+        self::assertSame( 404, $hidden->get_status() );
+        self::assertSame( $unknown->get_data(), $hidden->get_data() );
+        self::assertSame( [ 'status' => 404 ], $hidden->get_data()['data'] );
     }
 
     public function testFailedLocationLockIsRetryableLoggedAndRolledBack(): void

@@ -87,6 +87,19 @@ final class Phase3Slice6BStaffClinicAuthorizationTest extends WP_UnitTestCase
     // RED A — STAFF PATIENT ACCESS
     // ================================================================
 
+    public function test_unlisted_clinic_availability_is_indistinguishable_from_unknown(): void {
+        App::settingsFactory()->forClinic( $this->clinics['A'] )->set( 'public.listing_opt_in', false );
+        $request = new WP_REST_Request( 'GET', self::NS . '/availability' );
+        $request->set_param( 'clinician_id', $this->insertClinician( $this->clinics['A'], 0, 'Unlisted fixture doctor' ) );
+        $missing = new WP_REST_Request( 'GET', self::NS . '/availability' );
+        $missing->set_param( 'clinician_id', PHP_INT_MAX );
+        $hidden  = rest_do_request( $request );
+        $unknown = rest_do_request( $missing );
+        self::assertSame( 404, $hidden->get_status() );
+        self::assertSame( $unknown->get_data(), $hidden->get_data() );
+        self::assertSame( [ 'status' => 404 ], $hidden->get_data()['data'] );
+    }
+
     /**
      * RED A (read): secretary with the global coarse patient capability and an
      * ACTIVE membership, but an explicit scoped DENY on cpms_patient_read, must
@@ -587,6 +600,7 @@ final class Phase3Slice6BStaffClinicAuthorizationTest extends WP_UnitTestCase
         self::assertSame($patientId, (int) ($me->get_data()['data']['id'] ?? 0));
 
         // Public availability remains public (no authentication, no membership).
+        App::settingsFactory()->forClinic( $clinicA )->set( 'public.listing_opt_in', true );
         wp_set_current_user(0);
         $request = new WP_REST_Request('GET', self::NS . '/availability');
         $request->set_param('clinician_id', $this->insertClinician($clinicA, 0, 'Dr P3S6B Public'));

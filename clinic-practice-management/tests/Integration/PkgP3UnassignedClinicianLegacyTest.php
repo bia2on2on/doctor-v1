@@ -81,6 +81,18 @@ final class PkgP3UnassignedClinicianLegacyTest extends WP_UnitTestCase
     // A — no eligible Location must not be published as an empty contract
     // =====================================================================
 
+    public function test_unlisted_fixture_has_no_public_booking_markup(): void {
+        App::settingsFactory()->forClinic( $this->clinic_id )->set( 'public.listing_opt_in', false );
+        $hidden  = $this->render( (string) $this->clinic_id );
+        $unknown = $this->render( (string) PHP_INT_MAX );
+        $normalize = static fn ( string $html ): string => (string) preg_replace( '/id="cpms-public-booking-[0-9]+"/', 'id="fixture"', $html );
+        self::assertSame( $normalize( $unknown ), $normalize( $hidden ) );
+        self::assertStringContainsString( 'data-state="error"', $hidden );
+        foreach ( [ 'Clinic P3UL', 'data-clinic-id=', 'data-clinician-id=', 'data-location-id=', 'locations_by_clinic' ] as $witness ) {
+            self::assertStringNotContainsString( $witness, $hidden );
+        }
+    }
+
     public function test_clinic_with_no_eligible_location_publishes_no_contract_entry(): void
     {
         $config    = $this->config( $this->render( (string) $this->clinic_id ) );
@@ -187,6 +199,7 @@ final class PkgP3UnassignedClinicianLegacyTest extends WP_UnitTestCase
             ],
             [ '%d', '%s', '%s', '%s', '%s', '%s', '%s' ]
         );
+        App::settingsFactory()->forClinic( $this->clinic_id )->set( 'public.listing_opt_in', true );
 
         // One ACTIVE Location of this Clinic that nobody is assigned to yet.
         $this->location_id = $this->insert_row(
