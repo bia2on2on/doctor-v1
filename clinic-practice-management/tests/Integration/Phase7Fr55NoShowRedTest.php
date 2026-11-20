@@ -842,6 +842,8 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         self::$race_pcntl_available = true;
 
         $observations = [];
+        $race_anchor  = new DateTimeImmutable( 'now', new DateTimeZone( self::TZ ) );
+        $seed_failure = null;
         try {
             for ($attempt = 1; $attempt <= self::RACE_ATTEMPTS; $attempt++) {
                 self::$race_phase[$attempt] = ['fork' => 'not-reached', 'seed' => 'not-reached', 'state' => 'not-reached'];
@@ -867,13 +869,24 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                         $this->locationA,
                         $this->clinicianA,
                         $patientId,
-                        $this->eligibleRaceSlotSpec($attempt),
+                        $this->eligibleRaceSlotSpec( $race_anchor, $attempt ),
                         'rc' . $attempt
                     );
                     $this->assertRaceSeedVisible($seed['id'], $seed['slot_id'], $attempt);
                     self::$race_phase[$attempt]['seed'] = 'reached';
                 } catch (Throwable $e) {
-                    self::$race_phase[$attempt]['seed'] = get_class($e) . ': ' . $e->getMessage();
+                    global $wpdb;
+                    $db_error     = (string) $wpdb->last_error;
+                    $is_duplicate = false !== stripos( $db_error, 'duplicate entry' )
+                        || ( $e instanceof \mysqli_sql_exception && 1062 === $e->getCode() );
+                    if ( $is_duplicate ) {
+                        $seed_failure = 'duplicate-key';
+                    } elseif ( '' !== $db_error || $e instanceof \mysqli_sql_exception ) {
+                        $seed_failure = 'other-db-error';
+                    } else {
+                        $seed_failure = 'other-seed-error';
+                    }
+                    self::$race_phase[$attempt]['seed'] = $seed_failure;
                     throw $e;
                 }
 
@@ -903,7 +916,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                     ],
                 };
                 try {
-                    $outcomes = $this->runRace($seed['id'], $patientId, $workers, $attempt);
+                    $outcomes = $this->runRace( $seed['id'], $patientId, $workers, $attempt, $race_anchor );
                 } catch (Throwable $e) {
                     self::$race_error_fork = 'attempt ' . $attempt . ': ' . get_class($e) . ': ' . $e->getMessage();
                     self::$race_phase[$attempt]['fork'] = get_class($e) . ': ' . $e->getMessage();
@@ -928,7 +941,9 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                 ];
             }
         } catch (Throwable $e) {
-            self::$race_harness_error = get_class($e) . ': ' . $e->getMessage();
+            self::$race_harness_error = null !== $seed_failure
+                ? 'seed failure category: ' . $seed_failure
+                : get_class( $e ) . ': ' . $e->getMessage();
         }
 
         self::$race_observations = $observations;
@@ -977,6 +992,19 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                 self::fail($label . ': attempt ' . $attempt . ' was never started (no phase record — the harness died earlier)');
             }
             $attemptPhase = self::$race_phase[$attempt][$phase] ?? 'missing';
+            // The public reporter only projects source locations, never assertion text.
+            // Keep one assertion location per sanitized seed category.
+            if ( 'seed' === $phase ) {
+                if ( 'duplicate-key' === $attemptPhase ) {
+                    self::fail( 'Seed failure category: duplicate-key.' );
+                }
+                if ( 'other-db-error' === $attemptPhase ) {
+                    self::fail( 'Seed failure category: other-db-error.' );
+                }
+                if ( 'other-seed-error' === $attemptPhase ) {
+                    self::fail( 'Seed failure category: other-seed-error.' );
+                }
+            }
             self::assertSame(
                 'reached',
                 $attemptPhase,
@@ -1992,7 +2020,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
      *
      * @return array<string, array<string, mixed>> role => outcome
      */
-    private function runRace(int $appointmentId, int $patientId, array $workers, int $attempt): array {
+    private function runRace( int $appointmentId, int $patientId, array $workers, int $attempt, DateTimeImmutable $race_anchor ): array {
         $this->parentForkProbe = self::queryHookCensus();
 
         /** @var array<int, int> $pids parent-owned pids that have NOT been reaped yet */
@@ -2013,6 +2041,10 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                     );
                 }
                 if ($pid === 0) {
+                    if ( 'check_in' === $worker['role'] ) {
+                        // Pin only the eligibility clock. The fork barrier and overlap still use real time.
+                        VisitService::setTestNowUtc( $race_anchor );
+                    }
                     $this->raceWorker($worker['role'], (float) $worker['offset'], $appointmentId, $patientId, $attempt, $i);
                     exit(1); // backstop — a returning child is a harness fault, not a pass
                 }
@@ -2752,20 +2784,19 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
      * @return array{date: string, time: string}
      */
     /**
-     * Slot the check-in guard accepts: same trusted local day and inside the
-     * grace window (+5 min, or -5 min when +5 would cross local midnight), with
-     * a per-attempt second skew so `fx` slot uniqueness never collides.
+     * Reserve distinct slot seconds within the anchor's trusted local day.
      *
-     * @return array{date: string, time: string}
+     * @return array{date: string, time: string} Slot date and time.
      */
-    private function eligibleRaceSlotSpec(int $attempt): array
-    {
-        $now = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->setTimezone(new DateTimeZone(self::TZ));
-        $candidate = $now->add(new DateInterval('PT5M'));
-        if ($candidate->format('Y-m-d') !== $now->format('Y-m-d')) {
-            $candidate = $now->sub(new DateInterval('PT5M'));
-        }
-        $candidate = $candidate->sub(new DateInterval('PT' . (int) $attempt . 'S'));
+    private function eligibleRaceSlotSpec( DateTimeImmutable $anchor, int $attempt ): array {
+        $local_anchor = $anchor->setTimezone( new DateTimeZone( self::TZ ) );
+        $last_second  = $local_anchor->setTime( 23, 59, 59 )->getTimestamp();
+        $span         = self::RACE_ATTEMPTS - 1;
+        // Prefer a slot five minutes ahead. Near midnight, keep the entire block on
+        // the anchor day; its oldest slot is then at most two seconds before the
+        // anchor, well inside this fixture's default 30-minute check-in grace.
+        $first_second = min( $local_anchor->getTimestamp() + 300, $last_second - $span );
+        $candidate    = $local_anchor->setTimestamp( $first_second + $attempt - 1 );
 
         return ['date' => $candidate->format('Y-m-d'), 'time' => $candidate->format('H:i:s')];
     }
