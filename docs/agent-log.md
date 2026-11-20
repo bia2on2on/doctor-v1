@@ -8022,43 +8022,6 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 - Moved the unchanged PHPUnit reporter into `clinic-practice-management/bin/` and its seven CLI tests into `clinic-practice-management/tests/bin/`. Both are under the sole production prefix (`.github/scripts/companion-isolation.py:67–69`). Verified the reporter still resolves the repository root; updated workflow, contract, fixture and inventory paths only.
 - Local PR diff: companion isolation PASS (two production paths), 7 reporter tests and 180 workflow contracts OK, `WORKFLOW_YAML_OK files=17`, tenant tripwire 0 hardcodes / 3 suspects, whitespace clean. No classifier or assertion weakened. PHP/PHPCS/PHPUnit unavailable locally; real red-run publication remains unproven.
 
-<<<<<<< HEAD
-### [2026-11-20 UTC] — PR10-LOGIN-TABLE: add `cpms_patient_logins` table via migration 0032
-- Added `clinic-practice-management/src/Migrations/2026_11_20_0032_patient_logins.php` (`version => '2026_11_20_0032'`) creating `{wp_prefix}cpms_patient_logins` per `docs/architecture/patient-identity-login-design.md` §1 (15 columns, no `national_id`, 4 `UNIQUE` keys `u_pl_mobile`/`u_pl_bind`/`u_pl_live`/`u_pl_account`, `KEY idx_pl_kind_state_user (kind, state, wp_user_id)`, InnoDB/utf8mb4, no generated columns, no stored procedures, no FKs for WP temp-table safety).
-- Updated head-version/table assertions in `MigrationTest.php`, `StaffMessagingPricingMigrationTest.php`, `CustomRoleDisplayNameMigrationTest.php`, `CustomRoleMigrationSafetyTest.php`, `FinanceAuthorizationPolicyRegressionTest.php`, and `MariaDb1011CompatibilityTest.php`; added `PatientLoginsMigrationTest.php` (2 tests: schema/keys/idempotency + 0031->0032 upgrade). Companion/scoped-demo files left untouched for `companion-isolation.py`.
-- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (8 production files); `tenant-tripwire` 0 hardcodes / 3 known suspects; `git diff --check` clean; `wpcs-changed-lines.py` 54 added lines in scope. PHP/PHPCS/PHPUnit NOT run locally (no PHP runtime).
-
-### [2026-11-20 UTC] — PR10-DIAG: fix CustomRoleArchivalMigrationTest rollback list for 0032
-- OBSERVED: `Integration (WP 7.1 + MySQL 8)` failed on `MariaDB archival migration suite did not pass (PHPUnit exit 1)`. `CustomRoleArchivalMigrationTest.php:62` rolled back `['2026_10_31_0031', '2026_10_27_0030', '2026_10_18_0029', '2026_10_18_0028']` without `'2026_11_20_0032'`, leaving `currentVersion()` at `2026_11_20_0032`. Prepended `'2026_11_20_0032'` in place.
-- `Closure — PHP 8.1/8.3/8.4 runtime (WP 7.1.3)` failed with no annotation location; `Closure — destructive restoreApply` was in progress.
-- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (9 production files); `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean; `wpcs-changed-lines` 54 lines. PHP/PHPCS/PHPUnit NOT run locally.
-
-### [2026-11-20 UTC] — PR10-DIAG-2: fix StaffMessagingPricingMigrationTest rollback for 0032
-- OBSERVED: `Integration (WP 7.1 + MySQL 8)` failed on `StaffMessagingPricingMigrationTest::testUpgradeFrom0029PreservesExistingFinancialRows` (`ExpectationFailedException`). `StaffMessagingPricingMigrationTest.php:163` only called `rollbackOne()` once (rolling back `0032` and leaving `0031` applied), so `currentVersion()` was `2026_10_31_0031` instead of `2026_10_18_0029`. Added a second `rollbackOne()` for `'2026_10_31_0031'`.
-- `Closure — PHP 8.1/8.3/8.4 runtime (WP 7.1.3)` and `Closure — destructive restoreApply (isolated)` failed with no annotation location (UNKNOWN).
-- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (9 production files); `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean; `wpcs-changed-lines` 54 lines. PHP/PHPCS/PHPUnit NOT run locally.
-
-### [2026-11-20 UTC] — PR10-DIAG-3: update remaining Integration head assertions to 0032
-- Summary of PR10-LOGIN-TABLE / PR10-DIAG / PR10-DIAG-2 / PR10-DIAG-3: added `2026_11_20_0032_patient_logins.php` (`cpms_patient_logins`, 15 cols, no `national_id`, InnoDB/utf8mb4, max key length 160 bytes < 3072) + `PatientLoginsMigrationTest.php` (2 tests), and updated all Integration/Compatibility head-version assertions (`2026_10_31_0031` -> `2026_11_20_0032`) in `TempTableIsolationTest.php`, `Phase2SchemaTest.php`, `OrganizationPatientIdentityActivationTest.php`, `Phase10DoctorPortalRecommendationFollowUpWriteRedTest.php`, `Phase10StaffPortalVisitCompleteRedTest.php`, `Phase10StaffPortalVisitMedicalFilesRedTest.php`, and `Phase8Slice2OtpHoldConfirmRedTest.php`.
-- Closure PHP 8.4 runtime log returned `EOF` (no failure text); `Closure — PHP 8.1/8.3/8.4 runtime` and `Closure — destructive restoreApply` remain UNKNOWN.
-- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (16 production files); `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean; `wpcs-changed-lines` 54 lines. PHP/PHPCS/PHPUnit NOT run locally.
-
-### [2026-11-20 UTC] — PR10-FIX-5: add missing 0031 rollback step in DisplayName and OtpHoldConfirm tests
-- Updated `CustomRoleDisplayNameMigrationTest.php:117,151` to roll back `'2026_10_31_0031'` after `HEAD_VERSION` (`0032`), and `Phase8Slice2OtpHoldConfirmRedTest.php:1757` to roll back `'2026_10_31_0031'` after `'2026_11_20_0032'`.
-- Verified `.github/workflows/test_workflow_contracts.py` and `bin/` have 0 references to `2026_10_31_0031` or `0031`.
-- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (16 production files); `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean; `wpcs-changed-lines` 54 lines. PHP/PHPCS/PHPUnit NOT run locally.
-
-### [2026-11-20 UTC] — PR10-FIX-6: update closure-gate.yml schema head pins to 0032
-- OBSERVED: on head `851e43a`, `Integration (WP 7.1 + MySQL 8)` passed (9/13 green); only the 4 Closure checks failed.
-- Per explicit owner approval, updated `.github/workflows/closure-gate.yml:161` (`schema-0031` / `2026_10_31_0031` -> `schema-0032` / `2026_11_20_0032`) and `:495` (`schema:  2026_10_31_0031` / `SCHEMA NOT 0031 AFTER RESTORE` -> `schema:  2026_11_20_0032` / `SCHEMA NOT 0032 AFTER RESTORE`).
-- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS; `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean. PHP/PHPCS/PHPUnit NOT run locally.
-
-### [2026-11-20 UTC] — PR10-FIX-7: restore 0031 assertion, add unique-key duplicate tests, record R3 debt
-- R1: Restored `2026_10_31_0031` applied-version assertion in `CustomRoleMigrationSafetyTest.php:69` alongside `self::HEAD_VERSION` (`2026_11_20_0032`). Audited all `-` lines in `tests/`: all other 12 files are pure head/rollback updates.
-- R2: Added `testUniqueKeysRejectDuplicatesAndAllowDistinctRows` in `PatientLoginsMigrationTest.php` testing duplicate rejection + positive controls for `u_pl_mobile`, `u_pl_account`, `u_pl_bind`, and `u_pl_live`.
-- R3 (debt, not executed by `ci.yml` or `closure-gate.yml`): lane rewrite must bump or keep baselines before re-enabling — `first-practice-acceptance.yml:229`, `mariadb-10.11-compat.yml:175,179,205`, `pilot-gate.yml:306`, `real-wp-acceptance.yml:425`, `tests/bin/wp-activation-schema-proof.php:44`, `tests/bin/upgrade-path-fixture.php:22`, `bin/rwp-first-practice.py:913`.
-- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (16 production files); `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean; `wpcs-changed-lines` 54 lines. PHP/PHPCS/PHPUnit NOT run locally.
-=======
 ### [2026-11-20 UTC] — PR12-HANDWRITING-LICENSE (R3: handwriting save for opened visits)
 - Allowed `OP_HANDWRITING_NEW` (`createDocument`, `addPage`, `savePage` in `HandwritingService.php` and `SignedLicenseGate.php`) for already-opened visits (`cpms_visits.active = 1` and `status IN VisitMachine::ACTIVE_STATUSES`; in ordinary/outage-expired Stage 3 `now >= T1`, also `created_at < T1` where `T1 = PostExpirationPolicy::deadline(expires_at, 1)`) in every license state, while preserving denials for unopened/terminal/post-T1 visits, cross-clinic access, missing capability, non-owner clinician, and new visit creation under Stage 3.
 - Serialized handwriting writes against terminal Visit transitions using `VisitRepository::findForUpdate()` inside the write transaction before any document/page/version write or audit entry, preserving D6 audit atomicity, RBAC, clinic scope, and tenant isolation.
@@ -8097,4 +8060,38 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 - Seed failures still throw and stop; cached diagnostics use the fixed categories `duplicate-key`, `other-db-error`, or `other-seed-error` without emitting raw values. Each seed category has a separate failure line so the existing sanitized annotation can identify it by location; synthetic JUnit projection verified the mapping without publishing assertion text.
 - Added `testRaceSlotAnchorKeepsEveryAttemptDistinctAndCheckInEligible` using method-local reflection for the private helper; six simulated anchors include a one-second shift, near-midnight clamp and both sides of midnight. No prior test, assertion, or race attempt was removed or weakened. Scope is the FR-55 test and this entry only.
 - Local gates: 180 workflow contracts, workflow YAML (17), companion isolation, tenant tripwire (0 hardcodes, 3 known suspects), and diff check. PHP lint, PHPCS and PHPUnit NOT run locally. CI pending; one green run would not prove the flake is gone. PR stays draft for the targeted reader check.
->>>>>>> origin/main
+### [2026-11-20 UTC] — PR10-LOGIN-TABLE: add `cpms_patient_logins` table via migration 0032
+- Added `clinic-practice-management/src/Migrations/2026_11_20_0032_patient_logins.php` (`version => '2026_11_20_0032'`) creating `{wp_prefix}cpms_patient_logins` per `docs/architecture/patient-identity-login-design.md` §1 (15 columns, no `national_id`, 4 `UNIQUE` keys `u_pl_mobile`/`u_pl_bind`/`u_pl_live`/`u_pl_account`, `KEY idx_pl_kind_state_user (kind, state, wp_user_id)`, InnoDB/utf8mb4, no generated columns, no stored procedures, no FKs for WP temp-table safety).
+- Updated head-version/table assertions in `MigrationTest.php`, `StaffMessagingPricingMigrationTest.php`, `CustomRoleDisplayNameMigrationTest.php`, `CustomRoleMigrationSafetyTest.php`, `FinanceAuthorizationPolicyRegressionTest.php`, and `MariaDb1011CompatibilityTest.php`; added `PatientLoginsMigrationTest.php` (2 tests: schema/keys/idempotency + 0031->0032 upgrade). Companion/scoped-demo files left untouched for `companion-isolation.py`.
+- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (8 production files); `tenant-tripwire` 0 hardcodes / 3 known suspects; `git diff --check` clean; `wpcs-changed-lines.py` 54 added lines in scope. PHP/PHPCS/PHPUnit NOT run locally (no PHP runtime).
+
+### [2026-11-20 UTC] — PR10-DIAG: fix CustomRoleArchivalMigrationTest rollback list for 0032
+- OBSERVED: `Integration (WP 7.1 + MySQL 8)` failed on `MariaDB archival migration suite did not pass (PHPUnit exit 1)`. `CustomRoleArchivalMigrationTest.php:62` rolled back `['2026_10_31_0031', '2026_10_27_0030', '2026_10_18_0029', '2026_10_18_0028']` without `'2026_11_20_0032'`, leaving `currentVersion()` at `2026_11_20_0032`. Prepended `'2026_11_20_0032'` in place.
+- `Closure — PHP 8.1/8.3/8.4 runtime (WP 7.1.3)` failed with no annotation location; `Closure — destructive restoreApply` was in progress.
+- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (9 production files); `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean; `wpcs-changed-lines` 54 lines. PHP/PHPCS/PHPUnit NOT run locally.
+
+### [2026-11-20 UTC] — PR10-DIAG-2: fix StaffMessagingPricingMigrationTest rollback for 0032
+- OBSERVED: `Integration (WP 7.1 + MySQL 8)` failed on `StaffMessagingPricingMigrationTest::testUpgradeFrom0029PreservesExistingFinancialRows` (`ExpectationFailedException`). `StaffMessagingPricingMigrationTest.php:163` only called `rollbackOne()` once (rolling back `0032` and leaving `0031` applied), so `currentVersion()` was `2026_10_31_0031` instead of `2026_10_18_0029`. Added a second `rollbackOne()` for `'2026_10_31_0031'`.
+- `Closure — PHP 8.1/8.3/8.4 runtime (WP 7.1.3)` and `Closure — destructive restoreApply (isolated)` failed with no annotation location (UNKNOWN).
+- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (9 production files); `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean; `wpcs-changed-lines` 54 lines. PHP/PHPCS/PHPUnit NOT run locally.
+
+### [2026-11-20 UTC] — PR10-DIAG-3: update remaining Integration head assertions to 0032
+- Summary of PR10-LOGIN-TABLE / PR10-DIAG / PR10-DIAG-2 / PR10-DIAG-3: added `2026_11_20_0032_patient_logins.php` (`cpms_patient_logins`, 15 cols, no `national_id`, InnoDB/utf8mb4, max key length 160 bytes < 3072) + `PatientLoginsMigrationTest.php` (2 tests), and updated all Integration/Compatibility head-version assertions (`2026_10_31_0031` -> `2026_11_20_0032`) in `TempTableIsolationTest.php`, `Phase2SchemaTest.php`, `OrganizationPatientIdentityActivationTest.php`, `Phase10DoctorPortalRecommendationFollowUpWriteRedTest.php`, `Phase10StaffPortalVisitCompleteRedTest.php`, `Phase10StaffPortalVisitMedicalFilesRedTest.php`, and `Phase8Slice2OtpHoldConfirmRedTest.php`.
+- Closure PHP 8.4 runtime log returned `EOF` (no failure text); `Closure — PHP 8.1/8.3/8.4 runtime` and `Closure — destructive restoreApply` remain UNKNOWN.
+- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (16 production files); `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean; `wpcs-changed-lines` 54 lines. PHP/PHPCS/PHPUnit NOT run locally.
+
+### [2026-11-20 UTC] — PR10-FIX-5: add missing 0031 rollback step in DisplayName and OtpHoldConfirm tests
+- Updated `CustomRoleDisplayNameMigrationTest.php:117,151` to roll back `'2026_10_31_0031'` after `HEAD_VERSION` (`0032`), and `Phase8Slice2OtpHoldConfirmRedTest.php:1757` to roll back `'2026_10_31_0031'` after `'2026_11_20_0032'`.
+- Verified `.github/workflows/test_workflow_contracts.py` and `bin/` have 0 references to `2026_10_31_0031` or `0031`.
+- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (16 production files); `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean; `wpcs-changed-lines` 54 lines. PHP/PHPCS/PHPUnit NOT run locally.
+
+### [2026-11-20 UTC] — PR10-FIX-6: update closure-gate.yml schema head pins to 0032
+- OBSERVED: on head `851e43a`, `Integration (WP 7.1 + MySQL 8)` passed (9/13 green); only the 4 Closure checks failed.
+- Per explicit owner approval, updated `.github/workflows/closure-gate.yml:161` (`schema-0031` / `2026_10_31_0031` -> `schema-0032` / `2026_11_20_0032`) and `:495` (`schema:  2026_10_31_0031` / `SCHEMA NOT 0031 AFTER RESTORE` -> `schema:  2026_11_20_0032` / `SCHEMA NOT 0032 AFTER RESTORE`).
+- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS; `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean. PHP/PHPCS/PHPUnit NOT run locally.
+
+### [2026-11-20 UTC] — PR10-FIX-7: restore 0031 assertion, add unique-key duplicate tests, record R3 debt
+- R1: Restored `2026_10_31_0031` applied-version assertion in `CustomRoleMigrationSafetyTest.php:69` alongside `self::HEAD_VERSION` (`2026_11_20_0032`). Audited all `-` lines in `tests/`: all other 12 files are pure head/rollback updates.
+- R2: Added `testUniqueKeysRejectDuplicatesAndAllowDistinctRows` in `PatientLoginsMigrationTest.php` testing duplicate rejection + positive controls for `u_pl_mobile`, `u_pl_account`, `u_pl_bind`, and `u_pl_live`.
+- R3 (debt, not executed by `ci.yml` or `closure-gate.yml`): lane rewrite must bump or keep baselines before re-enabling — `first-practice-acceptance.yml:229`, `mariadb-10.11-compat.yml:175,179,205`, `pilot-gate.yml:306`, `real-wp-acceptance.yml:425`, `tests/bin/wp-activation-schema-proof.php:44`, `tests/bin/upgrade-path-fixture.php:22`, `bin/rwp-first-practice.py:913`.
+- Local gates: workflow contracts 180 OK; `check-workflow-yaml` 17 files; `companion-isolation` PASS (16 production files); `tenant-tripwire` 0 hardcodes / 3 suspects; `git diff --check` clean; `wpcs-changed-lines` 54 lines. PHP/PHPCS/PHPUnit NOT run locally.
