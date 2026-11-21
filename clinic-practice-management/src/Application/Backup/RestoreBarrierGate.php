@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace ClinicCore\Application\Backup;
 
 use ClinicCore\Auth\RolesAndCapabilities;
+use ClinicCore\Bootstrap\App;
+use WeakMap;
 use WP_Error;
 use WP_User;
 
@@ -12,14 +14,17 @@ use WP_User;
 final class RestoreBarrierGate {
     public const ERROR_CODE = 'cpms_restore_blocked';
 
+    /** @var WeakMap<WP_Error, list<string>>|null */
+    private static ?WeakMap $login_denials = null;
+
     public static function register(): void {
         add_action( 'login_init', [ self::class, 'guard_login_action' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WordPress login entry point.
         add_action( 'init', [ self::class, 'guard_worker' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
         add_action( 'admin_init', [ self::class, 'guard_admin' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
         add_action( 'template_redirect', [ self::class, 'guard_frontend' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
-        add_filter( 'wp_authenticate_user', [ self::class, 'guard_login' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core applies this before password rehash.
+        add_filter( 'wp_authenticate_user', [ self::class, 'guard_password_check' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core applies this before password rehash.
         add_filter( 'wp_is_application_passwords_available_for_user', [ self::class, 'guard_application_passwords' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core checks availability before recording usage.
-        add_filter( 'authenticate', [ self::class, 'guard_login' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
+        add_filter( 'authenticate', [ self::class, 'guard_login' ], PHP_INT_MAX, 2 ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
         add_filter( 'rest_authentication_errors', [ self::class, 'guard_rest' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
         add_filter( 'rest_pre_dispatch', [ self::class, 'guard_rest' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
         add_filter( 'pre_do_shortcode_tag', [ self::class, 'guard_shortcode' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
@@ -37,12 +42,52 @@ final class RestoreBarrierGate {
         }
     }
 
-    public static function guard_login( mixed $result ): mixed {
+    public static function guard_password_check( mixed $result ): mixed {
         if ( ! self::blocked() ) {
             return $result;
         }
+        if ( ! self::is_recovery_user( $result ) ) {
+            return self::error();
+        }
 
-        return $result instanceof WP_User && user_can( $result, 'manage_options' ) && user_can( $result, RolesAndCapabilities::CONFIG ) ? $result : self::error();
+        return App::loginRateLimiter()->is_login_throttled( $result->user_login ) ? self::error() : $result;
+    }
+
+    public static function guard_login( mixed $result, string $identifier = '' ): mixed {
+        if ( ! self::blocked() || self::is_recovery_user( $result ) ) {
+            return $result;
+        }
+
+        // WP can try both a username and an email lookup for one identifier.
+        // Account only for eligible accounts, using the same bucket as the precheck.
+        $accounts = [];
+        if ( '' !== $identifier ) {
+            $candidates = [ get_user_by( 'login', $identifier ), is_email( $identifier ) ? get_user_by( 'email', $identifier ) : false ];
+            foreach ( $candidates as $candidate ) {
+                if ( self::is_recovery_user( $candidate ) ) {
+                    $accounts[ $candidate->ID ] = $candidate->user_login;
+                }
+            }
+        }
+        $error = self::error();
+        self::$login_denials ??= new WeakMap();
+        self::$login_denials[ $error ] = array_values( $accounts );
+
+        return $error;
+    }
+
+    /**
+     * Null means this exact error was not issued by the final barrier login gate.
+     *
+     * @return list<string>|null
+     */
+    public static function recovery_failure_accounts( WP_Error $error ): ?array {
+        return self::$login_denials[ $error ] ?? null;
+    }
+
+    /** @phpstan-assert-if-true WP_User $user */
+    private static function is_recovery_user( mixed $user ): bool {
+        return $user instanceof WP_User && user_can( $user, 'manage_options' ) && user_can( $user, RolesAndCapabilities::CONFIG );
     }
 
     public static function guard_application_passwords( bool $available ): bool {

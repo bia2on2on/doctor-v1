@@ -8211,3 +8211,6 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 
 ### [2026-11-21 UTC] — PR14-BARRIER-FIX-3: boot cron and pre-rehash guards
 - Correction to FIX-2: the earlier “guarded known bootstrap writers” claim missed the eager boot cron scheduler and core pre-denial password rehash. Guarded those paths, restore-denial login accounting, core Application Password authentication while marked, and consumption of the recovery status notice. Added RB-16 and RB-17. No production marker writer, teardown clearance, or restore import was enabled.
+
+### [2026-11-21 UTC] — PR14-BARRIER-FIX-4: account for exempt login failures
+- Marked recovery logins now share the existing canonical-login throttle across username/email, checked before core password verification. The same outward denial covers failed, throttled, non-exempt and unknown attempts; only gate-issued errors are eligible for marker-specific accounting. RB-18 exercises the actual core dispatch and bounded failure accounting. No change to the recovery exemption policy or restore wiring.

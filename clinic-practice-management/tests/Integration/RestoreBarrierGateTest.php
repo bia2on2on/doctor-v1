@@ -264,6 +264,103 @@ final class RestoreBarrierGateTest extends WP_UnitTestCase {
         self::assertSame(1, $hits);
     }
 
+    /** RB-18: marked recovery failures share a bounded bucket, without a public error distinction. */
+    public function testRecoveryAuthenticationAccountsAndThrottlesFailures(): void {
+        global $wpdb;
+        $db = \ClinicCore\Bootstrap\App::db();
+        $rate = \ClinicCore\Bootstrap\App::rate();
+        $limiter = \ClinicCore\Infrastructure\Security\LoginRateLimiter::class;
+        $manager = self::factory()->user->create_and_get(['role' => 'administrator']);
+        $patient = self::factory()->user->create_and_get(['role' => 'subscriber']);
+        $manager->add_cap('cpms_config');
+        $password = 'synthetic-recovery-auth-witness';
+        $legacy_hash = md5($password);
+        foreach ([$manager, $patient] as $user) {
+            self::assertSame(1, $wpdb->update($wpdb->users, ['user_pass' => $legacy_hash], ['ID' => $user->ID]));
+            clean_user_cache($user);
+        }
+        $bucket = static fn (\WP_User $user): string => 'login-user:' . substr(hash('sha256', strtolower($user->user_login)), 0, 32);
+        $marks = static fn (): array => [
+            $rate->peek($bucket($manager), $limiter::WINDOW_SEC),
+            $rate->peek($bucket($patient), $limiter::WINDOW_SEC),
+            (int) $db->fetchValue('SELECT COUNT(*) FROM %i WHERE message = %s', [$db->table('operational_logs'), 'LOGIN_FAILED']),
+        ];
+        $manager_hash = static fn (): string => (string) $db->fetchValue('SELECT user_pass FROM %i WHERE ID = %d', [$wpdb->users, $manager->ID]);
+        $rate_pattern = '/\A' . preg_quote('INSERT INTO ' . $db->table('rate_limits') . ' (window_key, window_id, window_sec, hits)', '/')
+            . '\s+VALUES \(\'' . preg_quote($bucket($manager), '/') . '\', [0-9]+, 900, 1\)\s+ON DUPLICATE KEY UPDATE\s+window_sec = VALUES\(window_sec\),\s+hits = hits \+ 1\z/';
+        $hash_pattern = '/\AUPDATE `' . preg_quote($wpdb->users, '/') . "` SET `user_pass` = '[^']+', `user_activation_key` = '' WHERE `ID` = " . $manager->ID . '\z/';
+        $hits = ['rate' => 0, 'hash' => 0];
+        $watch = static function (string $sql) use ($rate_pattern, $hash_pattern, &$hits): string {
+            if (preg_match($rate_pattern, $sql) === 1) {
+                ++$hits['rate'];
+            }
+            if (preg_match($hash_pattern, $sql) === 1) {
+                ++$hits['hash'];
+            }
+            return $sql;
+        };
+        $server = $_SERVER;
+        unset($_SERVER['REMOTE_ADDR']); // Isolate the canonical account bucket from shared IP fixtures.
+        $before = $marks();
+        add_filter('query', $watch);
+        try {
+            self::assertTrue(add_option(RestoreBarrierStore::OPTION, 'test marker', '', false));
+            $wrong_login = wp_authenticate($manager->user_login, 'incorrect-synthetic-password');
+            $login_hits = $hits;
+            $after_login = $marks();
+            $wrong_email = wp_authenticate($manager->user_email, 'incorrect-synthetic-password');
+            $email_hits = $hits;
+            $after_email = $marks();
+            $denied = wp_authenticate($patient->user_login, $password);
+            $unknown = wp_authenticate('synthetic-unknown-' . $patient->ID, $password);
+            $after_denials = $marks();
+            $patient_hash = $db->fetchValue('SELECT user_pass FROM %i WHERE ID = %d', [$wpdb->users, $patient->ID]);
+            $allowed = wp_authenticate($manager->user_email, $password);
+            $after_rehash = $hits;
+            $upgraded_hash = $manager_hash();
+            for ($attempt = 2; $attempt < $limiter::MAX_PER_USERNAME; ++$attempt) {
+                wp_authenticate($manager->user_email, 'incorrect-synthetic-password');
+            }
+            $at_threshold = $marks();
+            $throttled = wp_authenticate($manager->user_login, $password);
+            $after_threshold = $marks();
+            $after_throttle = $hits;
+            delete_option(RestoreBarrierStore::OPTION);
+            $ordinary_failure = wp_authenticate($patient->user_login, 'incorrect-synthetic-password');
+            $ordinary_counts = $marks();
+            $ordinary_success = wp_authenticate($patient->user_login, $password);
+        } finally {
+            remove_filter('query', $watch);
+            delete_option(RestoreBarrierStore::OPTION);
+            $_SERVER = $server;
+        }
+        foreach ([$wrong_login, $wrong_email, $denied, $unknown, $throttled] as $failure) {
+            self::assertInstanceOf(WP_Error::class, $failure);
+            self::assertSame($wrong_login->get_error_code(), $failure->get_error_code());
+            self::assertSame($wrong_login->get_error_message(), $failure->get_error_message());
+            self::assertSame($wrong_login->get_error_data(), $failure->get_error_data());
+        }
+        self::assertSame(RestoreBarrierGate::ERROR_CODE, $wrong_login->get_error_code());
+        self::assertSame([1, 0, $before[2] + 1], $after_login);
+        self::assertSame(['rate' => 1, 'hash' => 0], $login_hits);
+        self::assertSame([2, 0, $before[2] + 2], $after_email);
+        self::assertSame(['rate' => 2, 'hash' => 0], $email_hits);
+        self::assertSame($after_email, $after_denials);
+        self::assertSame($legacy_hash, $patient_hash);
+        self::assertInstanceOf(\WP_User::class, $allowed);
+        self::assertSame($manager->ID, $allowed->ID);
+        self::assertSame(['rate' => 2, 'hash' => 1], $after_rehash);
+        self::assertNotSame($legacy_hash, $upgraded_hash);
+        self::assertSame([$limiter::MAX_PER_USERNAME, 0, $before[2] + $limiter::MAX_PER_USERNAME], $at_threshold);
+        self::assertSame($at_threshold, $after_threshold);
+        self::assertSame(['rate' => $limiter::MAX_PER_USERNAME, 'hash' => 1], $after_throttle);
+        self::assertInstanceOf(WP_Error::class, $ordinary_failure);
+        self::assertSame('incorrect_password', $ordinary_failure->get_error_code());
+        self::assertSame([$limiter::MAX_PER_USERNAME, 1, $at_threshold[2] + 1], $ordinary_counts);
+        self::assertInstanceOf(\WP_User::class, $ordinary_success);
+        self::assertSame($patient->ID, $ordinary_success->ID);
+    }
+
     private function denied(callable $guard): bool {
         try {
             $guard();

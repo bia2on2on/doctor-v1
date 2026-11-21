@@ -69,23 +69,11 @@ final class LoginRateLimiter
             return $user;
         }
 
-        $ip = ClientIp::resolve();
-        $blocked = false;
-
-        if ($ip !== null && $this->isOver('login-ip:' . $ip, self::MAX_PER_IP)) {
-            $blocked = true;
-        }
-        if (!$blocked && $username !== '' && $this->isOver('login-user:' . $this->userKey($username), self::MAX_PER_USERNAME)) {
-            $blocked = true;
-        }
-
-        if (!$blocked) {
+        // Core's password callback checks the canonical recovery account under the barrier.
+        if ( RestoreBarrierGate::blocked() || ! $this->is_login_throttled( $username ) ) {
             return $user;
         }
-
-        if ( ! RestoreBarrierGate::blocked() ) {
-            $this->record( 'LOGIN_THROTTLED', $username, $ip );
-        }
+        $this->record( 'LOGIN_THROTTLED', $username, ClientIp::resolve() );
 
         return new \WP_Error(
             'CLINIC_RATE_LIMITED',
@@ -100,9 +88,25 @@ final class LoginRateLimiter
     // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- Preserve the existing public callback.
     public function recordFailure( string $username, ?\WP_Error $error = null ): void
     {
-        if ( null !== $error && RestoreBarrierGate::ERROR_CODE === $error->get_error_code() ) {
+        $accounts = null !== $error && RestoreBarrierGate::blocked() ? RestoreBarrierGate::recovery_failure_accounts( $error ) : null;
+        if ( null !== $accounts ) {
+            foreach ( $accounts as $account ) {
+                if ( ! $this->is_login_throttled( $account ) ) {
+                    $this->count_failure( $account );
+                }
+            }
             return;
         }
+        $this->count_failure( $username );
+    }
+
+    public function is_login_throttled( string $username ): bool {
+        $ip = ClientIp::resolve();
+        return ( null !== $ip && $this->isOver( 'login-ip:' . $ip, self::MAX_PER_IP ) )
+            || ( '' !== $username && $this->isOver( 'login-user:' . $this->userKey( $username ), self::MAX_PER_USERNAME ) );
+    }
+
+    private function count_failure( string $username ): void {
         $ip = ClientIp::resolve();
         if ($ip !== null) {
             $this->rate->hit('login-ip:' . $ip, self::MAX_PER_IP, self::WINDOW_SEC);
