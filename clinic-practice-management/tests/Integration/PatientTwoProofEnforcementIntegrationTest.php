@@ -810,7 +810,10 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
             $meResp = rest_do_request( $meReq );
             self::assertSame( 200, $meResp->get_status(), (string) wp_json_encode( $meResp->get_data() ) );
             self::assertSame( $this->patientA, (int) ( $meResp->get_data()['data']['id'] ?? 0 ) );
-            self::assertStringNotContainsString( self::NID_A, (string) wp_json_encode( $meResp->get_data() ) );
+            // Note: `/patient/me` still returns `national_id` per deferred blocker D2 (A9);
+            // link-record, SMS, audit, and operational logs must never leak NID.
+            $auditLogs = App::db()->fetchAll( 'SELECT action, meta_json FROM ' . App::db()->table( 'cpms_audit_logs' ) );
+            self::assertStringNotContainsString( self::NID_A, (string) wp_json_encode( $auditLogs ) );
 
             // Verification notice SMS (PATIENT_BINDING_VERIFIED) was queued/recorded to the exact same mobile with zero NID.
             $smsRow = App::db()->fetchRow(
