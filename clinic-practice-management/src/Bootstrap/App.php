@@ -262,6 +262,7 @@ final class App
         // only); deliberately before the idempotence guard so a repeated boot still
         // restarts the profile exactly like a fresh request would.
         RequestProfiler::mark_boot();
+        \ClinicCore\Application\Backup\RestoreBarrierGate::register();
 
         // ==================================================================
         // Frontend عمومی (خارج از wp-admin) — Phase 8 Slice 1 / FR-3.5 / UC-01

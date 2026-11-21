@@ -331,9 +331,6 @@ final class BackupService
             throw BackupException::of('CLINIC_BACKUP_PREFLIGHT_FAILED', 'restore preflight failed');
         }
 
-        $safetyDestination = $this->safetyDestinationStore();
-        $safety = $this->createBackupTo($safetyDestination, 'pre-restore-safety-' . $backupId);
-
         $source = $this->resolveSourceStore($backupId);
         $sourceLabel = $source->isReadonly() ? 'legacy' : 'active';
         $dir = $source->dirOf($backupId);
@@ -342,6 +339,13 @@ final class BackupService
         if ($sql === '') {
             throw BackupException::of('CLINIC_BACKUP_IO', 'db.sql empty/missing');
         }
+
+        $this->require_empty_restore_target();
+        $this->require_restore_schema( $raw['db']['migration_version'] ?? null );
+        $this->require_restore_host();
+
+        $safety_destination = $this->safetyDestinationStore();
+        $safety             = $this->createBackupTo( $safety_destination, 'pre-restore-safety-' . $pre['backup_id'] );
 
         $applied = 0;
         $dropped = 0;
@@ -369,7 +373,7 @@ final class BackupService
         $this->audit->log('RESTORE_APPLIED', null, 'backup', null, null, null, null, [
             'backup_id' => $backupId,
             'safety_backup' => (string) ($safety['backup_id'] ?? ''),
-            'safety_destination' => $safetyDestination->basePath(),
+            'safety_destination' => $safety_destination->basePath(),
             'source' => $sourceLabel,
             'legacy_unverified' => (bool) $pre['legacy_unverified'],
             'statements' => $applied,
@@ -379,14 +383,60 @@ final class BackupService
         $this->op->info('RESTORE_APPLIED', [
             'backup_id' => $backupId,
             'safety_backup' => (string) ($safety['backup_id'] ?? ''),
-            'safety_destination' => $safetyDestination->basePath(),
+            'safety_destination' => $safety_destination->basePath(),
             'source' => $sourceLabel,
         ]);
 
         $pre['safety_backup'] = (string) ($safety['backup_id'] ?? '');
-        $pre['safety_backup_destination'] = $safetyDestination->basePath();
+        $pre['safety_backup_destination'] = $safety_destination->basePath();
 
         return $pre;
+    }
+
+    /** Refuse populated targets; the migration ledger is schema metadata. */
+    private function require_empty_restore_target(): void {
+        $ledger = $this->db->table( 'schema_migrations' );
+        $tables = $this->db->fetch_all_strict(
+            'SELECT TABLE_NAME AS table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name LIKE %s',
+            [ $this->db->esc_like( $this->db->table( '' ) ) . '%' ]
+        );
+        foreach ( $tables as $row ) {
+            $table = (string) $row['table_name'];
+            if ( $ledger === $table ) {
+                continue;
+            }
+            if ( 1 !== preg_match( '/\A[A-Za-z0-9_]+\z/', $table ) ) {
+                throw BackupException::of( 'RESTORE_TARGET_NOT_PREPARED', 'Unsupported target table name.' );
+            }
+            if ( [] !== $this->db->fetch_all_strict( 'SELECT 1 FROM %i LIMIT 1', [ $table ] ) ) {
+                throw BackupException::of( 'RESTORE_TARGET_NOT_EMPTY', 'Restore requires a prepared empty target.' );
+            }
+        }
+    }
+
+    /** Require DB migration metadata, not the backup format version. */
+    private function require_restore_schema( mixed $source_version ): void {
+        if ( ! is_string( $source_version ) || '' === $source_version ) {
+            throw BackupException::of( 'RESTORE_SCHEMA_MISMATCH', 'Backup DB migration version is unavailable.' );
+        }
+        $ledger = $this->db->table( 'schema_migrations' );
+        if ( 1 !== preg_match( '/\A[A-Za-z0-9_]+\z/', $ledger ) ) {
+            throw BackupException::of( 'RESTORE_TARGET_NOT_PREPARED', 'Unsupported migration ledger name.' );
+        }
+        $rows = $this->db->fetch_all_strict( 'SELECT MAX(version) AS version FROM %i', [ $ledger ] );
+        if ( $source_version !== ( $rows[0]['version'] ?? null ) ) {
+            throw BackupException::of( 'RESTORE_SCHEMA_MISMATCH', 'Backup and target DB migration versions differ.' );
+        }
+    }
+
+    /** Refuse until the restore worker can prove the designed lock fence. */
+    private function require_restore_host(): void {
+        throw BackupException::of( 'RESTORE_FILE_LOCK_UNSUPPORTED', 'Reliable restore lock fencing is not available.' );
+    }
+
+    /** Refuse to clear an attempt while restored legacy links cannot be gated. */
+    public function restore_teardown(): void {
+        throw BackupException::of( 'RESTORE_LEGACY_LINK_GATE_REQUIRED', 'Restore teardown cannot clear the barrier.' );
     }
 
     // ================= OD-9: source/destination resolution =================
