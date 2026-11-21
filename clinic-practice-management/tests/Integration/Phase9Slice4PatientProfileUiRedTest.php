@@ -604,6 +604,14 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         self::assertSame(200, $validEdit->get_status(),
             'positive control: valid unique National ID update succeeds via PUT /patient/me.'
         );
+        // Changing national_id closes active bindings and destroys WP sessions (B1 / §7.6);
+        // re-verify the user session before rendering the authenticated portal below.
+        PatientTwoProofTestHelper::acting_as(0);
+        PatientTwoProofTestHelper::seed_patient_proof((int) $fx['user_id'], (int) $fx['clinic_id'], (int) $fx['patient_id'], [
+            'mobile' => (string) $fx['mobile'],
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
 
         // ---- INTENDED RED (UI-4): save wiring is absent on live main. ----
         $html = $this->renderProductionFrontendPortalAs((int) $fx['user_id']);

@@ -396,6 +396,16 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
         self::assertSame('0000000140', (string) $this->patientRow($selectedPatient)['national_id']);
         self::assertSame($auditBeforeValidEdit + 1, $this->auditCountForPatient($selectedPatient), 'Successful edit retains PATIENT_PROFILE_UPDATED audit behavior.');
 
+        // Changing national_id closes active bindings and destroys WP sessions (B1 / §7.6);
+        // re-verify the caller session so the duplicate-NID test reaches updateMe() validation.
+        PatientTwoProofTestHelper::acting_as(0);
+        PatientTwoProofTestHelper::seed_patient_proof($callerUserId, $clinics['b_id'], $selectedPatient, [
+            'mobile' => $this->mobileFor('r4-s'),
+            'is_primary' => true,
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
+
         $selectedBeforeReject = $this->patientRow($selectedPatient);
         $patientCountBeforeReject = $this->countRows('cpms_patients');
         $linkCountBeforeReject = $this->countRows('cpms_patient_user_links');

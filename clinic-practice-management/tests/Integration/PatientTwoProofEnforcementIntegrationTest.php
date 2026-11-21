@@ -570,7 +570,7 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
         $this->insertPatient( $this->clinicA, 'MR-RL-MOB-' . uniqid(), $mobTarget, $mobNid );
         for ( $i = 0; $i < PatientBindingPromoter::RATE_MOBILE_MAX; $i++ ) {
             $u = $this->makeUser( 'tp_rl_mob_' . $i . '_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
-            $logins->insert_pending_account( $u, $mobTarget, 'RL', 'Mob' );
+            $logins->insert_pending_account( $u, sprintf( '09128871%03d', $i ), 'RL', 'Mob' );
             $t = $proofStore->issue_non_persistent_auth_cookie( $u );
             try {
                 App::patient_binding_promoter()->promote(
@@ -589,7 +589,7 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
             }
         }
         $mobFreshUser  = $this->makeUser( 'tp_rl_mob_ok_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
-        $logins->insert_pending_account( $mobFreshUser, $mobTarget, 'RL', 'MobOk' );
+        $logins->insert_pending_account( $mobFreshUser, '09128871999', 'RL', 'MobOk' );
         $mobFreshToken = $proofStore->issue_non_persistent_auth_cookie( $mobFreshUser );
         $this->seedOtp( $this->clinicA, $mobTarget, '334455', OtpService::PURPOSE_VERIFY_MOBILE );
         try {
@@ -1044,9 +1044,10 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
         self::assertStringContainsString( 'data-role="enrollment-section" data-state="unverified"', $htmlNone );
         self::assertStringNotContainsString( 'Portal Enroll Dest', $htmlNone );
 
-        // 2) LEVEL_MOBILE_OTP (OTP-only, no NID binding proof): must remain STATE_UNVERIFIED.
+        // 2) Mobile proof only (OTP-only, no NID binding proof): level remains LEVEL_NONE (< LEVEL_FULL) and enrollment stays STATE_UNVERIFIED.
         self::assertTrue( $proofStore->record_mobile_proof( $uid, $mob, $now, $token ) );
-        self::assertSame( PatientAccess::LEVEL_MOBILE_OTP, App::patient_access()->level( $uid, $pat, $this->clinicA, $now + 1, $token ) );
+        self::assertTrue( $proofStore->has_valid_mobile_proof( $uid, $mob, $now + 1, $token ) );
+        self::assertSame( PatientAccess::LEVEL_NONE, App::patient_access()->level( $uid, $pat, $this->clinicA, $now + 1, $token ) );
         ob_start();
         PatientPortalPage::render();
         $htmlOtp = (string) ob_get_clean();
