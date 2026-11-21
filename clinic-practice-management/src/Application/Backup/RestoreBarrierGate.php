@@ -69,8 +69,8 @@ final class RestoreBarrierGate {
                 }
             }
         }
-        $error = self::error();
-        self::$login_denials ??= new WeakMap();
+        $error                         = self::error();
+        self::$login_denials         ??= new WeakMap();
         self::$login_denials[ $error ] = array_values( $accounts );
 
         return $error;
