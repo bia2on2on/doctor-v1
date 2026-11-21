@@ -669,7 +669,7 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
             $rotNid      = '0060000007';
             $rotMobile   = '09128860001';
             $oldBucket   = ( new PatientNidHmac() )->rate_limit_key( $rotNid );
-            $rateLimiter = App::rateLimiter();
+            $rateLimiter = App::rate();
             for ( $i = 0; $i < PatientBindingPromoter::RATE_NID_MAX; $i++ ) {
                 $rateLimiter->hit( $oldBucket, PatientBindingPromoter::RATE_NID_MAX, PatientBindingPromoter::RATE_WINDOW_SEC );
             }
