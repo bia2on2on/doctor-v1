@@ -544,6 +544,12 @@ final class App
         PublicShortcodeAdminPage::register(); // Classic shortcode helper (manage_options + authorized Clinic selector)
     }
 
+    private static function ensure_boot_cron(): void {
+        if ( ! ( defined( 'WP_SANDBOX_SCRAPING' ) && WP_SANDBOX_SCRAPING ) && ! \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
+            CronScheduleRepair::ensure_scheduled();
+        }
+    }
+
     public static function activate( bool $network_wide = false ): void
     {
         // N1 — پیش‌بررسیِ موتورِ دیتابیس باید **اولین** کارِ فعال‌سازی باشد:
@@ -943,12 +949,6 @@ final class App
         // so the exception is scoped to exactly this statement.
         // phpcs:ignore WordPress.WP.CronInterval.CronSchedulesInterval
         add_filter( 'cron_schedules', array( self::class, 'filter_cron_schedules' ) );
-    }
-
-    private static function ensure_boot_cron(): void {
-        if ( ! ( defined( 'WP_SANDBOX_SCRAPING' ) && WP_SANDBOX_SCRAPING ) && ! \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
-            CronScheduleRepair::ensure_scheduled();
-        }
     }
 
     private static function ensureMigrated(): void
