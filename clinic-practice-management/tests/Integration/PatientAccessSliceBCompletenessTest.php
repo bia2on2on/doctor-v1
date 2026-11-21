@@ -223,7 +223,51 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
             self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
         } elseif ( str_starts_with( $pattern, '/clinic/v1/reports' ) ) {
             self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/sms' ) ) {
+        } elseif ( '/clinic/v1/sms/status' === $pattern ) {
+            if ( str_starts_with( (string) $code, 'rest_' ) ) {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            } elseif ( str_starts_with( (string) $code, 'CLINIC_' ) ) {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            } else {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            }
+        } elseif ( '/clinic/v1/sms/providers' === $pattern ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( '/clinic/v1/sms/settings' === $pattern ) {
+            if ( str_starts_with( (string) $code, 'rest_' ) ) {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            } else {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            }
+        } elseif ( '/clinic/v1/sms/test-connection' === $pattern ) {
+            if ( str_starts_with( (string) $code, 'rest_' ) ) {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            } else {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            }
+        } elseif ( '/clinic/v1/sms/test-send' === $pattern ) {
+            if ( 'rest_missing_callback_param' === $code ) {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            } elseif ( 'rest_invalid_param' === $code ) {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            } else {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            }
+        } elseif ( '/clinic/v1/sms/templates' === $pattern ) {
+            if ( 'GET /clinic/v1/sms/templates' === $pair ) {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            } else {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            }
+        } elseif ( '/clinic/v1/sms/templates/test' === $pattern ) {
+            if ( 'rest_missing_callback_param' === $code ) {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            } else {
+                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+            }
+        } elseif ( '/clinic/v1/sms/logs' === $pattern ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( '/clinic/v1/sms/balance' === $pattern ) {
             self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
         } elseif ( str_starts_with( $pattern, '/clinic/v1/notifications' ) || str_starts_with( $pattern, '/clinic/v1/rt/notifications' ) ) {
             self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
