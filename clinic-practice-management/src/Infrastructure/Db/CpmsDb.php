@@ -383,8 +383,7 @@ final class CpmsDb
     /**
      * Read-only transaction nesting depth (0 outside any `transactional()` boundary).
      */
-    public function tx_depth(): int
-    {
+    public function tx_depth(): int {
         return $this->tx_depth;
     }
 

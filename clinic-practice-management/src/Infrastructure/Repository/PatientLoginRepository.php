@@ -110,7 +110,7 @@ final class PatientLoginRepository {
             return null;
         }
 
-        $sql = 'SELECT id, kind, wp_user_id, mobile, state, clinic_id, patient_id, verified_at, verification_method, live_key, account_key, created_at, updated_at'
+        $sql    = 'SELECT id, kind, wp_user_id, mobile, state, clinic_id, patient_id, verified_at, verification_method, live_key, account_key, created_at, updated_at'
             . ' FROM ' . $this->db->table( 'cpms_patient_logins' )
             . ' WHERE kind = %s AND wp_user_id = %d AND clinic_id = %d AND patient_id = %d';
         $params = [ self::KIND_BINDING, $wp_user_id, $clinic_id, $patient_id ];
@@ -143,7 +143,7 @@ final class PatientLoginRepository {
             return [];
         }
 
-        $sql = 'SELECT b.id AS binding_id, b.wp_user_id, b.clinic_id, b.patient_id, b.verified_at, b.verification_method, b.live_key,'
+        $sql    = 'SELECT b.id AS binding_id, b.wp_user_id, b.clinic_id, b.patient_id, b.verified_at, b.verification_method, b.live_key,'
             . ' p.mobile, p.identity_id'
             . ' FROM ' . $this->db->table( 'cpms_patient_logins' ) . ' b'
             . ' INNER JOIN ' . $this->db->table( 'cpms_patient_logins' ) . ' a'

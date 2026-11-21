@@ -514,7 +514,7 @@ final class PatientService
             throw new BookingException( 'CLINIC_VALIDATION_FAILED', 'فیلدی برای ویرایش ارسال نشده است' );
         }
 
-        $close_bindings = ( array_key_exists( 'national_id', $data )
+        $close_bindings         = ( array_key_exists( 'national_id', $data )
                 && (string) ( $data['national_id'] ?? '' ) !== (string) ( $current['national_id'] ?? '' ) )
             || ( isset( $data['status'] ) && 'archived' === (string) $data['status'] );
         $affected_binding_users = [];

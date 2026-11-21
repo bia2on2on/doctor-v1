@@ -5,7 +5,6 @@ declare( strict_types=1 );
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Admin\PatientPortalPage;
-use ClinicCore\Application\Auth\OtpPolicy;
 use ClinicCore\Application\Auth\OtpService;
 use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientBindingPromoter;
@@ -15,6 +14,7 @@ use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
+use ClinicCore\Domain\Otp\OtpPolicy;
 use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use WP_REST_Request;

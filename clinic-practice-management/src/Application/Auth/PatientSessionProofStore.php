@@ -82,7 +82,7 @@ final class PatientSessionProofStore {
             ? $session[ self::KEY_MOBILE_PROOFS ]
             : [];
 
-        $proofs[ $normalized_mobile ] = [
+        $proofs[ $normalized_mobile ]       = [
             'at'         => gmdate( 'Y-m-d\TH:i:s\Z', $now_ts ),
             'token_hash' => hash( 'sha256', $session_token ),
         ];
@@ -134,7 +134,7 @@ final class PatientSessionProofStore {
             ? $session[ self::KEY_BINDING_PROOFS ]
             : [];
 
-        $proofs[ $binding_key ] = [
+        $proofs[ $binding_key ]              = [
             'binding_id'  => $binding_id,
             'verified_at' => $verified_at,
             'at'          => gmdate( 'Y-m-d\TH:i:s\Z', $now_ts ),
