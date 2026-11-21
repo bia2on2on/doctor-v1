@@ -92,7 +92,7 @@ final class SmsService
      * Three-stage license (design §7.3 staff/settings row, final 2026-11-17):
      * Stage 3 is view-only; only offline license activation/renewal remains writable.
      */
-    private function settingsWriteBlocked(): bool {
+    private function settings_write_blocked(): bool {
         $gate = $this->license_gate ?? \ClinicCore\Bootstrap\App::licenseGate();
         $decision = $gate->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
         if ( $decision->allowed ) {
@@ -109,20 +109,20 @@ final class SmsService
      * persisted care row owned by the same Clinic. Anything else — synthetic ids,
      * missing context, other tenants' rows — is new business and stays closed.
      */
-    private function care_linked_context( ?string $contextType, ?int $contextId, int $clinicId ): bool {
-        if ( null === $contextType || null === $contextId || $contextId <= 0 || $clinicId <= 0 ) {
+    private function care_linked_context( ?string $context_type, ?int $context_id, int $clinic_id ): bool {
+        if ( null === $context_type || null === $context_id || $context_id <= 0 || $clinic_id <= 0 ) {
             return false;
         }
         $table = null;
-        if ( $contextType === 'appointment' ) {
+        if ( 'appointment' === $context_type ) {
             $table = 'cpms_appointments';
-        } elseif ( $contextType === 'follow_up' ) {
+        } elseif ( 'follow_up' === $context_type ) {
             $table = 'cpms_follow_ups';
         } else {
             return false;
         }
         try {
-            $row = $this->db->fetchRow( 'SELECT id FROM ' . $this->db->table( $table ) . ' WHERE id = %d AND clinic_id = %d', [ $contextId, $clinicId ] );
+            $row = $this->db->fetchRow( 'SELECT id FROM ' . $this->db->table( $table ) . ' WHERE id = %d AND clinic_id = %d', [ $context_id, $clinic_id ] );
 
             return is_array( $row ) && $row !== [];
         } catch ( \Throwable ) {
@@ -130,13 +130,13 @@ final class SmsService
         }
     }
 
-    private function allows_licensed_event( string $event, ?string $contextType = null, ?int $contextId = null, int $clinicId = 0 ): bool {
+    private function allows_licensed_event( string $event, ?string $context_type = null, ?int $context_id = null, int $clinic_id = 0 ): bool {
         // OTP is the registry's authentication/security event, not a commercial reminder.
-        if ( $event === SmsEvents::OTP ) {
+        if ( SmsEvents::OTP === $event ) {
             return true;
         }
-        $gate = $this->license_gate ?? \ClinicCore\Bootstrap\App::licenseGate();
-        $context = [ 'care_linked' => $this->care_linked_context( $contextType, $contextId, $clinicId ) ];
+        $gate    = $this->license_gate ?? \ClinicCore\Bootstrap\App::licenseGate();
+        $context = [ 'care_linked' => $this->care_linked_context( $context_type, $context_id, $clinic_id ) ];
 
         return $gate->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SMS_COMMERCIAL, $context )->allowed;
     }
@@ -227,7 +227,7 @@ final class SmsService
         if (!$isTest && $info === null) {
             throw new DomainException('CLINIC_SMS_EVENT_UNKNOWN: ' . $event);
         }
-        if ( ! $this->allows_licensed_event( $event, $contextType, $contextId, $clinic_id ) ) {
+        if ( ! $this->allows_licensed_event( $event, $contextType, $contextId, $clinic_id ) ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing camelCase parameters
             // Do not fail the clinical transaction because its optional SMS is suppressed.
             $this->op->info( 'sms.license_suppressed', [ 'event' => $event ] );
             return [ 'message_id' => 0, 'status' => SmsMessageStatus::FAILED ];
@@ -576,8 +576,8 @@ final class SmsService
      */
     public function saveSettings(array $in, int $userId): array
     {
-        if ( $this->settingsWriteBlocked() ) {
-            throw new SmsTemplateException('CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازهٔ این تغییر را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.');
+        if ( $this->settings_write_blocked() ) {
+            throw new SmsTemplateException( 'CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازهٔ این تغییر را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.' );
         }
         $settings = $this->currentSettings();
         // Every read below is read-modify-write input (blank credential
@@ -698,7 +698,7 @@ final class SmsService
      */
     public function testConnection(array $in, int $userId): array
     {
-        if ( $this->settingsWriteBlocked() ) {
+        if ( $this->settings_write_blocked() ) {
             return ['ok' => false, 'message' => '✗ مجوز سامانه اجازهٔ این تغییر را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.'];
         }
         $settings = $this->currentSettings();
@@ -866,8 +866,8 @@ final class SmsService
      */
     public function saveTemplate(string $event, string $templateId, int $userId): array
     {
-        if ( $this->settingsWriteBlocked() ) {
-            throw new SmsTemplateException('CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازهٔ این تغییر را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.');
+        if ( $this->settings_write_blocked() ) {
+            throw new SmsTemplateException( 'CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازهٔ این تغییر را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.' );
         }
         $settings = $this->currentSettings();
         $info = SmsEvents::info($event);

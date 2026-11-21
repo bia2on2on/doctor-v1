@@ -127,11 +127,14 @@ final class VisitService
             // only while now < T1. The locked persisted row is the only provenance;
             // the decision is taken on this locked row, before any mutation
             // (pending→confirmed, Visit insert, history, audit) can happen.
-            $this->assert_license( LicenseGate::OP_VISIT_CHECKIN, [
-                'appointment_id' => $appointmentId,
-                'appointment_created_at' => $this->parseUtcTimestampToInt( (string) ( $appt['created_at'] ?? '' ) ) ?? 0,
-                'appointment_status' => (string) $appt['status'],
-            ] );
+            $this->assert_license(
+                LicenseGate::OP_VISIT_CHECKIN,
+                [
+                    'appointment_id'         => $appointmentId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy camelCase parameter
+                    'appointment_created_at' => $this->parse_utc_timestamp_to_int( (string) ( $appt['created_at'] ?? '' ) ) ?? 0,
+                    'appointment_status'     => (string) $appt['status'],
+                ]
+            );
 
             // ER-06: نوبت پایان‌یافته/لغوشده قابل Check-in نیست؛
             // بعد از مهلت Grace نیز پذیرش رد می‌شود، بدون ساخت Visit یا تغییر نوبت.
@@ -1675,8 +1678,7 @@ final class VisitService
      * Parse a UTC SQL datetime string into a Unix timestamp (null when
      * unparseable — callers map that to a fail-closed zero).
      */
-    private function parseUtcTimestampToInt( string $utc_sql ): ?int
-    {
+    private function parse_utc_timestamp_to_int( string $utc_sql ): ?int {
         if ( '' === $utc_sql ) {
             return null;
         }

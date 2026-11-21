@@ -574,7 +574,7 @@ final class ClinicianAdminPage
         $scope = self::authorizeAdminWrite( 'cpms_clinician_save' );
 
         if ( self::settings_writes_blocked() ) {
-            wp_die( self::LICENSE_BLOCKED_MESSAGE, 503 );
+            wp_die( esc_html( self::LICENSE_BLOCKED_MESSAGE ), 503 );
         }
         // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- published scope API.
         $clinic_id = (int) $scope->clinicId;
@@ -744,7 +744,7 @@ final class ClinicianAdminPage
         $scope = self::authorizeAdminWrite( 'cpms_clinician_toggle_' . $cid );
 
         if ( self::settings_writes_blocked() ) {
-            wp_die( self::LICENSE_BLOCKED_MESSAGE, 503 );
+            wp_die( esc_html( self::LICENSE_BLOCKED_MESSAGE ), 503 );
         }
         // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- published scope API.
         $clinic_id = (int) $scope->clinicId;
@@ -802,7 +802,7 @@ final class ClinicianAdminPage
         $scope = self::authorizeAdminWrite('cpms_schedule_save');
 
         if ( self::settings_writes_blocked() ) {
-            wp_die( self::LICENSE_BLOCKED_MESSAGE, 503 );
+            wp_die( esc_html( self::LICENSE_BLOCKED_MESSAGE ), 503 );
         }
         $clinicId = (int) $scope->clinicId;
         $userId = (int) get_current_user_id();
@@ -915,7 +915,7 @@ final class ClinicianAdminPage
         $scope = self::authorizeAdminWrite('cpms_schedule_delete');
 
         if ( self::settings_writes_blocked() ) {
-            wp_die( self::LICENSE_BLOCKED_MESSAGE, 503 );
+            wp_die( esc_html( self::LICENSE_BLOCKED_MESSAGE ), 503 );
         }
         $clinicId = (int) $scope->clinicId;
 
@@ -954,7 +954,7 @@ final class ClinicianAdminPage
         $scope = self::authorizeAdminWrite('cpms_exception_create');
 
         if ( self::settings_writes_blocked() ) {
-            wp_die( self::LICENSE_BLOCKED_MESSAGE, 503 );
+            wp_die( esc_html( self::LICENSE_BLOCKED_MESSAGE ), 503 );
         }
         $clinicId = (int) $scope->clinicId;
 
@@ -1007,7 +1007,7 @@ final class ClinicianAdminPage
         $scope = self::authorizeAdminWrite('cpms_exception_delete');
 
         if ( self::settings_writes_blocked() ) {
-            wp_die( self::LICENSE_BLOCKED_MESSAGE, 503 );
+            wp_die( esc_html( self::LICENSE_BLOCKED_MESSAGE ), 503 );
         }
         $clinicId = (int) $scope->clinicId;
 

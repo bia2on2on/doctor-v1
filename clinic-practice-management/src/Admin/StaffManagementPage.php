@@ -588,6 +588,7 @@ final class StaffManagementPage
      *
      * @return array{error:string, generated:string, user_id:int}
      */
+    // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy method name kept (cross-file API; see note above).
     public static function upsertUser( array $in, int $updated_by ): array {
         if ( self::settings_writes_blocked() ) {
             return ['error' => self::LICENSE_BLOCKED_MESSAGE, 'generated' => '', 'user_id' => 0];

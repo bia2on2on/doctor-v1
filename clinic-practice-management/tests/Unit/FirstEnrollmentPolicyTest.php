@@ -22,10 +22,15 @@ final class FirstEnrollmentPolicyTest extends TestCase
     {
         // Final Q1(a) (2026-11-17): the one-/six-month returning windows are
         // retired — no self-enrollment preview from T0 at all. Boundary
-        // points: T0−1s allowed (Stage 1), T0 denied, T1−1s denied, T1 denied.
+        // points: T0−1s allowed (Stage 1, ACTIVE document), T0 denied,
+        // T1−1s denied, T1 denied.
         $t1 = \ClinicCore\Domain\Licensing\LicenseStagePolicy::t1( self::T0 );
 
-        self::assertTrue( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, self::T0 - 1, true ) );
+        // Stage 1 = a live document: ACTIVE before T0 offers the preview.
+        self::assertTrue( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::ACTIVE, '', self::T0, self::T0 - 1, true ) );
+        // An incoherent pre-T0 RESTRICTED/'expired' fixture still fails closed
+        // (RESTRICTED is never new-business-capable) — defensive, not a product state.
+        self::assertFalse( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, self::T0 - 1, true ) );
         self::assertFalse( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, self::T0, true ) );
         self::assertFalse( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, $t1 - 1, true ) );
         self::assertFalse( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, $t1, true ) );

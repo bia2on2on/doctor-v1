@@ -16,5 +16,4 @@ final class PostExpirationPolicy {
 
         return $month->setDate( (int) $month->format( 'Y' ), (int) $month->format( 'n' ), $day )->getTimestamp();
     }
-
 }

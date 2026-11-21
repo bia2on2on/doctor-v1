@@ -306,13 +306,12 @@ final class MedicalFileService
      * The decision uses a server-derived VisitLicenseContext; a missing visit row
      * yields an unopened context (fail-closed at/after T0).
      */
-    private function assertUploadAllowed( ?int $visitId ): void
-    {
-        $license_context = [ 'visit_id' => (int) ( $visitId ?? 0 ) ];
-        if ( $visitId !== null && $visitId > 0 ) {
+    private function assert_upload_allowed( ?int $visit_id ): void {
+        $license_context = [ 'visit_id' => (int) ( $visit_id ?? 0 ) ];
+        if ( $visit_id !== null && $visit_id > 0 ) {
             $visit = \ClinicCore\Bootstrap\App::db()->fetchRow(
                 'SELECT * FROM ' . \ClinicCore\Bootstrap\App::db()->table( 'cpms_visits' ) . ' WHERE id = %d LIMIT 1', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-                [ $visitId ]
+                [ $visit_id ]
             );
             if ( is_array( $visit ) ) {
                 $license_context = \ClinicCore\Domain\Licensing\VisitLicenseContext::from_row( $visit );
@@ -405,7 +404,7 @@ final class MedicalFileService
         // Stage 2 preserves existing upload behavior; Stage 3 requires an
         // already-opened Visit (created_at < T1, active, non-terminal) — the
         // safe-finish lane above — and denies uploads otherwise. Records stay readable.
-        $this->assertUploadAllowed( $visitId );
+        $this->assert_upload_allowed( $visitId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing camelCase local
         if (!in_array($category, self::CATEGORIES, true)) {
             throw ClinicalException::of('CLINIC_VALIDATION_FAILED', 'دسته‌بندی فایل نامعتبر است', 422, ['category' => $category]);
         }

@@ -15,8 +15,7 @@ use ClinicCore\Domain\Machine\VisitMachine;
  * row — never from request data. HandwritingService keeps its own private
  * copy of this shape (PR#11); this helper is the same contract for the rest.
  */
-final class VisitLicenseContext
-{
+final class VisitLicenseContext {
     /**
      * @param array<string, mixed>|null $visit Persisted cpms_visits row.
      *

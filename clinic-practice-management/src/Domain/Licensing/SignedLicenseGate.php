@@ -135,8 +135,7 @@ final class SignedLicenseGate implements LicenseGate
      *
      * @param array<string, mixed> $context Server-derived eligibility context.
      */
-    private function assertOrdinaryExpiry( string $operation, array $context, string $status, int $expires_at, int $now ): LicenseDecision
-    {
+    private function assertOrdinaryExpiry( string $operation, array $context, string $status, int $expires_at, int $now ): LicenseDecision {
         $stage = LicenseStagePolicy::stage( $expires_at, $now );
         if ( LicenseStagePolicy::STAGE_VALID === $stage ) {
             return LicenseDecision::allow();
@@ -229,7 +228,7 @@ final class SignedLicenseGate implements LicenseGate
             return LicenseStagePolicy::stage( $expires_at, $now ) === LicenseStagePolicy::STAGE_READ_ONLY;
         }
 
-        return LicenseStatus::isRestricted($status);
+        return LicenseStatus::isRestricted( $status );
     }
 
     /**
@@ -239,8 +238,7 @@ final class SignedLicenseGate implements LicenseGate
      *
      * @param array<string, mixed> $state
      */
-    private static function isOrdinaryCached( string $status, array $state ): bool
-    {
+    private static function isOrdinaryCached( string $status, array $state ): bool {
         return match ( $status ) {
             LicenseStatus::ACTIVE => ( $state['reason'] ?? null ) === '',
             LicenseStatus::EXPIRING => ( $state['reason'] ?? null ) === 'near_expiry',
