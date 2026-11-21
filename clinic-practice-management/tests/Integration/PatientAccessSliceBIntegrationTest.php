@@ -5,9 +5,11 @@ declare( strict_types=1 );
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Application\Auth\PatientAccess;
+use ClinicCore\Application\Clinical\ClinicalException;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use WP_REST_Request;
@@ -313,6 +315,24 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         self::assertSame( 403, $tamperList->get_status() );
         $tamperStream = $this->dispatch( 'GET', self::NS . '/files/' . $fileId . '/stream', [ 'patient_id' => $this->patientA ], $this->patientUserOtherA );
         self::assertSame( 404, $tamperStream->get_status() );
+
+        // Service-layer tampered patient_id / link_id negatives + positive control (Scenario 10).
+        PatientTwoProofTestHelper::acting_as( $this->patientUserA );
+        self::assertCount( 1, App::medicalFileService()->patientFiles( $this->patientUserA, $this->patientA ) );
+        try {
+            App::medicalFileService()->patientFiles( $this->patientUserA, $this->patientOtherA );
+            self::fail( 'Service-layer patientFiles() must reject tampered patient_id.' );
+        } catch ( ClinicalException $e ) {
+            self::assertSame( 404, $e->httpStatus );
+            self::assertSame( 'CLINIC_NOT_FOUND', $e->errorCode );
+        }
+        try {
+            App::patientService()->me( $this->patientUserA, $this->linkB );
+            self::fail( 'Service-layer me() must reject foreign clinic link_id.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 404, $e->httpStatus );
+            self::assertSame( 'CLINIC_NOT_FOUND', $e->errorCode );
+        }
     }
 
     public function testBookingPatientRoutesPositiveAndRequiredNegatives(): void {
@@ -421,6 +441,25 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         );
         self::assertSame( 403, $this->dispatch( 'POST', self::NS . '/appointments/' . $liveAppt . '/cancel', [ 'patient_id' => $this->patientA ], $this->patientUserB )->get_status() );
         self::assertSame( 403, $this->dispatch( 'POST', self::NS . '/appointments/' . $liveAppt . '/cancel', [ 'patient_id' => $this->patientA ], $this->patientUserOtherA )->get_status() );
+        self::assertSame( 'confirmed', (string) App::db()->fetchValue( 'SELECT status FROM ' . App::db()->table( 'cpms_appointments' ) . ' WHERE id = %d', [ $liveAppt ] ) );
+
+        // Service-layer tampered patient_id hold & cross-patient cancel (Scenario 10).
+        PatientTwoProofTestHelper::acting_as( $this->patientUserA );
+        try {
+            App::bookingService()->hold( $this->patientUserA, $this->clinicianA, $date1, '10:00:00', $slot1, $this->patientOtherA );
+            self::fail( 'Service-layer hold() must reject tampered patient_id.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 422, $e->httpStatus );
+            self::assertSame( 'CLINIC_VALIDATION_FAILED', $e->errorCode );
+        }
+        PatientTwoProofTestHelper::acting_as( $this->patientUserOtherA );
+        try {
+            App::bookingService()->cancelByPatient( $this->patientUserOtherA, $liveAppt, 'service tamper' );
+            self::fail( 'Service-layer cancelByPatient() must reject cross-patient appointment.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 403, $e->httpStatus );
+            self::assertSame( 'CLINIC_PERMISSION_DENIED', $e->errorCode );
+        }
         self::assertSame( 'confirmed', (string) App::db()->fetchValue( 'SELECT status FROM ' . App::db()->table( 'cpms_appointments' ) . ' WHERE id = %d', [ $liveAppt ] ) );
     }
 
