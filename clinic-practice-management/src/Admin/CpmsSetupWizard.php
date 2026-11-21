@@ -314,6 +314,9 @@ final class CpmsSetupWizard
 
     private static function set_current_step( Settings $settings, string $id ): void
     {
+        if ( self::license_settings_write_blocked() ) {
+            return;
+        }
         $actor_user_id = (int) get_current_user_id();
         if ( ! self::has_clinic_local_config( $actor_user_id, $settings->clinicId() ) ) {
             return;
@@ -768,6 +771,9 @@ final class CpmsSetupWizard
      * @return string '' = ok
      */
     public static function save_health( Settings $settings, array $post, int $updated_by ): string {
+        if ( self::license_settings_write_blocked() ) {
+            return self::LICENSE_BLOCKED_MESSAGE;
+        }
         // Defense in depth: same Clinic-local CONFIG gate as every other
         // wizard write, before any flow or payload inspection.
         if ( ! self::has_clinic_local_config( $updated_by, $settings->clinicId() ) ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing public wizard API parameter name
@@ -1176,6 +1182,9 @@ final class CpmsSetupWizard
     }
 
     public static function mark_step_completed( Settings $settings, string $step_id, int $updated_by ): void {
+        if ( self::license_settings_write_blocked() ) {
+            return;
+        }
         if ( ! self::has_clinic_local_config( $updated_by, $settings->clinicId() ) ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing public wizard API parameter name
             return;
         }
@@ -1297,6 +1306,9 @@ final class CpmsSetupWizard
      * @param array<string, mixed> $post
      */
     public static function save_doctors( Settings $settings, array $post, int $updated_by ): string {
+        if ( self::license_settings_write_blocked() ) {
+            return self::LICENSE_BLOCKED_MESSAGE;
+        }
         // Defense in depth: the same Clinic-local CONFIG gate every other
         // wizard write enforces, even when this method is called directly.
         if ( ! self::has_clinic_local_config( $updated_by, $settings->clinicId() ) ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing public wizard API parameter name
@@ -1986,6 +1998,19 @@ final class CpmsSetupWizard
      * established by that actor's active membership. An explicit selector is
      * re-checked against that same Clinic; ambiguous or stale scope fails closed.
      */
+    private const LICENSE_BLOCKED_MESSAGE = 'مجوز سامانه اجازهٔ تکمیل راه‌اندازی را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.';
+
+    /** Three-stage license (design §7.3 staff/settings row, final 2026-11-17): Stage 3 is view-only. */
+    private static function license_settings_write_blocked(): bool {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+        if ( $decision->allowed ) {
+            return false;
+        }
+        \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+
+        return true;
+    }
+
     private static function has_clinic_local_config( int $actor_user_id, int $settings_clinic_id ): bool {
         if (
             $actor_user_id <= 0
@@ -2133,6 +2158,9 @@ final class CpmsSetupWizard
      */
     private static function saveFinish(Settings $settings, int $updatedBy): string
     {
+        if ( self::license_settings_write_blocked() ) {
+            return self::LICENSE_BLOCKED_MESSAGE;
+        }
         if ( ! self::has_clinic_local_config( $updatedBy, $settings->clinicId() ) ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing public wizard API parameter name
             return 'برای تکمیل راه‌اندازی، عضویت فعال در همین مطب و مجوز پیکربندی لازم است.';
         }

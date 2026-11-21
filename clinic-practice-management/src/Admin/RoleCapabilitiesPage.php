@@ -145,6 +145,19 @@ final class RoleCapabilitiesPage
      * بنابراین گیت صفحه «دسترسی‌ها» روی `manage_options` (مالک فنی/administrator) است،
      * نه روی `cpms_config`؛ و صفحهٔ «کاربران» (cpms-staff) روی cpms_config می‌ماند.
      */
+    private const LICENSE_BLOCKED_MESSAGE = 'مجوز سامانه اجازهٔ این تغییر را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.';
+
+    /** Three-stage license (design §7.3 staff/settings row, final 2026-11-17). */
+    private static function settings_writes_blocked(): bool {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+        if ( $decision->allowed ) {
+            return false;
+        }
+        \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+
+        return true;
+    }
+
     private static function isSecurityOwner(): bool
     {
         return is_user_logged_in() && current_user_can('manage_options');
@@ -380,6 +393,12 @@ final class RoleCapabilitiesPage
         }
         check_admin_referer(self::NONCE_ACTION);
 
+        if ( self::settings_writes_blocked() ) {
+            set_transient( self::NOTICE_KEY, self::LICENSE_BLOCKED_MESSAGE, 60 );
+            wp_safe_redirect( admin_url( 'admin.php?page=cpms-roles' ) );
+            exit;
+        }
+
         $user = wp_get_current_user();
         $input = isset($_POST['role_caps']) && is_array($_POST['role_caps']) ? wp_unslash($_POST['role_caps']) : []; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- sanitize در sanitizeCapList (whitelist سخت)
 
@@ -451,6 +470,9 @@ final class RoleCapabilitiesPage
      * @return list<string> human-readable per-role change report
      */
     public static function apply_capability_matrix( array $input, int $actor_wp_user_id ): array {
+        if ( self::settings_writes_blocked() ) {
+            throw new \RuntimeException( self::LICENSE_BLOCKED_MESSAGE );
+        }
         $report = [];
         // D6 audit atomicity: capability overrides (wp_options) and the WP role
         // registry (wp_user_roles option) are MySQL rows like any other, so the
@@ -710,6 +732,9 @@ final class RoleCapabilitiesPage
      * failure after the option/role changes have rolled back.
      */
     public static function reset_role_to_template( string $role ): void {
+        if ( self::settings_writes_blocked() ) {
+            throw new \RuntimeException( self::LICENSE_BLOCKED_MESSAGE );
+        }
         if ( ! in_array( $role, self::ROLE_PRESETS, true ) ) {
             return;
         }
@@ -754,6 +779,12 @@ final class RoleCapabilitiesPage
             wp_die('دسترسی ندارید', 403);
         }
         check_admin_referer('cpms_reset_role_caps_' . (string) ($_GET['role'] ?? ''));
+
+        if ( self::settings_writes_blocked() ) {
+            set_transient( self::NOTICE_KEY, self::LICENSE_BLOCKED_MESSAGE, 60 );
+            wp_safe_redirect( admin_url( 'admin.php?page=cpms-roles' ) );
+            exit;
+        }
 
         $role = (string) ( $_GET['role'] ?? '' );
         if ( in_array( $role, self::ROLE_PRESETS, true ) ) {

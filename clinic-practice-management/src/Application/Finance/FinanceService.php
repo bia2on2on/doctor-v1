@@ -51,6 +51,36 @@ final class FinanceService
     ) {
     }
 
+    /**
+     * Central three-stage license seam for the finance write lanes (final
+     * owner policy, design §7.3). Opens the shared singleton gate; decisions
+     * are server-derived and never cached. Denial reuses CLINIC_LICENSE_BLOCKED.
+     */
+    private function assertFinanceWritable( string $operation, array $context ): void
+    {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( $operation, $context );
+        if ( ! $decision->allowed ) {
+            \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => $operation, 'reason' => $decision->reason ] );
+            throw FinanceException::of( 'CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازه ثبت عملیات مالی را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند', 503 );
+        }
+    }
+
+    /**
+     * Parse a UTC SQL datetime string into a Unix timestamp (0 when unparseable).
+     */
+    private function parseUtcTimestampToInt( string $utc_sql ): int
+    {
+        if ( '' === $utc_sql ) {
+            return 0;
+        }
+        $clean = preg_replace( '/\.\d+$/', '', $utc_sql ) ?? $utc_sql;
+        try {
+            return ( new \DateTimeImmutable( $clean, new \DateTimeZone( 'UTC' ) ) )->getTimestamp();
+        } catch ( \Throwable ) {
+            return 0;
+        }
+    }
+
     // ================= G2 — تعرفه خدمات =================
 
     /**
@@ -111,6 +141,8 @@ final class FinanceService
         $this->requireCap( $actor_user_id, RolesAndCapabilities::CONFIG, 'services.config' );
         $clinic_id = $this->requireTrustedClinicId();
         $this->authorizeScoped( $actor_user_id, $clinic_id, RolesAndCapabilities::CONFIG, 'services.config' );
+        // Three-stage license (design §7.3 staff/settings row): service catalog writes are denied at Stage 3.
+        $this->assertFinanceWritable( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, [] );
         [ $code, $name, $price ] = $this->validateServiceInput( $input, null );
         if ( $this->services->existsWithCode( $clinic_id, $code ) ) {
             throw FinanceException::of( 'CLINIC_POLICY_VIOLATION', 'کد خدمت تکراری است', 409, [ 'code' => $code ] );
@@ -165,6 +197,8 @@ final class FinanceService
         $this->requireCap( $actor_user_id, RolesAndCapabilities::CONFIG, 'services.config' );
         $clinic_id = $this->requireTrustedClinicId();
         $this->authorizeScoped( $actor_user_id, $clinic_id, RolesAndCapabilities::CONFIG, 'services.config' );
+        // Three-stage license (design §7.3 staff/settings row): service catalog writes are denied at Stage 3.
+        $this->assertFinanceWritable( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, [] );
         $existing = $this->services->find( $id );
         if ( $existing === null || ! $this->rowBelongsToTrustedClinic( $existing ) ) {
             throw FinanceException::of( 'CLINIC_NOT_FOUND', 'خدمت یافت نشد', 404 );
@@ -221,6 +255,8 @@ final class FinanceService
         $this->requireCap( $actor_user_id, RolesAndCapabilities::CONFIG, 'services.config' );
         $clinic_id = $this->requireTrustedClinicId();
         $this->authorizeScoped( $actor_user_id, $clinic_id, RolesAndCapabilities::CONFIG, 'services.config' );
+        // Three-stage license (design §7.3 staff/settings row): service catalog writes are denied at Stage 3.
+        $this->assertFinanceWritable( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, [] );
         $existing = $this->services->find( $id );
         if ( $existing === null || ! $this->rowBelongsToTrustedClinic( $existing ) ) {
             throw FinanceException::of( 'CLINIC_NOT_FOUND', 'خدمت یافت نشد', 404 );
@@ -276,6 +312,9 @@ final class FinanceService
             if ($visit === null || !$this->rowBelongsToTrustedClinic($visit)) {
                 throw FinanceException::of('CLINIC_NOT_FOUND', 'ویزیت یافت نشد', 404);
             }
+            // Three-stage license (design §7.2 item 8): invoice creation for a visit
+            // is a safe-finish write, revalidated on the row locked in this transaction.
+            $this->assertFinanceWritable( \ClinicCore\Domain\Licensing\LicenseGate::OP_INVOICE_CREATE, \ClinicCore\Domain\Licensing\VisitLicenseContext::from_row( $visit ) );
             if (!in_array((string) $visit['status'], ['consultation_completed', 'awaiting_payment'], true)) {
                 throw FinanceException::of(
                     'CLINIC_INVALID_TRANSITION',
@@ -517,6 +556,10 @@ final class FinanceService
         $result = $this->db->transactional(
             function () use ($actorUserId, $invoiceId, $amount, $method, $ref, $idempotencyKey): array {
                 $invoice = $this->requireOpenInvoiceForUpdate($invoiceId);
+                $invoice_visit = $this->visits->findForUpdate( (int) $invoice['visit_id'] );
+                // Three-stage license (design §7.2 item 8): payment/settlement of a
+                // visit-linked invoice, revalidated under the visit row lock.
+                $this->assertFinanceWritable( \ClinicCore\Domain\Licensing\LicenseGate::OP_PAYMENT_RECORD, \ClinicCore\Domain\Licensing\VisitLicenseContext::from_row( $invoice_visit ) );
 
                 $effectiveTotal = $this->effectiveTotalCents($invoice);
                 $balance = $effectiveTotal - ($this->toMinor((string) $invoice['paid_amount']) ?? 0);
@@ -634,6 +677,10 @@ final class FinanceService
             if ((string) $invoice['status'] === 'voided') {
                 throw FinanceException::of('CLINIC_INVOICE_NOT_MODIFIABLE', 'فاکتور ابطال‌شده قابل تغییر نیست', 409);
             }
+            $invoice_visit = $this->visits->findForUpdate( (int) $invoice['visit_id'] );
+            // Three-stage license (design §7.2 item 8): voiding a captured payment is
+            // a payment-lane write of a visit-linked invoice.
+            $this->assertFinanceWritable( \ClinicCore\Domain\Licensing\LicenseGate::OP_PAYMENT_RECORD, \ClinicCore\Domain\Licensing\VisitLicenseContext::from_row( $invoice_visit ) );
 
             $amount = $this->toMinor((string) $payment['amount']) ?? 0;
             $this->payments->update($paymentId, [
@@ -714,6 +761,15 @@ final class FinanceService
             if (!$this->rowBelongsToTrustedClinic($payment)) {
                 throw FinanceException::of('CLINIC_NOT_FOUND', 'پرداخت یافت نشد', 404);
             }
+            // Three-stage license (final Q4a(a)): every historical refund is denied
+            // at/after T1 — no exception, not even the safe-finish lane.
+            $this->assertFinanceWritable(
+                \ClinicCore\Domain\Licensing\LicenseGate::OP_REFUND,
+                [
+                    'payment_id' => $paymentId,
+                    'original_payment_time' => $this->parseUtcTimestampToInt( (string) ( $payment['paid_at'] ?? '' ) ),
+                ]
+            );
             if ((string) $payment['status'] !== 'captured') {
                 throw FinanceException::of(
                     'CLINIC_INVALID_TRANSITION',
@@ -802,6 +858,10 @@ final class FinanceService
 
         return $this->db->transactional(function () use ($actorUserId, $invoiceId, $type, $reason, $amount): array {
             $invoice = $this->requireOpenInvoiceForUpdate($invoiceId);
+            $invoice_visit = $this->visits->findForUpdate( (int) $invoice['visit_id'] );
+            // Three-stage license (design §7.2 item 8): an invoice adjustment is a
+            // payment-lane write of a visit-linked invoice.
+            $this->assertFinanceWritable( \ClinicCore\Domain\Licensing\LicenseGate::OP_PAYMENT_RECORD, \ClinicCore\Domain\Licensing\VisitLicenseContext::from_row( $invoice_visit ) );
             $balance = $this->toMinor((string) $invoice['balance']) ?? 0;
 
             if ($type === 'credit' && $amount > $balance) {

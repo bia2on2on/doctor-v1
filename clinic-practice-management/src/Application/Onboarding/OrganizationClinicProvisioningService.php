@@ -67,6 +67,20 @@ final class OrganizationClinicProvisioningService {
 
     public const CLINIC_MANAGER_ROLE_KEY = 'cpms_manager';
 
+    /**
+     * Three-stage license (design §7.3 staff/settings row, final 2026-11-17):
+     * Stage 3 is view-only; only offline license activation/renewal remains writable.
+     * Uniform with the other settings/staff surfaces; callers already translate
+     * \RuntimeException denials into their safe error shape.
+     */
+    private function assert_settings_writable(): void {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+        if ( ! $decision->allowed ) {
+            \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+            throw new \RuntimeException( 'organization provisioning denied' );
+        }
+    }
+
     public function __construct(
         private readonly CpmsDb $db,
         private readonly AuditLogger $audit
@@ -188,6 +202,7 @@ final class OrganizationClinicProvisioningService {
      * @return array{clinic_id:int,location_id:int,audit_id:int}
      */
     public function provision( int $actor_id, int $organization_id, string $name, string $slug, string $timezone, ?string $location_name = null, ?string $address = null, ?string $phone = null ): array {
+        $this->assert_settings_writable();
         return $this->provision_clinic( false, $actor_id, $organization_id, $name, $slug, $timezone, $location_name, $address, $phone );
     }
 
@@ -203,6 +218,7 @@ final class OrganizationClinicProvisioningService {
      * @return array{clinic_id:int,location_id:int,audit_id:int}
      */
     public function provision_held( int $actor_id, int $organization_id, string $name, string $slug, string $timezone, ?string $location_name = null, ?string $address = null, ?string $phone = null ): array {
+        $this->assert_settings_writable();
         return $this->provision_clinic( true, $actor_id, $organization_id, $name, $slug, $timezone, $location_name, $address, $phone );
     }
 
@@ -360,6 +376,7 @@ final class OrganizationClinicProvisioningService {
 
     /** Explicit organization-scoped manager grant/revocation; last active manager is protected. */
     public function set_manager( int $actor_id, int $organization_id, int $target_user_id, bool $active ): int {
+        $this->assert_settings_writable();
 
         if ( $actor_id <= 0 || $organization_id <= 0 || $target_user_id <= 0 || get_userdata( $target_user_id ) === false ) {
             throw new InvalidArgumentException( 'invalid membership subject' );
@@ -496,6 +513,7 @@ final class OrganizationClinicProvisioningService {
      * @return array{membership_id:int,noop:bool,audit_id:int|null}
      */
     public function bootstrap_owner( int $actor_id, int $organization_id, int $target_user_id ): array {
+        $this->assert_settings_writable();
 
         if (
             $actor_id <= 0
@@ -632,6 +650,7 @@ final class OrganizationClinicProvisioningService {
      * @return array{clinic_id:int, name:string, address:?string, phone:?string, updated_at:string, noop:bool, audit_id:int|null}
      */
     public function update_clinic_profile( int $actor_id, int $organization_id, int $clinic_id, array $input ): array {
+        $this->assert_settings_writable();
 
         if ( $actor_id <= 0 || $organization_id <= 0 || $clinic_id <= 0 ) {
             throw new InvalidArgumentException( 'invalid clinic update context' );
@@ -771,6 +790,7 @@ final class OrganizationClinicProvisioningService {
      * @return array{clinic_id:int, status:string, noop:bool, audit_id:int|null}
      */
     public function set_clinic_status( int $actor_id, int $organization_id, int $clinic_id, bool $active ): array {
+        $this->assert_settings_writable();
 
         if ( $actor_id <= 0 || $organization_id <= 0 || $clinic_id <= 0 ) {
             throw new InvalidArgumentException( 'invalid clinic lifecycle context' );
@@ -884,6 +904,7 @@ final class OrganizationClinicProvisioningService {
      * @return array{clinic_id:int, membership_id:int, noop:bool, audit_id:int|null}
      */
     public function designate_clinic_manager( int $actor_id, int $organization_id, int $clinic_id, int $target_user_id ): array {
+        $this->assert_settings_writable();
         if ( $actor_id <= 0 || $organization_id <= 0 || $clinic_id <= 0 ) {
             throw new InvalidArgumentException( 'invalid clinic manager designation context' );
         }

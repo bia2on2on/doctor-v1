@@ -13,7 +13,7 @@ final class LicenseStatusNotice {
     public static function text( array $state ): ?string {
         $status = $state['status'];
         if ( $status === LicenseStatus::GRACE ) {
-            return 'مجوز در مهلت پس از انقضا است؛ تمدید آن را پیگیری کنید. ثبت نوبت و بیمار جدید در این وضعیت همچنان مجاز است و مراقبت بیماران موجود ادامه دارد.';
+            return 'مهلت پس از انقضای مجوز رسیده است؛ از T0 ثبت نوبت و بیمار جدید مسدود است. نوبت‌های قبلی و مراقبت بیماران موجود ادامه دارد؛ ثبت پذیرش فقط تا یک ماه پس از T0 ممکن است. تمدید را پیگیری کنید.';
         }
         if ( $status === LicenseStatus::RESTRICTED ) {
             $reason = $state['reason'] ?? '';

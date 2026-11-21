@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace ClinicCore\Domain\Licensing;
 
 /**
- * Read-only preview of the existing post-expiration first-enrollment policy.
+ * Read-only preview of the final owner first-enrollment policy (2026-11-17, Q1(a)).
  *
  * This class deliberately mirrors the ordinary-expiration branch of
  * {@see SignedLicenseGate::assert()} so the Patient Portal can decide whether to
@@ -16,7 +16,8 @@ namespace ClinicCore\Domain\Licensing;
 final class FirstEnrollmentPolicy {
     /**
      * True exactly when SignedLicenseGate treats the license as an ordinary
-     * expiration at $now (signed T0 reached). Grace/skew never moves T0.
+     * cached signed document reached its T0 at $now (signed T0 reached; outage age
+     * never moves it — B1/design §7.1). Grace/skew never move T0.
      */
     public static function is_post_expiration(
         string $status,
@@ -32,16 +33,17 @@ final class FirstEnrollmentPolicy {
             LicenseStatus::ACTIVE => $reason === '',
             LicenseStatus::EXPIRING => $reason === 'near_expiry',
             LicenseStatus::GRACE => in_array( $reason, [ 'grace', 'unreachable_grace' ], true ),
-            LicenseStatus::RESTRICTED => $reason === 'expired',
+            LicenseStatus::RESTRICTED => in_array( $reason, [ 'expired', 'expired_unreachable' ], true ),
+            LicenseStatus::UNREACHABLE => $reason === 'cached_state_stale',
             default => false,
         };
     }
 
     /**
-     * The same decision the gate will make for `patient.create` on this subject:
-     * ordinary expiration allows only a returning (strict pre-T0 encounter)
-     * subject inside the half-open six-Gregorian-month window; no reception
-     * exception is available on the patient-self path.
+     * The same decision the gate will make for `patient.create` on this subject.
+     * Final Q1(a) (2026-11-17): from T0 no self-enrollment is offered — no
+     * returning-evidence window, no reception exception; only a pre-T0 license
+     * (or a non-expiry new-business-capable state) can offer the form.
      */
     public static function allows_first_enrollment(
         string $status,
@@ -50,13 +52,9 @@ final class FirstEnrollmentPolicy {
         int $now,
         bool $returning
     ): bool {
+        unset( $returning ); // retained for call-site compatibility; evidence grants nothing from T0
         if ( self::is_post_expiration( $status, $reason, $expires_at, $now ) ) {
-            return PostExpirationPolicy::allows_new_service(
-                $now,
-                (int) $expires_at,
-                $returning,
-                false
-            );
+            return false;
         }
 
         return LicenseStatus::allowsNewBusiness( $status );

@@ -116,6 +116,22 @@ final class FacilitySetupService {
 
     private const REQUEST_KEY_PATTERN = '/^[a-f0-9]{32}$/';
 
+    /**
+     * Three-stage license (design §7.3 staff/settings row, final 2026-11-17):
+     * at/after T1 the facility/settings surface is view-only; only offline
+     * license activation/renewal remains writable. Every write refuses through
+     * the same non-disclosing 'denied' FacilitySetupException shape.
+     */
+    private function assert_settings_writable(): void {
+        $gate = \ClinicCore\Bootstrap\App::licenseGate();
+        $decision = $gate->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+        if ( $decision->allowed ) {
+            return;
+        }
+        \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+        throw new FacilitySetupException( 'denied', 'مجوز سامانه اجازه ثبت تغییرات مرکز را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.' );
+    }
+
     public function __construct(
         private readonly CpmsDb $db,
         private readonly OrganizationClinicProvisioningService $provisioning,
@@ -188,6 +204,7 @@ final class FacilitySetupService {
      * @return array<string, mixed>
      */
     public function start( int $actor_id, int $organization_id, string $facility_type, string $structure, string $display_name ): array {
+        $this->assert_settings_writable();
         $this->assert_organization( $actor_id, $organization_id, OrganizationClinicProvisioningService::CAPABILITY );
         $this->assert_organization( $actor_id, $organization_id, OrganizationClinicProvisioningService::CAPABILITY_LIFECYCLE );
 
@@ -263,6 +280,7 @@ final class FacilitySetupService {
      * @return array<string, mixed>
      */
     public function acknowledge_outpatient( int $actor_id, int $organization_id, bool $confirmed ): array {
+        $this->assert_settings_writable();
         $this->assert_organization( $actor_id, $organization_id, OrganizationClinicProvisioningService::CAPABILITY );
         if ( ! $confirmed ) {
             throw new FacilitySetupException( 'ack_required', 'برای ادامه باید صریحاً تأیید کنید که فقط درمانگاه‌ها و فرایندهای سرپایی پشتیبانی می‌شود.' );
@@ -292,6 +310,7 @@ final class FacilitySetupService {
      * @return array<string, mixed>
      */
     public function add_site( int $actor_id, int $organization_id, string $label, string $address ): array {
+        $this->assert_settings_writable();
         $this->assert_organization( $actor_id, $organization_id, OrganizationClinicProvisioningService::CAPABILITY );
         $label   = trim( $label );
         $address = trim( $address );
@@ -333,6 +352,7 @@ final class FacilitySetupService {
      * @return array<string, mixed> The plan entry of the Clinic.
      */
     public function add_clinic( int $actor_id, int $organization_id, string $request_key, string $name, string $site_key, string $timezone ): array {
+        $this->assert_settings_writable();
         $this->assert_organization( $actor_id, $organization_id, OrganizationClinicProvisioningService::CAPABILITY );
         $this->assert_organization( $actor_id, $organization_id, OrganizationClinicProvisioningService::CAPABILITY_LIFECYCLE );
         $this->assert_request_key( $request_key );
@@ -481,6 +501,7 @@ final class FacilitySetupService {
      * @return array<string, mixed> The Clinic's plan entry.
      */
     public function authorize_manager_designation( int $actor_id, int $organization_id, string $clinic_key ): array {
+        $this->assert_settings_writable();
         $this->assert_organization( $actor_id, $organization_id, OrganizationClinicProvisioningService::CAPABILITY_CLINIC_MANAGER );
         $this->assert_organization( $actor_id, $organization_id, OrganizationClinicProvisioningService::CAPABILITY );
 
@@ -493,6 +514,7 @@ final class FacilitySetupService {
      * @return array{clinic_id:int, membership_id:int, noop:bool, audit_id:int|null}
      */
     public function designate_manager( int $actor_id, int $organization_id, string $clinic_key, int $target_user_id ): array {
+        $this->assert_settings_writable();
         // Authorize before identifying: nothing about the target user is evaluated
         // before this passes, so a caller without the authority cannot tell
         // existing from nonexistent users.
@@ -522,6 +544,7 @@ final class FacilitySetupService {
      * @return array<string, mixed> The room entry.
      */
     public function add_room( int $actor_id, int $organization_id, string $clinic_key, string $request_key, string $name, string $site_key ): array {
+        $this->assert_settings_writable();
         $this->assert_clinic_step( $actor_id, $organization_id, $clinic_key );
         $this->assert_request_key( $request_key );
         $name = trim( $name );
@@ -654,6 +677,7 @@ final class FacilitySetupService {
      * @return array{clinician_id:int, profile_created:bool, membership_created:bool, location_ids:list<int>, noop:bool}
      */
     public function assign_clinician( int $actor_id, int $organization_id, string $clinic_key, int $wp_user_id, string $full_name, array $room_keys ): array {
+        $this->assert_settings_writable();
         $this->assert_clinic_step( $actor_id, $organization_id, $clinic_key );
         $entry     = $this->clinic_entry( $organization_id, $clinic_key );
         $clinic_id = (int) $entry['clinic_id'];
@@ -897,6 +921,7 @@ final class FacilitySetupService {
      * @return array{membership_id:int, noop:bool, scope_mode:string, location_ids:list<int>, denied:list<string>}
      */
     public function assign_staff( int $actor_id, int $organization_id, string $clinic_key, int $wp_user_id, string $role_key, string $access, array $room_keys, array $deny_caps ): array {
+        $this->assert_settings_writable();
         $this->assert_clinic_step( $actor_id, $organization_id, $clinic_key );
         $entry     = $this->clinic_entry( $organization_id, $clinic_key );
         $clinic_id = (int) $entry['clinic_id'];
@@ -1065,6 +1090,7 @@ final class FacilitySetupService {
      * @return array{schedule_id:int, noop:bool}
      */
     public function add_weekly_schedule( int $actor_id, int $organization_id, string $clinic_key, int $clinician_id, string $room_key, array $input ): array {
+        $this->assert_settings_writable();
         $this->assert_clinic_step( $actor_id, $organization_id, $clinic_key );
         $entry       = $this->clinic_entry( $organization_id, $clinic_key );
         $clinic_id   = (int) $entry['clinic_id'];
@@ -1132,6 +1158,7 @@ final class FacilitySetupService {
      * @return array<string, int>
      */
     public function save_booking_policy( int $actor_id, int $organization_id, string $clinic_key, array $input ): array {
+        $this->assert_settings_writable();
         $clinic_id = $this->assert_clinic_step( $actor_id, $organization_id, $clinic_key );
 
         return $this->apply_booking_policy( $actor_id, $clinic_id, $input );
@@ -1146,6 +1173,7 @@ final class FacilitySetupService {
      * @return array<string,int>
      */
     public function save_booking_policy_for_clinic( int $actor_id, int $clinic_id, array $input ): array {
+        $this->assert_settings_writable();
         if ( $clinic_id <= 0 ) {
             throw new FacilitySetupException( 'not_found', 'درمانگاه باید صریحاً انتخاب شود.' );
         }
@@ -1327,6 +1355,7 @@ final class FacilitySetupService {
      * @return array{activated: list<int>, plan: array<string, mixed>}
      */
     public function activate( int $actor_id, int $organization_id, bool $confirmed ): array {
+        $this->assert_settings_writable();
         $this->assert_organization( $actor_id, $organization_id, OrganizationClinicProvisioningService::CAPABILITY_LIFECYCLE );
         if ( ! $confirmed ) {
             throw new FacilitySetupException( 'confirm_required', 'برای فعال‌سازی، بازبینی را صریحاً تأیید کنید.' );

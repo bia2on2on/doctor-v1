@@ -247,6 +247,19 @@ final class ClinicReceptionRecoveryPage {
         echo '</div>';
     }
 
+    private const LICENSE_BLOCKED_MESSAGE = 'مجوز سامانه اجازهٔ این تغییر را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.';
+
+    /** Three-stage license (design §7.3 staff/settings row, final 2026-11-17): Stage 3 is view-only. */
+    private static function settings_writes_blocked(): bool {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+        if ( $decision->allowed ) {
+            return false;
+        }
+        \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+
+        return true;
+    }
+
     public static function handle_assign(): void {
         $actor_id = (int) \get_current_user_id();
         if ( $actor_id <= 0 ) {
@@ -257,6 +270,10 @@ final class ClinicReceptionRecoveryPage {
             self::redirect();
         }
 
+        if ( self::settings_writes_blocked() ) {
+            self::push_notice( 'error', self::LICENSE_BLOCKED_MESSAGE );
+            self::redirect();
+        }
         $clinic_id     = AdminClinicSelector::requested_clinic_id( $_POST ) ?? 0;
         $clinician_id  = self::request_id( $_POST['clinician_id'] ?? null );
         $raw_locations = $_POST['location_ids'] ?? [];

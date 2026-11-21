@@ -54,6 +54,20 @@ final class FirstPracticeSetupService {
     /** Practice display name bound in Unicode code points (schema allows 190). */
     private const NAME_MAX_CODE_POINTS = 120;
 
+    /**
+     * Three-stage license (design §7.3 staff/settings row, final 2026-11-17):
+     * the one-shot first-practice bootstrap is a settings surface; Stage 3 is
+     * view-only. A fresh/unclaimed install has no signed ordinary-expiry term and
+     * stays writable (NOT_CONFIGURED / ACTIVATION_PENDING / ACTIVATION_GRACE).
+     */
+    private function assert_settings_writable(): void {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+        if ( ! $decision->allowed ) {
+            \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+            throw FirstPracticeSetupException::not_available();
+        }
+    }
+
     public function __construct(
         private readonly CpmsDb $db,
         private readonly MembershipRepository $memberships,
@@ -136,6 +150,7 @@ final class FirstPracticeSetupService {
         ?string $phone = null,
         ?string $address = null
     ): array {
+        $this->assert_settings_writable();
         // Entry gate: WordPress administrator. This is NOT Clinic authority —
         // it only permits initiating the one-shot first-practice bootstrap.
         if ( $actor_wp_user_id <= 0 ) {
@@ -424,6 +439,7 @@ final class FirstPracticeSetupService {
         ?string $phone = null,
         ?string $address = null
     ): array {
+        $this->assert_settings_writable();
         if ( $actor_wp_user_id <= 0 ) {
             throw FirstPracticeSetupException::not_administrator();
         }

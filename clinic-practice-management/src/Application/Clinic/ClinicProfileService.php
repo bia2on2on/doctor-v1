@@ -49,6 +49,13 @@ final class ClinicProfileService
         if ($trustedClinicId <= 0) {
             throw ClinicProfileException::of(ClinicProfileException::SCOPE_REQUIRED, 'زمینه کلینیک معتبر لازم است', 400);
         }
+        // Three-stage license (design §7.3 staff/settings row): clinic profile
+        // mutation is view-only at Stage 3; only offline activation/renewal remains.
+        $license_decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+        if ( ! $license_decision->allowed ) {
+            \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $license_decision->reason ] );
+            throw ClinicProfileException::of( 'CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازهٔ تغییر پروفایل کلینیک را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند', 503 );
+        }
         // Explicitly deny clinic_id=0,1 fallback usage (must be dynamic trusted)
         // We do not accept 0/1 as magic; but we also enforce that row must exist and be trusted.
         // No first-clinic fallback: we never resolve implicit clinic.

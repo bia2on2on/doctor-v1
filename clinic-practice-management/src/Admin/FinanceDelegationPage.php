@@ -63,6 +63,19 @@ final class FinanceDelegationPage {
 		CpmsAdminMenu::hide_from_submenu( self::PAGE_SLUG );
 	}
 
+	private const LICENSE_BLOCKED_MESSAGE = 'مجوز سامانه اجازهٔ این تغییر را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.';
+
+	/** Three-stage license (design §7.3 staff/settings row, final 2026-11-17). */
+	private static function settings_writes_blocked(): bool {
+		$decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+		if ( $decision->allowed ) {
+			return false;
+		}
+		\ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+
+		return true;
+	}
+
 	public static function render(): void {
 		if ( ! current_user_can( 'read' ) ) {
 			wp_die( esc_html__( 'دسترسی ندارید', 'cpms' ), 403 );
@@ -104,6 +117,11 @@ final class FinanceDelegationPage {
 			wp_die( esc_html__( 'دسترسی ندارید', 'cpms' ), 403 );
 		}
 		check_admin_referer( self::NONCE, '_cpms_nonce' );
+		if ( self::settings_writes_blocked() ) {
+			set_transient( 'cpms_finance_delegation_notice_' . get_current_user_id(), self::LICENSE_BLOCKED_MESSAGE, 60 );
+			wp_safe_redirect( admin_url( 'admin.php?page=' . self::PAGE_SLUG ) );
+			exit;
+		}
 
 		$actor       = (int) get_current_user_id();
 		$clinic_id   = isset( $_POST['clinic_id'] ) ? (int) $_POST['clinic_id'] : 0;

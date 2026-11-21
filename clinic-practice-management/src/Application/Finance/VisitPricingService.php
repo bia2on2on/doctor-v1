@@ -63,6 +63,30 @@ final class VisitPricingService {
     private const READ_CAP   = RolesAndCapabilities::INVOICE_READ;
     private const WRITE_CAP  = RolesAndCapabilities::INVOICE_CREATE;
 
+    /**
+     * Three-stage license (design §7.3 staff/settings + finance rows).
+     * Pricing of a visit is an existing-care finance write (Visit-locked
+     * safe-finish lane); the clinic-wide default fee is a settings write.
+     */
+    private function assert_visit_writable( array $visit ): void {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert(
+            \ClinicCore\Domain\Licensing\LicenseGate::OP_PAYMENT_RECORD,
+            \ClinicCore\Domain\Licensing\VisitLicenseContext::from_row( $visit )
+        );
+        if ( ! $decision->allowed ) {
+            \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_PAYMENT_RECORD, 'reason' => $decision->reason, 'visit_id' => (int) ( $visit['id'] ?? 0 ) ] );
+            throw FinanceException::of( 'CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازهٔ این عملیات را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند', 503 );
+        }
+    }
+
+    private function assert_settings_writable(): void {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+        if ( ! $decision->allowed ) {
+            \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+            throw FinanceException::of( 'CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازهٔ این عملیات را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند', 503 );
+        }
+    }
+
     public function __construct(
         private readonly CpmsDb $db,
         private readonly VisitPricingRepository $pricing,
@@ -168,6 +192,7 @@ final class VisitPricingService {
      * @return array<string, mixed>
      */
     public function set_default_fee( int $actor_user_id, ?int $location_id, mixed $amount ): array {
+        $this->assert_settings_writable();
         $ctx       = $this->context_for( $actor_user_id, true );
         $clinician = $this->require_doctor( $ctx, $actor_user_id );
         $target    = $location_id === null ? 0 : $location_id;
@@ -230,6 +255,7 @@ final class VisitPricingService {
                 // Finance writers and invoice issuance acquire locks in this
                 // order: Visit first, then finance rows, then the audit row.
                 $visit  = $this->locked_visit_for_write( $ctx, $actor_user_id, $visit_id, $clinician );
+                $this->assert_visit_writable( $visit );
                 $before = $this->pricing->visit_fee_row( $visit_id );
                 $this->pricing->set_visit_override( $visit_id, $ctx['clinic_id'], (int) $clinician['id'], $fee, $actor_user_id );
                 $this->audit->log(
@@ -261,6 +287,7 @@ final class VisitPricingService {
         $charge_id = $this->db->transactional(
             function () use ( $ctx, $actor_user_id, $clinician, $visit_id, $fields ): int {
                 $visit = $this->locked_visit_for_write( $ctx, $actor_user_id, $visit_id, $clinician );
+                $this->assert_visit_writable( $visit );
                 $id    = $this->pricing->insert_charge(
                     [
                         'clinic_id'             => $ctx['clinic_id'],
@@ -308,6 +335,7 @@ final class VisitPricingService {
         $this->db->transactional(
             function () use ( $ctx, $actor_user_id, $clinician, $visit_id, $charge_id, $input ): void {
                 $visit  = $this->locked_visit_for_write( $ctx, $actor_user_id, $visit_id, $clinician );
+                $this->assert_visit_writable( $visit );
                 $charge = $this->require_charge( $ctx, $visit_id, $charge_id );
                 $fields = $this->charge_input(
                     [
@@ -367,6 +395,7 @@ final class VisitPricingService {
         $this->db->transactional(
             function () use ( $ctx, $actor_user_id, $clinician, $visit_id, $charge_id ): void {
                 $visit  = $this->locked_visit_for_write( $ctx, $actor_user_id, $visit_id, $clinician );
+                $this->assert_visit_writable( $visit );
                 $charge = $this->require_charge( $ctx, $visit_id, $charge_id );
                 $this->pricing->update_charge(
                     $charge_id,
