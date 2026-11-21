@@ -164,8 +164,8 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
             'from' => $tomorrow,
             'to'   => $dayAfter,
         ]);
-        self::assertSame(200, $mismatchedMine->get_status());
-        self::assertSame([], $this->payload($mismatchedMine), 'A Clinic-mismatched link must not list the appointment.');
+        self::assertSame(400, $mismatchedMine->get_status(), 'A Clinic-mismatched link invalidates the stamped session Clinic.');
+        self::assertSame('CLINIC_SCOPE_REQUIRED', $this->errCode($mismatchedMine));
         $mismatchedOptions = $this->dispatch('GET', '/clinic/v1/appointments/' . $apptId . '/reschedule-options');
         self::assertSame(403, $mismatchedOptions->get_status());
         $mismatchedReschedule = $this->dispatch(

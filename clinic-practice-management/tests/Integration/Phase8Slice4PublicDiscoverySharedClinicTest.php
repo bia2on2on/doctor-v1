@@ -829,6 +829,7 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
             'mobile' => '09121234999',
             'seed_session_scope' => true,
             'full_identity' => false,
+            'set_current_user' => false,
         ]);
 
         // Shared clinician: home Clinic A, ACTIVE membership in Clinic B (separate staff account).

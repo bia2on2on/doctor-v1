@@ -824,6 +824,7 @@ final class Phase9Slice3PatientPortalShellRedTest extends WP_UnitTestCase
 		self::assertSame( (int) $fx['user_id'], (int) $link['wp_user_id'] );
 		self::assertSame( (int) $fx['clinic_id'], (int) $link['clinic_id'] );
 
+		PatientTwoProofTestHelper::acting_as( (int) $fx['user_id'] );
 		$rows = App::bookingService()->listMine(
 			(int) $fx['user_id'],
 			gmdate( 'Y-m-d', strtotime( '-365 days' ) ),

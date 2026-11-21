@@ -827,8 +827,7 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
 
         $zero = $this->buildZeroLinkFixture('g2c');
         $resp0 = $this->dispatchRest('GET', self::MY_RECORDS_PATH, [], (int) $zero['user_id']);
-        self::assertSame(200, $resp0->get_status());
-        self::assertSame([], (array) $resp0->get_data()['data']);
+        $this->assertClinicError($resp0, PatientAccess::PROOF_FAILED_CODE, 403, 'Zero-link patient without proof fails closed on /patient/my-records.');
     }
 
     /**

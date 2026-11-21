@@ -226,6 +226,7 @@ final class Phase7SliceStaffRescheduleRedTest extends WP_UnitTestCase
         $near = $this->seedLocalSlotHoursFromNow($this->clinicA, $this->locationA, $this->clinicianA, 6, true);
         $dest = $this->seedOpenSlot($this->clinicA, $this->locationA, $this->clinicianA, 5, '15:00:00');
 
+        PatientTwoProofTestHelper::acting_as($this->patientUserA);
         $patientError = $this->captureBookingError(function () use ($near, $dest): void {
             $this->booking()->reschedule(
                 $this->patientUserA,
@@ -237,6 +238,7 @@ final class Phase7SliceStaffRescheduleRedTest extends WP_UnitTestCase
                 $dest['id']
             );
         }, 'patient deadline');
+        PatientTwoProofTestHelper::acting_as(0);
         self::assertSame('CLINIC_POLICY_VIOLATION', $patientError->errorCode);
         self::assertSame(409, $patientError->httpStatus);
         self::assertSame('confirmed', (string) $this->appointmentRow($near['id'])['status']);
@@ -263,6 +265,7 @@ final class Phase7SliceStaffRescheduleRedTest extends WP_UnitTestCase
         $appt = $this->seedConfirmedAppointment($this->clinicA, $this->locationA, $this->patientA, $this->clinicianA, 4, '10:00:00', 'lead');
         $nearDest = $this->seedLocalOpenSlotHoursFromNow($this->clinicA, $this->locationA, $this->clinicianA, 1);
 
+        PatientTwoProofTestHelper::acting_as($this->patientUserA);
         $patientError = $this->captureBookingError(function () use ($appt, $nearDest): void {
             $this->booking()->reschedule(
                 $this->patientUserA,
@@ -274,6 +277,7 @@ final class Phase7SliceStaffRescheduleRedTest extends WP_UnitTestCase
                 $nearDest['id']
             );
         }, 'patient min-lead');
+        PatientTwoProofTestHelper::acting_as(0);
         self::assertSame('CLINIC_POLICY_VIOLATION', $patientError->errorCode);
         self::assertSame(409, $patientError->httpStatus);
 
@@ -455,6 +459,7 @@ final class Phase7SliceStaffRescheduleRedTest extends WP_UnitTestCase
     {
         $near = $this->seedLocalSlotHoursFromNow($this->clinicA, $this->locationA, $this->clinicianA, 5, true);
         $farDest = $this->seedOpenSlot($this->clinicA, $this->locationA, $this->clinicianA, 6, '10:00:00');
+        PatientTwoProofTestHelper::acting_as($this->patientUserA);
         $deadline = $this->captureBookingError(function () use ($near, $farDest): void {
             $this->booking()->reschedule(
                 $this->patientUserA,
@@ -481,6 +486,7 @@ final class Phase7SliceStaffRescheduleRedTest extends WP_UnitTestCase
                 $nearDest['id']
             );
         }, 'patient min-lead retained');
+        PatientTwoProofTestHelper::acting_as(0);
         self::assertSame('CLINIC_POLICY_VIOLATION', $lead->errorCode);
         self::assertSame('confirmed', (string) $this->appointmentRow($far['id'])['status']);
     }

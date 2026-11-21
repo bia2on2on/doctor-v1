@@ -489,9 +489,8 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
             'patient_id' => $patientArchived,
         ], asUserId: $userId, withNonce: true);
 
-        // Positive control — live main already fails closed for inactive with 400 CLINIC_VALIDATION_FAILED.
-        // Keep contract: inactive must never be selectable, but do not artificially expect 422.
-        $this->assertClinicError($hold, 'CLINIC_VALIDATION_FAILED', 400, 'Inactive/archived Patient must be rejected with generic validation.');
+        // Two-proof gate rejects inactive/archived patient bindings before booking holds.
+        $this->assertClinicError($hold, PatientAccess::PROOF_FAILED_CODE, 403, 'Inactive/archived Patient must fail closed at two-proof gate.');
         self::assertSame(0, $this->countRows('cpms_slot_holds'), 'No Hold for inactive selector.');
         self::assertSame(0, $this->heldCountOf($slot['slot_id']), 'No capacity drift.');
         self::assertSame(0, $this->countAppointmentsForPatient($patientArchived), 'Inactive Patient must receive no Appointment.');
@@ -906,7 +905,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         self::assertSame([$own], array_column((array) ($recordResponse->get_data()['data'] ?? []), 'patient_id'));
         foreach (['/patient/me', '/visits', '/prescriptions', '/patients/' . $dependent . '/files'] as $path) {
             $denied = $this->restGet(self::NS . $path, ['link_id' => $dependentLink], $caregiver, true);
-            $this->assertClinicError($denied, 'CLINIC_NOT_FOUND', 404, 'Dependent clinical selector must fail closed: ' . $path);
+            $this->assertClinicError($denied, PatientAccess::PROOF_FAILED_CODE, 403, 'Dependent clinical selector must fail closed: ' . $path);
         }
         $streamDenied = $this->restGet(self::NS . '/files/' . $dependentFile . '/stream', [], $caregiver, true);
         $this->assertClinicError($streamDenied, 'CLINIC_NOT_FOUND', 404, 'Direct file stream must enforce identity-backed clinical ownership before disk read.');
