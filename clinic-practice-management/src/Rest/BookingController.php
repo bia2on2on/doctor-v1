@@ -8,14 +8,18 @@ use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Application\Booking\BookingService;
 use ClinicCore\Application\Clinic\PublicClinicDirectory;
+use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Scope\ScopeRequiredException;
+use ClinicCore\Application\Scope\TrustedClinicEstablisher;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
+use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use WP_Error;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_REST_Server;
+use WP_User;
 
 /**
  * Endpointهای نوبت‌دهی (F3) — API Contract A1/A4 + B1–B6 + D9–D11b.
@@ -384,51 +388,75 @@ final class BookingController extends RestBase
         if ($key === null) {
             return $this->error('CLINIC_VALIDATION_FAILED', 400, 'هدر Idempotency-Key (UUID) برای reschedule الزامی است');
         }
-        $appointmentId = (int) $request->get_param('id');
-        $isStaff = $user->has_cap(RolesAndCapabilities::APPT_RESCHEDULE);
+        $appointment_id = (int) $request->get_param( 'id' );
+        $is_staff       = $this->is_authorized_staff_booking_actor( $user, $request, RolesAndCapabilities::APPT_RESCHEDULE );
+        $bound_scope    = false;
 
-        if ($isStaff) {
-            $denied = $this->requireClinicPermission(RolesAndCapabilities::APPT_RESCHEDULE);
-            if ($denied instanceof WP_Error) {
-                return $denied;
+        if ( $is_staff && null === ScopeContext::tryGet() ) {
+            $clinic_selector = $this->extract_booking_clinic_selector( $request );
+            if ( $clinic_selector['invalid'] ) {
+                return $this->error( 'CLINIC_VALIDATION_FAILED', 422, 'شناسهٔ کلینیک نامعتبر است' );
+            }
+            try {
+                $scope = ( new TrustedClinicEstablisher( App::db(), new MembershipRepository( App::db() ) ) )
+                    ->establish( (int) $user->ID, $clinic_selector['clinic_id'], null );
+                App::replaceExplicitScope( $scope );
+                $bound_scope = true;
+            } catch ( ScopeRequiredException $e ) {
+                return $this->error( $e->apiCode(), $e->httpStatus(), $e->getMessage(), $e->getData() );
             }
         }
 
-        return $this->wrap(function () use ($request, $user, $key, $appointmentId, $isStaff) {
-            // GAP-1/G-3: clinician_id اختیاری — Default = پزشک فعلی نوبت.
-            // (Data-Access/مالکیت در Service enforce می‌شود؛ این خط فقط مقدار فیلد را resolve می‌کند.)
-            $newClinicianId = $request->get_param('clinician_id');
-            if ($newClinicianId === null || $newClinicianId === '') {
-                $current = $this->clinicianIdOfAppointment($appointmentId);
-                if ($current === null) {
-                    throw new BookingException('CLINIC_NOT_FOUND', 'نوبت یافت نشد', 404);
+        try {
+            if ( $is_staff ) {
+                $denied = $this->requireClinicPermission( RolesAndCapabilities::APPT_RESCHEDULE );
+                if ( $denied instanceof WP_Error ) {
+                    return $denied;
                 }
-                $newClinicianId = $current;
             }
 
-            $newSlotId = $request->get_param('slot_id');
-            $slotId = $newSlotId !== null && $newSlotId !== '' ? (int) $newSlotId : null;
+            return $this->wrap(
+                function () use ( $request, $user, $key, $appointment_id, $is_staff ) {
+                    // GAP-1/G-3: clinician_id اختیاری — Default = پزشک فعلی نوبت.
+                    // (Data-Access/مالکیت در Service enforce می‌شود؛ این خط فقط مقدار فیلد را resolve می‌کند.)
+                    $new_clinician_id = $request->get_param( 'clinician_id' );
+                    if ( $new_clinician_id === null || $new_clinician_id === '' ) {
+                        $current = $this->clinicianIdOfAppointment( $appointment_id );
+                        if ( $current === null ) {
+                            throw new BookingException( 'CLINIC_NOT_FOUND', 'نوبت یافت نشد', 404 );
+                        }
+                        $new_clinician_id = $current;
+                    }
 
-            return $isStaff
-                ? $this->booking->rescheduleByStaff(
-                    (int) $user->ID,
-                    $appointmentId,
-                    (int) $newClinicianId,
-                    (string) $request->get_param('slot_date'),
-                    (string) $request->get_param('slot_time'),
-                    $key,
-                    $slotId
-                )
-                : $this->booking->reschedule(
-                    (int) $user->ID,
-                    $appointmentId,
-                    (int) $newClinicianId,
-                    (string) $request->get_param('slot_date'),
-                    (string) $request->get_param('slot_time'),
-                    $key,
-                    $slotId
-                );
-        });
+                    $new_slot_id = $request->get_param( 'slot_id' );
+                    $slot_id     = $new_slot_id !== null && $new_slot_id !== '' ? (int) $new_slot_id : null;
+
+                    return $is_staff
+                        ? $this->booking->rescheduleByStaff(
+                            (int) $user->ID,
+                            $appointment_id,
+                            (int) $new_clinician_id,
+                            (string) $request->get_param( 'slot_date' ),
+                            (string) $request->get_param( 'slot_time' ),
+                            $key,
+                            $slot_id
+                        )
+                        : $this->booking->reschedule(
+                            (int) $user->ID,
+                            $appointment_id,
+                            (int) $new_clinician_id,
+                            (string) $request->get_param( 'slot_date' ),
+                            (string) $request->get_param( 'slot_time' ),
+                            $key,
+                            $slot_id
+                        );
+                }
+            );
+        } finally {
+            if ( $bound_scope ) {
+                App::replaceExplicitScope( null );
+            }
+        }
     }
 
     private function staffList(WP_REST_Request $request): WP_REST_Response|WP_Error
@@ -486,23 +514,25 @@ final class BookingController extends RestBase
 
     private function cancel(WP_REST_Request $request): WP_REST_Response|WP_Error
     {
-        $user = wp_get_current_user();
-        $appointmentId = (int) $request->get_param('id');
-        $reason = $request->get_param('reason') !== null ? (string) $request->get_param('reason') : null;
-        $isStaff = $user->has_cap(RolesAndCapabilities::APPT_CANCEL);
+        $user           = wp_get_current_user();
+        $appointment_id = (int) $request->get_param( 'id' );
+        $reason         = $request->get_param( 'reason' ) !== null ? (string) $request->get_param( 'reason' ) : null;
+        $is_staff       = $this->is_authorized_staff_booking_actor( $user, $request, RolesAndCapabilities::APPT_CANCEL );
 
-        if ($isStaff) {
+        if ( $is_staff ) {
             // Phase 3 Slice 6B — D11 مسیر کارکنی: مجوز Clinic-scoped cpms_appt_cancel.
             // شاخه بیمار (B4) عمداً از مجوزسازی کارکنی عبور نمی‌کند (patient-self).
-            $denied = $this->requireClinicPermission(RolesAndCapabilities::APPT_CANCEL);
-            if ($denied instanceof WP_Error) {
+            $denied = $this->requireClinicPermission( RolesAndCapabilities::APPT_CANCEL );
+            if ( $denied instanceof WP_Error ) {
                 return $denied;
             }
         }
 
-        return $this->wrap(fn () => $isStaff
-            ? $this->booking->cancelByStaff((int) $user->ID, $appointmentId, $reason)
-            : $this->booking->cancelByPatient((int) $user->ID, $appointmentId, $reason));
+        return $this->wrap(
+            fn () => $is_staff
+                ? $this->booking->cancelByStaff( (int) $user->ID, $appointment_id, $reason )
+                : $this->booking->cancelByPatient( (int) $user->ID, $appointment_id, $reason )
+        );
     }
 
     // ---------- Permission / error helpers ----------
@@ -522,10 +552,7 @@ final class BookingController extends RestBase
             return $this->error( 'CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید' );
         }
 
-        if (
-            ! in_array( RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true )
-            && $user->has_cap( RolesAndCapabilities::APPT_RESCHEDULE )
-        ) {
+        if ( $this->is_authorized_staff_booking_actor( $user, $request, RolesAndCapabilities::APPT_RESCHEDULE ) ) {
             return true;
         }
 
@@ -552,10 +579,7 @@ final class BookingController extends RestBase
             return $this->error( 'CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید' );
         }
 
-        if (
-            ! in_array( RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true )
-            && $user->has_cap( RolesAndCapabilities::APPT_CANCEL )
-        ) {
+        if ( $this->is_authorized_staff_booking_actor( $user, $request, RolesAndCapabilities::APPT_CANCEL ) ) {
             return true;
         }
 
@@ -566,6 +590,79 @@ final class BookingController extends RestBase
                 'clinic_id' => null,
             ]
         );
+    }
+
+    /**
+     * Identifies non-patient callers authorized for the requested staff booking
+     * capability via scoped Clinic authority (membership preset, custom role,
+     * explicit grant) or legacy global WordPress capability.
+     */
+    private function is_authorized_staff_booking_actor( WP_User $user, WP_REST_Request $request, string $capability ): bool {
+        $user_id = (int) $user->ID;
+        if ( $user_id <= 0 || in_array( RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true ) ) {
+            return false;
+        }
+
+        $scope     = ScopeContext::tryGet();
+        $clinic_id = ( null !== $scope && (int) $scope->clinicId > 0 ) ? (int) $scope->clinicId : null; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- ClinicScope::$clinicId is the published API.
+        if ( null === $clinic_id ) {
+            $selector = $this->extract_booking_clinic_selector( $request );
+            if ( ! $selector['invalid'] && null !== $selector['clinic_id'] ) {
+                $clinic_id = $selector['clinic_id'];
+            } elseif ( ! $selector['invalid'] ) {
+                $active_clinics = ( new MembershipRepository( App::db() ) )->active_clinic_ids_for_user( $user_id );
+                if ( 1 === count( $active_clinics ) ) {
+                    $clinic_id = (int) $active_clinics[0];
+                }
+            }
+        }
+
+        if ( null !== $clinic_id && $clinic_id > 0 ) {
+            $decision = App::authorization_service()->scoped_decision( $user_id, $clinic_id, $capability );
+            if ( null !== $decision ) {
+                return $decision;
+            }
+        }
+
+        return $user->has_cap( $capability );
+    }
+
+    /**
+     * @return array{clinic_id: ?int, invalid: bool}
+     */
+    private function extract_booking_clinic_selector( WP_REST_Request $request ): array {
+        $header_raw = $request->get_header( 'X-CPMS-Clinic-Id' );
+        $param_raw  = $request->get_param( 'clinic_id' );
+        $header_id  = $this->parse_booking_clinic_id( $header_raw );
+        $param_id   = $this->parse_booking_clinic_id( $param_raw );
+        if ( false === $header_id || false === $param_id ) {
+            return [ 'clinic_id' => null, 'invalid' => true ];
+        }
+        if ( null !== $header_id && null !== $param_id && $header_id !== $param_id ) {
+            return [ 'clinic_id' => null, 'invalid' => true ];
+        }
+
+        return [
+            'clinic_id' => $header_id ?? $param_id,
+            'invalid'   => false,
+        ];
+    }
+
+    /**
+     * @param mixed $raw Raw selector value.
+     */
+    private function parse_booking_clinic_id( mixed $raw ): int|null|false {
+        if ( null === $raw || '' === $raw || false === $raw ) {
+            return null;
+        }
+        if ( is_int( $raw ) ) {
+            return $raw > 0 ? $raw : false;
+        }
+        if ( is_string( $raw ) && 1 === preg_match( '/^[1-9][0-9]{0,18}$/', trim( $raw ) ) ) {
+            return (int) trim( $raw );
+        }
+
+        return false;
     }
 
     /**

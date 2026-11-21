@@ -503,7 +503,11 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         $appt1    = $this->insertConfirmedAppointment( $this->clinicA, $this->locationA, $this->patientA, $this->clinicianA, $slotA, $date1, '09:00:00' );
         $appt2    = $this->insertConfirmedAppointment( $this->clinicA, $this->locationA, $this->patientA, $this->clinicianA, $slotA, $date1, '09:00:00' );
 
-        // 1 & 2. Shared appointment reschedule/cancel: WP role `cpms_secretary` + global-cap subscriber with active membership.
+        // 1 & 2. Shared appointment reschedule/cancel across WP role, global cap, Clinic membership (subscriber), custom role, and explicit grant.
+        $appt3    = $this->insertConfirmedAppointment( $this->clinicA, $this->locationA, $this->patientA, $this->clinicianA, $slotA, $date1, '09:00:00' );
+        $appt4    = $this->insertConfirmedAppointment( $this->clinicA, $this->locationA, $this->patientA, $this->clinicianA, $slotA, $date1, '09:00:00' );
+        $appt5    = $this->insertConfirmedAppointment( $this->clinicA, $this->locationA, $this->patientA, $this->clinicianA, $slotA, $date1, '09:00:00' );
+
         $secWp = $this->makeUser( 'sb_sec_wp_' . uniqid(), RolesAndCapabilities::ROLE_SECRETARY );
         cpms_test_seed_membership( $secWp, $this->clinicA, RolesAndCapabilities::ROLE_SECRETARY );
 
@@ -514,8 +518,22 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         $capObj->add_cap( RolesAndCapabilities::APPT_CANCEL );
         cpms_test_seed_membership( $capStaff, $this->clinicA, RolesAndCapabilities::ROLE_SECRETARY );
 
-        foreach ( [ $secWp, $capStaff ] as $idx => $staffActor ) {
-            $targetAppt = 0 === $idx ? $appt1 : $appt2;
+        $subMembershipSec = $this->makeUser( 'sb_sub_msec_' . uniqid(), 'subscriber' );
+        cpms_test_seed_membership( $subMembershipSec, $this->clinicA, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $subCustomBooking = $this->makeUser( 'sb_sub_cbook_' . uniqid(), 'subscriber' );
+        $this->insertActiveCustomRoleDef( $this->clinicA, 'cx_sb_booking_ops', [ RolesAndCapabilities::APPT_RESCHEDULE, RolesAndCapabilities::APPT_CANCEL ] );
+        App::membership_service()->create_membership( $this->clinicA, $subCustomBooking, 'cx_sb_booking_ops' );
+
+        $subGrantBooking = $this->makeUser( 'sb_sub_gbook_' . uniqid(), 'subscriber' );
+        $this->insertActiveCustomRoleDef( $this->clinicA, 'cx_sb_booking_empty', [] );
+        $gBookMid = App::membership_service()->create_membership( $this->clinicA, $subGrantBooking, 'cx_sb_booking_empty' );
+        App::membership_service()->set_capability( $gBookMid, RolesAndCapabilities::APPT_RESCHEDULE, 'grant' );
+        App::membership_service()->set_capability( $gBookMid, RolesAndCapabilities::APPT_CANCEL, 'grant' );
+
+        foreach ( [ $secWp, $capStaff, $subMembershipSec, $subCustomBooking, $subGrantBooking ] as $idx => $staffActor ) {
+            $targetAppt = [ $appt1, $appt2, $appt3, $appt4, $appt5 ][ $idx ];
+            App::resetScope();
             $resched    = $this->dispatch(
                 'POST',
                 self::NS . '/appointments/' . $targetAppt . '/reschedule',
@@ -531,10 +549,11 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
                     'X-CPMS-Clinic-Id' => (string) $this->clinicA,
                 ]
             );
-            self::assertSame( 200, $resched->get_status(), 'Shared reschedule staff actor must stay 200.' );
+            self::assertSame( 200, $resched->get_status(), 'Shared reschedule staff actor #' . $idx . ' must stay 200.' );
             $newTargetAppt = (int) ( $resched->get_data()['data']['appointment_id'] ?? 0 );
             self::assertGreaterThan( 0, $newTargetAppt );
 
+            App::resetScope();
             $cancel = $this->dispatch(
                 'POST',
                 self::NS . '/appointments/' . $newTargetAppt . '/cancel',
@@ -542,7 +561,44 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
                 $staffActor,
                 [ 'X-CPMS-Clinic-Id' => (string) $this->clinicA ]
             );
-            self::assertSame( 200, $cancel->get_status(), 'Shared cancel staff actor must stay 200.' );
+            self::assertSame( 200, $cancel->get_status(), 'Shared cancel staff actor #' . $idx . ' must stay 200.' );
+        }
+
+        // Negative controls on shared reschedule/cancel: plain subscriber & doctor-membership subscriber without APPT_CANCEL/RESCHEDULE -> 403.
+        $plainSub = $this->makeUser( 'sb_plain_sub_' . uniqid(), 'subscriber' );
+        $liveNeg  = $this->insertConfirmedAppointment( $this->clinicA, $this->locationA, $this->patientA, $this->clinicianA, $slotA, $date1, '09:00:00' );
+        $subDocNoBooking = $this->makeUser( 'sb_sub_docnb_' . uniqid(), 'subscriber' );
+        cpms_test_seed_membership( $subDocNoBooking, $this->clinicA, RolesAndCapabilities::ROLE_DOCTOR );
+        foreach ( [ $plainSub, $subDocNoBooking ] as $unauthStaff ) {
+            App::resetScope();
+            $negResched = $this->dispatch(
+                'POST',
+                self::NS . '/appointments/' . $liveNeg . '/reschedule',
+                [
+                    'clinician_id' => $this->clinicianA,
+                    'slot_date'    => $date2,
+                    'slot_time'    => '14:00:00',
+                    'slot_id'      => $slotB,
+                ],
+                $unauthStaff,
+                [
+                    'Idempotency-Key'  => wp_generate_uuid4(),
+                    'X-CPMS-Clinic-Id' => (string) $this->clinicA,
+                ]
+            );
+            self::assertSame( 403, $negResched->get_status() );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $negResched->get_data()['code'] ?? null );
+
+            App::resetScope();
+            $negCancel = $this->dispatch(
+                'POST',
+                self::NS . '/appointments/' . $liveNeg . '/cancel',
+                [ 'reason' => 'no-cap' ],
+                $unauthStaff,
+                [ 'X-CPMS-Clinic-Id' => (string) $this->clinicA ]
+            );
+            self::assertSame( 403, $negCancel->get_status() );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $negCancel->get_data()['code'] ?? null );
         }
 
         // 3. Shared GET /files/{id}/stream: WP role, global cap, clinic membership (subscriber), custom role, explicit grant, org membership.
@@ -597,8 +653,21 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         );
         self::assertSame( 404, $this->dispatch( 'GET', self::NS . '/files/' . $fileId . '/stream', [], $orgMember )->get_status() );
 
-        // 4, 5, 6. Shared notification routes for WP staff (`cpms_secretary` and `cpms_doctor`).
-        foreach ( [ $secWp, $this->clinicianDocUser ] as $staffUser ) {
+        // 4, 5, 6. Shared notification routes across WP roles, Clinic membership (subscriber), custom role, explicit grant, and org membership.
+        $wpManager = $this->makeUser( 'sb_wp_mgr_' . uniqid(), RolesAndCapabilities::ROLE_MANAGER );
+        cpms_test_seed_membership( $wpManager, $this->clinicA, RolesAndCapabilities::ROLE_MANAGER );
+
+        $subNotifCustom = $this->makeUser( 'sb_sub_cnotif_' . uniqid(), 'subscriber' );
+        $this->insertActiveCustomRoleDef( $this->clinicA, 'cx_sb_notif', [ RolesAndCapabilities::QUEUE_READ ] );
+        App::membership_service()->create_membership( $this->clinicA, $subNotifCustom, 'cx_sb_notif' );
+
+        $subNotifGrant = $this->makeUser( 'sb_sub_gnotif_' . uniqid(), 'subscriber' );
+        $this->insertActiveCustomRoleDef( $this->clinicA, 'cx_sb_notif_empty', [] );
+        $gNotifMid = App::membership_service()->create_membership( $this->clinicA, $subNotifGrant, 'cx_sb_notif_empty' );
+        App::membership_service()->set_capability( $gNotifMid, RolesAndCapabilities::QUEUE_READ, 'grant' );
+
+        foreach ( [ $secWp, $this->clinicianDocUser, $wpManager, $subMembershipSec, $subNotifCustom, $subNotifGrant ] as $staffUser ) {
+            App::resetScope();
             $staffNotifId = (int) App::notificationService()->publishToUser(
                 $this->clinicA,
                 $staffUser,
@@ -621,6 +690,18 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
             $read = $this->dispatch( 'POST', self::NS . '/notifications/read', [ 'ids' => [ $staffNotifId ] ], $staffUser, [ 'X-CPMS-Clinic-Id' => (string) $this->clinicA ] );
             self::assertSame( 200, $read->get_status() );
         }
+
+        // Organization membership without Clinic membership: staff branch runs (400 CLINIC_SCOPE_REQUIRED on multi-clinic, never 403 patient lockout).
+        App::resetScope();
+        $orgNotif = $this->dispatch( 'GET', self::NS . '/notifications', [], $orgMember );
+        self::assertSame( 400, $orgNotif->get_status() );
+        self::assertSame( 'CLINIC_SCOPE_REQUIRED', $orgNotif->get_data()['code'] ?? null );
+
+        // Plain subscriber without any staff authority or patient proof is denied 403 PROOF_FAILED_CODE.
+        App::resetScope();
+        $plainNotif = $this->dispatch( 'GET', self::NS . '/notifications', [], $plainSub );
+        self::assertSame( 403, $plainNotif->get_status() );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $plainNotif->get_data()['code'] ?? null );
     }
 
     public function testSliceBDbErrorFailClosedWithWitnessAndStrictRestoration(): void {

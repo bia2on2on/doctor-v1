@@ -584,33 +584,52 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
             $token
         );
 
-        $gate         = App::patient_access();
-        $targetRegex  = '/\A\s*SELECT\b[\s\S]*\bFROM\s+[`"]?\w*cpms_patient_logins\b/i';
-        $witnessCount = 0;
-        $witness      = static function ( $query ) use ( $targetRegex, &$witnessCount ) {
-            if ( 1 === preg_match( $targetRegex, (string) $query ) ) {
-                ++$witnessCount;
+        $gate           = App::patient_access();
+        $loginTable     = preg_quote( App::db()->table( 'cpms_patient_logins' ), '/' );
+        $exactLookupSql = '/^\s*SELECT\s+id,\s+kind,\s+wp_user_id,\s+mobile,\s+state,\s+clinic_id,\s+patient_id,\s+verified_at,\s+verification_method,\s+live_key,\s+account_key,\s+given_name,\s+family_name,\s+created_at,\s+updated_at\s+FROM\s+' . $loginTable . '\s+WHERE\s+kind\s*=\s*\'account\'\s+AND\s+wp_user_id\s*=\s*' . $this->patientUserA . '\s+LIMIT\s+1\s*$/';
+        $witnessMatches = 0;
+        $witnessSeen    = [];
+        $witness        = static function ( $query ) use ( $exactLookupSql, &$witnessMatches, &$witnessSeen ) {
+            $sql = (string) $query;
+            if ( 1 === preg_match( $exactLookupSql, $sql ) ) {
+                ++$witnessMatches;
+                $witnessSeen[] = $sql;
             }
 
             return $query;
         };
 
-        // Positive witness pass: normal execution matches target SQL and grants LEVEL_FULL.
+        // 1. Clean witness pass: observe-only, exact SQL hits once and grants access.
         add_filter( 'query', $witness, 5 );
         try {
-            self::assertSame( PatientAccess::LEVEL_FULL, $gate->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 5, $token ) );
+            $witnessDecision = $gate->authorize_two_proof_request(
+                $this->patientUserA,
+                $this->clinicA,
+                $this->patientA,
+                null,
+                PatientAccess::MODE_CLINICAL,
+                false,
+                $now + 5,
+                $token
+            );
         } finally {
             remove_filter( 'query', $witness, 5 );
         }
-        self::assertGreaterThan( 0, $witnessCount, 'Witness must prove the target cpms_patient_logins SQL ran.' );
+        self::assertSame( 1, $witnessMatches );
+        self::assertCount( 1, $witnessSeen );
+        self::assertTrue( $witnessDecision['allowed'] );
+        self::assertSame( 200, $witnessDecision['http_status'] );
 
-        // Fault injection pass: corrupt ONLY the target cpms_patient_logins SELECT.
+        // 2. Single fault injection pass: corrupt ONLY that exact query, assert everything outside callbacks.
         global $wpdb;
         $strictBefore = App::db()->is_strict();
-        $faultCount   = 0;
-        $fault        = static function ( $query ) use ( $targetRegex, &$faultCount ) {
-            if ( 1 === preg_match( $targetRegex, (string) $query ) ) {
-                ++$faultCount;
+        $faultMatches = 0;
+        $faultSeen    = [];
+        $fault        = static function ( $query ) use ( $exactLookupSql, &$faultMatches, &$faultSeen ) {
+            $sql = (string) $query;
+            if ( 1 === preg_match( $exactLookupSql, $sql ) ) {
+                ++$faultMatches;
+                $faultSeen[] = $sql;
 
                 return 'SELECT cpms_fault_no_such_col FROM cpms_fault_nonexistent_table';
             }
@@ -621,8 +640,7 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
         $prevSuppress = (bool) $wpdb->suppress_errors( true );
         add_filter( 'query', $fault, 5 );
         try {
-            self::assertSame( PatientAccess::LEVEL_NONE, $gate->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 5, $token ) );
-            $decision = $gate->authorize_two_proof_request(
+            $deniedDecision = $gate->authorize_two_proof_request(
                 $this->patientUserA,
                 $this->clinicA,
                 $this->patientA,
@@ -632,15 +650,16 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
                 $now + 5,
                 $token
             );
-            self::assertFalse( $decision['allowed'] );
-            self::assertSame( 403, $decision['http_status'] );
-            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $decision['code'] );
         } finally {
             remove_filter( 'query', $fault, 5 );
             $wpdb->suppress_errors( $prevSuppress );
         }
 
-        self::assertGreaterThan( 0, $faultCount );
+        self::assertSame( 1, $faultMatches );
+        self::assertSame( $witnessSeen, $faultSeen );
+        self::assertFalse( $deniedDecision['allowed'] );
+        self::assertSame( 403, $deniedDecision['http_status'] );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedDecision['code'] );
         self::assertSame( $strictBefore, App::db()->is_strict() );
     }
 
@@ -685,6 +704,61 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
             self::assertSame( 403, $missingResp->get_status() );
             self::assertSame( PatientAccess::PROOF_FAILED_CODE, $missingResp->get_data()['code'] ?? null );
 
+            // Uniform failure parity on POST /patient/link-record: wrong OTP, expired OTP, wrong NID, missing NID, record without NID.
+            $failUser = $this->makeUser( 'tp_link_fail_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+            ( new PatientLoginRepository( App::db() ) )->insert_pending_account( $failUser, '09128880098', 'Fail', 'Pat' );
+            $this->seedOtp( $this->clinicA, self::MOBILE_A, '121212', OtpService::PURPOSE_VERIFY_MOBILE, -60 );
+            $this->seedOtp( $this->clinicA, self::MOBILE_A, '343434', OtpService::PURPOSE_VERIFY_MOBILE, 180 );
+            $this->seedOtp( $this->clinicB, self::MOBILE_B, '353535', OtpService::PURPOSE_VERIFY_MOBILE, 180 );
+            $failurePayloads = [
+                [
+                    'user' => $this->patientUserA,
+                    'body' => [ 'clinic_id' => $this->clinicA, 'mobile' => self::MOBILE_A, 'national_id' => self::NID_A, 'code' => '000000' ],
+                ],
+                [
+                    'user' => $this->patientUserA,
+                    'body' => [ 'clinic_id' => $this->clinicA, 'mobile' => self::MOBILE_A, 'national_id' => self::NID_A, 'code' => '121212' ],
+                ],
+                [
+                    'user' => $failUser,
+                    'body' => [ 'clinic_id' => $this->clinicA, 'mobile' => self::MOBILE_A, 'national_id' => '0499370899', 'code' => '343434' ],
+                ],
+                [
+                    'user' => $failUser,
+                    'body' => [ 'clinic_id' => $this->clinicA, 'mobile' => self::MOBILE_A, 'national_id' => '', 'code' => '343434' ],
+                ],
+                [
+                    'user' => $this->patientUserB,
+                    'body' => [ 'clinic_id' => $this->clinicB, 'mobile' => self::MOBILE_B, 'national_id' => self::NID_A, 'code' => '353535' ],
+                ],
+            ];
+            $smsCountBefore = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_sms_messages' ) );
+            foreach ( $failurePayloads as $case ) {
+                $uid = (int) $case['user'];
+                if ( $uid === $this->patientUserA ) {
+                    $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie( $this->patientUserA, time() + 28800, 'logged_in', $token );
+                } else {
+                    $tokOther = $proofStore->issue_non_persistent_auth_cookie( $uid );
+                    $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie( $uid, time() + 28800, 'logged_in', $tokOther );
+                }
+                wp_set_current_user( $uid );
+                $failReq = new WP_REST_Request( 'POST', '/clinic/v1/patient/link-record' );
+                $failReq->set_header( 'Content-Type', 'application/json' );
+                $failReq->set_header( 'X-WP-Nonce', wp_create_nonce( 'wp_rest' ) );
+                $failReq->set_body( (string) wp_json_encode( $case['body'] ) );
+                $failResp = rest_do_request( $failReq );
+                self::assertSame( 403, $failResp->get_status() );
+                self::assertSame( PatientAccess::PROOF_FAILED_CODE, $failResp->get_data()['code'] ?? null );
+                self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $failResp->get_data()['message'] ?? null );
+                self::assertStringNotContainsString( self::NID_A, (string) wp_json_encode( $failResp->get_data() ) );
+                self::assertStringNotContainsString( self::NID_WRONG, (string) wp_json_encode( $failResp->get_data() ) );
+            }
+            $smsCountAfterFail = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_sms_messages' ) );
+            self::assertSame( $smsCountBefore, $smsCountAfterFail, 'Failed link-record attempts must dispatch zero verification SMS.' );
+
+            $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie( $this->patientUserA, time() + 28800, 'logged_in', $token );
+            $nonce                       = wp_create_nonce( 'wp_rest' );
+
             // Staff user cannot call /patient/link-record.
             wp_set_current_user( $this->staffDocUser );
             $staffReq = new WP_REST_Request( 'POST', '/clinic/v1/patient/link-record' );
@@ -723,6 +797,7 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
             );
             $okResp = rest_do_request( $okReq );
             self::assertSame( 200, $okResp->get_status(), (string) wp_json_encode( $okResp->get_data() ) );
+            self::assertStringNotContainsString( self::NID_A, (string) wp_json_encode( $okResp->get_data() ) );
             $payload = $okResp->get_data()['data'] ?? [];
             self::assertSame( $this->patientA, (int) ( $payload['patient_id'] ?? 0 ) );
             self::assertSame( $this->clinicA, (int) ( $payload['clinic_id'] ?? 0 ) );
@@ -734,22 +809,135 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
             $meResp = rest_do_request( $meReq );
             self::assertSame( 200, $meResp->get_status(), (string) wp_json_encode( $meResp->get_data() ) );
             self::assertSame( $this->patientA, (int) ( $meResp->get_data()['data']['id'] ?? 0 ) );
+            self::assertStringNotContainsString( self::NID_A, (string) wp_json_encode( $meResp->get_data() ) );
 
-            // Verification notice SMS (PATIENT_BINDING_VERIFIED) was queued/recorded.
+            // Verification notice SMS (PATIENT_BINDING_VERIFIED) was queued/recorded to the exact same mobile with zero NID.
             $smsRow = App::db()->fetchRow(
-                'SELECT event, context_type, context_id, clinic_id FROM ' . App::db()->table( 'cpms_sms_messages' )
+                'SELECT event, recipient, context_type, context_id, clinic_id, message, vars_json FROM ' . App::db()->table( 'cpms_sms_messages' )
                 . ' WHERE clinic_id = %d AND event = %s AND context_id = %d ORDER BY id DESC LIMIT 1',
                 [ $this->clinicA, SmsEvents::PATIENT_BINDING_VERIFIED, $this->patientA ]
             );
             self::assertIsArray( $smsRow );
             self::assertSame( SmsEvents::PATIENT_BINDING_VERIFIED, (string) $smsRow['event'] );
+            self::assertSame( self::MOBILE_A, (string) $smsRow['recipient'] );
             self::assertSame( 'patient_binding', (string) $smsRow['context_type'] );
+            self::assertStringNotContainsString( self::NID_A, (string) ( $smsRow['message'] ?? '' ) );
+            self::assertStringNotContainsString( self::NID_A, (string) ( $smsRow['vars_json'] ?? '' ) );
+
+            $opLogs = App::db()->fetchAll( 'SELECT message, context_json FROM ' . App::db()->table( 'cpms_operational_logs' ) );
+            self::assertStringNotContainsString( self::NID_A, (string) wp_json_encode( $opLogs ) );
         } finally {
             if ( null === $previousCookie ) {
                 unset( $_COOKIE[ LOGGED_IN_COOKIE ] );
             } else {
                 $_COOKIE[ LOGGED_IN_COOKIE ] = $previousCookie;
             }
+        }
+    }
+
+    public function testExpiredOtpCrossMobileOtpAndSharedMobileIsolation(): void {
+        $proofStore = new PatientSessionProofStore();
+        $tokenA     = $proofStore->issue_non_persistent_auth_cookie( $this->patientUserA );
+        $tokenB     = $proofStore->issue_non_persistent_auth_cookie( $this->patientUserB );
+        $now        = time();
+
+        // 1) Expired OTP fails closed with uniform 403 and leaves no binding.
+        $this->seedOtp( $this->clinicA, self::MOBILE_A, '135790', OtpService::PURPOSE_VERIFY_MOBILE, -30 );
+        try {
+            App::patient_binding_promoter()->promote(
+                $this->patientUserA,
+                $this->clinicA,
+                self::MOBILE_A,
+                self::NID_A,
+                '135790',
+                '198.51.100.50',
+                $now,
+                $tokenA
+            );
+            self::fail( 'Expired OTP must fail closed.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 403, $e->httpStatus );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $e->errorCode );
+        }
+
+        // 2) OTP issued for another mobile (MOBILE_B) fails closed when promoting MOBILE_A.
+        $this->seedOtp( $this->clinicA, self::MOBILE_B, '246810', OtpService::PURPOSE_VERIFY_MOBILE, 180 );
+        try {
+            App::patient_binding_promoter()->promote(
+                $this->patientUserA,
+                $this->clinicA,
+                self::MOBILE_A,
+                self::NID_A,
+                '246810',
+                '198.51.100.51',
+                $now,
+                $tokenA
+            );
+            self::fail( 'OTP issued for another mobile must fail closed.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 403, $e->httpStatus );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $e->errorCode );
+        }
+
+        // 3) Shared mobile across two patients in clinicA and clinicB: NID + clinic scope selects only the matching patient.
+        $sharedMobile   = '09127770099';
+        $sharedNid1     = '0499370899';
+        $sharedNid2     = '0079948278';
+        $sharedPatient1 = $this->insertPatient( $this->clinicA, 'MR-SH-1-' . uniqid(), $sharedMobile, $sharedNid1 );
+        $sharedPatient2 = $this->insertPatient( $this->clinicB, 'MR-SH-2-' . uniqid(), $sharedMobile, $sharedNid2 );
+
+        // Wrong NID (or other clinic's NID) on shared mobile in clinicA binds neither record.
+        $this->seedOtp( $this->clinicA, $sharedMobile, '717171', OtpService::PURPOSE_VERIFY_MOBILE, 180 );
+        try {
+            App::patient_binding_promoter()->promote(
+                $this->patientUserA,
+                $this->clinicA,
+                $sharedMobile,
+                $sharedNid2,
+                '717171',
+                '198.51.100.52',
+                $now,
+                $tokenA
+            );
+            self::fail( 'Mismatched NID on shared mobile must bind neither patient.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 403, $e->httpStatus );
+        }
+
+        // Valid OTP + sharedNid1 in clinicA binds ONLY sharedPatient1, never sharedPatient2.
+        $this->seedOtp( $this->clinicA, $sharedMobile, '727272', OtpService::PURPOSE_VERIFY_MOBILE, 180 );
+        $res = App::patient_binding_promoter()->promote(
+            $this->patientUserA,
+            $this->clinicA,
+            $sharedMobile,
+            $sharedNid1,
+            '727272',
+            '198.51.100.52',
+            $now,
+            $tokenA
+        );
+        self::assertSame( $sharedPatient1, $res['patient_id'] );
+        self::assertSame( [ $sharedPatient1 ], App::patient_access()->proved_patient_ids( $this->patientUserA, $this->clinicA, $now + 5, $tokenA ) );
+        self::assertSame( [], App::patient_access()->proved_patient_ids( $this->patientUserA, $this->clinicB, $now + 5, $tokenA ) );
+        self::assertSame( PatientAccess::LEVEL_NONE, App::patient_access()->level( $this->patientUserA, $sharedPatient2, $this->clinicB, $now + 5, $tokenA ) );
+
+        // Competing account B cannot hijack sharedPatient1 in clinicA with the shared mobile + sharedNid1.
+        $this->seedOtp( $this->clinicA, $sharedMobile, '737373', OtpService::PURPOSE_VERIFY_MOBILE, 180 );
+        try {
+            App::patient_binding_promoter()->promote(
+                $this->patientUserB,
+                $this->clinicA,
+                $sharedMobile,
+                $sharedNid1,
+                '737373',
+                '198.51.100.53',
+                $now,
+                $tokenB
+            );
+            self::fail( 'Competing account must not bind already-bound shared-mobile record.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 403, $e->httpStatus );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $e->errorCode );
         }
     }
 
@@ -772,6 +960,10 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
         self::assertTrue( PortalLogin::is_authorized( $this->staffDocUser, 'doctor' ) );
         self::assertTrue( PortalLogin::is_authorized( $this->staffDocUser, 'staff' ) );
 
+        // Pure patient must be rejected on both portals.
+        self::assertFalse( PortalLogin::is_authorized( $this->patientUserA, 'doctor' ), 'Pure patient must be rejected on doctor portal login.' );
+        self::assertFalse( PortalLogin::is_authorized( $this->patientUserA, 'staff' ), 'Pure patient must be rejected on staff portal login.' );
+
         // Mixed-role user holding BOTH cpms_doctor AND cpms_patient must be rejected on PortalLogin.
         $mixedUser = $this->makeUser( 'tp_mixed_doc_' . uniqid(), RolesAndCapabilities::ROLE_DOCTOR );
         $userObj   = get_userdata( $mixedUser );
@@ -793,6 +985,46 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
         self::assertFalse( PortalLogin::is_authorized( $mixedUser, 'doctor' ), 'Mixed patient+doctor account must be rejected on doctor portal login.' );
         self::assertFalse( PortalLogin::is_authorized( $mixedUser, 'staff' ), 'Mixed patient+doctor account must be rejected on staff portal login.' );
         self::assertFalse( PatientPortalPage::isPatientOnly( $mixedUser ), 'Mixed patient+doctor account must also be rejected on patient-only portal.' );
+
+        // Positive controls across staff authority sources on PortalLogin:
+        // 1) WP secretary role + Clinic membership.
+        $wpSec = $this->makeUser( 'tp_wp_sec_' . uniqid(), RolesAndCapabilities::ROLE_SECRETARY );
+        cpms_test_seed_membership( $wpSec, $this->clinicA, RolesAndCapabilities::ROLE_SECRETARY );
+        self::assertTrue( PortalLogin::is_authorized( $wpSec, 'staff' ) );
+
+        // 2) Subscriber with built-in secretary Clinic membership.
+        $subSec = $this->makeUser( 'tp_sub_sec_' . uniqid(), 'subscriber' );
+        cpms_test_seed_membership( $subSec, $this->clinicA, RolesAndCapabilities::ROLE_SECRETARY );
+        self::assertTrue( PortalLogin::is_authorized( $subSec, 'staff' ) );
+
+        // 3) Subscriber with active Clinic custom role granting REPORT_READ.
+        $subCustom = $this->makeUser( 'tp_sub_custom_' . uniqid(), 'subscriber' );
+        $this->insertActiveCustomRoleDef( $this->clinicA, 'cx_tp_portal_rep', [ RolesAndCapabilities::REPORT_READ ] );
+        App::membership_service()->create_membership( $this->clinicA, $subCustom, 'cx_tp_portal_rep' );
+        self::assertTrue( PortalLogin::is_authorized( $subCustom, 'staff' ) );
+
+        // 4) Subscriber with explicit capability grant of REPORT_READ.
+        $subGrant = $this->makeUser( 'tp_sub_grant_' . uniqid(), 'subscriber' );
+        $this->insertActiveCustomRoleDef( $this->clinicA, 'cx_tp_portal_empty', [] );
+        $grantMid = App::membership_service()->create_membership( $this->clinicA, $subGrant, 'cx_tp_portal_empty' );
+        App::membership_service()->set_capability( $grantMid, RolesAndCapabilities::REPORT_READ, 'grant' );
+        self::assertTrue( PortalLogin::is_authorized( $subGrant, 'staff' ) );
+
+        // 5) Subscriber with active clinician + Clinic membership on 'doctor' portal.
+        $subDoc = $this->makeUser( 'tp_sub_doc_' . uniqid(), 'subscriber' );
+        cpms_test_seed_membership( $subDoc, $this->clinicA, RolesAndCapabilities::ROLE_DOCTOR );
+        $db->insert(
+            'cpms_clinicians',
+            [
+                'clinic_id'  => $this->clinicA,
+                'full_name'  => 'Dr Subscriber',
+                'wp_user_id' => $subDoc,
+                'is_active'  => 1,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]
+        );
+        self::assertTrue( PortalLogin::is_authorized( $subDoc, 'doctor' ) );
     }
 
     private function insertPatient( int $clinicId, string $mrn, string $mobile, ?string $nationalId ): int {
@@ -816,7 +1048,42 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
         return $db->wpdb_last_insert_id();
     }
 
-    private function seedOtp( int $clinicId, string $mobile, string $code, string $purpose ): void {
+    /**
+     * @param list<string> $capabilities
+     */
+    private function insertActiveCustomRoleDef( int $clinicId, string $roleKey, array $capabilities ): void {
+        global $wpdb;
+        $now    = App::db()->nowUtcSql();
+        $defs   = $wpdb->prefix . 'cpms_custom_role_defs';
+        $defCap = $wpdb->prefix . 'cpms_custom_role_capabilities';
+
+        $wpdb->query(
+            $wpdb->prepare(
+                "INSERT INTO {$defs} (clinic_id, role_key, status, version, created_at, updated_at) VALUES (%d, %s, %s, %d, %s, %s)", // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                $clinicId,
+                $roleKey,
+                'active',
+                1,
+                $now,
+                $now
+            )
+        );
+        $defId = (int) $wpdb->insert_id;
+        self::assertGreaterThan( 0, $defId );
+
+        foreach ( $capabilities as $capability ) {
+            $wpdb->query(
+                $wpdb->prepare(
+                    "INSERT INTO {$defCap} (role_def_id, capability, created_at) VALUES (%d, %s, %s)", // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                    $defId,
+                    $capability,
+                    $now
+                )
+            );
+        }
+    }
+
+    private function seedOtp( int $clinicId, string $mobile, string $code, string $purpose, int $expiresOffset = 180 ): void {
         $pepper = defined( 'CPMS_PEPPER' ) && '' !== (string) CPMS_PEPPER
             ? (string) CPMS_PEPPER
             : (string) get_option( 'cpms_otp_pepper', '' );
@@ -832,7 +1099,7 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
                 'mobile'     => $mobile,
                 'purpose'    => $purpose,
                 'code_hash'  => OtpPolicy::hashCode( $code, $pepper ),
-                'expires_at' => gmdate( 'Y-m-d H:i:s', time() + 180 ) . '.000',
+                'expires_at' => gmdate( 'Y-m-d H:i:s', time() + $expiresOffset ) . '.000',
                 'attempts'   => 0,
                 'created_at' => App::db()->nowUtcSql(),
             ]
