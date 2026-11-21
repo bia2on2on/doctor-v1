@@ -190,7 +190,7 @@ final class PatientNameValidationTest extends WP_UnitTestCase
             $userId,
             $clinicId,
             $patientId,
-            ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => false]
+            ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => true]
         );
 
         return [
@@ -211,6 +211,7 @@ final class PatientNameValidationTest extends WP_UnitTestCase
      */
     private function seedLinkedAddress( array $fixture, string $address = 'اصلی' ): void
     {
+        PatientTwoProofTestHelper::acting_as( (int) $fixture['user_id'] );
         $this->service()->updateMe( (int) $fixture['user_id'], [ 'address' => $address ], (int) $fixture['link_id'] );
     }
 
@@ -729,6 +730,13 @@ final class PatientNameValidationTest extends WP_UnitTestCase
         ];
         $this->assertGreaterThan( 0, $second['patient_id'], 'the authorized second enrollment must mint the second record' );
         $this->assertNotSame( (int) $first['patient_id'], $second['patient_id'], 'the second record must be a different patient row' );
+
+        PatientTwoProofTestHelper::seed_patient_proof(
+            (int) $first['user_id'],
+            $secondClinicId,
+            (int) $second['patient_id'],
+            [ 'mobile' => '09120001010', 'seed_session_scope' => true ]
+        );
 
         try {
             $this->service()->updateMe($first['user_id'], [ 'birth_date' => '1990-01-01' ], null);

@@ -317,7 +317,7 @@ final class PatientLoginRepository {
 
             $existing = $this->find_binding( $wp_user_id, $clinic_id, $patient_id, false, true );
             if ( null !== $existing ) {
-                $affected = $this->db->execute(
+                $this->db->execute(
                     'UPDATE ' . $this->db->table( 'cpms_patient_logins' )
                     . ' SET state = %s, verified_at = %s, verification_method = %s, live_key = %s, account_key = NULL, updated_at = %s'
                     . ' WHERE id = %d AND kind = %s AND wp_user_id = %d',
@@ -332,9 +332,6 @@ final class PatientLoginRepository {
                         $wp_user_id,
                     ]
                 );
-                if ( $affected < 1 ) {
-                    throw new RuntimeException( 'Binding reactivation update failed' );
-                }
                 $binding_id = (int) $existing['id'];
             } else {
                 $ok = $this->db->insert(

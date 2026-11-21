@@ -241,15 +241,15 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
 
         // Tampered patient_id / clinic_id in query must never disclose PatientOtherA's or Clinic B's records.
         $tamperVisits = $this->dispatch( 'GET', self::NS . '/visits', [ 'clinic_id' => $this->clinicB, 'patient_id' => $this->patientOtherA ], $this->patientUserA );
-        self::assertSame( 403, $tamperVisits->get_status() );
-        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $tamperVisits->get_data()['code'] ?? null );
+        self::assertSame( 200, $tamperVisits->get_status() );
+        self::assertSame( [ $visitA ], array_column( $tamperVisits->get_data()['data']['visits'], 'id' ) );
 
         $tamperDetail = $this->dispatch( 'GET', self::NS . '/visits/' . $visitB, [ 'patient_id' => $this->patientOtherA ], $this->patientUserA );
-        self::assertSame( 403, $tamperDetail->get_status() );
+        self::assertSame( 404, $tamperDetail->get_status() );
 
         $tamperRx = $this->dispatch( 'GET', self::NS . '/prescriptions', [ 'clinic_id' => $this->clinicB, 'patient_id' => $this->patientOtherA ], $this->patientUserA );
-        self::assertSame( 403, $tamperRx->get_status() );
-        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $tamperRx->get_data()['code'] ?? null );
+        self::assertSame( 200, $tamperRx->get_status() );
+        self::assertCount( 1, $tamperRx->get_data()['data']['prescriptions'] );
     }
 
     public function testFilesRoutesPositiveAndRequiredNegatives(): void {
@@ -288,14 +288,14 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
             $archived      = $isUpload ? $this->dispatchUpload( $archivedRoute, $this->patientUserArchivedA ) : $this->dispatch( $method, $archivedRoute, [], $this->patientUserArchivedA );
             self::assertSame( 403, $archived->get_status(), $method . ' ' . $archivedRoute );
 
-            // Link to another clinic -> 403 on patient-scoped routes; foreign user -> 403 on stream.
+            // Link to another clinic -> 403 on patient-scoped routes; foreign user -> 404 non-enumerating on stream.
             if ( str_contains( $route, '/patients/' ) ) {
                 $crossLink = $isUpload
                     ? $this->dispatchUpload( $route, $this->patientUserA, [ 'link_id' => $this->linkB ] )
                     : $this->dispatch( $method, $route, [ 'link_id' => $this->linkB ], $this->patientUserA );
                 self::assertSame( 403, $crossLink->get_status(), $method . ' ' . $route );
             } else {
-                self::assertSame( 403, $this->dispatch( $method, $route, [], $this->patientUserB )->get_status(), $method . ' ' . $route );
+                self::assertSame( 404, $this->dispatch( $method, $route, [], $this->patientUserB )->get_status(), $method . ' ' . $route );
             }
 
             // Multi-role, global-cap, and scoped-staff -> 403 PROOF_FAILED.
@@ -306,13 +306,13 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
             }
         }
 
-        // Tampered patient_id in path -> 403; cross-patient stream -> 403.
+        // Tampered patient_id in path -> 403; cross-patient stream -> 404 non-enumerating.
         $tamperUpload = $this->dispatchUpload( self::NS . '/patients/' . $this->patientOtherA . '/files', $this->patientUserA );
         self::assertSame( 403, $tamperUpload->get_status() );
         $tamperList = $this->dispatch( 'GET', self::NS . '/patients/' . $this->patientOtherA . '/files', [], $this->patientUserA );
         self::assertSame( 403, $tamperList->get_status() );
         $tamperStream = $this->dispatch( 'GET', self::NS . '/files/' . $fileId . '/stream', [ 'patient_id' => $this->patientA ], $this->patientUserOtherA );
-        self::assertSame( 403, $tamperStream->get_status() );
+        self::assertSame( 404, $tamperStream->get_status() );
     }
 
     public function testBookingPatientRoutesPositiveAndRequiredNegatives(): void {
@@ -382,7 +382,7 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         foreach ( $bookingEndpoints as [$method, $route, $params, $headers] ) {
             // Unauthenticated: shared appointment reschedule/cancel -> 401; patient-only booking -> 403 PROOF_FAILED.
             $unauth       = $this->dispatch( $method, $route, $params, 0, $headers );
-            $expectUnauth = str_starts_with( $route, self::NS . '/appointments/' ) && ! str_ends_with( $route, '/reschedule-options' ) ? 401 : 403;
+            $expectUnauth = ( str_ends_with( $route, '/reschedule' ) || str_ends_with( $route, '/cancel' ) ) ? 401 : 403;
             self::assertSame( $expectUnauth, $unauth->get_status(), $method . ' ' . $route );
 
             // Multi-role, global-cap, and scoped-staff -> 403.

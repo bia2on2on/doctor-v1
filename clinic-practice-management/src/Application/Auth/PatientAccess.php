@@ -230,6 +230,21 @@ final class PatientAccess {
             return self::LEVEL_NONE;
         }
 
+        return $this->level_for_verified_patient( $wp_user_id, $patient_id, $clinic_id, $now, $token );
+    }
+
+    /**
+     * Computes the two-factor patient access level after the caller has already
+     * verified pure-patient actor separation so `has_scoped_staff_authority()`
+     * runs at most once per authorization call.
+     */
+    private function level_for_verified_patient(
+        int $wp_user_id,
+        ?int $patient_id = null,
+        ?int $clinic_id = null,
+        ?int $now = null,
+        ?string $token = null
+    ): string {
         $use_unit_seam = null === $this->logins && null === $this->db && null !== $this->two_proof_bindings_reader;
         if ( ! $use_unit_seam && ( null === $this->logins || null === $this->db || null === $this->patients ) ) {
             return self::LEVEL_NONE;
@@ -485,7 +500,7 @@ final class PatientAccess {
                     $this->proof_failed_decision( 'enroll_ineligible', $primary_role )
                 );
             }
-            $has_full_session = self::LEVEL_FULL === $this->level( $wp_user_id, null, null, $now, $token );
+            $has_full_session = self::LEVEL_FULL === $this->level_for_verified_patient( $wp_user_id, null, null, $now, $token );
             $ok               = $has_full_session && $this->has_enrollment_eligibility( $wp_user_id, $clinic_id );
             $decision         = $ok
                 ? $this->allow_decision( $primary_role )
@@ -505,7 +520,7 @@ final class PatientAccess {
             );
         }
 
-        $level = $this->level( $wp_user_id, $patient_id, $clinic_id, $now, $token );
+        $level = $this->level_for_verified_patient( $wp_user_id, $patient_id, $clinic_id, $now, $token );
         $ok    = match ( $mode ) {
             self::MODE_CLINICAL, self::MODE_PATIENT_RESOURCE => self::LEVEL_FULL === $level,
             self::MODE_BOOKING_APPOINTMENT, self::MODE_RECORDS_LIST => in_array( $level, [ self::LEVEL_BOOKING, self::LEVEL_FULL ], true ),

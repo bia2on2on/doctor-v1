@@ -164,8 +164,8 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
             'from' => $tomorrow,
             'to'   => $dayAfter,
         ]);
-        self::assertSame(200, $mismatchedMine->get_status());
-        self::assertSame([], $this->payload($mismatchedMine), 'A Clinic-mismatched link must not list the appointment.');
+        self::assertSame(403, $mismatchedMine->get_status(), 'A Clinic-mismatched link must fail closed at PatientAccess gate.');
+        self::assertSame('CLINIC_PATIENT_PROOF_FAILED', $this->errCode($mismatchedMine));
         $mismatchedOptions = $this->dispatch('GET', '/clinic/v1/appointments/' . $apptId . '/reschedule-options');
         self::assertSame(403, $mismatchedOptions->get_status());
         $mismatchedReschedule = $this->dispatch(
@@ -767,7 +767,7 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
             return $sql;
         };
 
-        wp_set_current_user($foreignUser);
+        PatientTwoProofTestHelper::acting_as($foreignUser);
         global $wpdb;
         $prevSuppress = $wpdb->suppress_errors(true);
         add_filter('query', $fault, 10, 1);
@@ -843,6 +843,7 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
         };
 
         // Case A: max_future_days = 1
+        PatientTwoProofTestHelper::acting_as($patientUser);
         $targetSettings->set('booking.max_future_days', 1);
         Settings::flushCache();
         $ids1 = $extractIds(App::bookingService()->reschedule_options($patientUser, $apptId, $nowDaytimeUtc));
