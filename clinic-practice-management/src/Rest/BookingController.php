@@ -389,7 +389,7 @@ final class BookingController extends RestBase
             return $this->error('CLINIC_VALIDATION_FAILED', 400, 'هدر Idempotency-Key (UUID) برای reschedule الزامی است');
         }
         $appointment_id = (int) $request->get_param( 'id' );
-        $is_staff       = $this->is_authorized_staff_booking_actor( $user, $request, RolesAndCapabilities::APPT_RESCHEDULE );
+        $is_staff       = $this->is_staff_booking_actor( $user, $request, RolesAndCapabilities::APPT_RESCHEDULE );
         $bound_scope    = false;
 
         if ( $is_staff && null === ScopeContext::tryGet() ) {
@@ -517,7 +517,7 @@ final class BookingController extends RestBase
         $user           = wp_get_current_user();
         $appointment_id = (int) $request->get_param( 'id' );
         $reason         = $request->get_param( 'reason' ) !== null ? (string) $request->get_param( 'reason' ) : null;
-        $is_staff       = $this->is_authorized_staff_booking_actor( $user, $request, RolesAndCapabilities::APPT_CANCEL );
+        $is_staff       = $this->is_staff_booking_actor( $user, $request, RolesAndCapabilities::APPT_CANCEL );
 
         if ( $is_staff ) {
             // Phase 3 Slice 6B — D11 مسیر کارکنی: مجوز Clinic-scoped cpms_appt_cancel.
@@ -541,8 +541,7 @@ final class BookingController extends RestBase
      * B5/staff reschedule: بیمار (نقش) یا Staff با `cpms_appt_reschedule`.
      * شاخه کارکنی مجوز Clinic-scoped را در handler اعمال می‌کند (همان الگوی D11).
      */
-    private function reschedulePermission(WP_REST_Request $request): bool|WP_Error
-    {
+    private function reschedulePermission( WP_REST_Request $request ): bool|WP_Error {
         $nonce_error = $this->requireNonce( $request );
         if ( $nonce_error instanceof WP_Error ) {
             return $nonce_error;
@@ -552,7 +551,7 @@ final class BookingController extends RestBase
             return $this->error( 'CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید' );
         }
 
-        if ( $this->is_authorized_staff_booking_actor( $user, $request, RolesAndCapabilities::APPT_RESCHEDULE ) ) {
+        if ( $this->is_staff_booking_actor( $user, $request, RolesAndCapabilities::APPT_RESCHEDULE ) ) {
             return true;
         }
 
@@ -568,8 +567,7 @@ final class BookingController extends RestBase
     /**
      * B4/D11: بیمار (نقش) یا Staff با `cpms_appt_cancel`.
      */
-    private function cancelPermission(WP_REST_Request $request): bool|WP_Error
-    {
+    private function cancelPermission( WP_REST_Request $request ): bool|WP_Error {
         $nonce_error = $this->requireNonce( $request );
         if ( $nonce_error instanceof WP_Error ) {
             return $nonce_error;
@@ -579,7 +577,7 @@ final class BookingController extends RestBase
             return $this->error( 'CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید' );
         }
 
-        if ( $this->is_authorized_staff_booking_actor( $user, $request, RolesAndCapabilities::APPT_CANCEL ) ) {
+        if ( $this->is_staff_booking_actor( $user, $request, RolesAndCapabilities::APPT_CANCEL ) ) {
             return true;
         }
 
@@ -593,14 +591,19 @@ final class BookingController extends RestBase
     }
 
     /**
-     * Identifies non-patient callers authorized for the requested staff booking
-     * capability via scoped Clinic authority (membership preset, custom role,
-     * explicit grant) or legacy global WordPress capability.
+     * Identifies non-patient callers eligible for the staff booking path via
+     * scoped Clinic authority (membership preset, custom role, explicit grant)
+     * or global WordPress capability (whose Clinic-level deny is enforced inside
+     * the handler via `requireClinicPermission()`, preserving `CLINIC_PERMISSION_DENIED`).
      */
-    private function is_authorized_staff_booking_actor( WP_User $user, WP_REST_Request $request, string $capability ): bool {
+    private function is_staff_booking_actor( WP_User $user, WP_REST_Request $request, string $capability ): bool {
         $user_id = (int) $user->ID;
         if ( $user_id <= 0 || in_array( RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true ) ) {
             return false;
+        }
+
+        if ( $user->has_cap( $capability ) ) {
+            return true;
         }
 
         $scope     = ScopeContext::tryGet();
@@ -624,7 +627,7 @@ final class BookingController extends RestBase
             }
         }
 
-        return $user->has_cap( $capability );
+        return false;
     }
 
     /**

@@ -756,6 +756,7 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
             $smsCountAfterFail = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_sms_messages' ) );
             self::assertSame( $smsCountBefore, $smsCountAfterFail, 'Failed link-record attempts must dispatch zero verification SMS.' );
 
+            wp_set_current_user( $this->patientUserA );
             $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie( $this->patientUserA, time() + 28800, 'logged_in', $token );
             $nonce                       = wp_create_nonce( 'wp_rest' );
 

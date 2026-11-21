@@ -564,12 +564,12 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
             self::assertSame( 200, $cancel->get_status(), 'Shared cancel staff actor #' . $idx . ' must stay 200.' );
         }
 
-        // Negative controls on shared reschedule/cancel: plain subscriber & doctor-membership subscriber without APPT_CANCEL/RESCHEDULE -> 403.
+        // Negative controls on shared reschedule/cancel: plain subscriber & accountant-membership subscriber without APPT_CANCEL/RESCHEDULE -> 403.
         $plainSub = $this->makeUser( 'sb_plain_sub_' . uniqid(), 'subscriber' );
         $liveNeg  = $this->insertConfirmedAppointment( $this->clinicA, $this->locationA, $this->patientA, $this->clinicianA, $slotA, $date1, '09:00:00' );
-        $subDocNoBooking = $this->makeUser( 'sb_sub_docnb_' . uniqid(), 'subscriber' );
-        cpms_test_seed_membership( $subDocNoBooking, $this->clinicA, RolesAndCapabilities::ROLE_DOCTOR );
-        foreach ( [ $plainSub, $subDocNoBooking ] as $unauthStaff ) {
+        $subAcctNoBooking = $this->makeUser( 'sb_sub_acctnb_' . uniqid(), 'subscriber' );
+        cpms_test_seed_membership( $subAcctNoBooking, $this->clinicA, RolesAndCapabilities::ROLE_ACCOUNTANT );
+        foreach ( [ $plainSub, $subAcctNoBooking ] as $unauthStaff ) {
             App::resetScope();
             $negResched = $this->dispatch(
                 'POST',
