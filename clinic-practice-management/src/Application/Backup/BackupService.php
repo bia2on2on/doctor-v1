@@ -345,7 +345,7 @@ final class BackupService
         $this->require_restore_host();
 
         $safety_destination = $this->safetyDestinationStore();
-        $safety             = $this->createBackupTo( $safety_destination, 'pre-restore-safety-' . $backupId );
+        $safety             = $this->createBackupTo( $safety_destination, 'pre-restore-safety-' . $pre['backup_id'] );
 
         $applied = 0;
         $dropped = 0;
