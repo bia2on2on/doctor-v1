@@ -15,7 +15,7 @@ final class RestoreIdentityCleanup {
     }
 
     public function revoke(): void {
-        $manager = apply_filters( 'session_token_manager', WP_User_Meta_Session_Tokens::class );
+        $manager = apply_filters( 'session_token_manager', WP_User_Meta_Session_Tokens::class ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Reuse the WordPress core session backend selector.
         if ( WP_User_Meta_Session_Tokens::class !== $manager ) {
             throw BackupException::of( 'RESTORE_SESSION_MANAGER_UNSUPPORTED', 'Cannot verify custom session storage.' );
         }
