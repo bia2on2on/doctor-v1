@@ -569,9 +569,9 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         $patientNotif = (int) $service->publishToPatient($this->clinicA, $patientId, 'appt_reminder', $this->apptVars(), null);
         $staffNotif   = (int) $service->publishToUser($this->clinicA, $uid, 'report_export_ready', $this->reportVars(), null);
 
-        // No ambient ScopeContext: patient path (the user has one linked Clinic).
+        // No ambient ScopeContext: patient path (bare subscriber lacks ROLE_PATIENT and two-proof binding so inbox stays fail-closed empty).
         $ids = $this->inboxIds($uid);
-        self::assertContains($patientNotif, $ids, 'no ambient scope: patient path lists the linked patient notification.');
+        self::assertNotContains($patientNotif, $ids, 'no ambient scope: unproved non-patient subscriber must not receive patient-portal notifications.');
         self::assertNotContains($staffNotif, $ids, 'no ambient scope: patient path does not list the user-addressed notification.');
 
         // With an ambient ScopeContext: staff path (current behaviour; the ambient scope decides).

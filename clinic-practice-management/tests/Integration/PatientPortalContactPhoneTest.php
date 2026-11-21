@@ -323,7 +323,7 @@ final class PatientPortalContactPhoneTest extends WP_UnitTestCase
         global $wpdb;
 
         $now    = App::db()->nowUtcSql();
-        $mobile = '09' . substr( bin2hex( random_bytes( 5 ) ), 0, 9 );
+        $mobile = '0912' . sprintf( '%07d', random_int( 1000000, 9999999 ) );
         $mrn    = 'MR-CPC' . strtoupper( (string) ( preg_replace( '/[^a-z0-9]/i', '', $tag ) ?? '' ) ) . bin2hex( random_bytes( 4 ) );
 
         $ok = $wpdb->insert(

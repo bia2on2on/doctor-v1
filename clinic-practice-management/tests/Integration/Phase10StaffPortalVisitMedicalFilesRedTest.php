@@ -118,6 +118,7 @@ use ClinicCore\Bootstrap\App;
 use ClinicCore\Frontend\DoctorPortalShell;
 use ClinicCore\Frontend\StaffPortalShell;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -246,7 +247,7 @@ final class Phase10StaffPortalVisitMedicalFilesRedTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         $_GET = [];
         $_POST = [];
         $_REQUEST = [];
@@ -950,7 +951,7 @@ final class Phase10StaffPortalVisitMedicalFilesRedTest extends WP_UnitTestCase
         $privateVisit = $this->insertVisit($patient, $fx['clinician'], $fx['clinic'], $fx['location'], 'in_consultation');
         $fPriv = $this->seedFile($fx['doctor'], $patient, $privateVisit, 'lab_result', 'doctor_private', 'g7-priv.pdf', $this->pdfContent() . "%g7priv\n");
 
-        wp_set_current_user($patientUser);
+        PatientTwoProofTestHelper::acting_as($patientUser);
         $rList = $this->dispatch('GET', '/' . sprintf(self::PATIENT_FILES, $patient), [], $this->scopeHeaders($fx['clinic'], null));
         $this->gate(200, $rList, 'G7.C: Patient Portal file list unchanged');
         $names = array_map(static fn (array $f): string => (string) ($f['original_filename'] ?? ''), (array) ($this->payload($rList)['files'] ?? []));
@@ -1488,10 +1489,22 @@ final class Phase10StaffPortalVisitMedicalFilesRedTest extends WP_UnitTestCase
     {
         global $wpdb;
         $now = App::db()->nowUtcSql();
-        $mobile = '0912' . sprintf('%07d', random_int(1000000, 9999999));
+        $mobile = (string) $wpdb->get_var($wpdb->prepare(
+            'SELECT mobile FROM ' . $wpdb->prefix . 'cpms_patients WHERE id = %d',
+            $patientId
+        ));
+        if ('' === $mobile) {
+            $mobile = '0912' . sprintf('%07d', random_int(1000000, 9999999));
+        }
         $wpdb->query($wpdb->prepare('INSERT INTO ' . $wpdb->prefix . 'cpms_patient_user_links (clinic_id, patient_id, wp_user_id, mobile_at_link, is_primary, linked_at) VALUES (%d, %d, %d, %s, 1, %s)', $clinicId, $patientId, $wpUserId, $mobile, $now));
         $id = (int) $wpdb->insert_id;
         self::assertGreaterThan(0, $id, 'patient-user link fixture row must persist');
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $wpUserId,
+            $clinicId,
+            $patientId,
+            ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => false]
+        );
         return $id;
     }
 

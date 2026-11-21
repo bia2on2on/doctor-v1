@@ -14,6 +14,7 @@ use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Domain\Notifications\NotificationEvents;
 use ClinicCore\Domain\Sms\SmsEvents;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use Throwable;
 use WP_REST_Request;
 use WP_REST_Response;
@@ -109,6 +110,10 @@ final class Phase7SliceStaffRescheduleRedTest extends WP_UnitTestCase
         $this->patientA = $this->insertPatient($this->clinicA, 'A', $now);
         $this->patientB = $this->insertPatient($this->clinicB, 'B', $now);
 
+        $patientMobile = (string) $wpdb->get_var($wpdb->prepare(
+            'SELECT mobile FROM ' . $wpdb->prefix . 'cpms_patients WHERE id = %d',
+            $this->patientA
+        ));
         $wpdb->query($wpdb->prepare(
             'INSERT INTO ' . $wpdb->prefix . 'cpms_patient_user_links
                  (clinic_id, patient_id, wp_user_id, mobile_at_link, is_primary, linked_at)
@@ -116,9 +121,19 @@ final class Phase7SliceStaffRescheduleRedTest extends WP_UnitTestCase
             $this->clinicA,
             $this->patientA,
             $this->patientUserA,
-            '09120000000',
+            $patientMobile !== '' ? $patientMobile : '09120000000',
             $now
         ));
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserA,
+            $this->clinicA,
+            $this->patientA,
+            [
+                'mobile'             => $patientMobile !== '' ? $patientMobile : '09120000000',
+                'seed_session_scope' => true,
+                'set_current_user'   => false,
+            ]
+        );
 
         self::assertGreaterThan(0, cpms_test_seed_membership($this->secretaryA, $this->clinicA, RolesAndCapabilities::ROLE_SECRETARY));
         self::assertGreaterThan(0, cpms_test_seed_membership($this->doctorA, $this->clinicA, RolesAndCapabilities::ROLE_DOCTOR));
@@ -139,6 +154,7 @@ final class Phase7SliceStaffRescheduleRedTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
+        PatientTwoProofTestHelper::reset();
         $this->purgeFixture();
         ScopeContext::clear();
         App::resetScope();

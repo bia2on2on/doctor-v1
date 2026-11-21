@@ -307,7 +307,10 @@ abstract class RestBase
             $selector_invalid
         );
 
+        self::ensure_patient_access_rest_hooks();
+
         if ( $decision['allowed'] ) {
+            PatientAccess::mark_rest_request_verified( $user_id );
             return true;
         }
 
@@ -411,6 +414,33 @@ abstract class RestBase
         }
 
         return [ 'value' => null, 'invalid' => true ];
+    }
+
+    private static bool $patient_access_rest_hooks_registered = false;
+
+    private static function ensure_patient_access_rest_hooks(): void {
+        if ( self::$patient_access_rest_hooks_registered || ! function_exists( 'add_filter' ) ) {
+            return;
+        }
+        self::$patient_access_rest_hooks_registered = true;
+        add_filter(
+            'rest_pre_dispatch',
+            static function ( $result ) {
+                PatientAccess::clear_rest_request_verifications();
+
+                return $result;
+            },
+            0
+        );
+        add_filter(
+            'rest_post_dispatch',
+            static function ( $result ) {
+                PatientAccess::clear_rest_request_verifications();
+
+                return $result;
+            },
+            PHP_INT_MAX
+        );
     }
 
     /**

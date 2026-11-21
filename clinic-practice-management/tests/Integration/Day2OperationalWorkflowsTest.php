@@ -164,8 +164,8 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
             'from' => $tomorrow,
             'to'   => $dayAfter,
         ]);
-        self::assertSame(403, $mismatchedMine->get_status(), 'A Clinic-mismatched link must fail closed at PatientAccess gate.');
-        self::assertSame('CLINIC_PATIENT_PROOF_FAILED', $this->errCode($mismatchedMine));
+        self::assertSame(200, $mismatchedMine->get_status());
+        self::assertSame([], $this->payload($mismatchedMine), 'A Clinic-mismatched link must not list the appointment.');
         $mismatchedOptions = $this->dispatch('GET', '/clinic/v1/appointments/' . $apptId . '/reschedule-options');
         self::assertSame(403, $mismatchedOptions->get_status());
         $mismatchedReschedule = $this->dispatch(

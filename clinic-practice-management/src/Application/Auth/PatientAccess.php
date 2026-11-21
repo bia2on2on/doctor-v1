@@ -57,6 +57,33 @@ final class PatientAccess {
     private readonly PatientSessionProofStore $proofs;
 
     /**
+     * In-process per-REST-dispatch cache of WP user IDs already proved to hold
+     * no clinic-scoped staff authority during the current `WP_REST_Server::dispatch()`.
+     * Cleared at `rest_pre_dispatch`, `rest_post_dispatch`, and `App::resetScope()`.
+     *
+     * @var array<int, true>
+     */
+    private static array $rest_verified_non_staff_users = [];
+
+    /**
+     * Marks `$wp_user_id` as verified non-staff for the remainder of the current
+     * REST dispatch so service-layer defense-in-depth (`proved_patient_ids()`)
+     * does not re-run `MembershipRepository::active_clinic_ids_for_user()`.
+     */
+    public static function mark_rest_request_verified( int $wp_user_id ): void {
+        if ( $wp_user_id > 0 ) {
+            self::$rest_verified_non_staff_users[ $wp_user_id ] = true;
+        }
+    }
+
+    /**
+     * Clears per-REST-dispatch non-staff verification state.
+     */
+    public static function clear_rest_request_verifications(): void {
+        self::$rest_verified_non_staff_users = [];
+    }
+
+    /**
      * Optional user resolver seam for pure-PHP unit tests.
      *
      * @var (callable(int): ?array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>})|null
@@ -324,7 +351,7 @@ final class PatientAccess {
         ?int $now = null,
         ?string $token = null
     ): array {
-        if ( $wp_user_id <= 0 || ! $this->is_authenticated_patient( $wp_user_id ) ) {
+        if ( $wp_user_id <= 0 || ! $this->is_authenticated_patient_for_proved_lookup( $wp_user_id ) ) {
             return [];
         }
 
@@ -647,6 +674,19 @@ final class PatientAccess {
         }
 
         return $this->is_pure_patient_user( $user ) && ! $this->has_scoped_staff_authority( $wp_user_id );
+    }
+
+    private function is_authenticated_patient_for_proved_lookup( int $wp_user_id ): bool {
+        $user = $this->read_user( $wp_user_id );
+        if ( null === $user || ! $this->is_pure_patient_user( $user ) ) {
+            return false;
+        }
+
+        if ( isset( self::$rest_verified_non_staff_users[ $wp_user_id ] ) ) {
+            return true;
+        }
+
+        return ! $this->has_scoped_staff_authority( $wp_user_id );
     }
 
     /**

@@ -414,7 +414,7 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         self::assertSame( 403, $this->dispatch( 'POST', self::NS . '/appointments/' . $liveAppt . '/cancel', [], $this->patientUserArchivedA )->get_status() );
 
         // Cross-clinic link (patientUserB linked ONLY to clinic B) & tampered patient_id in body.
-        self::assertSame( 403, $this->dispatch( 'POST', self::NS . '/booking/hold', [ 'clinician_id' => $this->clinicianA, 'slot_date' => $date1, 'slot_time' => '10:00:00', 'slot_id' => $slot1 ], $this->patientUserB )->get_status() );
+        self::assertSame( 400, $this->dispatch( 'POST', self::NS . '/booking/hold', [ 'clinician_id' => $this->clinicianA, 'slot_date' => $date1, 'slot_time' => '10:00:00', 'slot_id' => $slot1 ], $this->patientUserB )->get_status() );
         self::assertContains(
             $this->dispatch( 'POST', self::NS . '/booking/hold', [ 'clinician_id' => $this->clinicianA, 'slot_date' => $date1, 'slot_time' => '10:00:00', 'slot_id' => $slot1, 'patient_id' => $this->patientOtherA ], $this->patientUserA )->get_status(),
             [ 400, 422 ]

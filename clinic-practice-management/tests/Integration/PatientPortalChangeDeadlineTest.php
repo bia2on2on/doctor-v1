@@ -303,7 +303,7 @@ final class PatientPortalChangeDeadlineTest extends WP_UnitTestCase
         global $wpdb;
 
         $now    = App::db()->nowUtcSql();
-        $mobile = '09' . substr(bin2hex(random_bytes(5)), 0, 9);
+        $mobile = '0912' . sprintf('%07d', random_int(1000000, 9999999));
 
         $ok = $wpdb->insert(
             $wpdb->prefix . 'cpms_patients',

@@ -2347,6 +2347,7 @@ final class App
         if ( null !== self::$patient_session_scope ) {
             self::$patient_session_scope->reset_in_process_state();
         }
+        \ClinicCore\Application\Auth\PatientAccess::clear_rest_request_verifications();
     }
 
     /**
