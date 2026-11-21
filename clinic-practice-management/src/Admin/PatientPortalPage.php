@@ -107,7 +107,8 @@ final class PatientPortalPage
             && ! in_array( RolesAndCapabilities::ROLE_ACCOUNTANT, $roles, true )
             && ! in_array( RolesAndCapabilities::ROLE_MANAGER, $roles, true )
             && ! user_can( $user, 'manage_options' )
-            && ! self::holds_any_cpms_capability( $user );
+            && ! self::holds_any_cpms_capability( $user )
+            && ! App::patient_access()->is_scoped_staff_actor( (int) $user->ID );
     }
 
     /**

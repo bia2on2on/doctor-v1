@@ -9,6 +9,7 @@ use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Repository\CustomRoleRepository;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 use Throwable;
 use WP_User;
@@ -41,10 +42,19 @@ final class PatientAccess {
     public const NOT_FOUND_CODE    = 'CLINIC_NOT_FOUND';
     public const NOT_FOUND_MESSAGE = 'بیماری به این حساب متصل نیست';
 
+    public const LEVEL_NONE    = 'none';
+    public const LEVEL_BOOKING = 'booking';
+    public const LEVEL_FULL    = 'full';
+
+    public const PROOF_FAILED_CODE    = 'CLINIC_PATIENT_PROOF_FAILED';
+    public const PROOF_FAILED_MESSAGE = 'احراز هویت دو مرحله‌ای بیمار انجام نشد؛ لطفاً کد پیامکی معتبر و کد ملی منطبق را در همین نشست بررسی کنید.';
+
     private readonly ?CpmsDb $db;
     private readonly ?PatientRepository $patients;
     private readonly ?MembershipRepository $memberships;
     private readonly ?AuthorizationService $authorization;
+    private readonly ?PatientLoginRepository $logins;
+    private readonly PatientSessionProofStore $proofs;
 
     /**
      * Optional user resolver seam for pure-PHP unit tests.
@@ -167,12 +177,16 @@ final class PatientAccess {
         ?callable $any_patient_binding_checker = null,
         ?callable $booking_clinic_binding_checker = null,
         ?callable $any_booking_binding_checker = null,
-        ?callable $booking_link_resolver = null
+        ?callable $booking_link_resolver = null,
+        ?PatientLoginRepository $logins = null,
+        ?PatientSessionProofStore $proofs = null
     ) {
         $this->db                             = $db;
         $this->patients                       = $patients ?? ( null !== $db ? new PatientRepository( $db ) : null );
         $this->memberships                    = $memberships ?? ( null !== $db ? new MembershipRepository( $db ) : null );
         $this->authorization                  = $authorization ?? ( null !== $db && null !== $this->memberships ? new AuthorizationService( $this->memberships, new CustomRoleRepository( $db ) ) : null );
+        $this->logins                         = $logins ?? ( null !== $db ? new PatientLoginRepository( $db ) : null );
+        $this->proofs                         = $proofs ?? new PatientSessionProofStore();
         $this->user_reader                    = $user_reader;
         $this->clinic_binding_checker         = $clinic_binding_checker;
         $this->patient_binding_checker        = $patient_binding_checker;
@@ -227,6 +241,270 @@ final class PatientAccess {
         }
 
         return $this->has_enrollment_eligibility( $wp_user_id, $clinic_id );
+    }
+
+    /**
+     * Checks whether `$wp_user_id` is an authenticated pure-patient actor
+     * (no staff WP roles, capabilities, clinic memberships, or organization memberships).
+     */
+    public function is_pure_patient_actor( int $wp_user_id ): bool {
+        return $this->is_authenticated_patient( $wp_user_id );
+    }
+
+    /**
+     * Checks whether `$wp_user_id` holds any Clinic-scoped or Organization-scoped
+     * staff authority (fail-closed on lookup failure).
+     */
+    public function is_scoped_staff_actor( int $wp_user_id ): bool {
+        return $this->has_scoped_staff_authority( $wp_user_id );
+    }
+
+    /**
+     * Computes the two-factor patient access level (`none` | `booking` | `full`)
+     * for `$wp_user_id`, failing closed on any missing proof, inactive account,
+     * inactive/unverified binding, or DB error (§2.1, §2.7).
+     */
+    public function level(
+        int $wp_user_id,
+        ?int $patient_id = null,
+        ?int $clinic_id = null,
+        ?int $now = null,
+        ?string $token = null
+    ): string {
+        if ( $wp_user_id <= 0 ) {
+            return self::LEVEL_NONE;
+        }
+        if ( null !== $patient_id && $patient_id <= 0 ) {
+            return self::LEVEL_NONE;
+        }
+        if ( null !== $clinic_id && $clinic_id <= 0 ) {
+            return self::LEVEL_NONE;
+        }
+        if ( ! $this->is_authenticated_patient( $wp_user_id ) ) {
+            return self::LEVEL_NONE;
+        }
+        if ( null === $this->logins || null === $this->db || null === $this->patients ) {
+            return self::LEVEL_NONE;
+        }
+
+        try {
+            $account = $this->logins->find_account_by_user_id( $wp_user_id );
+            if ( null === $account || PatientLoginRepository::STATE_ACTIVE !== (string) ( $account['state'] ?? '' ) ) {
+                return self::LEVEL_NONE;
+            }
+
+            $bindings = $this->logins->find_active_bindings_for_user( $wp_user_id, $clinic_id );
+            if ( [] === $bindings ) {
+                return self::LEVEL_NONE;
+            }
+
+            $proved_bindings = [];
+            foreach ( $bindings as $binding ) {
+                $b_patient_id = (int) ( $binding['patient_id'] ?? 0 );
+                if ( null !== $patient_id && $b_patient_id !== $patient_id ) {
+                    continue;
+                }
+                if ( $this->proofs->has_valid_binding_proof(
+                    $wp_user_id,
+                    (int) ( $binding['clinic_id'] ?? 0 ),
+                    $b_patient_id,
+                    (int) ( $binding['binding_id'] ?? 0 ),
+                    (string) ( $binding['verified_at'] ?? '' ),
+                    (string) ( $binding['mobile'] ?? '' ),
+                    $now,
+                    $token
+                ) ) {
+                    $proved_bindings[] = $binding;
+                }
+            }
+
+            if ( [] === $proved_bindings ) {
+                return self::LEVEL_NONE;
+            }
+
+            foreach ( $proved_bindings as $proved ) {
+                if ( $this->has_full_identity_edges(
+                    $wp_user_id,
+                    (int) ( $proved['clinic_id'] ?? 0 ),
+                    (int) ( $proved['patient_id'] ?? 0 )
+                ) ) {
+                    return self::LEVEL_FULL;
+                }
+            }
+
+            return self::LEVEL_BOOKING;
+        } catch ( Throwable ) {
+            return self::LEVEL_NONE;
+        }
+    }
+
+    /**
+     * Returns the intersection of active bindings and session-proved patient IDs (§2.8).
+     *
+     * @return list<int>
+     */
+    public function proved_patient_ids(
+        int $wp_user_id,
+        ?int $clinic_id = null,
+        ?int $now = null,
+        ?string $token = null
+    ): array {
+        if ( $wp_user_id <= 0 || ! $this->is_authenticated_patient( $wp_user_id ) ) {
+            return [];
+        }
+        if ( null === $this->logins ) {
+            return [];
+        }
+
+        try {
+            $bindings = $this->logins->find_active_bindings_for_user( $wp_user_id, $clinic_id );
+
+            return $this->proofs->proved_patient_ids( $wp_user_id, $bindings, $now, $token );
+        } catch ( Throwable ) {
+            return [];
+        }
+    }
+
+    /**
+     * Fail-closed two-proof authorization check returning the uniform §6.10
+     * envelope (`403 CLINIC_PATIENT_PROOF_FAILED`) for every denial cause.
+     *
+     * @return array{
+     *     allowed: bool,
+     *     http_status: int,
+     *     code: string,
+     *     message: string,
+     *     reason: string,
+     *     role: string
+     * }
+     */
+    public function authorize_two_proof_request(
+        int $wp_user_id,
+        ?int $clinic_id = null,
+        ?int $patient_id = null,
+        ?int $link_id = null,
+        string $mode = self::MODE_CLINICAL,
+        bool $selector_invalid = false,
+        ?int $now = null,
+        ?string $token = null
+    ): array {
+        if ( $wp_user_id <= 0 ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                $patient_id,
+                $link_id,
+                $mode,
+                $this->proof_failed_decision( 'unauthenticated', 'anonymous' )
+            );
+        }
+
+        $user         = $this->read_user( $wp_user_id );
+        $primary_role = ( null !== $user && [] !== $user['roles'] ) ? $user['roles'][0] : 'unknown';
+
+        if ( null === $user || ! $this->is_pure_patient_user( $user ) || $this->has_scoped_staff_authority( $wp_user_id ) ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                $patient_id,
+                $link_id,
+                $mode,
+                $this->proof_failed_decision( 'patient_role_required', $primary_role )
+            );
+        }
+
+        if ( $selector_invalid ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                $patient_id,
+                $link_id,
+                $mode,
+                $this->proof_failed_decision( 'invalid_selector', $primary_role )
+            );
+        }
+
+        if ( ! in_array(
+            $mode,
+            [
+                self::MODE_CLINICAL,
+                self::MODE_PATIENT_RESOURCE,
+                self::MODE_RECORDS_LIST,
+                self::MODE_BOOKING_APPOINTMENT,
+                self::MODE_ENROLL,
+            ],
+            true
+        ) ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                $patient_id,
+                $link_id,
+                $mode,
+                $this->proof_failed_decision( 'invalid_mode', $primary_role )
+            );
+        }
+
+        if ( null !== $link_id ) {
+            if ( $link_id <= 0 ) {
+                return $this->observe_decision(
+                    $wp_user_id,
+                    $clinic_id,
+                    $patient_id,
+                    $link_id,
+                    $mode,
+                    $this->proof_failed_decision( 'invalid_link_id', $primary_role )
+                );
+            }
+            $target = self::MODE_BOOKING_APPOINTMENT === $mode
+                ? $this->resolve_booking_link_target( $wp_user_id, $link_id )
+                : $this->resolve_link_target( $wp_user_id, $link_id );
+            if ( null === $target ) {
+                return $this->observe_decision(
+                    $wp_user_id,
+                    $clinic_id,
+                    $patient_id,
+                    $link_id,
+                    $mode,
+                    $this->proof_failed_decision( 'link_not_found', $primary_role )
+                );
+            }
+            if ( null !== $clinic_id && $clinic_id !== $target['clinic_id'] ) {
+                return $this->observe_decision(
+                    $wp_user_id,
+                    $clinic_id,
+                    $patient_id,
+                    $link_id,
+                    $mode,
+                    $this->proof_failed_decision( 'link_clinic_mismatch', $primary_role )
+                );
+            }
+            if ( null !== $patient_id && $patient_id !== $target['patient_id'] ) {
+                return $this->observe_decision(
+                    $wp_user_id,
+                    $clinic_id,
+                    $patient_id,
+                    $link_id,
+                    $mode,
+                    $this->proof_failed_decision( 'link_patient_mismatch', $primary_role )
+                );
+            }
+            $clinic_id  = $target['clinic_id'];
+            $patient_id = $target['patient_id'];
+        }
+
+        $level = $this->level( $wp_user_id, $patient_id, $clinic_id, $now, $token );
+        $ok    = match ( $mode ) {
+            self::MODE_CLINICAL, self::MODE_PATIENT_RESOURCE, self::MODE_ENROLL => self::LEVEL_FULL === $level,
+            self::MODE_BOOKING_APPOINTMENT, self::MODE_RECORDS_LIST            => in_array( $level, [ self::LEVEL_BOOKING, self::LEVEL_FULL ], true ),
+            default                                                            => false,
+        };
+
+        $decision = $ok
+            ? $this->allow_decision( $primary_role )
+            : $this->proof_failed_decision( 'two_proof_required', $primary_role );
+
+        return $this->observe_decision( $wp_user_id, $clinic_id, $patient_id, $link_id, $mode, $decision );
     }
 
     /**
@@ -587,6 +865,15 @@ final class PatientAccess {
         $was_strict = $this->db->is_strict();
         $this->db->setStrict( true );
         try {
+            $org_rows = $this->db->fetch_all_strict(
+                'SELECT id FROM ' . $this->db->table( 'cpms_organization_memberships' )
+                . " WHERE wp_user_id = %d AND status = 'active' LIMIT 1",
+                [ $wp_user_id ]
+            );
+            if ( [] !== $org_rows ) {
+                return true;
+            }
+
             $clinic_ids = $this->memberships->active_clinic_ids_for_user( $wp_user_id );
             foreach ( $clinic_ids as $clinic_id ) {
                 if ( $clinic_id <= 0 ) {
@@ -605,6 +892,34 @@ final class PatientAccess {
         } finally {
             $this->db->setStrict( $was_strict );
         }
+    }
+
+    /**
+     * Verifies both durable identity edges required for `LEVEL_FULL` (§2.4):
+     * `cpms_patients.identity_id IS NOT NULL`, an Organization-scoped row in
+     * `cpms_patient_identity_links`, and a Clinic row in `cpms_patient_user_links`.
+     */
+    private function has_full_identity_edges( int $wp_user_id, int $clinic_id, int $patient_id ): bool {
+        if ( null === $this->db || $wp_user_id <= 0 || $clinic_id <= 0 || $patient_id <= 0 ) {
+            return false;
+        }
+
+        $rows = $this->db->fetch_all_strict(
+            'SELECT 1 FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patients' ) . ' p'
+            . ' ON p.id = l.patient_id AND p.clinic_id = l.clinic_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_clinics' ) . ' c ON c.id = l.clinic_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patient_identity_links' ) . ' pil'
+            . ' ON pil.identity_id = p.identity_id AND pil.wp_user_id = l.wp_user_id AND pil.organization_id = o.id'
+            . ' WHERE l.wp_user_id = %d AND l.clinic_id = %d AND l.patient_id = %d'
+            . " AND p.status = 'active' AND c.status = 'active' AND o.status = 'active'"
+            . ' AND p.identity_id IS NOT NULL'
+            . ' LIMIT 1',
+            [ $wp_user_id, $clinic_id, $patient_id ]
+        );
+
+        return [] !== $rows;
     }
 
     /**
@@ -913,6 +1228,27 @@ final class PatientAccess {
             'http_status' => 404,
             'code'        => self::NOT_FOUND_CODE,
             'message'     => self::NOT_FOUND_MESSAGE,
+            'reason'      => $reason,
+            'role'        => $role,
+        ];
+    }
+
+    /**
+     * @return array{
+     *     allowed: bool,
+     *     http_status: int,
+     *     code: string,
+     *     message: string,
+     *     reason: string,
+     *     role: string
+     * }
+     */
+    private function proof_failed_decision( string $reason, string $role ): array {
+        return [
+            'allowed'     => false,
+            'http_status' => 403,
+            'code'        => self::PROOF_FAILED_CODE,
+            'message'     => self::PROOF_FAILED_MESSAGE,
             'reason'      => $reason,
             'role'        => $role,
         ];

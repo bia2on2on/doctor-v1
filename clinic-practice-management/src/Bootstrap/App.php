@@ -29,6 +29,9 @@ use ClinicCore\Admin\SecretaryQueuePage;
 use ClinicCore\Admin\SmsSettingsPage;
 use ClinicCore\Application\Auth\OtpService;
 use ClinicCore\Application\Auth\PatientAccess;
+use ClinicCore\Application\Auth\PatientBindingPromoter;
+use ClinicCore\Application\Auth\PatientNidHmac;
+use ClinicCore\Application\Auth\PatientSessionProofStore;
 use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Application\Backup\BackupService;
 use ClinicCore\Application\Booking\BookingService;
@@ -108,6 +111,7 @@ use ClinicCore\Infrastructure\Repository\LocationRepository;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use ClinicCore\Infrastructure\Repository\PatientEnrollmentRepository;
 use ClinicCore\Infrastructure\Repository\PatientIdentityRepository;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Infrastructure\Repository\FollowUpRepository;
 use ClinicCore\Infrastructure\Repository\HandwritingRepository;
 use ClinicCore\Infrastructure\Repository\InvoiceRepository;
@@ -1950,11 +1954,33 @@ final class App
                 $current_deps[0],
                 new PatientRepository( $current_deps[0] ),
                 memberships: $memberships,
-                authorization: $current_deps[1]
+                authorization: $current_deps[1],
+                logins: new PatientLoginRepository( $current_deps[0] ),
+                proofs: new PatientSessionProofStore()
             );
         }
 
         return $gate;
+    }
+
+    /**
+     * Resolves the atomic two-factor binding promoter (`cpms_patient_logins`).
+     */
+    public static function patient_binding_promoter(): PatientBindingPromoter {
+        return new PatientBindingPromoter(
+            self::db(),
+            self::patient_access(),
+            new PatientLoginRepository( self::db() ),
+            new PatientSessionProofStore(),
+            self::otpService(),
+            self::rate(),
+            new PatientNidHmac(),
+            new PatientIdentityRepository( self::db() ),
+            self::patient_identity_service(),
+            self::patient_identity_activator(),
+            self::audit(),
+            self::op()
+        );
     }
 
     /**

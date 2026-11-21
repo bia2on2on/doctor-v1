@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Application\Patients;
 
+use ClinicCore\Application\Auth\PatientSessionProofStore;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Domain\Licensing\LicenseGate;
@@ -15,6 +16,7 @@ use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 use ClinicCore\Infrastructure\Repository\PatientIdentityRepository;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 
 /**
@@ -512,10 +514,24 @@ final class PatientService
             throw new BookingException( 'CLINIC_VALIDATION_FAILED', 'فیلدی برای ویرایش ارسال نشده است' );
         }
 
-        // D6 audit atomicity: staff profile write + mandatory audit in one boundary.
+        $close_bindings = ( array_key_exists( 'national_id', $data )
+                && (string) ( $data['national_id'] ?? '' ) !== (string) ( $current['national_id'] ?? '' ) )
+            || ( isset( $data['status'] ) && 'archived' === (string) $data['status'] );
+        $affected_binding_users = [];
+
+        // D6 audit atomicity: staff profile write + binding closure (§7.6) + mandatory audit in one boundary.
         $this->db->transactional(
-            function () use ( $patient_id, $data, $current, $actor_user_id ) {
+            function () use ( $patient_id, $data, $current, $actor_user_id, $close_bindings, &$affected_binding_users ) {
                 $this->patients->update( $patient_id, $data + [ 'updated_at' => $this->db->nowUtcSql() ] );
+                if ( $close_bindings ) {
+                    $login_repo = new PatientLoginRepository( $this->db );
+                    if ( $login_repo->table_exists() ) {
+                        $affected_binding_users = $login_repo->close_bindings_for_patient(
+                            (int) $current['clinic_id'],
+                            $patient_id
+                        );
+                    }
+                }
                 $updated = (array) $this->patients->find( $patient_id );
 
                 $this->audit->log(
@@ -531,6 +547,12 @@ final class PatientService
                 );
             }
         );
+        if ( [] !== $affected_binding_users ) {
+            $proof_store = new PatientSessionProofStore();
+            foreach ( $affected_binding_users as $affected_user_id ) {
+                $proof_store->destroy_all_sessions( $affected_user_id );
+            }
+        }
         $updated = (array) $this->patients->find( $patient_id );
         $this->op->info(
             'patient.updated',
