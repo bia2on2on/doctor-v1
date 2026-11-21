@@ -105,7 +105,7 @@ final class RestoreBarrierGateTest extends WP_UnitTestCase {
         self::assertSame(PHP_INT_MIN, has_action('login_init', [RestoreBarrierGate::class, 'guard_login_action']));
         $handler = static fn (): callable => static function (): void { throw new RuntimeException('restore denied'); };
         add_filter('wp_die_handler', $handler, PHP_INT_MAX);
-        $dispatch = static function (): void { do_action('login_init'); };
+        $dispatch = [RestoreBarrierGate::class, 'guard_login_action'];
         try {
             self::assertTrue(add_option(RestoreBarrierStore::OPTION, 'test marker', '', false));
             foreach (['lostpassword', 'retrievepassword', 'rp', 'resetpass', 'register'] as $action) {

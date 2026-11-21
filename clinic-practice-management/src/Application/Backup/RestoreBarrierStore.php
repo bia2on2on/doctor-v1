@@ -48,7 +48,7 @@ final class RestoreBarrierStore {
         }
         $this->invalidate_option_cache();
         // Preserve the WordPress post-insert notification for this option.
-        do_action( 'add_option_' . self::OPTION, self::OPTION, $payload );
+        do_action( 'add_option_' . self::OPTION, self::OPTION, $payload ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Match the core option notification.
         $this->confirm( $fence, $payload );
     }
 
