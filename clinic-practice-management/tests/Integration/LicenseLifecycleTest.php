@@ -264,13 +264,14 @@ final class LicenseLifecycleTest extends WP_UnitTestCase
         $gate = new SignedLicenseGate($svc);
         $this->assertFalse($gate->assert(LicenseGate::OP_APPOINTMENT_BOOK)->allowed);
         $this->assertFalse($gate->assert(LicenseGate::OP_PATIENT_CREATE)->allowed);
-        $this->assertTrue($gate->assert(LicenseGate::OP_PATIENT_CREATE, ['reception' => true])->allowed);
-        $this->assertTrue($gate->assert(LicenseGate::OP_INVOICE_CREATE)->allowed);
+        $this->assertFalse($gate->assert(LicenseGate::OP_PATIENT_CREATE, ['reception' => true])->allowed); // Final Q1(a): no new patient row from T0, reception-shaped or not
+        $this->assertTrue($gate->assert(LicenseGate::OP_INVOICE_CREATE)->allowed); // Stage 2: finish-lane without visit context stays open until T1
         // بهداشت/تکمیل/به‌روزرسانی مجاز (spec §16)
         $this->assertTrue($gate->assert(LicenseGate::OP_APPOINTMENT_CANCEL)->allowed);
         $this->assertTrue($gate->assert(LicenseGate::OP_PATIENT_UPDATE)->allowed);
-        // نمایش وضعیت بدون تغییر باقی می‌ماند
-        $this->assertTrue($gate->isReadOnly());
+        // نمایش وضعیت بدون تغییر باقی می‌ماند — Stage 2 read-only نیست؛
+        // read-only از T1 شروع می‌شود (قواعد قطعی three-stage، 2026-11-17).
+        $this->assertFalse($gate->isReadOnly());
         $this->assertSame(LicenseStatus::RESTRICTED, $gate->state());
     }
 

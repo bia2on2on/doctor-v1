@@ -206,11 +206,37 @@ final class SignedLicenseGateTest extends TestCase
         }
     }
 
+    public function testActivationWindowExhaustionStillBlocksStage2FinalityOps(): void
+    {
+        // First-run fallback has no T0/T1 and no Stage 2 continuity (design §7.4):
+        // the final-policy demand lanes *and* the uncontextualized Stage-2 open set
+        // (OP_INVOICE_CREATE / OP_SMS_COMMERCIAL / OP_VISIT_FINISH / OP_PAYMENT_RECORD /
+        // OP_APPOINTMENT_NOSHOW / OP_SETTINGS_WRITE / OP_FILE_UPLOAD) all stay denied.
+        foreach (['activation_window_expired', 'migration_grace_expired'] as $reason) {
+            $gate = new SignedLicenseGate($this->providerWithReason(LicenseStatus::RESTRICTED, $reason));
+
+            foreach ([
+                LicenseGate::OP_INVOICE_CREATE,
+                LicenseGate::OP_SMS_COMMERCIAL,
+                LicenseGate::OP_VISIT_FINISH,
+                LicenseGate::OP_PAYMENT_RECORD,
+                LicenseGate::OP_APPOINTMENT_NOSHOW,
+                LicenseGate::OP_SETTINGS_WRITE,
+                LicenseGate::OP_FILE_UPLOAD,
+            ] as $op) {
+                $this->assertFalse($gate->assert($op)->allowed, "{$op} با reason={$reason} باید مسدود بماند");
+            }
+        }
+    }
+
     public function testVendorUnreachableStaleExpirationStillBlocksNewBusiness(): void
     {
-        // RESTRICTED + expired_unreachable = «انقضا با وضعیت vendor-unreachable/
-        // stale» — نزدیک‌ترین همسایهٔ معنایی به انقضای عادی و صریحاً بیرون از
-        // استثنای آن (تطبیق باید دقیق باشد، نه prefix/contains).
+        // RESTRICTED + expired_unreachable WITH a readable cached signed bound is an
+        // ordinary cached document and enforces its own T0/T1 (B1, design §7.1).
+        // This fixture provides NO expires_at, so the ordinary path cannot engage:
+        // fail-closed denial stands. The bound-present case is pinned by
+        // testNonExpiryStatusesWithExpiryReasonsStillAllowOpenedVisit and the
+        // LicenseStagePolicy boundary tests.
         $gate = new SignedLicenseGate($this->providerWithReason(LicenseStatus::RESTRICTED, 'expired_unreachable'));
 
         foreach (SignedLicenseGate::BLOCKED_UNDER_RESTRICTION as $op) {

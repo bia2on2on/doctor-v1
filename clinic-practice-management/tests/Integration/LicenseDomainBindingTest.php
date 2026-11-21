@@ -260,7 +260,7 @@ final class LicenseDomainBindingTest extends WP_UnitTestCase
         );
     }
 
-    public function testCorrectlyBoundExpiredDocumentUsesOwnerReceptionWindowButBlocksBookings(): void
+    public function testCorrectlyBoundExpiredDocumentKeepsStage2FinanceButBlocksDemand(): void
     {
         $this->setLocalHome('https://clinic-a.example');
         $licenses = $this->licenseService();
@@ -276,7 +276,8 @@ final class LicenseDomainBindingTest extends WP_UnitTestCase
         $this->assertSame('expired', $state['reason']);
         $gate = new SignedLicenseGate($licenses);
         $this->assertFalse($gate->assert(LicenseGate::OP_PATIENT_CREATE)->allowed);
-        $this->assertTrue($gate->assert(LicenseGate::OP_PATIENT_CREATE, ['reception' => true])->allowed);
+        $this->assertFalse($gate->assert(LicenseGate::OP_PATIENT_CREATE, ['reception' => true])->allowed); // Final Q1(a): no new patient row from T0, reception-shaped or not
+        $this->assertTrue($gate->assert(LicenseGate::OP_INVOICE_CREATE)->allowed); // Stage 2: finish-lane without visit context stays open until T1
         $this->assertFalse($gate->assert(LicenseGate::OP_APPOINTMENT_BOOK)->allowed);
     }
 

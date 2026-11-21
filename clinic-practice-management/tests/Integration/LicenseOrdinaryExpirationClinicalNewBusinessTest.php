@@ -396,7 +396,7 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
         $this->installOrdinaryExpiredLicense();
         $slot = $this->makeSlot(2, '14:20');
         $appointment = App::bookingService()->createByStaff($this->secretaryUserId, $this->patientId, $this->clinicianId, $slot['date'], '14:20', null);
-        $this->expiresAt = time() - 220 * 86400;
+        $this->expiresAt = time() - 86400; // Stage 2 (T0+1d < T1) — previously booked appointments remain followable
         $licenses = $this->installOrdinaryExpiredLicense();
         $id = (int) $appointment['appointment_id'];
         // Fixture an appointment booked before the now-expired signed term.
@@ -419,9 +419,20 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
         $this->assertSame('waiting', $visit['status']);
         $this->assertSame($id, (int) $visit['appointment_id']);
         $this->assertTrue(App::audit()->verifyChain(500)['ok']);
+
+        // Final Q3(a) (2026-11-17): at/after T1 no first admission of any kind — not even a
+        // persisted pre-T0 pending/confirmed appointment — is admitted.
+        $this->expiresAt = time() - 45 * 86400; // signed T0 45d ago; T1 ≈ 15d ago
+        $late = $this->installOrdinaryExpiredLicense();
+        try {
+            $this->visitService($late)->checkIn($this->secretaryUserId, $this->patientId, $id);
+            $this->fail('Q3(a): first admission at/after T1 must be denied');
+        } catch (VisitException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+        }
     }
 
-    public function testNewPatientAndWalkInStopAfterOneMonthButVerifiedReturningContinues(): void
+    public function testNewPatientAndWalkInDeniedFromT0ReturningGrantsNothing(): void
     {
         $this->expiresAt = time() - 60 * 86400;
         $licenses = $this->installOrdinaryExpiredLicense();
@@ -449,12 +460,18 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
             'consultation_completed_at' => gmdate('Y-m-d H:i:s', $this->expiresAt - 1),
             'status' => 'checked_out', 'active' => 0,
         ]);
-        $visit = $this->visitService($licenses)->walkIn($this->secretaryUserId, $this->patientId, $this->clinicianId);
-        $this->assertSame('waiting', $visit['status']);
-        $deadline = \ClinicCore\Domain\Licensing\PostExpirationPolicy::deadline($this->expiresAt, 6);
+        // Final Q2(a) (2026-11-17): no walk-in Visit opens from T0 — not even with a
+        // server-verified returning identity linked to an existing checked-out record.
+        try {
+            $this->visitService($licenses)->walkIn($this->secretaryUserId, $this->patientId, $this->clinicianId);
+            $this->fail('Final Q2(a): walk-in must be denied from T0');
+        } catch (VisitException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+        }
+        $deadline = \ClinicCore\Domain\Licensing\LicenseStagePolicy::t1($this->expiresAt);
         try {
             $this->visitService($licenses, static fn (): int => $deadline)->walkIn($this->secretaryUserId, $this->patientId, $this->clinicianId);
-            $this->fail('Even verified returning status ends at the exact six-month boundary');
+            $this->fail('Even verified returning status ends at the exact T1 boundary');
         } catch (VisitException $e) {
             $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
         }
@@ -481,34 +498,38 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
 
         $gate = new SignedLicenseGate($service);
         $this->assertSame(LicenseStatus::RESTRICTED, $gate->state());
-        $this->assertTrue($gate->isReadOnly());
+        // Stage 2 is not read-only; read-only begins at T1 (final three-stage rule, 2026-11-17).
+        $this->assertFalse($gate->isReadOnly());
     }
 
-    public function testRealGateBlocksBookingsButPreservesFinanceAndReception(): void
+    public function testRealGateBlocksDemandButKeepsStage2FinanceOpen(): void
     {
         $gate = new SignedLicenseGate($this->installOrdinaryExpiredLicense());
         $this->assertFalse($gate->assert(\ClinicCore\Domain\Licensing\LicenseGate::OP_APPOINTMENT_BOOK)->allowed);
         $this->assertFalse($gate->assert(\ClinicCore\Domain\Licensing\LicenseGate::OP_PATIENT_CREATE)->allowed);
-        $this->assertTrue($gate->assert(\ClinicCore\Domain\Licensing\LicenseGate::OP_PATIENT_CREATE, ['reception' => true])->allowed);
-        $this->assertTrue($gate->assert(\ClinicCore\Domain\Licensing\LicenseGate::OP_INVOICE_CREATE)->allowed);
+        $this->assertFalse($gate->assert(\ClinicCore\Domain\Licensing\LicenseGate::OP_PATIENT_CREATE, ['reception' => true])->allowed); // Final Q1(a)
+        $this->assertTrue($gate->assert(\ClinicCore\Domain\Licensing\LicenseGate::OP_INVOICE_CREATE)->allowed); // Stage 2: finish-lane open until T1
+        $this->assertFalse($gate->assert(\ClinicCore\Domain\Licensing\LicenseGate::OP_APPOINTMENT_RESCHEDULE)->allowed); // Stage 2: no new demand
+        $this->assertTrue($gate->assert(\ClinicCore\Domain\Licensing\LicenseGate::OP_REFUND, ['original_payment_time' => time() - 86400])->allowed); // Q4a: allowed through T1−1s
     }
 
-    public function testReceptionCanCreateNewPatientInsideOneMonthWindow(): void
+    public function testReceptionCannotCreateNewPatientAtOrAfterT0(): void
     {
         $this->installOrdinaryExpiredLicense();
 
+        // Final Q1(a) (2026-11-17): no new patient row from T0 — the reception exception is retired.
         try {
-            $created = App::patientService()->create([
+            App::patientService()->create([
                 'first_name' => 'مریم',
                 'last_name' => 'انقضای عادی',
                 'mobile' => '09127770102',
             ], $this->secretaryUserId);
+            $this->fail('انقضای عادی تجاری از T0 ثبت بیمار جدید را مسدود می‌کند (Q1(a))');
         } catch (BookingException $e) {
-            $this->fail('انقضای عادی تجاری نباید ثبت بیمار جدید را مسدود کند — دریافت: ' . $e->errorCode);
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
         }
 
-        $this->assertSame('active', $created['status']);
-        $this->assertMatchesRegularExpression('/^MR-\d{6}-[A-Z0-9]{5}$/', (string) $created['mrn']);
+        $this->assertSame(0, (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . App::db()->table('cpms_patients') . ' WHERE mobile = %s', ['09127770102']));
     }
 
     public function testOrdinaryExpirationBlocksStaffAppointmentBooking(): void
@@ -524,17 +545,20 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
         $this->assertSame(0, (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . App::db()->table('cpms_appointments')));
     }
 
-    public function testReceptionCanStartWalkInInsideOneMonthWindow(): void
+    public function testReceptionCannotStartWalkInAtOrAfterT0(): void
     {
         $service = $this->installOrdinaryExpiredLicense();
 
+        // Final Q2(a) (2026-11-17): appointment-free walk-ins are denied from T0.
         try {
-            $visit = $this->visitService($service)->walkIn($this->secretaryUserId, $this->patientId, $this->clinicianId);
+            $this->visitService($service)->walkIn($this->secretaryUserId, $this->patientId, $this->clinicianId);
+            $this->fail('انقضای عادی تجاری از T0 ثبت مراجعهٔ بدون نوبت را مسدود می‌کند (Q2(a))');
         } catch (VisitException $e) {
-            $this->fail('انقضای عادی تجاری نباید ثبت مراجعهٔ بدون نوبت را مسدود کند — دریافت: ' . $e->errorCode);
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
         }
 
-        $this->assertSame('waiting', (string) $visit['status']);
-        $this->assertSame('walk_in', (string) $visit['source']);
+        $this->assertSame(0, (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . App::db()->table('cpms_visits') . " WHERE source = 'walk_in'"));
+        $gate = new SignedLicenseGate($service);
+        $this->assertFalse($gate->assert(\ClinicCore\Domain\Licensing\LicenseGate::OP_VISIT_CHECKIN)->allowed); // Stage 2: no admission without pre-T0 provenance
     }
 }

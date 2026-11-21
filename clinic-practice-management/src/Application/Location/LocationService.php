@@ -35,6 +35,19 @@ use RuntimeException;
  */
 final class LocationService
 {
+    /**
+     * Three-stage license (design §7.3 staff/settings row, final 2026-11-17):
+     * at/after T1 location mutation is view-only; only offline license
+     * activation/renewal remains writable.
+     */
+    private function assert_settings_writable(): void {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+        if ( ! $decision->allowed ) {
+            \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+            throw LocationException::of( 'CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازهٔ تغییر محل را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند', 503 );
+        }
+    }
+
     public function __construct(
         private readonly CpmsDb $db,
         private readonly LocationRepository $locations,
@@ -53,6 +66,7 @@ final class LocationService
      */
     public function createLocation( int $actor_user_id, int $trusted_clinic_id, array $input ): array // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy method name: renaming it is a cross-file API change to code outside this PR, so it stays as published.
     {
+        $this->assert_settings_writable();
         // Authorize before examining caller-controlled fields.
         $this->guard_actor_and_scope( $actor_user_id, $trusted_clinic_id );
 
@@ -182,6 +196,7 @@ final class LocationService
      * @throws LocationException
      */
     public function updateLocation( int $actor_user_id, int $trusted_clinic_id, int $location_id, array $input ): array { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy method name: renaming it is a cross-file API change to code outside this PR, so it stays as published.
+        $this->assert_settings_writable();
         $this->guard_actor_and_scope( $actor_user_id, $trusted_clinic_id );
 
         try {
@@ -313,6 +328,7 @@ final class LocationService
      * @throws LocationException
      */
     public function set_active( int $actor_user_id, int $trusted_clinic_id, int $location_id, bool $active ): array {
+        $this->assert_settings_writable();
 
         $this->guard_actor_and_scope( $actor_user_id, $trusted_clinic_id );
         if ( $location_id <= 0 ) {

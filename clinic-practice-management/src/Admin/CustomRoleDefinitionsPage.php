@@ -141,6 +141,10 @@ final class CustomRoleDefinitionsPage {
 
 	public static function handle_create(): void {
 		self::assert_entry();
+		if ( self::settings_writes_blocked() ) {
+			self::set_notice( 'error', self::LICENSE_BLOCKED_MESSAGE );
+			self::redirect_back( absint( wp_unslash( $_POST['cpms_clinic_id'] ?? 0 ) ) );
+		}
 		check_admin_referer( self::NONCE_CREATE );
 
 		$clinic_id    = absint( wp_unslash( $_POST['cpms_clinic_id'] ?? 0 ) );
@@ -178,6 +182,10 @@ final class CustomRoleDefinitionsPage {
 
 	public static function handle_rename(): void {
 		self::assert_entry();
+		if ( self::settings_writes_blocked() ) {
+			self::set_notice( 'error', self::LICENSE_BLOCKED_MESSAGE );
+			self::redirect_back( absint( wp_unslash( $_POST['cpms_clinic_id'] ?? 0 ) ) );
+		}
 		check_admin_referer( self::NONCE_RENAME );
 
 		$clinic_id        = absint( wp_unslash( $_POST['cpms_clinic_id'] ?? 0 ) );
@@ -215,6 +223,10 @@ final class CustomRoleDefinitionsPage {
 
 	public static function handle_replace_capabilities(): void {
 		self::assert_entry();
+		if ( self::settings_writes_blocked() ) {
+			self::set_notice( 'error', self::LICENSE_BLOCKED_MESSAGE );
+			self::redirect_back( absint( wp_unslash( $_POST['cpms_clinic_id'] ?? 0 ) ) );
+		}
 		check_admin_referer( self::NONCE_CAPS );
 
 		$clinic_id        = absint( wp_unslash( $_POST['cpms_clinic_id'] ?? 0 ) );
@@ -260,6 +272,10 @@ final class CustomRoleDefinitionsPage {
 
 	public static function handle_archive(): void {
 		self::assert_entry();
+		if ( self::settings_writes_blocked() ) {
+			self::set_notice( 'error', self::LICENSE_BLOCKED_MESSAGE );
+			self::redirect_back( absint( wp_unslash( $_POST['cpms_clinic_id'] ?? 0 ) ) );
+		}
 		check_admin_referer( self::NONCE_ARCHIVE );
 
 		$clinic_id        = isset( $_POST['cpms_clinic_id'] ) && is_scalar( $_POST['cpms_clinic_id'] )
@@ -298,6 +314,10 @@ final class CustomRoleDefinitionsPage {
 
 	private static function handle_status_change( bool $is_reactivate ): void {
 		self::assert_entry();
+		if ( self::settings_writes_blocked() ) {
+			self::set_notice( 'error', self::LICENSE_BLOCKED_MESSAGE );
+			self::redirect_back( absint( wp_unslash( $_POST['cpms_clinic_id'] ?? 0 ) ) );
+		}
 		$nonce_action = $is_reactivate ? self::NONCE_REACTIVATE : self::NONCE_DEACTIVATE;
 		check_admin_referer( $nonce_action );
 
@@ -575,6 +595,19 @@ final class CustomRoleDefinitionsPage {
 	}
 
 	// ================= request helpers =================
+
+	private const LICENSE_BLOCKED_MESSAGE = 'مجوز سامانه اجازهٔ این تغییر را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.';
+
+	/** Three-stage license (design §7.3 staff/settings row, final 2026-11-17). */
+	private static function settings_writes_blocked(): bool {
+		$decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+		if ( $decision->allowed ) {
+			return false;
+		}
+		\ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+
+		return true;
+	}
 
 	private static function assert_entry(): void {
 		if ( ! current_user_can( 'read' ) ) {

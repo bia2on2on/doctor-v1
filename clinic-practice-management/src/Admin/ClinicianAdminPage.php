@@ -572,6 +572,10 @@ final class ClinicianAdminPage
     public static function saveClinician(): void
     {
         $scope = self::authorizeAdminWrite( 'cpms_clinician_save' );
+
+        if ( self::settings_writes_blocked() ) {
+            wp_die( esc_html( self::LICENSE_BLOCKED_MESSAGE ), 503 );
+        }
         // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- published scope API.
         $clinic_id = (int) $scope->clinicId;
 
@@ -738,6 +742,10 @@ final class ClinicianAdminPage
         // Nonce الگو شامل clinician_id است (cpms_clinician_toggle_{id}).
         $cid = isset($_GET['clinician_id']) ? absint($_GET['clinician_id']) : 0;
         $scope = self::authorizeAdminWrite( 'cpms_clinician_toggle_' . $cid );
+
+        if ( self::settings_writes_blocked() ) {
+            wp_die( esc_html( self::LICENSE_BLOCKED_MESSAGE ), 503 );
+        }
         // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- published scope API.
         $clinic_id = (int) $scope->clinicId;
 
@@ -792,6 +800,10 @@ final class ClinicianAdminPage
     public static function saveSchedules(): void
     {
         $scope = self::authorizeAdminWrite('cpms_schedule_save');
+
+        if ( self::settings_writes_blocked() ) {
+            wp_die( esc_html( self::LICENSE_BLOCKED_MESSAGE ), 503 );
+        }
         $clinicId = (int) $scope->clinicId;
         $userId = (int) get_current_user_id();
 
@@ -901,6 +913,10 @@ final class ClinicianAdminPage
     public static function deleteSchedule(): void
     {
         $scope = self::authorizeAdminWrite('cpms_schedule_delete');
+
+        if ( self::settings_writes_blocked() ) {
+            wp_die( esc_html( self::LICENSE_BLOCKED_MESSAGE ), 503 );
+        }
         $clinicId = (int) $scope->clinicId;
 
         $cid = isset($_POST['clinician_id']) ? absint($_POST['clinician_id']) : 0;
@@ -936,6 +952,10 @@ final class ClinicianAdminPage
     public static function createException(): void
     {
         $scope = self::authorizeAdminWrite('cpms_exception_create');
+
+        if ( self::settings_writes_blocked() ) {
+            wp_die( esc_html( self::LICENSE_BLOCKED_MESSAGE ), 503 );
+        }
         $clinicId = (int) $scope->clinicId;
 
         $cid = isset($_POST['clinician_id']) ? absint($_POST['clinician_id']) : 0;
@@ -985,6 +1005,10 @@ final class ClinicianAdminPage
     public static function deleteException(): void
     {
         $scope = self::authorizeAdminWrite('cpms_exception_delete');
+
+        if ( self::settings_writes_blocked() ) {
+            wp_die( esc_html( self::LICENSE_BLOCKED_MESSAGE ), 503 );
+        }
         $clinicId = (int) $scope->clinicId;
 
         $cid = isset($_POST['clinician_id']) ? absint($_POST['clinician_id']) : 0;
@@ -1035,6 +1059,19 @@ final class ClinicianAdminPage
      *
      * هیچ clinic_id از POST/GET پذیرفته نمی‌شود. چندعضویتی ⇒ fail-closed.
      */
+    private const LICENSE_BLOCKED_MESSAGE = 'مجوز سامانه اجازهٔ این تغییر را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.';
+
+    /** Three-stage license (design §7.3 staff/settings row, final 2026-11-17). */
+    private static function settings_writes_blocked(): bool {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+        if ( $decision->allowed ) {
+            return false;
+        }
+        \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+
+        return true;
+    }
+
     private static function authorizeAdminWrite(string $nonceAction): ClinicScope
     {
         self::guard($nonceAction);

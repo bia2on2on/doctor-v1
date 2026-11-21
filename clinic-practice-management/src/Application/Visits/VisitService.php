@@ -122,6 +122,20 @@ final class VisitService
                     'نوبت به این بیمار تعلق ندارد', 403, 'CLINIC_PERMISSION_DENIED' ); // phpcs:ignore PEAR.Functions.FunctionCallSignature.CloseBracketLine,PEAR.Functions.FunctionCallSignature.Indent,PEAR.Functions.FunctionCallSignature.MultipleArguments -- WPCS
             }
 
+            // Three-stage license (final Q3(a), design §7.2 item 7): first admission
+            // is lawful only for a durable pre-T0 pending/confirmed appointment, and
+            // only while now < T1. The locked persisted row is the only provenance;
+            // the decision is taken on this locked row, before any mutation
+            // (pending→confirmed, Visit insert, history, audit) can happen.
+            $this->assert_license(
+                LicenseGate::OP_VISIT_CHECKIN,
+                [
+                    'appointment_id'         => $appointmentId, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy camelCase parameter
+                    'appointment_created_at' => $this->parse_utc_timestamp_to_int( (string) ( $appt['created_at'] ?? '' ) ) ?? 0,
+                    'appointment_status'     => (string) $appt['status'],
+                ]
+            );
+
             // ER-06: نوبت پایان‌یافته/لغوشده قابل Check-in نیست؛
             // بعد از مهلت Grace نیز پذیرش رد می‌شود، بدون ساخت Visit یا تغییر نوبت.
             $source = 'scheduled';
@@ -326,6 +340,10 @@ final class VisitService
             }
             // Defense-in-depth — همان مالکیت داخل Transaction (post-lock).
             $this->guardVisitWithinExplicitScope($visit);
+            // Three-stage license (design §7.2 items 4–8): every write of an existing
+            // Visit is a safe-finish lane write; from T1 onwards the Visit itself must
+            // have been opened before T1 and stay active and non-terminal.
+            $this->assert_license( LicenseGate::OP_VISIT_FINISH, \ClinicCore\Domain\Licensing\VisitLicenseContext::from_row( $visit ) );
 
             return $this->applyTransition($actorUserId, $visit, $event, $meta);
         });
@@ -347,6 +365,11 @@ final class VisitService
         string $event,
         array $meta = [],
         ?string $forceRole = null ): array { // phpcs:ignore Squiz.Functions.MultiLineFunctionDeclaration.CloseBracketLine,WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy PSR-style, established contract
+        // Three-stage license (design §7.2 item 4/5): defense-in-depth at the service
+        // boundary — every caller (controller, admin page, job, direct service call)
+        // is subject to the same finish-lane rule. Context is the persisted, caller-
+        // supplied Visit row; denial rolls back the enclosing transaction.
+        $this->assert_license( LicenseGate::OP_VISIT_FINISH, \ClinicCore\Domain\Licensing\VisitLicenseContext::from_row( $visit ) );
         $visitId = (int) $visit['id'];
         $actorRole = $forceRole ?? ($this->roleForUser($actorUserId) ?? 'secretary');
         $fromStatus = (string) $visit['status'];
@@ -821,6 +844,9 @@ final class VisitService
             // Phase 3 Slice 6B — مالکیت پایدار ویزیت در برابر Clinic معتبرِ صریحِ
             // درخواست (D16 مسیر کارکنی؛ 404 parity؛ پیش از هر Transition).
             $this->guardVisitWithinExplicitScope($visit);
+            // Three-stage license (design §7.2 item 4/5): closing a Visit is a
+            // safe-finish write; at/after T1 only a qualifying active Visit may close.
+            $this->assert_license( LicenseGate::OP_VISIT_FINISH, \ClinicCore\Domain\Licensing\VisitLicenseContext::from_row( $visit ) );
 
             $status = (string) $visit['status'];
             if ( $status === 'awaiting_payment' ) {
@@ -1646,6 +1672,22 @@ final class VisitService
         $now_utc = $this->nowUtc();
         $local   = $now_utc->setTimezone( $tz );
         return $local->format( 'Y-m-d' );
+    }
+
+    /**
+     * Parse a UTC SQL datetime string into a Unix timestamp (null when
+     * unparseable — callers map that to a fail-closed zero).
+     */
+    private function parse_utc_timestamp_to_int( string $utc_sql ): ?int {
+        if ( '' === $utc_sql ) {
+            return null;
+        }
+        $clean = preg_replace( '/\.\d+$/', '', $utc_sql ) ?? $utc_sql;
+        try {
+            return ( new \DateTimeImmutable( $clean, new \DateTimeZone( 'UTC' ) ) )->getTimestamp();
+        } catch ( \Throwable ) {
+            return null;
+        }
     }
 
     /**

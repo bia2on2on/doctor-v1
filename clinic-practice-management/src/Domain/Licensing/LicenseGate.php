@@ -32,6 +32,16 @@ interface LicenseGate
     public const OP_VISIT_CHECKIN = 'visit.checkin';
     public const OP_INVOICE_CREATE = 'invoice.create';
 
+    // Three-stage license rule (2026-11-17 owner decisions): finish-lane and
+    // read-only-stage operations. Context for the finish lane is always the
+    // server-derived VisitLicenseContext of the persisted cpms_visits row.
+    public const OP_VISIT_FINISH       = 'visit.finish';
+    public const OP_PAYMENT_RECORD     = 'payment.record';
+    public const OP_REFUND             = 'payment.refund';
+    public const OP_APPOINTMENT_NOSHOW = 'appointment.noshow';
+    public const OP_SETTINGS_WRITE     = 'settings.write';
+    public const OP_FILE_UPLOAD        = 'file.upload';
+
     /**
      * بررسی مجوز عملیات. هم‌زمان و فقط محلی (بدون I/O شبکه)؛ evidence از DB محلی.
      *

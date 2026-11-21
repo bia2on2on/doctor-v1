@@ -36,6 +36,19 @@ final class ScheduleService
     private const FULL_DAY_TYPES = ['holiday', 'leave'];
     private const RANGE_TYPES = ['blocked', 'open_override'];
 
+    /**
+     * Three-stage license (design §7.3 staff/settings row, final 2026-11-17):
+     * at/after T1 scheduling surfaces are view-only; only offline license
+     * activation/renewal remains writable.
+     */
+    private function assert_settings_writable(): void {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+        if ( ! $decision->allowed ) {
+            \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+            throw BookingException::of( 'CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازهٔ تغییر برنامه را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند', 503 );
+        }
+    }
+
     public function __construct(
         private readonly CpmsDb $db,
         private readonly ScheduleRepository $schedules,
@@ -78,6 +91,7 @@ final class ScheduleService
      */
     public function create(int $actorUserId, array $fields): array
     {
+        $this->assert_settings_writable();
         $actor_user_id = (int) func_get_arg( 0 );
         $clinician_id  = $this->intField( $fields, 'clinician_id' );
         // C7-S5: پزشکِ انتخاب‌شدهٔ کلاینت «شیء» است، نه tenant context —
@@ -180,6 +194,7 @@ final class ScheduleService
      */
     public function update(int $actorUserId, int $id, array $fields): array
     {
+        $this->assert_settings_writable();
         $actor_user_id = (int) func_get_arg( 0 );
         // Phase 6 Slice 7: ترتیبی‌سازی همزمان Create و Update تحت یک قرارداد قفل یکسان.
         $result = $this->db->transactional(
@@ -345,6 +360,7 @@ final class ScheduleService
 
     public function delete(int $actorUserId, int $id): array
     {
+        $this->assert_settings_writable();
         $actor_user_id = (int) func_get_arg( 0 );
         // C7-S2: ownership preflight, then revalidate the persisted row while
         // holding the shared Organization -> Clinic -> Clinician -> Schedule order.
@@ -479,6 +495,7 @@ final class ScheduleService
      */
     public function createException(int $actorUserId, array $fields): array
     {
+        $this->assert_settings_writable();
         $actor_user_id = (int) func_get_arg( 0 );
         $clinician_id  = $this->intField( $fields, 'clinician_id' );
         // C7-S6: همان قاعدهٔ مالکیت create (C7-S5) — پزشکِ انتخاب‌شدهٔ کلاینت
@@ -598,6 +615,7 @@ final class ScheduleService
      */
     public function deleteException(int $actorUserId, int $id): array
     {
+        $this->assert_settings_writable();
         $actor_user_id = (int) func_get_arg( 0 );
         // C7-S2: ownership preflight, then revalidate under the lifecycle prefix.
         // No Location lock is needed: deleting a policy row creates no demand and
