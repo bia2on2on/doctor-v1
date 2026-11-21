@@ -166,6 +166,7 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
             $concreteRoute      = $this->instantiateRoutePattern( $pattern );
             $request            = new WP_REST_Request( $method, $concreteRoute );
             $request->set_header( 'X-WP-Nonce', wp_create_nonce( 'wp_rest' ) );
+            $this->populateRequiredArgsFromRouteSpec( $request, $routes, $pattern, $method );
             $response = rest_do_request( $request );
             $status   = $response->get_status();
             self::assertContains(
@@ -174,106 +175,92 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
                 'Non-allowlisted route ' . $pair . ' must not be reachable by ROLE_PATIENT (got HTTP ' . $status . ').'
             );
             if ( 400 === $status ) {
-                $this->assertScopeRequiredForUnexpected400( $pair, $pattern, $response->get_data() );
+                self::assertSame(
+                    'CLINIC_SCOPE_REQUIRED',
+                    $response->get_data()['code'] ?? null,
+                    $pair . ' returned 400: ' . wp_json_encode( $response->get_data() )
+                );
             }
         }
         self::assertCount( 22, $nonPublic22 );
     }
 
     /**
-     * @param mixed $data
+     * Populates valid placeholder values for required REST args on a non-allowlisted
+     * route so WP_REST_Server::match_request_to_handler() does not short-circuit
+     * with 400 rest_missing_callback_param before permission_callback executes.
+     *
+     * @param array<string, mixed> $routes
      */
-    private function assertScopeRequiredForUnexpected400( string $pair, string $pattern, $data ): void {
-        $code = is_array( $data ) ? ( $data['code'] ?? null ) : null;
-        $msg  = $pair . ' returned 400: ' . wp_json_encode( $data );
-
-        if ( str_starts_with( $pattern, '/clinic/v1/staff/portal/finance' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/staff/portal/reception' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/staff/portal/pricing' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/staff/portal/messages' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/doctor/portal/rt/queue' ) || str_starts_with( $pattern, '/clinic/v1/doctor/portal/today' ) || str_starts_with( $pattern, '/clinic/v1/doctor/today' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/doctor/portal' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/appointments' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/booking' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/patient/' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/patients' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/visits/checkin' ) || str_starts_with( $pattern, '/clinic/v1/visits/walk-in' ) || str_starts_with( $pattern, '/clinic/v1/secretary/today' ) || str_starts_with( $pattern, '/clinic/v1/queue' ) || str_starts_with( $pattern, '/clinic/v1/rt/queue' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_contains( $pattern, '/invoice' ) || str_starts_with( $pattern, '/clinic/v1/invoices' ) || str_starts_with( $pattern, '/clinic/v1/payments' ) || str_starts_with( $pattern, '/clinic/v1/finance/' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/config/services' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/config/schedule' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/visits' ) || str_starts_with( $pattern, '/clinic/v1/notes' ) || str_starts_with( $pattern, '/clinic/v1/prescriptions' ) || str_starts_with( $pattern, '/clinic/v1/search' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/files' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/handwriting' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/reports' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( '/clinic/v1/sms/status' === $pattern ) {
-            if ( str_starts_with( (string) $code, 'rest_' ) ) {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            } elseif ( str_starts_with( (string) $code, 'CLINIC_' ) ) {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            } else {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            }
-        } elseif ( '/clinic/v1/sms/providers' === $pattern ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( '/clinic/v1/sms/settings' === $pattern ) {
-            if ( str_starts_with( (string) $code, 'rest_' ) ) {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            } else {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            }
-        } elseif ( '/clinic/v1/sms/test-connection' === $pattern ) {
-            if ( str_starts_with( (string) $code, 'rest_' ) ) {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            } else {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            }
-        } elseif ( '/clinic/v1/sms/test-send' === $pattern ) {
-            if ( 'rest_missing_callback_param' === $code ) {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            } elseif ( 'rest_invalid_param' === $code ) {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            } else {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            }
-        } elseif ( '/clinic/v1/sms/templates' === $pattern ) {
-            if ( 'GET /clinic/v1/sms/templates' === $pair ) {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            } else {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            }
-        } elseif ( '/clinic/v1/sms/templates/test' === $pattern ) {
-            if ( 'rest_missing_callback_param' === $code ) {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            } else {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-            }
-        } elseif ( '/clinic/v1/sms/logs' === $pattern ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( '/clinic/v1/sms/balance' === $pattern ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } elseif ( str_starts_with( $pattern, '/clinic/v1/notifications' ) || str_starts_with( $pattern, '/clinic/v1/rt/notifications' ) ) {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
-        } else {
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+    private function populateRequiredArgsFromRouteSpec( WP_REST_Request $request, array $routes, string $pattern, string $method ): void {
+        $endpoints = $routes[ $pattern ] ?? null;
+        if ( ! is_array( $endpoints ) ) {
+            return;
         }
+        $methodUpper = strtoupper( $method );
+        foreach ( $endpoints as $endpoint ) {
+            if ( ! is_array( $endpoint ) ) {
+                continue;
+            }
+            $methods = array_map( 'strtoupper', array_keys( array_filter( (array) ( $endpoint['methods'] ?? [] ) ) ) );
+            if ( ! in_array( $methodUpper, $methods, true ) ) {
+                continue;
+            }
+            $args = $endpoint['args'] ?? [];
+            if ( ! is_array( $args ) ) {
+                return;
+            }
+            foreach ( $args as $argName => $schema ) {
+                if ( ! is_string( $argName ) || ! is_array( $schema ) || empty( $schema['required'] ) ) {
+                    continue;
+                }
+                if ( str_contains( $pattern, '(?P<' . $argName . '>' ) ) {
+                    continue;
+                }
+                $request->set_param( $argName, $this->sampleValueForArgSchema( $argName, $schema ) );
+            }
+            return;
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $schema
+     * @return mixed
+     */
+    private function sampleValueForArgSchema( string $argName, array $schema ) {
+        if ( isset( $schema['enum'] ) && is_array( $schema['enum'] ) && [] !== $schema['enum'] ) {
+            return $schema['enum'][0];
+        }
+        $type  = $schema['type'] ?? 'string';
+        $types = is_array( $type ) ? $type : [ $type ];
+        if ( in_array( 'integer', $types, true ) || in_array( 'number', $types, true ) ) {
+            return 1;
+        }
+        if ( in_array( 'boolean', $types, true ) ) {
+            return true;
+        }
+        if ( in_array( 'array', $types, true ) ) {
+            $itemType = is_array( $schema['items'] ?? null ) ? ( $schema['items']['type'] ?? 'string' ) : 'string';
+
+            return 'object' === $itemType ? [ [ 'id' => 1 ] ] : [ 'test' ];
+        }
+        if ( in_array( 'object', $types, true ) ) {
+            return [ 'id' => 1 ];
+        }
+        if ( 'date' === ( $schema['format'] ?? null ) || 'slot_date' === $argName || 'date' === $argName ) {
+            return '2026-11-20';
+        }
+        if ( 'slot_time' === $argName || 'start_time' === $argName ) {
+            return '10:00:00';
+        }
+        if ( 'end_time' === $argName ) {
+            return '11:00:00';
+        }
+        if ( 'mobile' === $argName ) {
+            return '09123334455';
+        }
+
+        return 'test';
     }
 
     public function testAll22PatientReachableRoutesPassThroughPatientAccessGate(): void {
