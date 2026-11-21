@@ -4,9 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Application\Backup;
 
-use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Backup\BackupException;
-use RuntimeException;
 
 /** Standalone marker and journal. Not an authorization to start importing. */
 final class RestoreBarrierStore {
@@ -16,16 +14,12 @@ final class RestoreBarrierStore {
     private const MAX_EVENTS  = 256;
 
     public function is_set(): bool {
-        // Presence is authoritative even if the value is malformed or cached as absent.
-        $db = App::db();
-        try {
-            return [] !== $db->fetch_all_strict(
-                'SELECT 1 FROM %i WHERE option_name = %s LIMIT 1',
-                [ $db->wpdb()->options, self::OPTION ]
-            );
-        } catch ( RuntimeException ) {
-            return true;
-        }
+        global $wpdb;
+        // Probe the core options table directly: cached defaults cannot distinguish a DB error from absence.
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- An uncached presence check is the access decision.
+        $present = $wpdb->get_var( $wpdb->prepare( 'SELECT 1 FROM %i WHERE option_name = %s LIMIT 1', $wpdb->options, self::OPTION ) );
+
+        return '' !== $wpdb->last_error || null !== $present;
     }
 
     public function set( RestoreFileFence $fence, string $attempt_id, string $backup_id ): void {
@@ -58,7 +52,7 @@ final class RestoreBarrierStore {
             'state'      => $state,
             'at'         => gmdate( 'Y-m-d\TH:i:s\Z' ),
         ];
-        $payload['state'] = $state;
+        $payload['state']     = $state;
         $fence->assert_held();
         if ( ! update_option( self::OPTION, $payload, false ) ) {
             throw $this->ambiguous();

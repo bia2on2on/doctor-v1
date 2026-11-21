@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Application\Backup;
 
+use ClinicCore\Auth\RolesAndCapabilities;
 use WP_Error;
 use WP_User;
 
@@ -28,7 +29,7 @@ final class RestoreBarrierGate {
             return $result;
         }
 
-        return $result instanceof WP_User && user_can( $result, 'manage_options' ) && user_can( $result, 'cpms_config' ) ? $result : self::error();
+        return $result instanceof WP_User && user_can( $result, 'manage_options' ) && user_can( $result, RolesAndCapabilities::CONFIG ) ? $result : self::error();
     }
 
     public static function guard_shortcode( mixed $result ): mixed {
@@ -59,7 +60,7 @@ final class RestoreBarrierGate {
         // Only the read-only recovery screen; no admin-post action is exempted.
         $page   = isset( $_GET['page'] ) && is_string( $_GET['page'] ) ? sanitize_key( wp_unslash( $_GET['page'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Classify a read-only screen, not a mutation.
         $method = isset( $_SERVER['REQUEST_METHOD'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) : '';
-        if ( 'admin.php' === $pagenow && 'GET' === $method && 'cpms-system' === $page && current_user_can( 'manage_options' ) && current_user_can( 'cpms_config' ) ) {
+        if ( 'admin.php' === $pagenow && 'GET' === $method && 'cpms-system' === $page && current_user_can( 'manage_options' ) && current_user_can( RolesAndCapabilities::CONFIG ) ) {
             return;
         }
         self::deny();
