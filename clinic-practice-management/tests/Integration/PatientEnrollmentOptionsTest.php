@@ -43,8 +43,11 @@ final class PatientEnrollmentOptionsTest extends WP_UnitTestCase
         $this->user = (int) self::factory()->user->create(
             [ 'role' => RolesAndCapabilities::ROLE_PATIENT, 'user_login' => 'enrollment_options' ]
         );
-        $this->t0 = strtotime( '-3 months' );
-        $this->now = $this->t0 - DAY_IN_SECONDS; // Stage 1 (verified by setUp fixture install below)
+        // Wall clock stays in wall-clock Stage 1 for the fixture below (installed at
+        // setUp with this same expiry); the policy stage is driven by the injected
+        // clock in $this->now, so both boundary frames agree at Stage 1 here.
+        $this->t0 = time() + 30 * DAY_IN_SECONDS;
+        $this->now = $this->t0 - DAY_IN_SECONDS; // Stage 1
         $this->org = (int) $db->fetchValue( 'SELECT organization_id FROM ' . $db->table( 'cpms_clinics' ) . ' WHERE id = %d', [ 1 ] );
 
         $db->insert( 'cpms_clinics', [
@@ -161,9 +164,9 @@ final class PatientEnrollmentOptionsTest extends WP_UnitTestCase
             'patient_id' => $source,
             'clinician_id' => $clinician,
             'status' => 'consultation_completed',
-            'visit_date' => gmdate( 'Y-m-d', $this->t0 - DAY_IN_SECONDS ),
-            'check_in_at' => gmdate( 'Y-m-d H:i:s', $this->t0 - DAY_IN_SECONDS ),
-            'consultation_completed_at' => gmdate( 'Y-m-d H:i:s', $this->t0 - 1 ),
+            'visit_date' => gmdate( 'Y-m-d', time() - DAY_IN_SECONDS ),
+            'check_in_at' => gmdate( 'Y-m-d H:i:s', time() - DAY_IN_SECONDS ),
+            'consultation_completed_at' => gmdate( 'Y-m-d H:i:s', time() - 1 ),
             'active' => 0,
             'created_at' => $stamp,
             'updated_at' => $stamp,
