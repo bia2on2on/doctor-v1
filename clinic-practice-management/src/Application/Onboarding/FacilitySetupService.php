@@ -123,7 +123,7 @@ final class FacilitySetupService {
      * the same non-disclosing 'denied' FacilitySetupException shape.
      */
     private function assert_settings_writable(): void {
-        $gate = \ClinicCore\Bootstrap\App::licenseGate();
+        $gate     = \ClinicCore\Bootstrap\App::licenseGate();
         $decision = $gate->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
         if ( $decision->allowed ) {
             return;

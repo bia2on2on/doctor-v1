@@ -254,7 +254,7 @@ final class VisitPricingService {
             function () use ( $ctx, $actor_user_id, $clinician, $visit_id, $fee ): void {
                 // Finance writers and invoice issuance acquire locks in this
                 // order: Visit first, then finance rows, then the audit row.
-                $visit  = $this->locked_visit_for_write( $ctx, $actor_user_id, $visit_id, $clinician );
+                $visit = $this->locked_visit_for_write( $ctx, $actor_user_id, $visit_id, $clinician );
                 $this->assert_visit_writable( $visit );
                 $before = $this->pricing->visit_fee_row( $visit_id );
                 $this->pricing->set_visit_override( $visit_id, $ctx['clinic_id'], (int) $clinician['id'], $fee, $actor_user_id );
@@ -288,7 +288,7 @@ final class VisitPricingService {
             function () use ( $ctx, $actor_user_id, $clinician, $visit_id, $fields ): int {
                 $visit = $this->locked_visit_for_write( $ctx, $actor_user_id, $visit_id, $clinician );
                 $this->assert_visit_writable( $visit );
-                $id    = $this->pricing->insert_charge(
+                $id = $this->pricing->insert_charge(
                     [
                         'clinic_id'             => $ctx['clinic_id'],
                         'visit_id'              => $visit_id,
@@ -334,7 +334,7 @@ final class VisitPricingService {
 
         $this->db->transactional(
             function () use ( $ctx, $actor_user_id, $clinician, $visit_id, $charge_id, $input ): void {
-                $visit  = $this->locked_visit_for_write( $ctx, $actor_user_id, $visit_id, $clinician );
+                $visit = $this->locked_visit_for_write( $ctx, $actor_user_id, $visit_id, $clinician );
                 $this->assert_visit_writable( $visit );
                 $charge = $this->require_charge( $ctx, $visit_id, $charge_id );
                 $fields = $this->charge_input(
@@ -394,7 +394,7 @@ final class VisitPricingService {
 
         $this->db->transactional(
             function () use ( $ctx, $actor_user_id, $clinician, $visit_id, $charge_id ): void {
-                $visit  = $this->locked_visit_for_write( $ctx, $actor_user_id, $visit_id, $clinician );
+                $visit = $this->locked_visit_for_write( $ctx, $actor_user_id, $visit_id, $clinician );
                 $this->assert_visit_writable( $visit );
                 $charge = $this->require_charge( $ctx, $visit_id, $charge_id );
                 $this->pricing->update_charge(

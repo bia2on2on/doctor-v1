@@ -93,7 +93,7 @@ final class SmsService
      * Stage 3 is view-only; only offline license activation/renewal remains writable.
      */
     private function settings_write_blocked(): bool {
-        $gate = $this->license_gate ?? \ClinicCore\Bootstrap\App::licenseGate();
+        $gate     = $this->license_gate ?? \ClinicCore\Bootstrap\App::licenseGate();
         $decision = $gate->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
         if ( $decision->allowed ) {
             return false;

@@ -58,7 +58,7 @@ final class SignedLicenseGate implements LicenseGate
         // B1 (design §7.1): a locally cached verified ordinary signed document must
         // enforce its own T0/T1 regardless of outage age; binding mismatch, revocation,
         // expiry-window and no-cache states are never synthesized into an ordinary term.
-        $ordinary   = self::isOrdinaryCached( $status, $state );
+        $ordinary = self::isOrdinaryCached( $status, $state );
 
         // Owner rule (three-stage license; PR#11 for handwriting): the finish
         // lane for an already-opened Visit stays open in every license state.
