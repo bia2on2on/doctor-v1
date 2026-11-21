@@ -14,6 +14,7 @@ final class LicenseStatusNoticeTest extends TestCase
         self::assertNull(LicenseStatusNotice::text(['status' => 'active']));
         $grace = LicenseStatusNotice::text(['status' => 'grace']);
         self::assertStringContainsString('نوبت', $grace);
+        self::assertStringNotContainsString('همچنان مجاز', $grace); // Final policy: GRACE after T0 grants no new bookings
         $expired = LicenseStatusNotice::text(['status' => 'restricted', 'reason' => 'expired']);
         self::assertStringContainsString('بازیابی', $expired);
         $invalid = LicenseStatusNotice::text(['status' => 'restricted', 'reason' => 'signature_invalid']);

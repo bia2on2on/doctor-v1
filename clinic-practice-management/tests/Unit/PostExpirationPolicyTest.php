@@ -34,11 +34,25 @@ final class PostExpirationPolicyTest extends TestCase
     public function testBookingAndCommercialFeaturesStopExactlyAtSignedT0DespiteGraceAndSkew(): void
     {
         $t0 = 1793448000;
-        foreach ([LicenseGate::OP_APPOINTMENT_BOOK, LicenseGate::OP_APPOINTMENT_RESCHEDULE, LicenseGate::OP_SMS_COMMERCIAL, LicenseGate::OP_HANDWRITING_NEW] as $op) {
+        foreach ([LicenseGate::OP_APPOINTMENT_BOOK, LicenseGate::OP_APPOINTMENT_RESCHEDULE, LicenseGate::OP_HANDWRITING_NEW] as $op) {
             $this->assertTrue($this->gate($t0, $t0 - 1)->assert($op)->allowed);
             foreach ([$t0, $t0 + 1, $t0 + 300, $t0 + 7 * 86400, $t0 + 200 * 86400] as $now) {
                 $this->assertFalse($this->gate($t0, $now, true)->assert($op, ['reception' => true])->allowed, $op . ' at ' . $now);
             }
+        }
+        // Final 2026-11-17: commercial SMS needed to follow previously booked care stays allowed in
+        // Stage 2 (T0..T1-1s) ONLY with server-derived persisted care linkage (design §7.2 item 6;
+        // T-R12-14) — synthetic/orphaned contexts stay denied. Stage 3 denies outright.
+        $t1 = PostExpirationPolicy::deadline($t0, 1);
+        $care = ['care_linked' => true];
+        foreach ([$t0, $t0 + 1, $t0 + 300, $t1 - 1] as $now) {
+            $this->assertTrue($this->gate($t0, $now, true)->assert(LicenseGate::OP_SMS_COMMERCIAL, $care)->allowed, 'care sms at ' . $now);
+        }
+        foreach ([$t0, $t0 + 1, $t1 - 1] as $now) {
+            $this->assertFalse($this->gate($t0, $now, true)->assert(LicenseGate::OP_SMS_COMMERCIAL, ['reception' => true])->allowed, 'unlinked sms at ' . $now);
+        }
+        foreach ([$t1, $t1 + 1, $t1 + 200 * 86400] as $now) {
+            $this->assertFalse($this->gate($t0, $now, true)->assert(LicenseGate::OP_SMS_COMMERCIAL, $care)->allowed, 'sms at ' . $now);
         }
     }
 
@@ -56,29 +70,48 @@ final class PostExpirationPolicyTest extends TestCase
 
     public function testNewAndVerifiedReturningPatientExactHalfOpenWindows(): void
     {
+        // Final Q1(a)/Q2(a)/Q3(a) (2026-11-17): every new patient row, self-enrollment,
+        // reception creation and appointment-free/first-admission is denied from T0;
+        // returning/reception flags and pre-T0-passed evidence grant nothing from T0.
+        // Boundary points: T0−1s allow (Stage 1), T0 deny, T1−1s deny, T1 deny, T1+1s deny.
         $t0 = strtotime('2028-01-31 12:34:56 UTC');
+        $t1 = PostExpirationPolicy::deadline($t0, 1);
         $context = ['patient_id' => 42, 'clinic_id' => 7, 'reception' => true];
         foreach ([LicenseGate::OP_PATIENT_CREATE, LicenseGate::OP_VISIT_CHECKIN] as $op) {
-            foreach ([false => 1, true => 6] as $returning => $months) {
-                $end = PostExpirationPolicy::deadline($t0, $months);
-                $this->assertTrue($this->gate($t0, $end - 1, (bool) $returning)->assert($op, $context)->allowed);
-                $this->assertFalse($this->gate($t0, $end, (bool) $returning)->assert($op, $context)->allowed);
-                $this->assertFalse($this->gate($t0, $end + 1, (bool) $returning)->assert($op, $context)->allowed);
+            foreach ([false, true] as $returning) {
+                $this->assertTrue($this->gate($t0, $t0 - 1, $returning)->assert($op, $context)->allowed);
+                $this->assertFalse($this->gate($t0, $t0, $returning)->assert($op, $context)->allowed);
+                $this->assertFalse($this->gate($t0, $t1 - 1, $returning)->assert($op, $context)->allowed);
+                $this->assertFalse($this->gate($t0, $t1, $returning)->assert($op, $context)->allowed);
+                $this->assertFalse($this->gate($t0, $t1 + 1, $returning)->assert($op, $context)->allowed);
             }
             $this->assertFalse($this->gate($t0, $t0)->assert($op)->allowed);
-            $this->assertTrue($this->gate($t0, $t0, true)->assert($op)->allowed);
+            $this->assertFalse($this->gate($t0, $t0, true)->assert($op)->allowed);
         }
     }
 
     public function testContinuityAndRenewal(): void
     {
         $t0 = strtotime('2027-01-31 UTC');
-        $now = PostExpirationPolicy::deadline($t0, 6);
-        foreach ([LicenseGate::OP_PATIENT_UPDATE, LicenseGate::OP_APPOINTMENT_CANCEL, LicenseGate::OP_INVOICE_CREATE, 'clinical.note', 'clinical.export', 'backup.restore', 'payment.refund'] as $op) {
-            $this->assertTrue($this->gate($t0, $now)->assert($op)->allowed);
+        $t1 = PostExpirationPolicy::deadline($t0, 1);
+        // Stage 2 (T0..T1−1s): existing-record maintenance + finish-lane ops stay open under RBAC.
+        foreach ([LicenseGate::OP_PATIENT_UPDATE, LicenseGate::OP_APPOINTMENT_CANCEL, LicenseGate::OP_INVOICE_CREATE] as $op) {
+            $this->assertTrue($this->gate($t0, $t1 - 1)->assert($op)->allowed);
         }
-        $this->assertFalse($this->gate($t0, $now)->assert(LicenseGate::OP_APPOINTMENT_BOOK)->allowed);
-        $this->assertTrue($this->gate($now + 86400, $now)->assert(LicenseGate::OP_APPOINTMENT_BOOK)->allowed);
+        // Stage 3 (now ≥ T1): view-only; even finish-lane ops without an opened-Visit context are closed;
+        // historical refunds are denied exactly at T1 (final Q4a(a)); reads/hygiene outside the blocked list stay allowed.
+        foreach ([LicenseGate::OP_PATIENT_UPDATE, LicenseGate::OP_APPOINTMENT_CANCEL, LicenseGate::OP_INVOICE_CREATE, LicenseGate::OP_REFUND] as $op) {
+            $this->assertFalse($this->gate($t0, $t1)->assert($op)->allowed);
+        }
+        foreach (['clinical.note', 'clinical.export', 'backup.restore'] as $op) {
+            $this->assertTrue($this->gate($t0, $t1)->assert($op)->allowed);
+        }
+        $this->assertFalse($this->gate($t0, $t1)->assert(LicenseGate::OP_APPOINTMENT_BOOK)->allowed);
+        // Q4a(a): a historical refund stays allowed through T1−1s under RBAC and is denied exactly at T1.
+        $this->assertTrue($this->gate($t0, $t1 - 1)->assert(LicenseGate::OP_REFUND, ['original_payment_time' => $t1 - 2])->allowed);
+        $this->assertFalse($this->gate($t0, $t1)->assert(LicenseGate::OP_REFUND, ['original_payment_time' => $t1 - 1])->allowed);
+        // A freshly renewed term (its own Stage 1) restores new business.
+        $this->assertTrue($this->gate($t1 + 86400, $t1)->assert(LicenseGate::OP_APPOINTMENT_BOOK)->allowed);
     }
 
     public function testHandwritingForOpenedVisitExactStage2AndStage3HalfOpenBoundaries(): void

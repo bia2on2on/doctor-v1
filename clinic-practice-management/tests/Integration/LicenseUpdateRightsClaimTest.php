@@ -357,8 +357,18 @@ final class LicenseUpdateRightsClaimTest extends WP_UnitTestCase
         $this->assertSame(LicenseStatus::RESTRICTED, $withoutClaim['status']);
         $this->assertSame('expired', $withoutClaim['reason']);
         $this->assertTrue($withoutClaim['needs_renewal']);
+        // Final 2026-11-17 Stage 2: uncontextualized allow = finish-lane/service
+        // maintenance ops; the demand lanes and Q4a refunds stay denied until renewal.
+        $stage2_open = [
+            LicenseGate::OP_INVOICE_CREATE,
+            LicenseGate::OP_VISIT_FINISH,
+            LicenseGate::OP_PAYMENT_RECORD,
+            LicenseGate::OP_APPOINTMENT_NOSHOW,
+            LicenseGate::OP_SETTINGS_WRITE,
+            LicenseGate::OP_FILE_UPLOAD,
+        ];
         foreach (SignedLicenseGate::BLOCKED_UNDER_RESTRICTION as $operation) {
-            $this->assertSame($operation === LicenseGate::OP_INVOICE_CREATE, $withoutClaim['gate'][$operation]['allowed'], 'Owner policy: only care finance among these uncontextualized operations remains open');
+            $this->assertSame(in_array($operation, $stage2_open, true), $withoutClaim['gate'][$operation]['allowed'], 'Final Stage 2: only demand lanes and uncontextualized refunds are denied');
         }
 
         $payload['update_rights_until'] = 1893463200;

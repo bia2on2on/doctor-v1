@@ -6,14 +6,13 @@ namespace ClinicCore\Tests\Unit;
 
 use ClinicCore\Domain\Licensing\FirstEnrollmentPolicy;
 use ClinicCore\Domain\Licensing\LicenseStatus;
-use ClinicCore\Domain\Licensing\PostExpirationPolicy;
 use PHPUnit\Framework\TestCase;
 
 /**
- * The Patient Portal must not offer a form the server will reject. This pins
- * the preview to the existing ordinary-expiration policy: same half-open
- * six-Gregorian-month window, same strict pre-T0 returning evidence, no
- * reception exception, and no new business after T0 for other operations.
+ * The Patient Portal must not offer a form the server will reject. Final
+ * owner policy (2026-11-17, Q1(a)): no self-enrollment preview from T0 — no
+ * returning-evidence window, no reception exception; the preview closes with
+ * the signed ordinary-expiry T0 and stays closed through Stage 2 and Stage 3.
  */
 final class FirstEnrollmentPolicyTest extends TestCase
 {
@@ -21,20 +20,31 @@ final class FirstEnrollmentPolicyTest extends TestCase
 
     public function testOrdinaryExpirationBoundaryIsHalfOpenForReturningSubject(): void
     {
-        $deadline = PostExpirationPolicy::deadline( self::T0, 6 );
+        // Final Q1(a) (2026-11-17): the one-/six-month returning windows are
+        // retired — no self-enrollment preview from T0 at all. Boundary
+        // points: T0−1s allowed (Stage 1), T0 denied, T1−1s denied, T1 denied.
+        $t1 = \ClinicCore\Domain\Licensing\LicenseStagePolicy::t1( self::T0 );
 
-        self::assertTrue( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, $deadline - 1, true ) );
-        self::assertFalse( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, $deadline, true ) );
-        self::assertFalse( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, $deadline + 1, true ) );
+        self::assertTrue( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, self::T0 - 1, true ) );
+        self::assertFalse( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, self::T0, true ) );
+        self::assertFalse( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, $t1 - 1, true ) );
+        self::assertFalse( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, $t1, true ) );
     }
 
     public function testPostExpirationNeverOffersTheReceptionOnlyNewPatientWindow(): void
     {
-        $oneMonth = PostExpirationPolicy::deadline( self::T0, 1 );
+        $t1 = \ClinicCore\Domain\Licensing\LicenseStagePolicy::t1( self::T0 );
 
         self::assertFalse(
-            FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, $oneMonth - 1, false ),
-            'The one-month reception window is staff/reception-only; patient-self enrollment must not inherit it.'
+            FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, $t1 - 1, false ),
+            'Final Q1(a): no new patient row of any shape — patient self or reception — is offered from T0.'
+        );
+        self::assertFalse(
+            FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, $t1 - 1, true ),
+            'Returning evidence grants nothing from T0 (final Q1(a)).'
+        );
+        self::assertFalse(
+            FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, $t1, false )
         );
         self::assertFalse(
             FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', self::T0, self::T0, false )
@@ -48,6 +58,8 @@ final class FirstEnrollmentPolicyTest extends TestCase
         self::assertTrue( FirstEnrollmentPolicy::is_post_expiration( LicenseStatus::GRACE, 'grace', self::T0, self::T0 ) );
         self::assertTrue( FirstEnrollmentPolicy::is_post_expiration( LicenseStatus::GRACE, 'unreachable_grace', self::T0, self::T0 ) );
         self::assertTrue( FirstEnrollmentPolicy::is_post_expiration( LicenseStatus::RESTRICTED, 'expired', self::T0, self::T0 ) );
+        self::assertTrue( FirstEnrollmentPolicy::is_post_expiration( LicenseStatus::RESTRICTED, 'expired_unreachable', self::T0, self::T0 ) );
+        self::assertTrue( FirstEnrollmentPolicy::is_post_expiration( LicenseStatus::UNREACHABLE, 'cached_state_stale', self::T0, self::T0 ) );
 
         self::assertFalse( FirstEnrollmentPolicy::is_post_expiration( LicenseStatus::ACTIVE, '', self::T0, self::T0 - 1 ) );
         self::assertFalse( FirstEnrollmentPolicy::is_post_expiration( LicenseStatus::SUSPENDED, 'suspended', self::T0, self::T0 + 1 ) );
@@ -81,11 +93,12 @@ final class FirstEnrollmentPolicyTest extends TestCase
 
     public function testActualSixGregorianMonthDeadlineUsesClampedGregorianMonths(): void
     {
-        $endOfMonth = strtotime( '2026-08-31 10:00:00 UTC' );
-        $deadline = PostExpirationPolicy::deadline( $endOfMonth, 6 );
+        // T1 = T0 + 1 Gregorian month, UTC, day-clamped, half-open (design §6.1).
+        $endOfMonth = strtotime( '2026-01-31 10:00:00 UTC' );
+        $t1 = \ClinicCore\Domain\Licensing\LicenseStagePolicy::t1( $endOfMonth );
 
-        self::assertSame( '2027-02-28 10:00:00', gmdate( 'Y-m-d H:i:s', $deadline ) );
-        self::assertTrue( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', $endOfMonth, $deadline - 1, true ) );
-        self::assertFalse( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', $endOfMonth, $deadline, true ) );
+        self::assertSame( '2026-02-28 10:00:00', gmdate( 'Y-m-d H:i:s', $t1 ) );
+        self::assertFalse( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', $endOfMonth, $t1 - 1, true ) );
+        self::assertFalse( FirstEnrollmentPolicy::allows_first_enrollment( LicenseStatus::RESTRICTED, 'expired', $endOfMonth, $t1, true ) );
     }
 }
