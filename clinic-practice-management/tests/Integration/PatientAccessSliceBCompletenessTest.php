@@ -85,6 +85,7 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
         parent::setUp();
         App::migrations()->migrate();
         \ClinicCore\Settings\Settings::flushCache();
+        App::resetScope();
 
         global $wp_rest_server, $wp_filter;
         rest_get_server();
@@ -173,7 +174,11 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
                 'Non-allowlisted route ' . $pair . ' must not be reachable by ROLE_PATIENT (got HTTP ' . $status . ').'
             );
             if ( 400 === $status ) {
-                self::assertSame( 'CLINIC_SCOPE_REQUIRED', $response->get_data()['code'] ?? null, $pair );
+                self::assertSame(
+                    'CLINIC_SCOPE_REQUIRED',
+                    $response->get_data()['code'] ?? null,
+                    $pair . ' returned 400: ' . wp_json_encode( $response->get_data() )
+                );
             }
         }
         self::assertCount( 22, $nonPublic22 );
