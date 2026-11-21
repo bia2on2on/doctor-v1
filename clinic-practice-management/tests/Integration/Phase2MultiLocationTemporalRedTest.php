@@ -47,6 +47,7 @@ require_once __DIR__ . '/Fixtures/RecordingSmsProvider.php';
 
 use ClinicCore\Tests\Integration\Fixtures\Phase2MultiLocationTemporalFixture;
 use ClinicCore\Tests\Integration\Fixtures\RecordingSmsProvider;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 
 final class Phase2MultiLocationTemporalRedTest extends WP_UnitTestCase
 {
@@ -64,6 +65,11 @@ final class Phase2MultiLocationTemporalRedTest extends WP_UnitTestCase
         // The lazy check-in contract pins the VisitService clock seam; never let
         // it leak into another test in this or any later class.
         \ClinicCore\Application\Visits\VisitService::setTestNowUtc(null);
+        PatientTwoProofTestHelper::reset();
+        App::db()->query(
+            'DELETE FROM ' . App::db()->table('cpms_patient_logins') . ' WHERE clinic_id = %d',
+            [self::FX_T_CLINIC_ID]
+        );
         $this->purgeMultiLocationTemporalFixture();
         parent::tearDown();
     }
@@ -684,6 +690,12 @@ final class Phase2MultiLocationTemporalRedTest extends WP_UnitTestCase
             '09120000001',
             $now
         ));
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            self::FX_T_CLINIC_ID,
+            $this->fxTPatient,
+            ['mobile' => '09120000001', 'seed_session_scope' => true, 'full_identity' => false]
+        );
         return $userId;
     }
 

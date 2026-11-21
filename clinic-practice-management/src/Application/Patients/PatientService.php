@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Application\Patients;
 
+use ClinicCore\Application\Auth\PatientSessionProofStore;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Domain\Licensing\LicenseGate;
@@ -15,6 +16,7 @@ use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 use ClinicCore\Infrastructure\Repository\PatientIdentityRepository;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 
 /**
@@ -97,6 +99,18 @@ final class PatientService
      * @return list<array<string, mixed>>
      */
     public function linked_records( int $wp_user_id ): array {
+        $proved_ids = array_flip( App::patient_access()->proved_patient_ids( $wp_user_id ) );
+        if ( [] === $proved_ids ) {
+            return [];
+        }
+
+        $rows = array_values(
+            array_filter(
+                $this->patients->active_linked_records_for_user( $wp_user_id ),
+                static fn ( array $row ): bool => isset( $proved_ids[ (int) ( $row['patient_id'] ?? 0 ) ] )
+            )
+        );
+
         return array_map(
             static fn ( array $row ): array => [
                 'link_id'              => (int) $row['link_id'],
@@ -107,7 +121,7 @@ final class PatientService
                 'mrn'                  => (string) $row['mrn'],
                 'is_primary'           => (bool) $row['is_primary'],
             ],
-            $this->patients->active_linked_records_for_user( $wp_user_id )
+            $rows
         );
     }
 
@@ -119,7 +133,15 @@ final class PatientService
      * @return list<array{id:int, name:string}>
      */
     public function booking_clinics( int $wp_user_id ): array {
-        return $this->patients->active_booking_clinics_for_user( $wp_user_id );
+        $access  = App::patient_access();
+        $clinics = $this->patients->active_booking_clinics_for_user( $wp_user_id );
+
+        return array_values(
+            array_filter(
+                $clinics,
+                static fn ( array $clinic ): bool => \ClinicCore\Application\Auth\PatientAccess::LEVEL_NONE !== $access->level( $wp_user_id, null, (int) ( $clinic['id'] ?? 0 ) )
+            )
+        );
     }
 
     /**
@@ -217,16 +239,32 @@ final class PatientService
      * @return array<string, mixed>
      */
     public function require_selected_patient( int $wp_user_id, ?int $link_id = null ): array {
+        $access = App::patient_access();
+
         if ( $link_id !== null ) {
             $selected = $this->patients->find_active_linked_patient_by_link( $wp_user_id, $link_id );
             if ( $selected === null ) {
+                throw $this->linked_patient_not_found();
+            }
+            $proved_ids = $access->proved_patient_ids( $wp_user_id, (int) ( $selected['clinic_id'] ?? 0 ) );
+            if ( ! in_array( (int) ( $selected['id'] ?? 0 ), $proved_ids, true ) ) {
                 throw $this->linked_patient_not_found();
             }
 
             return $selected;
         }
 
-        $candidates = $this->patients->active_linked_patients_for_user( $wp_user_id );
+        $proved_ids = array_flip( $access->proved_patient_ids( $wp_user_id ) );
+        if ( [] === $proved_ids ) {
+            throw $this->linked_patient_not_found();
+        }
+
+        $candidates = array_values(
+            array_filter(
+                $this->patients->active_linked_patients_for_user( $wp_user_id ),
+                static fn ( array $row ): bool => isset( $proved_ids[ (int) ( $row['id'] ?? 0 ) ] )
+            )
+        );
         if ( $candidates === [] ) {
             throw $this->linked_patient_not_found();
         }
@@ -512,10 +550,24 @@ final class PatientService
             throw new BookingException( 'CLINIC_VALIDATION_FAILED', 'فیلدی برای ویرایش ارسال نشده است' );
         }
 
-        // D6 audit atomicity: staff profile write + mandatory audit in one boundary.
+        $close_bindings         = ( array_key_exists( 'national_id', $data )
+                && (string) ( $data['national_id'] ?? '' ) !== (string) ( $current['national_id'] ?? '' ) )
+            || ( isset( $data['status'] ) && 'archived' === (string) $data['status'] );
+        $affected_binding_users = [];
+
+        // D6 audit atomicity: staff profile write + binding closure (§7.6) + mandatory audit in one boundary.
         $this->db->transactional(
-            function () use ( $patient_id, $data, $current, $actor_user_id ) {
+            function () use ( $patient_id, $data, $current, $actor_user_id, $close_bindings, &$affected_binding_users ) {
                 $this->patients->update( $patient_id, $data + [ 'updated_at' => $this->db->nowUtcSql() ] );
+                if ( $close_bindings ) {
+                    $login_repo = new PatientLoginRepository( $this->db );
+                    if ( $login_repo->table_exists() ) {
+                        $affected_binding_users = $login_repo->close_bindings_for_patient(
+                            (int) $current['clinic_id'],
+                            $patient_id
+                        );
+                    }
+                }
                 $updated = (array) $this->patients->find( $patient_id );
 
                 $this->audit->log(
@@ -531,6 +583,12 @@ final class PatientService
                 );
             }
         );
+        if ( [] !== $affected_binding_users ) {
+            $proof_store = new PatientSessionProofStore();
+            foreach ( $affected_binding_users as $affected_user_id ) {
+                $proof_store->destroy_all_sessions( $affected_user_id );
+            }
+        }
         $updated = (array) $this->patients->find( $patient_id );
         $this->op->info(
             'patient.updated',

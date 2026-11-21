@@ -6,6 +6,7 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -94,6 +95,12 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
             $now
         ));
         self::assertGreaterThan(0, (int) $wpdb->insert_id, 'precondition: link created');
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserId,
+            1,
+            $patientId,
+            ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => false]
+        );
 
         $this->locationId = (int) App::db()->fetchValue(
             'SELECT id FROM ' . App::db()->table('cpms_locations')
@@ -111,7 +118,7 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
     protected function tearDown(): void
     {
         $this->removeFault();
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         parent::tearDown();
     }
 
@@ -133,7 +140,7 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
 
     public function testFailedLocationLockIsRetryableLoggedAndRolledBack(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot('10:00');
         $this->installFault('error');
 
@@ -164,7 +171,7 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
 
     public function testSyntheticDriverValuesNeverReachResponseOrStoredDiagnostic(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot('21:00');
         $this->installFault('synthetic_values');
 
@@ -214,7 +221,7 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
 
     public function testMissingLocationUnderLockKeepsLegacy404(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot('11:00');
         $this->installFault('missing');
 
@@ -229,7 +236,7 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
 
     public function testInactiveLocationUnderLockKeepsLegacy404(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot('13:00');
         $this->installFault('inactive');
 
@@ -244,7 +251,7 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
 
     public function testHoldSuccessPathIsUnchanged(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot('14:00');
 
         $response = $this->dispatch($this->holdBody($slot));
@@ -258,7 +265,7 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
 
     public function testConfirmLockFailureKeepsHoldAndIdempotencyKeyRetryable(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot('15:00');
         $hold = $this->dispatch($this->holdBody($slot));
         self::assertSame(200, $hold->get_status());
@@ -289,7 +296,7 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
 
     public function testDiagnosticSqlErrnoIsPositiveInteger(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot('20:00');
         $this->installFault('error');
 
@@ -369,7 +376,7 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
 
     private function assertLockFailure(string $target, string $label): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot('16:00');
         $this->installFault('error', $target);
 
@@ -383,7 +390,7 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
 
     private function assertNonLockingFailure(string $target, string $label): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot('17:00');
         $this->installFault('error', $target);
 
@@ -400,7 +407,7 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
 
     private function assertNonLockingAbsent(string $target, string $text): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot('18:00');
         $this->installFault('absent', $target);
 

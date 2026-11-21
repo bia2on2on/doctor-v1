@@ -10,6 +10,7 @@ use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Response;
 use WP_UnitTestCase;
 
@@ -78,7 +79,7 @@ final class PatientPortalChangeDeadlineTest extends WP_UnitTestCase
     protected function tearDown(): void
     {
         $this->setDeadlines(24, 24);
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         ScopeContext::clear();
         App::resetScope();
         SystemClinicResolver::flush();
@@ -152,7 +153,7 @@ final class PatientPortalChangeDeadlineTest extends WP_UnitTestCase
     {
         [$userId, $appointmentId, $slotId] = $this->fixtureWithAppointment('parity', '+2 hours', null);
 
-        wp_set_current_user($userId);
+        PatientTwoProofTestHelper::acting_as($userId);
 
         $options = $this->dispatch('GET', '/clinic/v1/appointments/' . $appointmentId . '/reschedule-options');
         $post    = $this->dispatch(
@@ -187,7 +188,7 @@ final class PatientPortalChangeDeadlineTest extends WP_UnitTestCase
 
         $altSlot = $this->insertSlot($clinicianId, $this->localDate('+6 days'), '11:30:00', 0);
 
-        wp_set_current_user($userId);
+        PatientTwoProofTestHelper::acting_as($userId);
 
         $options = $this->dispatch('GET', '/clinic/v1/appointments/' . $appointmentId . '/reschedule-options');
         self::assertSame(200, $options->get_status(), 'outside the reschedule deadline options must load.');
@@ -358,6 +359,12 @@ final class PatientPortalChangeDeadlineTest extends WP_UnitTestCase
             ['%d', '%d', '%d', '%s', '%d', '%s']
         );
         self::assertTrue((bool) $ok, 'fixture: patient_user_link insert failed: ' . $wpdb->last_error);
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $this->clinicId,
+            $patientId,
+            ['mobile' => $mobile, 'seed_session_scope' => true]
+        );
     }
 
     private function insertClinician(string $name): int
@@ -539,7 +546,7 @@ final class PatientPortalChangeDeadlineTest extends WP_UnitTestCase
 
     private function renderPortalAs(int $userId): string
     {
-        wp_set_current_user($userId);
+        PatientTwoProofTestHelper::acting_as($userId);
         ob_start();
         try {
             PatientPortalPage::render();

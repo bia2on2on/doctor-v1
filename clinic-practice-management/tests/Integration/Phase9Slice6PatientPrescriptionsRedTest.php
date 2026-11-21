@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Time\Jalali;
 use ClinicCore\Frontend\PatientPortalShell;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -77,7 +79,7 @@ final class Phase9Slice6PatientPrescriptionsRedTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         ScopeContext::clear();
         App::resetScope();
         SystemClinicResolver::flush();
@@ -208,7 +210,7 @@ final class Phase9Slice6PatientPrescriptionsRedTest extends WP_UnitTestCase
         $canonical = null;
         foreach ([$this->other['link'], $inactive['link'], $mismatch['link'], 2147483647] as $link) {
             $response = $this->get('/prescriptions', ['link_id' => $link]);
-            $this->error($response, 404, 'CLINIC_NOT_FOUND');
+            $this->error($response, 403, PatientAccess::PROOF_FAILED_CODE);
             $error = $response->get_data();
             $fingerprint = [$error['code'], $error['message'], $error['data']['status']];
             $canonical ??= $fingerprint;
@@ -219,7 +221,7 @@ final class Phase9Slice6PatientPrescriptionsRedTest extends WP_UnitTestCase
     public function testZeroAndSingleRecordControlsKeepExistingBoundsAndAuthentication(): void
     {
         $before = $this->counts();
-        $this->error($this->get('/prescriptions', [], $this->empty), 404, 'CLINIC_NOT_FOUND');
+        $this->error($this->get('/prescriptions', [], $this->empty), 403, PatientAccess::PROOF_FAILED_CODE);
         $this->error($this->get('/prescriptions', [], $this->user, false), 403, 'CLINIC_INVALID_NONCE');
         $this->error($this->get('/prescriptions', [], 0, false), 403, 'CLINIC_INVALID_NONCE');
         self::assertSame($before, $this->counts(), 'Read/denial must not create Patients, links, or prescriptions.');
@@ -360,6 +362,14 @@ final class Phase9Slice6PatientPrescriptionsRedTest extends WP_UnitTestCase
             'clinic_id' => $clinic, 'patient_id' => $patient, 'wp_user_id' => $user,
             'mobile_at_link' => $mobile, 'is_primary' => $primary, 'linked_at' => $now,
         ]);
+        if ('active' === $status) {
+            PatientTwoProofTestHelper::seed_patient_proof($user, $clinic, $patient, [
+                'mobile' => $mobile,
+                'is_primary' => 1 === $primary,
+                'seed_session_scope' => true,
+                'set_current_user' => false,
+            ]);
+        }
         $clinician = $this->insert('cpms_clinicians', [
             'clinic_id' => $clinic, 'full_name' => 'Doctor ' . $name,
             'is_active' => 1, 'created_at' => $now, 'updated_at' => $now,
@@ -520,7 +530,7 @@ final class Phase9Slice6PatientPrescriptionsRedTest extends WP_UnitTestCase
 
     private function get(string $path, array $params = [], ?int $user = null, bool $nonce = true): WP_REST_Response
     {
-        wp_set_current_user($user ?? $this->user);
+        PatientTwoProofTestHelper::acting_as($user ?? $this->user);
         $request = new WP_REST_Request('GET', '/clinic/v1' . $path);
         foreach ($params as $key => $value) {
             $request->set_param($key, $value);
@@ -550,7 +560,7 @@ final class Phase9Slice6PatientPrescriptionsRedTest extends WP_UnitTestCase
 
     private function render(int $user): string
     {
-        wp_set_current_user($user);
+        PatientTwoProofTestHelper::acting_as($user);
         $url = PatientPortalShell::portal_url();
         self::assertStringNotContainsString('/wp-admin/', $url);
         $this->go_to($url);

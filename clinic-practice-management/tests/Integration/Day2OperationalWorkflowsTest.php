@@ -12,6 +12,7 @@ use ClinicCore\Infrastructure\Repository\CustomRoleRepository;
 use ClinicCore\Infrastructure\Repository\FollowUpRepository;
 use ClinicCore\Infrastructure\Repository\PaymentRepository;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -53,7 +54,7 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
     {
         ScopeContext::clear();
         App::resetScope();
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         parent::tearDown();
     }
 
@@ -110,7 +111,7 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
         $apptId = $this->insertAppointment($clinicA, $locA, $patientA, $clinician, $curSlot, $tomorrow, '09:00:00', 'confirmed');
 
         // 1. Foreign patient denied with 403 + FORBIDDEN_ACCESS_ATTEMPT audit.
-        wp_set_current_user($otherPtUser);
+        PatientTwoProofTestHelper::acting_as($otherPtUser);
         $denied = $this->dispatch('GET', '/clinic/v1/appointments/' . $apptId . '/reschedule-options');
         self::assertSame(403, $denied->get_status());
         self::assertSame('CLINIC_PERMISSION_DENIED', $this->errCode($denied));
@@ -121,7 +122,7 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
 
         // 2. Owning patient receives a bounded appointment projection with clear,
         // server-resolved display details and same-Location reschedule choices.
-        wp_set_current_user($patientUser);
+        PatientTwoProofTestHelper::acting_as($patientUser);
         $mine = $this->dispatch('GET', '/clinic/v1/appointments/mine', [
             'from' => $tomorrow,
             'to'   => $dayAfter,
@@ -197,7 +198,7 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
             'from' => $tomorrow,
             'to'   => $dayAfter,
         ]);
-        self::assertSame([], $this->payload($archivedMine), 'An archived Patient must not retain portal appointment authority.');
+        self::assertSame(403, $archivedMine->get_status(), 'An archived Patient must fail closed at PatientAccess gate.');
         self::assertSame(403, $this->dispatch('POST', '/clinic/v1/appointments/' . $apptId . '/cancel')->get_status());
         self::assertSame(1, App::db()->update('cpms_patients', ['status' => 'active'], ['id' => $patientA]));
 
@@ -931,7 +932,7 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
 
         $targetSettings->set('booking.max_future_days', 7);
         Settings::flushCache();
-        wp_set_current_user($patientUser);
+        PatientTwoProofTestHelper::acting_as($patientUser);
         $restRes = $this->dispatch('GET', '/clinic/v1/appointments/' . $liveAppt . '/reschedule-options');
         self::assertSame(200, $restRes->get_status(), 'REST reschedule-options must succeed when booking.max_future_days=7 (< 28 days).');
         $restIds = $extractIds($this->payload($restRes));
@@ -1109,8 +1110,15 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
             'is_primary'     => 1,
             'linked_at'      => App::db()->nowUtcSql(),
         ]);
+        $linkId = App::db()->wpdb_last_insert_id();
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $wpUserId,
+            $clinicId,
+            $patientId,
+            ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => false]
+        );
 
-        return App::db()->wpdb_last_insert_id();
+        return $linkId;
     }
 
     /**

@@ -37,6 +37,7 @@ use ClinicCore\Frontend\PatientPortalShell;
 use ClinicCore\Frontend\PublicBookingAssets;
 use ClinicCore\Frontend\StaffPortalShell;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 final class PkgP1JalaliAssetsTest extends WP_UnitTestCase {
@@ -56,7 +57,7 @@ final class PkgP1JalaliAssetsTest extends WP_UnitTestCase {
 
 	protected function tearDown(): void {
 		$this->reset_asset_state();
-		wp_set_current_user( 0 );
+		PatientTwoProofTestHelper::reset();
 		$_GET                      = [];
 		$_POST                     = [];
 		$_REQUEST                  = [];
@@ -369,7 +370,7 @@ final class PkgP1JalaliAssetsTest extends WP_UnitTestCase {
 	 * @param array<string, string> $query   Extra GET parameters.
 	 */
 	private function render_shell( int $user_id, string $url, array $query = [] ): string {
-		wp_set_current_user( $user_id );
+		PatientTwoProofTestHelper::acting_as( $user_id );
 		$target       = [] !== $query ? add_query_arg( $query, $url ) : $url;
 		$path         = (string) ( wp_parse_url( $target, PHP_URL_PATH ) ?? '/' );
 		$qs           = (string) ( wp_parse_url( $target, PHP_URL_QUERY ) ?? '' );
@@ -603,6 +604,16 @@ final class PkgP1JalaliAssetsTest extends WP_UnitTestCase {
 		self::assertTrue( (bool) $ok, 'patient_user_links insert failed: ' . $wpdb->last_error );
 		$patient_link_id = (int) $wpdb->insert_id;
 		self::assertGreaterThan( 0, $patient_link_id );
+		PatientTwoProofTestHelper::seed_patient_proof(
+			$patient_user_id,
+			$clinic_id,
+			$patient_id,
+			[
+				'mobile'             => $mobile,
+				'seed_session_scope' => true,
+				'set_current_user'   => false,
+			]
+		);
 
 		return [
 			'org_id'          => $org_id,

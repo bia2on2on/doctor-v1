@@ -7,6 +7,7 @@ namespace ClinicCore\Tests\Integration;
 use ClinicCore\Application\Clinical\ClinicalException;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Storage\LocalFileStorage;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -75,6 +76,12 @@ final class MedicalFilesTest extends WP_UnitTestCase
                 $this->patientBId = $patientId;
                 $this->patientBUser = $userId;
             }
+            PatientTwoProofTestHelper::seed_patient_proof(
+                $userId,
+                1,
+                $patientId,
+                ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => ($tag === 'A')]
+            );
         }
 
         // C6 repair — عضویت فعال staff صریح است (نه fixture سراسری).
@@ -88,6 +95,7 @@ final class MedicalFilesTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
+        PatientTwoProofTestHelper::reset();
         // فایل‌های فیزیکی تست — خارج از تراکنش DB
         if (is_dir($this->storagePath)) {
             $it = new \RecursiveIteratorIterator(
@@ -273,7 +281,7 @@ final class MedicalFilesTest extends WP_UnitTestCase
     {
         $tmp = $this->tempFile($this->pdfContent());
 
-        wp_set_current_user($this->patientAUser);
+        PatientTwoProofTestHelper::acting_as($this->patientAUser);
         $request = new WP_REST_Request('POST', self::NS . '/patients/' . $this->patientAId . '/files');
         $request->set_param('category', 'document');
         $request->set_file_params(['file' => [
@@ -307,7 +315,7 @@ final class MedicalFilesTest extends WP_UnitTestCase
     {
         $tmp = $this->tempFile($this->pdfContent());
 
-        wp_set_current_user($this->patientAUser);
+        PatientTwoProofTestHelper::acting_as($this->patientAUser);
         $request = new WP_REST_Request('POST', self::NS . '/patients/' . $this->patientBId . '/files');
         $request->set_file_params(['file' => [
             'name' => 'evil.pdf',
@@ -319,8 +327,8 @@ final class MedicalFilesTest extends WP_UnitTestCase
         $request->set_header('X-WP-Nonce', wp_create_nonce('wp_rest'));
 
         $response = rest_do_request($request);
-        $this->assertSame(404, $response->get_status());
-        $this->assertSame('CLINIC_NOT_FOUND', $response->get_data()['code'] ?? null);
+        $this->assertSame(403, $response->get_status());
+        $this->assertSame(\ClinicCore\Application\Auth\PatientAccess::PROOF_FAILED_CODE, $response->get_data()['code'] ?? null);
     }
 
     public function testUnauthenticatedStreamIs401(): void

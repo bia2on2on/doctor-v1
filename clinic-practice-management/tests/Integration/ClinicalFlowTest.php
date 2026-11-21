@@ -6,6 +6,7 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Application\Clinical\ClinicalException;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -115,7 +116,20 @@ final class ClinicalFlowTest extends WP_UnitTestCase
                 $this->patientBId = $patientId;
                 $this->patientBUser = $userId;
             }
+            PatientTwoProofTestHelper::seed_patient_proof(
+                $userId,
+                1,
+                $patientId,
+                ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => ( $tag === 'A' )]
+            );
         }
+    }
+
+    protected function tearDown(): void
+    {
+        PatientTwoProofTestHelper::reset();
+        App::resetScope();
+        parent::tearDown();
     }
 
     // ================= E8/E9 — Notes + نسخه‌بندی =================
@@ -282,7 +296,7 @@ final class ClinicalFlowTest extends WP_UnitTestCase
         );
 
         // سطح API (REST dispatch واقعی)
-        wp_set_current_user($this->patientAUser);
+        PatientTwoProofTestHelper::acting_as($this->patientAUser);
         $response = $this->dispatch('GET', self::NS . '/visits/' . $visitId);
         $this->assertSame(200, $response->get_status());
         $body = (string) json_encode($response->get_data(), JSON_UNESCAPED_UNICODE);
@@ -325,7 +339,7 @@ final class ClinicalFlowTest extends WP_UnitTestCase
         ]);
 
         // بیمار A → ویزیت بیمار B (سطح API)
-        wp_set_current_user($this->patientAUser);
+        PatientTwoProofTestHelper::acting_as($this->patientAUser);
         $response = $this->dispatch('GET', self::NS . '/visits/' . $visitB);
         $this->assertSame(404, $response->get_status());
         $this->assertSame('CLINIC_NOT_FOUND', $response->get_data()['code'] ?? null);
@@ -430,7 +444,7 @@ final class ClinicalFlowTest extends WP_UnitTestCase
         }
 
         // REST: بدون Cap → 403 (لایه کنترلر)
-        wp_set_current_user($this->patientAUser);
+        PatientTwoProofTestHelper::acting_as($this->patientAUser);
         $response = $this->dispatch('POST', self::NS . '/search', ['q' => 'MR-CF-0001']);
         $this->assertSame(403, $response->get_status());
         $this->assertSame('CLINIC_PERMISSION_DENIED', $response->get_data()['code'] ?? null);
@@ -868,7 +882,7 @@ final class ClinicalFlowTest extends WP_UnitTestCase
         $visitA = $this->makeConsultation($this->patientAId);
         $this->makeConsultation($this->patientBId);
 
-        wp_set_current_user($this->patientAUser);
+        PatientTwoProofTestHelper::acting_as($this->patientAUser);
         $response = $this->dispatch('GET', self::NS . '/visits');
         $this->assertSame(200, $response->get_status());
         $visits = $response->get_data()['data']['visits'] ?? [];

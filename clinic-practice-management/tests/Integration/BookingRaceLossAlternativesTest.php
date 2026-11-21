@@ -45,6 +45,7 @@ use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 final class BookingRaceLossAlternativesTest extends WP_UnitTestCase
@@ -84,7 +85,7 @@ final class BookingRaceLossAlternativesTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         ScopeContext::clear();
         App::resetScope();
         SystemClinicResolver::flush();
@@ -144,6 +145,7 @@ final class BookingRaceLossAlternativesTest extends WP_UnitTestCase
         );
 
         // ---- real winner hold consumes the only capacity unit
+        PatientTwoProofTestHelper::acting_as($this->winnerUserId);
         $winnerHold = App::bookingService()->hold(
             $this->winnerUserId,
             self::FX_CLINICIAN_ID,
@@ -174,6 +176,7 @@ final class BookingRaceLossAlternativesTest extends WP_UnitTestCase
         );
 
         // ---- real BookingService::hold() failure path for the loser
+        PatientTwoProofTestHelper::acting_as($this->loserUserId);
         try {
             App::bookingService()->hold(
                 $this->loserUserId,
@@ -277,6 +280,7 @@ final class BookingRaceLossAlternativesTest extends WP_UnitTestCase
         $nextDateWitness = $this->insertSlot(self::FX_LOC_MAIN_ID, $nextDate, '08:00:00', 1);
 
         // ---- legitimate hold via the REAL hold() path
+        PatientTwoProofTestHelper::acting_as($this->loserUserId);
         $hold = App::bookingService()->hold(
             $this->loserUserId,
             self::FX_CLINICIAN_ID,
@@ -371,6 +375,7 @@ final class BookingRaceLossAlternativesTest extends WP_UnitTestCase
         $nextDateWitness = $this->insertSlot(self::FX_LOC_MAIN_ID, $nextDate, '09:00:00', 1);
 
         // ---- real winner hold consumes the only capacity unit
+        PatientTwoProofTestHelper::acting_as($this->winnerUserId);
         $winnerHold = App::bookingService()->hold(
             $this->winnerUserId,
             self::FX_CLINICIAN_ID,
@@ -389,6 +394,7 @@ final class BookingRaceLossAlternativesTest extends WP_UnitTestCase
         );
 
         // ---- real BookingService::hold() failure path for the loser
+        PatientTwoProofTestHelper::acting_as($this->loserUserId);
         try {
             App::bookingService()->hold(
                 $this->loserUserId,
@@ -435,6 +441,8 @@ final class BookingRaceLossAlternativesTest extends WP_UnitTestCase
         $date = gmdate('Y-m-d', time() + 4 * 86400);
         $slotId = $this->insertSlot(self::FX_LOC_MAIN_ID, $date, '10:00:00', 1);
 
+        $hold = null;
+        PatientTwoProofTestHelper::acting_as($this->winnerUserId);
         $hold = App::bookingService()->hold($this->winnerUserId, self::FX_CLINICIAN_ID, $date, '10:00:00', $slotId);
         self::assertNotEmpty($hold['hold_token']);
         self::assertSame($slotId, (int) $hold['slot']['slot_id'], 'hold view unchanged');
@@ -469,6 +477,7 @@ final class BookingRaceLossAlternativesTest extends WP_UnitTestCase
         $date = gmdate('Y-m-d', time() + 4 * 86400);
         $slotId = $this->insertSlot(self::FX_LOC_MAIN_ID, $date, '10:00:00', 1);
 
+        PatientTwoProofTestHelper::acting_as($this->winnerUserId);
         $hold = App::bookingService()->hold($this->winnerUserId, self::FX_CLINICIAN_ID, $date, '10:00:00', $slotId);
         $key = $this->uuid();
 
@@ -565,7 +574,12 @@ final class BookingRaceLossAlternativesTest extends WP_UnitTestCase
             'INSERT INTO ' . $db->table('cpms_patient_user_links') . ' (clinic_id, patient_id, wp_user_id, mobile_at_link, is_primary, linked_at) VALUES (%d, %d, %d, %s, 1, %s)',
             [self::FX_CLINIC_ID, $patientId, (int) $userId, $mobile, $now]
         ));
-        cpms_test_seed_patient_session((int) $userId, self::FX_CLINIC_ID);
+        PatientTwoProofTestHelper::seed_patient_proof(
+            (int) $userId,
+            self::FX_CLINIC_ID,
+            $patientId,
+            ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => false]
+        );
 
         return (int) $userId;
     }

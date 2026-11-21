@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Rest;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Notifications\NotificationService;
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Auth\RolesAndCapabilities;
@@ -25,8 +26,14 @@ final class NotificationsController extends RestBase
 {
     protected const NS = 'clinic/v1';
 
-    public function __construct(private readonly NotificationService $notifications)
-    {
+    public function __construct(
+        private readonly NotificationService $notifications,
+        private readonly ?PatientAccess $patient_access = null
+    ) {
+    }
+
+    protected function patient_access(): PatientAccess {
+        return $this->patient_access ?? parent::patient_access();
     }
 
     public function register_routes(): void
@@ -39,8 +46,7 @@ final class NotificationsController extends RestBase
                     (bool) ($r['unread'] ?? false),
                     (int) ($r['limit'] ?? 50)
                 )),
-                'permission_callback' => fn (WP_REST_Request $r)
-                    => $this->permAnyRole($r, [RolesAndCapabilities::ROLE_PATIENT, RolesAndCapabilities::ROLE_SECRETARY, RolesAndCapabilities::ROLE_DOCTOR], 'دسترسی به اعلان‌ها برای نقش شما مجاز نیست'),
+                'permission_callback' => fn ( WP_REST_Request $r ) => $this->notifications_permission( $r ),
                 'args' => [
                     'unread' => ['required' => false, 'type' => 'boolean', 'default' => false],
                     'limit' => ['required' => false, 'type' => 'integer', 'default' => 50, 'sanitize_callback' => 'absint'],
@@ -61,8 +67,7 @@ final class NotificationsController extends RestBase
 
                     return ['marked' => $marked];
                 }),
-                'permission_callback' => fn (WP_REST_Request $r)
-                    => $this->permAnyRole($r, [RolesAndCapabilities::ROLE_PATIENT, RolesAndCapabilities::ROLE_SECRETARY, RolesAndCapabilities::ROLE_DOCTOR], 'دسترسی به اعلان‌ها برای نقش شما مجاز نیست'),
+                'permission_callback' => fn ( WP_REST_Request $r ) => $this->notifications_permission( $r ),
                 'args' => [
                     'ids' => ['required' => false, 'type' => 'array', 'items' => ['type' => 'integer']],
                     'all' => ['required' => false, 'type' => 'boolean', 'default' => false],
@@ -75,13 +80,39 @@ final class NotificationsController extends RestBase
             [
                 'methods' => WP_REST_Server::READABLE,
                 'callback' => fn (WP_REST_Request $r) => $this->rtNotifications($r),
-                'permission_callback' => fn (WP_REST_Request $r)
-                    => $this->permAnyRole($r, [RolesAndCapabilities::ROLE_PATIENT, RolesAndCapabilities::ROLE_SECRETARY, RolesAndCapabilities::ROLE_DOCTOR], 'دسترسی به اعلان‌ها برای نقش شما مجاز نیست'),
+                'permission_callback' => fn ( WP_REST_Request $r ) => $this->notifications_permission( $r ),
                 'args' => [
                     'since' => ['required' => false, 'type' => 'integer', 'default' => 0, 'sanitize_callback' => 'absint'],
                 ],
             ],
         ]);
+    }
+
+    /**
+     * Shared notification permission gate: staff roles (`cpms_secretary`,
+     * `cpms_doctor` without `cpms_patient`) keep `main` behavior; patient
+     * requests pass through the central `PatientAccess` gate.
+     */
+    private function notifications_permission( WP_REST_Request $request ): bool|WP_Error {
+        $nonce_error = $this->requireNonce( $request );
+        if ( $nonce_error instanceof WP_Error ) {
+            return $nonce_error;
+        }
+
+        $user = wp_get_current_user();
+        if ( ! $user->exists() ) {
+            return $this->error( 'CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید' );
+        }
+
+        $roles = (array) $user->roles;
+        if (
+            ! in_array( RolesAndCapabilities::ROLE_PATIENT, $roles, true )
+            && [] !== array_intersect( [ RolesAndCapabilities::ROLE_SECRETARY, RolesAndCapabilities::ROLE_DOCTOR ], $roles )
+        ) {
+            return true;
+        }
+
+        return $this->require_patient_access( $request, [ 'mode' => PatientAccess::MODE_RECORDS_LIST ] );
     }
 
     // ================= R2 — ETag/304 =================

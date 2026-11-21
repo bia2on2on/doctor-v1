@@ -66,6 +66,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Frontend;
 
+use ClinicCore\Admin\PatientPortalPage;
 use ClinicCore\Application\Clinic\PublicClinicDirectory;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Domain\Clinical\DoctorDisplayName;
@@ -1197,7 +1198,7 @@ final class PublicBookingShortcode
         }
 
         $user = wp_get_current_user();
-        if (in_array(RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true)) {
+        if ( PatientPortalPage::isPatientOnly( $user ) ) {
             return self::CONTINUATION_PATIENT;
         }
 
