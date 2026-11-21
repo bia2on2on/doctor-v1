@@ -10,13 +10,13 @@ use WP_User;
 /** Request-bound restrictions for a durable restore marker. */
 final class RestoreBarrierGate {
     public static function register(): void {
-        add_action( 'init', [ self::class, 'guard_worker' ], PHP_INT_MIN );
-        add_action( 'admin_init', [ self::class, 'guard_admin' ], PHP_INT_MIN );
-        add_action( 'template_redirect', [ self::class, 'guard_frontend' ], PHP_INT_MIN );
-        add_filter( 'authenticate', [ self::class, 'guard_login' ], PHP_INT_MAX );
-        add_filter( 'rest_authentication_errors', [ self::class, 'guard_rest' ], PHP_INT_MAX );
-        add_filter( 'rest_pre_dispatch', [ self::class, 'guard_rest' ], PHP_INT_MAX );
-        add_filter( 'pre_do_shortcode_tag', [ self::class, 'guard_shortcode' ], PHP_INT_MAX );
+        add_action( 'init', [ self::class, 'guard_worker' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
+        add_action( 'admin_init', [ self::class, 'guard_admin' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
+        add_action( 'template_redirect', [ self::class, 'guard_frontend' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
+        add_filter( 'authenticate', [ self::class, 'guard_login' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
+        add_filter( 'rest_authentication_errors', [ self::class, 'guard_rest' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
+        add_filter( 'rest_pre_dispatch', [ self::class, 'guard_rest' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
+        add_filter( 'pre_do_shortcode_tag', [ self::class, 'guard_shortcode' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
     }
 
     public static function guard_rest( mixed $result ): mixed {

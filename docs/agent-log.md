@@ -8202,3 +8202,6 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 
 ### [2026-11-20 UTC] — PR14-RESTORE-BARRIER-BUILD: standalone prerequisites
 - Added standalone post-import identity cleanup and a conservative native lock probe with integration tests RB-01–RB-03. The destructive entry point remains a zero-write refusal; the lock probe is not authorization to start an import. Durable barrier/journal and complete request enforcement still require the non-reconnecting fenced worker and recovery entry-point integration.
+
+### [2026-11-21 UTC] — PR14-RESTORE-BARRIER-FINISH: standalone marker and request gate
+- Added a file-fenced non-autoloaded marker, bounded embedded attempt journal, and WordPress request guards; added RB-04–RB-10 integration coverage. The writer remains unwired from restoreApply, which still refuses before writes. Teardown still refuses to clear the marker. CLI/cron guards cover normal WordPress bootstrap; server-level files and independently bootstrapped workers still need release integration.

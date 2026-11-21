@@ -4,19 +4,28 @@ declare(strict_types=1);
 
 namespace ClinicCore\Application\Backup;
 
+use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Backup\BackupException;
+use RuntimeException;
 
 /** Standalone marker and journal. Not an authorization to start importing. */
 final class RestoreBarrierStore {
-    public const OPTION = 'cpms_restore_barrier';
+    public const OPTION       = 'cpms_restore_barrier';
     private const IN_PROGRESS = 'RESTORE_IN_PROGRESS';
-    private const FAILED = 'RESTORE_FAILED_NEEDS_TEARDOWN';
-    private const MAX_EVENTS = 256;
+    private const FAILED      = 'RESTORE_FAILED_NEEDS_TEARDOWN';
+    private const MAX_EVENTS  = 256;
 
     public function is_set(): bool {
-        $absent = new \stdClass();
-
-        return $absent !== get_option( self::OPTION, $absent );
+        // Presence is authoritative even if the value is malformed or cached as absent.
+        $db = App::db();
+        try {
+            return [] !== $db->fetch_all_strict(
+                'SELECT 1 FROM %i WHERE option_name = %s LIMIT 1',
+                [ $db->wpdb()->options, self::OPTION ]
+            );
+        } catch ( RuntimeException ) {
+            return true;
+        }
     }
 
     public function set( RestoreFileFence $fence, string $attempt_id, string $backup_id ): void {
