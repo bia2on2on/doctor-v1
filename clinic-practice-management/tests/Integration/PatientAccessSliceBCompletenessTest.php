@@ -174,14 +174,62 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
                 'Non-allowlisted route ' . $pair . ' must not be reachable by ROLE_PATIENT (got HTTP ' . $status . ').'
             );
             if ( 400 === $status ) {
-                self::assertSame(
-                    'CLINIC_SCOPE_REQUIRED',
-                    $response->get_data()['code'] ?? null,
-                    $pair . ' returned 400: ' . wp_json_encode( $response->get_data() )
-                );
+                $this->assertScopeRequiredForUnexpected400( $pair, $pattern, $response->get_data() );
             }
         }
         self::assertCount( 22, $nonPublic22 );
+    }
+
+    /**
+     * @param mixed $data
+     */
+    private function assertScopeRequiredForUnexpected400( string $pair, string $pattern, $data ): void {
+        $code = is_array( $data ) ? ( $data['code'] ?? null ) : null;
+        $msg  = $pair . ' returned 400: ' . wp_json_encode( $data );
+
+        if ( str_starts_with( $pattern, '/clinic/v1/staff/portal/finance' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/staff/portal/reception' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/staff/portal/pricing' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/staff/portal/messages' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/doctor/portal/rt/queue' ) || str_starts_with( $pattern, '/clinic/v1/doctor/portal/today' ) || str_starts_with( $pattern, '/clinic/v1/doctor/today' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/doctor/portal' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/appointments' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/booking' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/patient/' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/patients' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/visits/checkin' ) || str_starts_with( $pattern, '/clinic/v1/visits/walk-in' ) || str_starts_with( $pattern, '/clinic/v1/secretary/today' ) || str_starts_with( $pattern, '/clinic/v1/queue' ) || str_starts_with( $pattern, '/clinic/v1/rt/queue' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_contains( $pattern, '/invoice' ) || str_starts_with( $pattern, '/clinic/v1/invoices' ) || str_starts_with( $pattern, '/clinic/v1/payments' ) || str_starts_with( $pattern, '/clinic/v1/finance/' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/config/services' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/config/schedule' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/visits' ) || str_starts_with( $pattern, '/clinic/v1/notes' ) || str_starts_with( $pattern, '/clinic/v1/prescriptions' ) || str_starts_with( $pattern, '/clinic/v1/search' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/files' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/handwriting' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/reports' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/sms' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } elseif ( str_starts_with( $pattern, '/clinic/v1/notifications' ) || str_starts_with( $pattern, '/clinic/v1/rt/notifications' ) ) {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        } else {
+            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $code, $msg );
+        }
     }
 
     public function testAll22PatientReachableRoutesPassThroughPatientAccessGate(): void {
