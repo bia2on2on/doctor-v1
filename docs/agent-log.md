@@ -8205,3 +8205,6 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 
 ### [2026-11-21 UTC] — PR14-RESTORE-BARRIER-FINISH: standalone marker and request gate
 - Added a file-fenced non-autoloaded marker, bounded embedded attempt journal, and WordPress request guards; added RB-04–RB-10 integration coverage. The writer remains unwired from restoreApply, which still refuses before writes. Teardown still refuses to clear the marker. CLI/cron guards cover normal WordPress bootstrap; server-level files and independently bootstrapped workers still need release integration.
+
+### [2026-11-21 UTC] — PR14-BARRIER-FIX-2: restore barrier review fixes
+- Added login action denial, guarded known bootstrap writers, required canonical staging for marker writes, used conditional marker/journal writes, and restored a shared safety-backup operation witness. Added RB-11–RB-15. The recovery identity contract remains pending; restoreApply and teardown still refuse before writes.

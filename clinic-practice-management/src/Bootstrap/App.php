@@ -313,7 +313,16 @@ final class App
         // درخواستِ عادی — از جمله retry حالت بازیابی برای افزونهٔ فعال که
         // نقش‌ها از قبل در Optionها ماندگارند — رفتارِ امروز را نگه می‌دارد.
         if ( ! ( defined( 'WP_SANDBOX_SCRAPING' ) && WP_SANDBOX_SCRAPING ) ) {
-            RolesAndCapabilities::register();
+            $roles  = wp_roles();
+            $use_db = $roles->use_db;
+            if ( \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
+                $roles->use_db = false;
+            }
+            try {
+                RolesAndCapabilities::register();
+            } finally {
+                $roles->use_db = $use_db;
+            }
         }
 
         // Phase 1A — Item 3: محدودسازی نرخ ورود. پیش از این هیچ کنترل
@@ -446,6 +455,9 @@ final class App
         // موفقیت فقط در مسیرِ صریح و کاربر-آغازشدهٔ `admin_post_cpms_cron_repair`
         // انجام می‌شود.
         $cron_self_heal = static function (): void {
+            if ( \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
+                return;
+            }
             $result = CronScheduleRepair::self_heal_in_admin_result();
 
             if ( CronScheduleRepair::RESULT_FAILED === $result ) {
@@ -937,6 +949,9 @@ final class App
 
     private static function ensureMigrated(): void
     {
+        if ( \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
+            return;
+        }
         $lock = 'cpms_migrate_lock';
         if (get_transient($lock)) {
             return;

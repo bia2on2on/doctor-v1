@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ClinicCore\Application\Backup;
 
 use ClinicCore\Infrastructure\Backup\BackupException;
+use ClinicCore\Infrastructure\Storage\PrivateStorageLocation;
 
 /** Standalone marker and journal. Not an authorization to start importing. */
 final class RestoreBarrierStore {
@@ -12,6 +13,10 @@ final class RestoreBarrierStore {
     private const IN_PROGRESS = 'RESTORE_IN_PROGRESS';
     private const FAILED      = 'RESTORE_FAILED_NEEDS_TEARDOWN';
     private const MAX_EVENTS  = 256;
+
+    /** Override staging only for an isolated component test. */
+    public function __construct( private readonly ?string $test_directory = null ) {
+    }
 
     public function is_set(): bool {
         global $wpdb;
@@ -34,16 +39,25 @@ final class RestoreBarrierStore {
             'state'      => self::IN_PROGRESS,
             'journal'    => [],
         ];
-        $fence->assert_held();
-        if ( ! add_option( self::OPTION, $payload, '', false ) ) {
+        global $wpdb;
+        $this->assert_fence( $fence );
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Atomic insert must never replace an existing attempt.
+        $written = $wpdb->query( $wpdb->prepare( 'INSERT INTO %i (option_name, option_value, autoload) VALUES (%s, %s, %s) ON DUPLICATE KEY UPDATE option_name = option_name', $wpdb->options, self::OPTION, maybe_serialize( $payload ), 'no' ) );
+        if ( 1 !== $written ) {
             throw $this->ambiguous();
         }
+        $this->invalidate_option_cache();
+        // Preserve the WordPress post-insert notification for this option.
+        do_action( 'add_option_' . self::OPTION, self::OPTION, $payload );
         $this->confirm( $fence, $payload );
     }
 
     /** Append an attempt state event without allowing a transition out of failure. */
     public function append( RestoreFileFence $fence, string $attempt_id, string $state ): void {
-        $payload = get_option( self::OPTION );
+        global $wpdb;
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Compare the exact persisted value, not a cache or filter result.
+        $raw     = $wpdb->get_var( $wpdb->prepare( 'SELECT option_value FROM %i WHERE option_name = %s', $wpdb->options, self::OPTION ) );
+        $payload = maybe_unserialize( $raw );
         if ( ! is_array( $payload ) || 1 !== ( $payload['version'] ?? null ) || $attempt_id !== ( $payload['attempt_id'] ?? null ) || self::IN_PROGRESS !== ( $payload['state'] ?? null ) || ! isset( $payload['journal'] ) || ! is_array( $payload['journal'] ) || count( $payload['journal'] ) >= self::MAX_EVENTS || ! in_array( $state, [ self::IN_PROGRESS, self::FAILED ], true ) ) {
             throw BackupException::of( 'RESTORE_JOURNAL_REFUSED', 'Restore journal cannot accept this event.' );
         }
@@ -53,20 +67,32 @@ final class RestoreBarrierStore {
             'at'         => gmdate( 'Y-m-d\TH:i:s\Z' ),
         ];
         $payload['state']     = $state;
-        $fence->assert_held();
-        if ( ! update_option( self::OPTION, $payload, false ) ) {
+        $this->assert_fence( $fence );
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- CAS refuses a stale journal, including case-only changes.
+        $written = $wpdb->query( $wpdb->prepare( 'UPDATE %i SET option_value = %s, autoload = %s WHERE option_name = %s AND BINARY option_value = %s', $wpdb->options, maybe_serialize( $payload ), 'no', self::OPTION, $raw ) );
+        if ( 1 !== $written ) {
             throw $this->ambiguous();
         }
         $this->confirm( $fence, $payload );
     }
 
     private function confirm( RestoreFileFence $fence, array $expected ): void {
-        wp_cache_delete( self::OPTION, 'options' );
+        $this->invalidate_option_cache();
         $observed = get_option( self::OPTION );
-        $fence->assert_held();
+        $this->assert_fence( $fence );
         if ( $expected !== $observed ) {
             throw $this->ambiguous();
         }
+    }
+
+    private function assert_fence( RestoreFileFence $fence ): void {
+        $fence->assert_held( $this->test_directory ?? PrivateStorageLocation::path( 'cpms-restore-staging' ) );
+    }
+
+    private function invalidate_option_cache(): void {
+        wp_cache_delete( self::OPTION, 'options' );
+        wp_cache_delete( 'notoptions', 'options' );
+        wp_cache_delete( 'alloptions', 'options' );
     }
 
     private function ambiguous(): BackupException {

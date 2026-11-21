@@ -601,10 +601,9 @@ final class BackupStorageBoundaryTest extends WP_UnitTestCase
         $id = $this->seedBackupOutside($this->legacyProbe);
         self::assertNotEmpty(file_get_contents($this->legacyProbe . '/' . $id . '/db.sql'));
         $service = $this->service(ProtectedBackupStore::legacySource($this->legacyProbe));
-        $destination = new ReflectionMethod(BackupService::class, 'safetyDestinationStore');
-        $create = new ReflectionMethod(BackupService::class, 'createBackupTo');
+        $create = new ReflectionMethod(BackupService::class, 'create_restore_safety_backup');
         $before = $this->privateRootBackupDirs();
-        $create->invoke($service, $destination->invoke($service), 'pre-restore-safety-' . $id);
+        $create->invoke($service, $id);
         // Safety Backup فقط در ریشهٔ خصوصی ساخته شد
         $after = $this->privateRootBackupDirs();
         $new = array_values(array_diff($after, $before));
@@ -632,7 +631,7 @@ final class BackupStorageBoundaryTest extends WP_UnitTestCase
         $active = ProtectedBackupStore::active($this->tmp . '/active-safety-witness');
         $service = $this->service($active);
         $before = count((array) glob($active->basePath() . '/cpms-backup-*'));
-        $create->invoke($service, $destination->invoke($service), 'pre-restore-safety-' . $id);
+        $create->invoke($service, $id);
         $after = count((array) glob($active->basePath() . '/cpms-backup-*'));
         self::assertSame($before + 1, $after, 'Safety Backup باید در مخزن فعال نوشته شود.');
         self::assertSame([], $this->privateRootBackupDirs(), 'وقتی مخزن فعال امن است، مقصد خصوصی جدا لازم نیست.');

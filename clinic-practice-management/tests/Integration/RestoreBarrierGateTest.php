@@ -93,6 +93,82 @@ final class RestoreBarrierGateTest extends WP_UnitTestCase {
         }
     }
 
+    /** RB-14: the core login dispatcher guard denies recovery mutations, not logout. */
+    public function testPasswordRecoveryActionsRespectMarker(): void {
+        global $action;
+        $previous = $action;
+        $account = self::factory()->user->create_and_get();
+        $hash = $account->user_pass;
+        $key = get_password_reset_key($account);
+        self::assertIsString($key);
+        self::assertInstanceOf(\WP_User::class, check_password_reset_key($key, $account->user_login));
+        self::assertSame(PHP_INT_MIN, has_action('login_init', [RestoreBarrierGate::class, 'guard_login_action']));
+        $handler = static fn (): callable => static function (): void { throw new RuntimeException('restore denied'); };
+        add_filter('wp_die_handler', $handler, PHP_INT_MAX);
+        $dispatch = static function (): void { do_action('login_init'); };
+        try {
+            self::assertTrue(add_option(RestoreBarrierStore::OPTION, 'test marker', '', false));
+            foreach (['lostpassword', 'retrievepassword', 'rp', 'resetpass', 'register'] as $action) {
+                self::assertTrue($this->denied($dispatch));
+            }
+            self::assertSame($hash, get_userdata($account->ID)->user_pass);
+            self::assertInstanceOf(\WP_User::class, check_password_reset_key($key, $account->user_login));
+            $action = 'logout';
+            self::assertFalse($this->denied($dispatch));
+            delete_option(RestoreBarrierStore::OPTION);
+            foreach (['lostpassword', 'resetpass'] as $action) {
+                self::assertFalse($this->denied($dispatch));
+            }
+            $validated = check_password_reset_key($key, $account->user_login);
+            self::assertInstanceOf(\WP_User::class, $validated);
+            reset_password($validated, 'synthetic-new-password');
+            self::assertNotSame($hash, get_userdata($account->ID)->user_pass);
+        } finally {
+            delete_option(RestoreBarrierStore::OPTION);
+            remove_filter('wp_die_handler', $handler, PHP_INT_MAX);
+            $action = $previous;
+        }
+    }
+
+    /** RB-15: the registered portal provisioner cannot repair its option while blocked. */
+    public function testPortalBootstrapWriteHasAbsentMarkerWitness(): void {
+        global $wpdb;
+        $portal = \ClinicCore\Frontend\DoctorPortalShell::class;
+        $provision = [$portal, 'ensure_portal_page'];
+        self::assertSame(20, has_action('init', $provision));
+        $page = $provision();
+        self::assertGreaterThan(0, $page);
+        $option = $portal::PAGE_OPTION;
+        $old = get_option($option);
+        delete_option($option);
+        $hits = 0;
+        $pattern = '/\AINSERT INTO `?' . preg_quote($wpdb->options, '/') . '`? .*VALUES \(\'' . preg_quote($option, '/') . '\',/s';
+        $watch = static function (string $sql) use ($pattern, &$hits): string {
+            if (preg_match($pattern, $sql) === 1) {
+                ++$hits;
+            }
+            return $sql;
+        };
+        add_filter('query', $watch);
+        try {
+            self::assertTrue(add_option(RestoreBarrierStore::OPTION, 'test marker', '', false));
+            $blocked = $provision();
+            $while_blocked = $hits;
+            $blocked_option = get_option($option, 0);
+            delete_option(RestoreBarrierStore::OPTION);
+            $allowed = $provision();
+        } finally {
+            remove_filter('query', $watch);
+            delete_option(RestoreBarrierStore::OPTION);
+            update_option($option, $old, false);
+        }
+        self::assertSame(0, $blocked);
+        self::assertSame(0, $blocked_option);
+        self::assertSame(0, $while_blocked);
+        self::assertSame(1, $hits);
+        self::assertSame($page, $allowed);
+    }
+
     private function denied(callable $guard): bool {
         try {
             $guard();

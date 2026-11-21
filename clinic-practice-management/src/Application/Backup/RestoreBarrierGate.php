@@ -11,6 +11,7 @@ use WP_User;
 /** Request-bound restrictions for a durable restore marker. */
 final class RestoreBarrierGate {
     public static function register(): void {
+        add_action( 'login_init', [ self::class, 'guard_login_action' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WordPress login entry point.
         add_action( 'init', [ self::class, 'guard_worker' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
         add_action( 'admin_init', [ self::class, 'guard_admin' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
         add_action( 'template_redirect', [ self::class, 'guard_frontend' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
@@ -22,6 +23,14 @@ final class RestoreBarrierGate {
 
     public static function guard_rest( mixed $result ): mixed {
         return self::blocked() ? self::error() : $result;
+    }
+
+    public static function guard_login_action(): void {
+        // Core resolves the action (including key-based resets) before login_init.
+        global $action;
+        if ( ! in_array( $action, [ 'login', 'logout' ], true ) && self::blocked() ) {
+            self::deny();
+        }
     }
 
     public static function guard_login( mixed $result ): mixed {
@@ -66,7 +75,7 @@ final class RestoreBarrierGate {
         self::deny();
     }
 
-    private static function blocked(): bool {
+    public static function blocked(): bool {
         return ( new RestoreBarrierStore() )->is_set();
     }
 

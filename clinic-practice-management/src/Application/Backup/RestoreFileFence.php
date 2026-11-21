@@ -11,14 +11,14 @@ final class RestoreFileFence {
     private ?\Closure $verify_held = null;
 
     /** The mount reader is injectable for tests; production reads the kernel. */
-    public function __construct( private readonly ?\Closure $mount_reader = null ) {
+    public function __construct( private readonly ?\Closure $mount_reader = null, private readonly ?\Closure $probe_lock = null ) {
     }
 
-    public function assert_held(): void {
+    public function assert_held( ?string $directory = null ): void {
         if ( null === $this->verify_held ) {
             throw $this->unsupported();
         }
-        ( $this->verify_held )();
+        ( $this->verify_held )( $directory );
     }
 
     /** Run a worker only while an independently probed lock is held. */
@@ -59,7 +59,8 @@ final class RestoreFileFence {
             try {
                 $this->assert_inode( $path, $probe, $before );
                 $excluded = 0;
-                if ( flock( $probe, LOCK_EX | LOCK_NB, $excluded ) || 1 !== $excluded ) {
+                $acquired = null === $this->probe_lock ? flock( $probe, LOCK_EX | LOCK_NB, $excluded ) : ( $this->probe_lock )( $probe, $excluded );
+                if ( $acquired || 1 !== $excluded ) {
                     throw $this->unsupported();
                 }
             } finally {
@@ -67,7 +68,10 @@ final class RestoreFileFence {
             }
             $this->assert_inode( $path, $handle, $before );
 
-            $this->verify_held = function () use ( $path, $handle, $before ): void {
+            $this->verify_held = function ( ?string $expected ) use ( $directory, $path, $handle, $before ): void {
+                if ( null !== $expected && $expected !== $directory ) {
+                    throw $this->unsupported();
+                }
                 $this->assert_inode( $path, $handle, $before );
             };
 

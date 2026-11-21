@@ -344,8 +344,7 @@ final class BackupService
         $this->require_restore_schema( $raw['db']['migration_version'] ?? null );
         $this->require_restore_host();
 
-        $safety_destination = $this->safetyDestinationStore();
-        $safety             = $this->createBackupTo( $safety_destination, 'pre-restore-safety-' . $pre['backup_id'] );
+        [ $safety_destination, $safety ] = $this->create_restore_safety_backup( $pre['backup_id'] );
 
         $applied = 0;
         $dropped = 0;
@@ -457,6 +456,13 @@ final class BackupService
         }
 
         return $this->store;
+    }
+
+    /** @return array{ProtectedBackupStore, array<string, mixed>} */
+    private function create_restore_safety_backup( string $backup_id ): array {
+        $destination = $this->safetyDestinationStore();
+
+        return [ $destination, $this->createBackupTo( $destination, 'pre-restore-safety-' . $backup_id ) ];
     }
 
     private function safetyDestinationStore(): ProtectedBackupStore

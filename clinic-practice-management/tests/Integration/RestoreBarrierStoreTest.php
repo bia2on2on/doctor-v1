@@ -25,7 +25,7 @@ final class RestoreBarrierStoreTest extends WP_UnitTestCase {
         self::assertTrue(touch($this->lock));
         self::assertTrue(chmod($this->lock, 0600));
         $this->fence = new RestoreFileFence(static fn (): array => ['1 0 0:0 / / rw - ext4 /dev/test rw']);
-        $this->store = new RestoreBarrierStore();
+        $this->store = new RestoreBarrierStore($this->directory);
     }
 
     protected function tearDown(): void {
@@ -108,6 +108,83 @@ final class RestoreBarrierStoreTest extends WP_UnitTestCase {
         self::assertTrue($moved);
         self::assertSame('RESTORE_FILE_LOCK_UNSUPPORTED', $failure);
         self::assertTrue($this->store->is_set());
+    }
+
+    /** RB-11: production must refuse when the independent lock probe does not prove exclusion. */
+    public function testInconclusiveProbePreventsWorker(): void {
+        $mount = static fn (): array => ['1 0 0:0 / / rw - ext4 /dev/test rw'];
+        $probes = 0;
+        $runs = 0;
+        $worker = static function () use (&$runs): void { ++$runs; };
+        $failure = null;
+        try {
+            (new RestoreFileFence($mount, static function ($handle, &$busy) use (&$probes): bool {
+                ++$probes;
+                $busy = 0;
+                return false;
+            }))->run($this->directory, $worker);
+        } catch (BackupException $exception) {
+            $failure = $exception->getErrorCode();
+        }
+        self::assertSame(1, $probes);
+        self::assertSame(0, $runs);
+        self::assertSame('RESTORE_FILE_LOCK_UNSUPPORTED', $failure);
+        $this->fence->run($this->directory, $worker);
+        self::assertSame(1, $runs);
+    }
+
+    /** RB-12: an existing attempt cannot be replaced even with a valid lock. */
+    public function testSecondAttemptCannotReplaceMarker(): void {
+        $this->fence->run($this->directory, function (): void {
+            self::assertNull($this->attemptSet());
+            $first = get_option(RestoreBarrierStore::OPTION);
+            try {
+                $this->store->set($this->fence, str_repeat('a', 32), self::BACKUP);
+                self::fail('Second marker write was accepted');
+            } catch (BackupException $exception) {
+                self::assertSame('RESTORE_BARRIER_WRITE_AMBIGUOUS', $exception->getErrorCode());
+            }
+            self::assertSame($first, get_option(RestoreBarrierStore::OPTION));
+        });
+    }
+
+    /** RB-13: a changed persisted value cannot be overwritten by a stale append. */
+    public function testJournalCompareAndSwapRejectsStaleValue(): void {
+        global $wpdb;
+        $failure = null;
+        $hits = 0;
+        $changed = false;
+        $this->fence->run($this->directory, function () use ($wpdb, &$failure, &$hits, &$changed): void {
+            $this->store->set($this->fence, self::ATTEMPT, self::BACKUP);
+            $replacement = get_option(RestoreBarrierStore::OPTION);
+            // Establish a clean witness before installing the interleaving.
+            $this->store->append($this->fence, self::ATTEMPT, 'RESTORE_IN_PROGRESS');
+            $replacement['state'] = 'RESTORE_FAILED_NEEDS_TEARDOWN';
+            $prefix = 'UPDATE `' . $wpdb->options . "` SET option_value = ";
+            $where = " WHERE option_name = 'cpms_restore_barrier' AND BINARY option_value = ";
+            $pattern = '/\A' . preg_quote($prefix, '/') . "'.*', autoload = 'no'" . preg_quote($where, '/') . "'.*'\z/s";
+            $inject = static function (string $sql) use ($pattern, $replacement, &$hits, &$changed): string {
+                if (preg_match($pattern, $sql) === 1) {
+                    ++$hits;
+                    $changed = update_option(RestoreBarrierStore::OPTION, $replacement, false);
+                }
+                return $sql;
+            };
+            add_filter('query', $inject);
+            try {
+                $this->store->append($this->fence, self::ATTEMPT, 'RESTORE_FAILED_NEEDS_TEARDOWN');
+            } catch (BackupException $exception) {
+                $failure = $exception->getErrorCode();
+            } finally {
+                remove_filter('query', $inject);
+            }
+        });
+        self::assertSame(1, $hits);
+        self::assertTrue($changed);
+        self::assertSame('RESTORE_BARRIER_WRITE_AMBIGUOUS', $failure);
+        $persisted = get_option(RestoreBarrierStore::OPTION);
+        self::assertSame('RESTORE_FAILED_NEEDS_TEARDOWN', $persisted['state']);
+        self::assertSame([], $persisted['journal']);
     }
 
     private function attemptSet(): ?string {
