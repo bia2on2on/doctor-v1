@@ -582,7 +582,7 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
         $this->assert_booking_reads_visible( $this->clinicB, $this->sharedSlotB, $this->locationB );
 
         App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
-        wp_set_current_user( $this->patientUserId );
+        PatientTwoProofTestHelper::acting_as( $this->patientUserId );
         $this->assert_booking_reads_denied( $this->clinicB, $this->sharedSlotB );
         $this->assert_booking_reads_visible( $this->clinicB, $this->sharedSlotB, $this->locationB, true );
         App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
@@ -607,7 +607,7 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
         App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
         App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
         $unknown = $this->without_surface_id( $this->render( (string) PHP_INT_MAX ) );
-        wp_set_current_user( $this->patientUserId );
+        PatientTwoProofTestHelper::acting_as( $this->patientUserId );
         self::assertSame( $unknown, $this->without_surface_id( $this->render( (string) $this->clinicB ) ) );
         self::assertSame( $unknown, $this->without_surface_id( PublicBookingShortcode::render_for_patient_portal( $this->clinicA ) ) );
 
