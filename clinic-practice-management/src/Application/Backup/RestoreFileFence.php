@@ -8,8 +8,24 @@ use ClinicCore\Infrastructure\Backup\BackupException;
 
 /** Lock a provisioned permanent file in staging controlled by the restore worker. */
 final class RestoreFileFence {
+    private ?\Closure $verify_held = null;
+
+    /** The mount reader is injectable for tests; production reads the kernel. */
+    public function __construct( private readonly ?\Closure $mount_reader = null ) {
+    }
+
+    public function assert_held(): void {
+        if ( null === $this->verify_held ) {
+            throw $this->unsupported();
+        }
+        ( $this->verify_held )();
+    }
+
     /** Run a worker only while an independently probed lock is held. */
     public function run( string $directory, callable $worker ): mixed {
+        if ( null !== $this->verify_held ) {
+            throw $this->unsupported();
+        }
         $path = $directory . '/.cpms-restore-staging.lock';
         if ( 'Linux' !== PHP_OS_FAMILY || PHP_ZTS || realpath( $directory ) !== $directory || ! $this->local_mount( $directory ) ) {
             throw $this->unsupported();
@@ -51,8 +67,13 @@ final class RestoreFileFence {
             }
             $this->assert_inode( $path, $handle, $before );
 
+            $this->verify_held = function () use ( $path, $handle, $before ): void {
+                $this->assert_inode( $path, $handle, $before );
+            };
+
             return $worker();
         } finally {
+            $this->verify_held = null;
             fclose( $handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- Release the native lock on every exit.
         }
     }
@@ -71,7 +92,7 @@ final class RestoreFileFence {
     }
 
     private function local_mount( string $directory ): bool {
-        $mounts = @file( '/proc/self/mountinfo', FILE_IGNORE_NEW_LINES ); // phpcs:ignore WordPress.WP.AlternativeFunctions, WordPress.PHP.NoSilencedErrors.Discouraged -- Read kernel mount evidence, or refuse.
+        $mounts = $this->mount_reader ? ( $this->mount_reader )() : @file( '/proc/self/mountinfo', FILE_IGNORE_NEW_LINES ); // phpcs:ignore WordPress.WP.AlternativeFunctions, WordPress.PHP.NoSilencedErrors.Discouraged -- Read kernel mount evidence, or refuse.
         if ( false === $mounts ) {
             return false;
         }
