@@ -8199,3 +8199,6 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 
 ### [2026-11-20 UTC] — PR-RESTORE-BARRIER-DECIDED: fail-closed restore prerequisites
 - Empty SQL is refused before writing a safety backup; restore also refuses populated targets, unverified DB migration versions, and hosts without the required lock fence. The legacy importer is unchanged and cannot run until that fence is implemented. Teardown refuses clearance pending the legacy-link gate. No workflow or migration was edited.
+
+### [2026-11-20 UTC] — PR14-RESTORE-BARRIER-BUILD: standalone prerequisites
+- Added standalone post-import identity cleanup and a conservative native lock probe with integration tests RB-01–RB-03. The destructive entry point remains a zero-write refusal; the lock probe is not authorization to start an import. Durable barrier/journal and complete request enforcement still require the non-reconnecting fenced worker and recovery entry-point integration.
