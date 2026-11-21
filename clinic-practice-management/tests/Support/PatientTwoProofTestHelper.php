@@ -217,7 +217,7 @@ final class PatientTwoProofTestHelper {
         if ( $wp_user_id <= 0 ) {
             wp_set_current_user( 0 );
             unset( $_COOKIE[ LOGGED_IN_COOKIE ] );
-            App::patient_session_scope()->set_in_process_session_token( 0, null );
+            App::patient_session_scope()->reset_in_process_state();
 
             return;
         }
@@ -235,7 +235,7 @@ final class PatientTwoProofTestHelper {
         self::$tokens_by_user  = [];
         self::$cookies_by_user = [];
         unset( $_COOKIE[ LOGGED_IN_COOKIE ] );
-        App::patient_session_scope()->clear_in_process_session_tokens();
+        App::patient_session_scope()->reset_in_process_state();
         wp_set_current_user( 0 );
     }
 }

@@ -20,8 +20,10 @@
  * خروجی: خطوط «PASS <id> — <title>» + JSON summary؛ exit 2 در صورت شکست.
  */
 
+use ClinicCore\Application\Auth\PatientSessionProofStore;
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 
 if (!defined('ABSPATH') || PHP_SAPI !== 'cli') {
     fwrite(STDERR, "must run via wp eval-file\n");
@@ -152,17 +154,52 @@ scenario('S1', 'Patient: OTP request + booking hold→confirm', function () use 
     if (!$patientUserId) {
         throw new RuntimeException('patient user creation failed');
     }
-    $otp = App::otpService()->request('09120009999');
-    if (!isset($otp['expires_in'])) {
-        throw new RuntimeException('otp request failed: ' . wp_json_encode($otp));
+    // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase
+    $patient_user_id = (int) $patientUserId;
+    $smoke_db        = App::db();
+    $smoke_now       = $smoke_db->nowUtcSql();
+    $link_row        = $smoke_db->fetchRow(
+        'SELECT clinic_id, patient_id FROM ' . $smoke_db->table( 'cpms_patient_user_links' ) . ' WHERE wp_user_id = %d ORDER BY id DESC LIMIT 1',
+        [ $patient_user_id ]
+    );
+    if ( ! is_array( $link_row ) ) {
+        throw new RuntimeException( 'patient link missing for pilot_patient' );
     }
-    $hold = App::bookingService()->hold($patientUserId, $clinicianId, $slotDate, '10:00');
-    if (empty($hold['hold_token'])) {
-        throw new RuntimeException('hold failed');
+    $login_repo = new PatientLoginRepository( $smoke_db );
+    $acct       = $login_repo->find_account_by_user_id( $patient_user_id );
+    if ( null === $acct ) {
+        $acct_id = $login_repo->insert_pending_account( $patient_user_id, '09120009999', 'بیمار', 'آزمایشی-دودی' );
+        $login_repo->activate_account_from_pending( $acct_id, $patient_user_id );
+    } elseif ( 'active' !== (string) ( $acct['state'] ?? '' ) ) {
+        $login_repo->activate_account_from_pending( (int) $acct['id'], $patient_user_id );
     }
-    $appt = App::bookingService()->confirm($hold['hold_token'], $patientUserId, 'بررسی دوره‌ای (Synthetic)', uuid4());
-    if (($appt['status'] ?? '') !== 'confirmed') {
-        throw new RuntimeException('confirm status=' . ($appt['status'] ?? '?'));
+    $binding     = $login_repo->upsert_active_binding( $patient_user_id, (int) $link_row['clinic_id'], (int) $link_row['patient_id'], $smoke_now );
+    $proof_store = new PatientSessionProofStore();
+    $session_ttl = PatientSessionProofStore::SESSION_TTL_SECONDS;
+    $proof_token = WP_Session_Tokens::get_instance( $patient_user_id )->create( time() + $session_ttl );
+    $proof_store->record_mobile_proof( $patient_user_id, '09120009999', null, $proof_token );
+    $proof_store->record_binding_proof( $patient_user_id, (int) $link_row['clinic_id'], (int) $link_row['patient_id'], (int) $binding['id'], (string) $binding['verified_at'], null, $proof_token );
+    $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie( $patient_user_id, time() + $session_ttl, 'logged_in', $proof_token );
+    App::patient_session_scope()->set_in_process_session_token( $patient_user_id, $proof_token );
+    wp_set_current_user( $patient_user_id );
+    try {
+        $otp = App::otpService()->request( '09120009999' );
+        if ( ! isset( $otp['expires_in'] ) ) {
+            throw new RuntimeException( 'otp request failed: ' . wp_json_encode( $otp ) );
+        }
+        // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase
+        $hold = App::bookingService()->hold( $patient_user_id, $clinicianId, $slotDate, '10:00' );
+        if ( empty( $hold['hold_token'] ) ) {
+            throw new RuntimeException( 'hold failed' );
+        }
+        $appt = App::bookingService()->confirm( $hold['hold_token'], $patient_user_id, 'بررسی دوره‌ای (Synthetic)', uuid4() );
+        if ( ( $appt['status'] ?? '' ) !== 'confirmed' ) {
+            throw new RuntimeException( 'confirm status=' . ( $appt['status'] ?? '?' ) );
+        }
+    } finally {
+        unset( $_COOKIE[ LOGGED_IN_COOKIE ] );
+        App::patient_session_scope()->reset_in_process_state();
+        wp_set_current_user( 0 );
     }
     return 'otp queued; appointment #' . $appt['appointment_id'] . ' ref=' . $appt['reference_code'];
 });
