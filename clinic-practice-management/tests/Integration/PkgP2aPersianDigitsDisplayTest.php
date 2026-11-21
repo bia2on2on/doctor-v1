@@ -15,6 +15,7 @@ use ClinicCore\Domain\Time\Jalali;
 use ClinicCore\Domain\Time\PersianDigits;
 use ClinicCore\Infrastructure\Repository\NotificationRepository;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_UnitTestCase;
 
@@ -36,7 +37,7 @@ final class PkgP2aPersianDigitsDisplayTest extends WP_UnitTestCase {
 		Settings::flushCache();
 		ScopeContext::clear();
 		App::resetScope();
-		wp_set_current_user( 0 );
+		PatientTwoProofTestHelper::reset();
 		parent::tearDown();
 	}
 
@@ -304,6 +305,16 @@ final class PkgP2aPersianDigitsDisplayTest extends WP_UnitTestCase {
 			],
 			[ '%d', '%d', '%d', '%s', '%d', '%s' ]
 		);
+		PatientTwoProofTestHelper::seed_patient_proof(
+			$user_id,
+			$clinic_id,
+			$patient_id,
+			[
+				'mobile'             => '09197770111',
+				'seed_session_scope' => true,
+				'set_current_user'   => false,
+			]
+		);
 
 		App::notificationService()->publishToPatient(
 			$clinic_id,
@@ -347,7 +358,7 @@ final class PkgP2aPersianDigitsDisplayTest extends WP_UnitTestCase {
 			[ '%d', '%d', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%d', '%s' ]
 		);
 
-		wp_set_current_user( $user_id );
+		PatientTwoProofTestHelper::acting_as( $user_id );
 		ob_start();
 		try {
 			PatientPortalPage::render();
@@ -391,6 +402,16 @@ final class PkgP2aPersianDigitsDisplayTest extends WP_UnitTestCase {
 			],
 			[ '%d', '%d', '%d', '%s', '%d', '%s' ]
 		);
+		PatientTwoProofTestHelper::seed_patient_proof(
+			$user_id,
+			$clinic_id,
+			$patient_id,
+			[
+				'mobile'             => '09197770222',
+				'seed_session_scope' => true,
+				'set_current_user'   => false,
+			]
+		);
 
 		// Real write path: NotificationRepository::insert() fills created_at only when the
 		// caller omits it, so this row carries CpmsDb::nowUtcSql() — the production shape.
@@ -433,7 +454,7 @@ final class PkgP2aPersianDigitsDisplayTest extends WP_UnitTestCase {
 			'fixture: DATETIME(3) read-back carries milliseconds'
 		);
 
-		wp_set_current_user( $user_id );
+		PatientTwoProofTestHelper::acting_as( $user_id );
 		ob_start();
 		try {
 			PatientPortalPage::render();

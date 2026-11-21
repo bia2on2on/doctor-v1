@@ -12,6 +12,7 @@ use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use ClinicCore\Infrastructure\Storage\LocalFileStorage;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -92,6 +93,7 @@ final class ClinicalFilesScopedAuthorizationTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
+        PatientTwoProofTestHelper::reset();
         App::replaceExplicitScope(null);
         Settings::flushCache();
         App::resetScope();
@@ -1876,6 +1878,16 @@ final class ClinicalFilesScopedAuthorizationTest extends WP_UnitTestCase
             )
         );
         self::assertGreaterThan(0, (int) $wpdb->insert_id, 'precondition: patient↔user link');
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $clinicId,
+            $patientId,
+            [
+                'mobile'             => $mobile,
+                'seed_session_scope' => true,
+                'set_current_user'   => false,
+            ]
+        );
 
         return [ $patientId, $userId ];
     }
@@ -2034,7 +2046,7 @@ final class ClinicalFilesScopedAuthorizationTest extends WP_UnitTestCase
         self::assertIsString($tmp);
         file_put_contents($tmp, $content);
 
-        wp_set_current_user($patientUser);
+        PatientTwoProofTestHelper::acting_as($patientUser);
         $request = new WP_REST_Request('POST', self::NS . '/patients/' . $patientId . '/files');
         $request->set_param('category', 'document');
         $request->set_header('X-WP-Nonce', wp_create_nonce('wp_rest'));
@@ -2059,7 +2071,7 @@ final class ClinicalFilesScopedAuthorizationTest extends WP_UnitTestCase
     private function dispatchStream(int $userId, int $fileId): WP_REST_Response
     {
         App::replaceExplicitScope(null);
-        wp_set_current_user($userId);
+        PatientTwoProofTestHelper::acting_as($userId);
         $request = new WP_REST_Request('GET', self::NS . '/files/' . $fileId . '/stream');
         $request->set_header('X-WP-Nonce', wp_create_nonce('wp_rest'));
 

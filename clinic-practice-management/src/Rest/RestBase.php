@@ -328,6 +328,44 @@ abstract class RestBase
     }
 
     /**
+     * Enforces CSRF nonce, pure-patient separation, and valid target Clinic
+     * selector for `POST /clinic/v1/patient/link-record` (§6.2, §6.10).
+     */
+    protected function require_patient_link_record_access( WP_REST_Request $request ): bool|WP_Error {
+        $nonce_error = $this->requireNonce( $request );
+        if ( $nonce_error instanceof WP_Error ) {
+            return $nonce_error;
+        }
+
+        $clinic_selector = $this->extract_patient_clinic_selector( $request );
+        $user_id         = (int) get_current_user_id();
+        $decision        = $this->patient_access()->authorize_link_record_request(
+            $user_id,
+            $clinic_selector['clinic_id'],
+            $clinic_selector['invalid']
+        );
+
+        if ( $decision['allowed'] ) {
+            return true;
+        }
+
+        if ( 403 === $decision['http_status'] ) {
+            App::audit()->log(
+                'FORBIDDEN_ACCESS_ATTEMPT',
+                [ 'wp_user_id' => $user_id, 'role' => $decision['role'] ],
+                'patient',
+                null,
+                null,
+                null,
+                null,
+                [ 'reason' => $decision['reason'] ]
+            );
+        }
+
+        return $this->error( $decision['code'], $decision['http_status'], $decision['message'] );
+    }
+
+    /**
      * Extracts an optional Clinic selector from `X-CPMS-Clinic-Id` and/or
      * `clinic_id` without trusting browser input as authority.
      *

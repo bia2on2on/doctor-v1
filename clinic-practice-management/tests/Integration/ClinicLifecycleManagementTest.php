@@ -9,6 +9,7 @@ use ClinicCore\Bootstrap\App;
 use ClinicCore\Application\Clinic\ClinicLifecyclePolicy;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Domain\Membership\MembershipException;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use RuntimeException;
 use WP_UnitTestCase;
 
@@ -99,6 +100,7 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
                 $db->query( 'DELETE FROM ' . $db->table( 'cpms_schedule_exceptions' ) . ' WHERE clinic_id = %d', [ $cid ] );
                 $db->query( 'DELETE FROM ' . $db->table( 'cpms_schedule' ) . ' WHERE clinic_id = %d', [ $cid ] );
                 $db->query( 'DELETE FROM ' . $db->table( 'cpms_clinicians' ) . ' WHERE clinic_id = %d', [ $cid ] );
+                $db->query( 'DELETE FROM ' . $db->table( 'cpms_patient_logins' ) . ' WHERE clinic_id = %d', [ $cid ] );
                 $db->query( 'DELETE FROM ' . $db->table( 'cpms_patient_user_links' ) . ' WHERE clinic_id = %d', [ $cid ] );
                 $db->query( 'DELETE FROM ' . $db->table( 'cpms_patients' ) . ' WHERE clinic_id = %d', [ $cid ] );
                 $db->query( 'DELETE FROM ' . $db->table( 'cpms_invoices' ) . ' WHERE clinic_id = %d', [ $cid ] );
@@ -111,6 +113,8 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
         }
         foreach ( [$this->orgA, $this->orgB] as $oid ) {
             if ( $oid > 0 ) {
+                $db->query( 'DELETE FROM ' . $db->table( 'cpms_patient_identity_links' ) . ' WHERE organization_id = %d', [$oid] );
+                $db->query( 'DELETE FROM ' . $db->table( 'cpms_patient_identities' ) . ' WHERE organization_id = %d', [$oid] );
                 $db->query( 'DELETE FROM ' . $db->table( 'cpms_organization_membership_capabilities' ) . ' WHERE membership_id IN (SELECT id FROM ' . $db->table( 'cpms_organization_memberships' ) . ' WHERE organization_id = %d)', [$oid] );
                 $db->query( 'DELETE FROM ' . $db->table( 'cpms_organization_memberships' ) . ' WHERE organization_id = %d', [$oid] );
                 $db->query( 'DELETE FROM ' . $db->table( 'cpms_clinics' ) . ' WHERE organization_id = %d', [$oid] );
@@ -119,9 +123,11 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
         }
         foreach ( array_merge( [$this->managerA, $this->managerB, $this->clinicMember, $this->outsider, $this->admin], $this->extraUsers ) as $uid ) {
             if ( $uid > 0 ) {
+                $db->query( 'DELETE FROM ' . $db->table( 'cpms_patient_logins' ) . ' WHERE wp_user_id = %d', [ $uid ] );
                 wp_delete_user( $uid );
             }
         }
+        PatientTwoProofTestHelper::reset();
         App::resetScope();
         parent::tearDown();
     }
@@ -371,7 +377,7 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
         $linked       = $this->make_linked_patient( $this->clinicA );
         $patient_user = $linked['user_id'];
         $patient_id   = $linked['patient_id'];
-        wp_set_current_user( $patient_user );
+        PatientTwoProofTestHelper::acting_as( $patient_user );
 
         // CONTROL (active Clinic): the hold boundary really works with this fixture.
         $booking->hold( $patient_user, $clinician_id, $slot_a['slot_date'], $slot_a['slot_time'], $slot_a['id'], $patient_id );
@@ -382,7 +388,7 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
         App::organization_clinic_provisioning_service()->set_clinic_status( $this->managerA, $this->orgA, $this->clinicA, false );
 
         // NEGATIVE (suspended Clinic): new hold refused, zero capacity claimed.
-        wp_set_current_user( $patient_user );
+        PatientTwoProofTestHelper::acting_as( $patient_user );
         try {
             $booking->hold( $patient_user, $clinician_id, $slot_b['slot_date'], $slot_b['slot_time'], $slot_b['id'], $patient_id );
             self::fail( 'suspended Clinic must refuse a new hold' );
@@ -404,7 +410,7 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
         // Reactivation restores new demand at the same boundary.
         wp_set_current_user( $this->managerA );
         App::organization_clinic_provisioning_service()->set_clinic_status( $this->managerA, $this->orgA, $this->clinicA, true );
-        wp_set_current_user( $patient_user );
+        PatientTwoProofTestHelper::acting_as( $patient_user );
         $booking->hold( $patient_user, $clinician_id, $slot_b['slot_date'], $slot_b['slot_time'], $slot_b['id'], $patient_id );
         self::assertSame( 1, $this->slot_counters( $slot_b['id'] )['held_count'], 'reactivated Clinic must accept a new hold' );
         \ClinicCore\Application\Scope\ScopeContext::clear();
@@ -584,6 +590,13 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
             'is_primary'     => 1,
             'linked_at'      => $now,
         ] );
+        $this->extraUsers[] = $user_id;
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $user_id,
+            $clinic_id,
+            $patient_id,
+            [ 'mobile' => $mobile, 'seed_session_scope' => true ]
+        );
 
         return [ 'user_id' => $user_id, 'patient_id' => $patient_id, 'mobile' => $mobile ];
     }
@@ -662,7 +675,7 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
         $slot         = $fixture['slots'][0];
         $linked       = $this->make_linked_patient( $this->clinicA );
         $booking      = App::bookingService();
-        wp_set_current_user( $linked['user_id'] );
+        PatientTwoProofTestHelper::acting_as( $linked['user_id'] );
 
         // Legitimate hold taken while the Clinic is ACTIVE.
         $hold = $booking->hold( $linked['user_id'], $clinician_id, $slot['slot_date'], $slot['slot_time'], $slot['id'], $linked['patient_id'] );
@@ -672,7 +685,7 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
         $this->suspend_clinic_a();
 
         // NEGATIVE: confirmation is refused under the Clinic row lock (race-safe).
-        wp_set_current_user( $linked['user_id'] );
+        PatientTwoProofTestHelper::acting_as( $linked['user_id'] );
         try {
             $booking->confirm( (string) $hold['hold_token'], $linked['user_id'], null, 'idem-susp-confirm-' . bin2hex( random_bytes( 4 ) ) );
             self::fail( 'suspended Clinic must refuse to confirm a hold into a new appointment' );
@@ -707,7 +720,7 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
         $slot_b       = $fixture['slots'][1];
         $linked       = $this->make_linked_patient( $this->clinicA );
         $booking      = App::bookingService();
-        wp_set_current_user( $linked['user_id'] );
+        PatientTwoProofTestHelper::acting_as( $linked['user_id'] );
 
         // Existing appointment created legitimately while the Clinic is ACTIVE.
         $hold = $booking->hold( $linked['user_id'], $clinician_id, $slot_a['slot_date'], $slot_a['slot_time'], $slot_a['id'], $linked['patient_id'] );
@@ -719,7 +732,7 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
         $this->suspend_clinic_a();
 
         // NEGATIVE (patient path).
-        wp_set_current_user( $linked['user_id'] );
+        PatientTwoProofTestHelper::acting_as( $linked['user_id'] );
         try {
             $booking->reschedule( $linked['user_id'], $appointment_id, $clinician_id, $slot_b['slot_date'], $slot_b['slot_time'], 'idem-susp-rp-' . bin2hex( random_bytes( 4 ) ), $slot_b['id'] );
             self::fail( 'suspended Clinic must refuse a patient reschedule' );

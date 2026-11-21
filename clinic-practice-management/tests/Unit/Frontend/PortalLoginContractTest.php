@@ -34,5 +34,12 @@ final class PortalLoginContractTest extends TestCase {
 		self::assertStringContainsString( 'in_array( RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true )', $this->source );
 		self::assertStringContainsString( "wp_logout();", $this->source );
 		self::assertStringContainsString( 'wp_safe_redirect( self::portal_url( $portal ) )', $this->source );
+
+		// D3: Patient exclusion MUST execute before the `'doctor' === $portal` branch.
+		$patientCheckPos = strpos( $this->source, 'RolesAndCapabilities::ROLE_PATIENT' );
+		$doctorBranchPos = strpos( $this->source, "'doctor' === \$portal" );
+		self::assertIsInt( $patientCheckPos );
+		self::assertIsInt( $doctorBranchPos );
+		self::assertLessThan( $doctorBranchPos, $patientCheckPos, 'ROLE_PATIENT exclusion must run before doctor portal branch.' );
 	}
 }

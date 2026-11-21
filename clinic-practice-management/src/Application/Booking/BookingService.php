@@ -899,7 +899,8 @@ final class BookingService
                 'SELECT 1 AS ok FROM ' . $this->db->table('cpms_patient_user_links') . ' WHERE wp_user_id = %d AND clinic_id = %d AND patient_id = %d LIMIT 1',
                 [$wpUserId, $holdClinicId, $holdPatientId]
             );
-            if ($link === null) {
+            $proved_ids = App::patient_access()->proved_patient_ids( $wpUserId, $holdClinicId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- existing host parameters.
+            if ( $link === null || ! in_array( $holdPatientId, $proved_ids, true ) ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- existing host parameter.
                 throw BookingException::of('CLINIC_VALIDATION_FAILED', 'پیوند بیمار با کاربر نامعتبر است', 422);
             }
         } else {
@@ -1240,7 +1241,18 @@ final class BookingService
             return [];
         }
 
-        $rows = $this->appointments->list_for_patient_portal( $wpUserId, $fromDate, $toDate, $resolved_clinic_id ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- published public parameters.
+        $proved_ids = App::patient_access()->proved_patient_ids( $wpUserId, $resolved_clinic_id ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- published public parameter.
+        if ( [] === $proved_ids ) {
+            return [];
+        }
+        $proved_map = array_flip( $proved_ids );
+
+        $rows = array_values(
+            array_filter(
+                $this->appointments->list_for_patient_portal( $wpUserId, $fromDate, $toDate, $resolved_clinic_id ), // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- published public parameters.
+                static fn ( array $row ): bool => isset( $proved_map[ (int) ( $row['patient_id'] ?? 0 ) ] )
+            )
+        );
 
         return $this->mapAppointmentViews( $rows );
     }
@@ -1351,7 +1363,8 @@ final class BookingService
                 . " WHERE l.wp_user_id = %d AND l.clinic_id = %d AND l.patient_id = %d AND p.status = 'active' LIMIT 1",
                 [ $actor_user_id, $clinic_id, $patient_id ]
             );
-            if ( null === $linked ) {
+            $proved_ids = App::patient_access()->proved_patient_ids( $actor_user_id, $clinic_id );
+            if ( null === $linked || ! in_array( $patient_id, $proved_ids, true ) ) {
                 $this->audit(
                     'FORBIDDEN_ACCESS_ATTEMPT',
                     $actor_user_id,
@@ -3022,16 +3035,24 @@ final class BookingService
      * در دور ۳ حذف شد — تصمیم مالک A، ۲۰۲۶-۱۱-۰۹.)
      */
     private function mobile_for_user_in_clinic( int $wp_user_id, int $clinic_id ): ?string {
-        $primary = $this->db->fetchRow(
-            'SELECT p.mobile FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
+        $proved_ids = App::patient_access()->proved_patient_ids( $wp_user_id, $clinic_id );
+        if ( [] === $proved_ids ) {
+            return null;
+        }
+        $proved_map = array_flip( $proved_ids );
+
+        $rows = $this->db->fetchAll(
+            'SELECT p.id, p.mobile FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
             . ' INNER JOIN ' . $this->db->table( 'cpms_patients' ) . ' p'
             . ' ON p.id = l.patient_id AND p.clinic_id = l.clinic_id'
             . ' WHERE l.wp_user_id = %d AND l.clinic_id = %d AND p.status = %s'
-            . ' ORDER BY l.is_primary DESC, l.id ASC LIMIT 1',
+            . ' ORDER BY l.is_primary DESC, l.id ASC',
             [ $wp_user_id, $clinic_id, 'active' ]
         );
-        if ( null !== $primary ) {
-            return (string) $primary['mobile'];
+        foreach ( $rows as $row ) {
+            if ( isset( $proved_map[ (int) ( $row['id'] ?? 0 ) ] ) ) {
+                return (string) $row['mobile'];
+            }
         }
 
         // owner decision A (2026-11-09) + review round 3 (2026-11-10):
@@ -3066,9 +3087,22 @@ final class BookingService
      */
     private function linkedActivePatientsForClinic(int $wpUserId, int $clinicId): array
     {
-        return $this->db->fetchAll(
+        $proved_ids = App::patient_access()->proved_patient_ids( $wpUserId, $clinicId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- existing host parameters.
+        if ( [] === $proved_ids ) {
+            return [];
+        }
+        $proved_map = array_flip( $proved_ids );
+
+        $rows = $this->db->fetchAll(
             'SELECT p.* FROM ' . $this->db->table('cpms_patient_user_links') . ' l JOIN ' . $this->db->table('cpms_patients') . ' p ON p.id = l.patient_id WHERE l.wp_user_id = %d AND l.clinic_id = %d AND p.status = %s AND p.clinic_id = %d ORDER BY l.is_primary DESC, l.id ASC',
             [$wpUserId, $clinicId, 'active', $clinicId]
+        );
+
+        return array_values(
+            array_filter(
+                $rows,
+                static fn ( array $row ): bool => isset( $proved_map[ (int) ( $row['id'] ?? 0 ) ] )
+            )
         );
     }
 
@@ -3151,7 +3185,8 @@ final class BookingService
             . ' WHERE wp_user_id = %d AND clinic_id = %d AND patient_id = %d LIMIT 1',
             [ $wp_user_id, $clinic_id, $patient_id ]
         );
-        if ( null === $link ) {
+        $proved_ids = App::patient_access()->proved_patient_ids( $wp_user_id, $clinic_id );
+        if ( null === $link || ! in_array( $patient_id, $proved_ids, true ) ) {
             throw $this->invalid_patient_selection();
         }
 
@@ -3223,6 +3258,10 @@ final class BookingService
         if ( $wp_user_id <= 0 || $patient_id <= 0 || $clinic_id <= 0 ) {
             return false;
         }
+        $proved_ids = App::patient_access()->proved_patient_ids( $wp_user_id, $clinic_id );
+        if ( ! in_array( $patient_id, $proved_ids, true ) ) {
+            return false;
+        }
 
         $v = $this->db->fetchValue(
             'SELECT 1 FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
@@ -3243,7 +3282,7 @@ final class BookingService
 
         $clinic_id = (int) $clinicId; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing private method parameter is retained.
 
-        return $this->db->fetchRow(
+        $row = $this->db->fetchRow(
             'SELECT a.* FROM ' . $this->db->table( 'cpms_appointments' ) . ' a'
             . ' INNER JOIN ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
             . ' ON l.patient_id = a.patient_id AND l.clinic_id = a.clinic_id'
@@ -3253,6 +3292,15 @@ final class BookingService
             . " AND a.status IN ('pending','confirmed') ORDER BY a.id DESC LIMIT 1",
             [ $clinic_id, $clinic_id, $slot_id, $wp_user_id ]
         );
+        if ( null === $row ) {
+            return null;
+        }
+        $proved_ids = App::patient_access()->proved_patient_ids( $wp_user_id, $clinic_id );
+        if ( ! in_array( (int) ( $row['patient_id'] ?? 0 ), $proved_ids, true ) ) {
+            return null;
+        }
+
+        return $row;
     }
 
     private function referenceCode( string $slot_date ): string // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- established private method.

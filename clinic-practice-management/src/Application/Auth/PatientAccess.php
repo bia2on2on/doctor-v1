@@ -64,27 +64,6 @@ final class PatientAccess {
     private $user_reader;
 
     /**
-     * Optional clinic-binding resolver seam for pure-PHP unit tests.
-     *
-     * @var (callable(int, int): bool)|null
-     */
-    private $clinic_binding_checker;
-
-    /**
-     * Optional patient-binding resolver seam for pure-PHP unit tests.
-     *
-     * @var (callable(int, int, int): bool)|null
-     */
-    private $patient_binding_checker;
-
-    /**
-     * Optional any-binding resolver seam for pure-PHP unit tests.
-     *
-     * @var (callable(int): bool)|null
-     */
-    private $any_binding_checker;
-
-    /**
      * Optional link-target resolver seam for pure-PHP unit tests.
      *
      * @var (callable(int, int): ?array{clinic_id: int, patient_id: int})|null
@@ -114,27 +93,6 @@ final class PatientAccess {
     private $scoped_staff_checker;
 
     /**
-     * Optional any-clinic patient-binding resolver seam for pure-PHP unit tests.
-     *
-     * @var (callable(int, int): bool)|null
-     */
-    private $any_patient_binding_checker;
-
-    /**
-     * Optional booking-clinic binding resolver seam for pure-PHP unit tests.
-     *
-     * @var (callable(int, int): bool)|null
-     */
-    private $booking_clinic_binding_checker;
-
-    /**
-     * Optional any-booking binding resolver seam for pure-PHP unit tests.
-     *
-     * @var (callable(int): bool)|null
-     */
-    private $any_booking_binding_checker;
-
-    /**
      * Optional booking link-target resolver seam for pure-PHP unit tests.
      *
      * @var (callable(int, int): ?array{clinic_id: int, patient_id: int})|null
@@ -142,24 +100,34 @@ final class PatientAccess {
     private $booking_link_resolver;
 
     /**
+     * Optional two-proof bindings reader seam for pure-PHP unit tests.
+     *
+     * @var (callable(int, ?int): list<array{binding_id: int, clinic_id: int, patient_id: int, verified_at: string, mobile: string, full_identity?: bool}>)|null
+     */
+    private $two_proof_bindings_reader;
+
+    /**
      * Construct the central patient access gate.
      *
-     * @param CpmsDb|null                                                                                                         $db                             Database adapter.
-     * @param PatientRepository|null                                                                                              $patients                       Patient repository.
-     * @param (callable(int): ?array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>})|null $user_reader                    Optional user reader seam.
-     * @param (callable(int, int): bool)|null                                                                                     $clinic_binding_checker         Optional clinic binding seam.
-     * @param (callable(int, int, int): bool)|null                                                                                $patient_binding_checker        Optional patient binding seam.
-     * @param (callable(int): bool)|null                                                                                          $any_binding_checker            Optional any-binding seam.
-     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null                                                  $link_resolver                  Optional link resolver seam.
-     * @param (callable(int, int): bool)|null                                                                                     $enroll_checker                 Optional enroll eligibility seam.
-     * @param (callable(array<string, mixed>): void)|null                                                                         $decision_observer              Optional decision observer seam.
-     * @param (callable(int): bool)|null                                                                                          $scoped_staff_checker           Optional scoped staff authority seam.
-     * @param MembershipRepository|null                                                                                           $memberships                    Membership repository.
-     * @param AuthorizationService|null                                                                                           $authorization                  Clinic-scoped authorization service.
-     * @param (callable(int, int): bool)|null                                                                                     $any_patient_binding_checker    Optional any-clinic patient seam.
-     * @param (callable(int, int): bool)|null                                                                                     $booking_clinic_binding_checker Optional booking clinic seam.
-     * @param (callable(int): bool)|null                                                                                          $any_booking_binding_checker    Optional any-booking seam.
-     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null                                                  $booking_link_resolver          Optional booking link resolver seam.
+     * @param CpmsDb|null                                                                                                                                      $db                             Database adapter.
+     * @param PatientRepository|null                                                                                                                           $patients                       Patient repository.
+     * @param (callable(int): ?array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>})|null                              $user_reader                    Optional user reader seam.
+     * @param (callable(int, int): bool)|null                                                                                                                  $clinic_binding_checker         Optional clinic binding seam.
+     * @param (callable(int, int, int): bool)|null                                                                                                             $patient_binding_checker        Optional patient binding seam.
+     * @param (callable(int): bool)|null                                                                                                                       $any_binding_checker            Optional any-binding seam.
+     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null                                                                               $link_resolver                  Optional link resolver seam.
+     * @param (callable(int, int): bool)|null                                                                                                                  $enroll_checker                 Optional enroll eligibility seam.
+     * @param (callable(array<string, mixed>): void)|null                                                                                                      $decision_observer              Optional decision observer seam.
+     * @param (callable(int): bool)|null                                                                                                                       $scoped_staff_checker           Optional scoped staff authority seam.
+     * @param MembershipRepository|null                                                                                                                        $memberships                    Membership repository.
+     * @param AuthorizationService|null                                                                                                                        $authorization                  Clinic-scoped authorization service.
+     * @param (callable(int, int): bool)|null                                                                                                                  $any_patient_binding_checker    Optional any-clinic patient seam.
+     * @param (callable(int, int): bool)|null                                                                                                                  $booking_clinic_binding_checker Optional booking clinic seam.
+     * @param (callable(int): bool)|null                                                                                                                       $any_booking_binding_checker    Optional any-booking seam.
+     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null                                                                               $booking_link_resolver          Optional booking link resolver seam.
+     * @param PatientLoginRepository|null                                                                                                                      $logins                         Patient login repository.
+     * @param PatientSessionProofStore|null                                                                                                                    $proofs                         Session proof store.
+     * @param (callable(int, ?int): list<array{binding_id: int, clinic_id: int, patient_id: int, verified_at: string, mobile: string, full_identity?: bool}>)|null $two_proof_bindings_reader  Optional pure-PHP unit test seam.
      */
     public function __construct(
         ?CpmsDb $db = null,
@@ -179,7 +147,8 @@ final class PatientAccess {
         ?callable $any_booking_binding_checker = null,
         ?callable $booking_link_resolver = null,
         ?PatientLoginRepository $logins = null,
-        ?PatientSessionProofStore $proofs = null
+        ?PatientSessionProofStore $proofs = null,
+        ?callable $two_proof_bindings_reader = null
     ) {
         $this->db                             = $db;
         $this->patients                       = $patients ?? ( null !== $db ? new PatientRepository( $db ) : null );
@@ -187,46 +156,35 @@ final class PatientAccess {
         $this->authorization                  = $authorization ?? ( null !== $db && null !== $this->memberships ? new AuthorizationService( $this->memberships, new CustomRoleRepository( $db ) ) : null );
         $this->logins                         = $logins ?? ( null !== $db ? new PatientLoginRepository( $db ) : null );
         $this->proofs                         = $proofs ?? new PatientSessionProofStore();
-        $this->user_reader                    = $user_reader;
-        $this->clinic_binding_checker         = $clinic_binding_checker;
-        $this->patient_binding_checker        = $patient_binding_checker;
-        $this->any_binding_checker            = $any_binding_checker;
-        $this->link_resolver                  = $link_resolver;
-        $this->enroll_checker                 = $enroll_checker;
-        $this->decision_observer              = $decision_observer;
-        $this->scoped_staff_checker           = $scoped_staff_checker;
-        $this->any_patient_binding_checker    = $any_patient_binding_checker;
-        $this->booking_clinic_binding_checker = $booking_clinic_binding_checker;
-        $this->any_booking_binding_checker    = $any_booking_binding_checker;
-        $this->booking_link_resolver          = $booking_link_resolver;
+        $this->user_reader               = $user_reader;
+        $this->link_resolver             = $link_resolver;
+        $this->enroll_checker            = $enroll_checker;
+        $this->decision_observer         = $decision_observer;
+        $this->scoped_staff_checker      = $scoped_staff_checker;
+        $this->booking_link_resolver     = $booking_link_resolver;
+        $this->two_proof_bindings_reader = $two_proof_bindings_reader;
     }
 
     /**
-     * May this authenticated patient-role user act inside `$clinic_id`?
+     * May this authenticated patient-role user act inside `$clinic_id` with full identity proof?
      */
     public function can_access_clinic( int $wp_user_id, int $clinic_id ): bool {
         if ( $wp_user_id <= 0 || $clinic_id <= 0 ) {
             return false;
         }
-        if ( ! $this->is_authenticated_patient( $wp_user_id ) ) {
-            return false;
-        }
 
-        return $this->has_clinic_binding( $wp_user_id, $clinic_id );
+        return self::LEVEL_FULL === $this->level( $wp_user_id, null, $clinic_id );
     }
 
     /**
-     * May this authenticated patient-role user act on `$patient_id` in `$clinic_id`?
+     * May this authenticated patient-role user act on `$patient_id` in `$clinic_id` with full identity proof?
      */
     public function can_access_patient( int $wp_user_id, int $clinic_id, int $patient_id ): bool {
         if ( $wp_user_id <= 0 || $clinic_id <= 0 || $patient_id <= 0 ) {
             return false;
         }
-        if ( ! $this->is_authenticated_patient( $wp_user_id ) ) {
-            return false;
-        }
 
-        return $this->has_patient_binding( $wp_user_id, $clinic_id, $patient_id );
+        return self::LEVEL_FULL === $this->level( $wp_user_id, $patient_id, $clinic_id );
     }
 
     /**
@@ -236,7 +194,7 @@ final class PatientAccess {
         if ( $wp_user_id <= 0 || $clinic_id <= 0 ) {
             return false;
         }
-        if ( ! $this->is_authenticated_patient( $wp_user_id ) ) {
+        if ( self::LEVEL_FULL !== $this->level( $wp_user_id, null, null ) ) {
             return false;
         }
 
@@ -283,30 +241,41 @@ final class PatientAccess {
         if ( ! $this->is_authenticated_patient( $wp_user_id ) ) {
             return self::LEVEL_NONE;
         }
-        if ( null === $this->logins || null === $this->db || null === $this->patients ) {
+
+        $use_unit_seam = null === $this->logins && null === $this->db && null !== $this->two_proof_bindings_reader;
+        if ( ! $use_unit_seam && ( null === $this->logins || null === $this->db || null === $this->patients ) ) {
             return self::LEVEL_NONE;
         }
 
         try {
-            $account = $this->logins->find_account_by_user_id( $wp_user_id );
-            if ( null === $account || PatientLoginRepository::STATE_ACTIVE !== (string) ( $account['state'] ?? '' ) ) {
-                return self::LEVEL_NONE;
+            if ( $use_unit_seam ) {
+                $bindings = ( $this->two_proof_bindings_reader )( $wp_user_id, $clinic_id );
+            } else {
+                $account = $this->logins->find_account_by_user_id( $wp_user_id );
+                if ( null === $account || PatientLoginRepository::STATE_ACTIVE !== (string) ( $account['state'] ?? '' ) ) {
+                    return self::LEVEL_NONE;
+                }
+
+                $bindings = $this->logins->find_active_bindings_for_user( $wp_user_id, $clinic_id );
             }
 
-            $bindings = $this->logins->find_active_bindings_for_user( $wp_user_id, $clinic_id );
             if ( [] === $bindings ) {
                 return self::LEVEL_NONE;
             }
 
             $proved_bindings = [];
             foreach ( $bindings as $binding ) {
+                $b_clinic_id  = (int) ( $binding['clinic_id'] ?? 0 );
                 $b_patient_id = (int) ( $binding['patient_id'] ?? 0 );
+                if ( null !== $clinic_id && $b_clinic_id !== $clinic_id ) {
+                    continue;
+                }
                 if ( null !== $patient_id && $b_patient_id !== $patient_id ) {
                     continue;
                 }
                 if ( $this->proofs->has_valid_binding_proof(
                     $wp_user_id,
-                    (int) ( $binding['clinic_id'] ?? 0 ),
+                    $b_clinic_id,
                     $b_patient_id,
                     (int) ( $binding['binding_id'] ?? 0 ),
                     (string) ( $binding['verified_at'] ?? '' ),
@@ -323,11 +292,14 @@ final class PatientAccess {
             }
 
             foreach ( $proved_bindings as $proved ) {
-                if ( $this->has_full_identity_edges(
-                    $wp_user_id,
-                    (int) ( $proved['clinic_id'] ?? 0 ),
-                    (int) ( $proved['patient_id'] ?? 0 )
-                ) ) {
+                $full_identity = $use_unit_seam
+                    ? (bool) ( $proved['full_identity'] ?? false )
+                    : $this->has_full_identity_edges(
+                        $wp_user_id,
+                        (int) ( $proved['clinic_id'] ?? 0 ),
+                        (int) ( $proved['patient_id'] ?? 0 )
+                    );
+                if ( $full_identity ) {
                     return self::LEVEL_FULL;
                 }
             }
@@ -352,12 +324,16 @@ final class PatientAccess {
         if ( $wp_user_id <= 0 || ! $this->is_authenticated_patient( $wp_user_id ) ) {
             return [];
         }
-        if ( null === $this->logins ) {
+
+        $use_unit_seam = null === $this->logins && null === $this->db && null !== $this->two_proof_bindings_reader;
+        if ( ! $use_unit_seam && null === $this->logins ) {
             return [];
         }
 
         try {
-            $bindings = $this->logins->find_active_bindings_for_user( $wp_user_id, $clinic_id );
+            $bindings = $use_unit_seam
+                ? ( $this->two_proof_bindings_reader )( $wp_user_id, $clinic_id )
+                : $this->logins->find_active_bindings_for_user( $wp_user_id, $clinic_id );
 
             return $this->proofs->proved_patient_ids( $wp_user_id, $bindings, $now, $token );
         } catch ( Throwable ) {
@@ -402,7 +378,18 @@ final class PatientAccess {
         $user         = $this->read_user( $wp_user_id );
         $primary_role = ( null !== $user && [] !== $user['roles'] ) ? $user['roles'][0] : 'unknown';
 
-        if ( null === $user || ! $this->is_pure_patient_user( $user ) || $this->has_scoped_staff_authority( $wp_user_id ) ) {
+        if ( null === $user || ! $user['exists'] ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                $patient_id,
+                $link_id,
+                $mode,
+                $this->proof_failed_decision( 'unauthenticated', 'anonymous' )
+            );
+        }
+
+        if ( ! $this->is_pure_patient_user( $user ) || $this->has_scoped_staff_authority( $wp_user_id ) ) {
             return $this->observe_decision(
                 $wp_user_id,
                 $clinic_id,
@@ -413,7 +400,12 @@ final class PatientAccess {
             );
         }
 
-        if ( $selector_invalid ) {
+        if (
+            $selector_invalid
+            || ( null !== $clinic_id && $clinic_id <= 0 )
+            || ( null !== $patient_id && $patient_id <= 0 )
+            || ( null !== $link_id && $link_id <= 0 )
+        ) {
             return $this->observe_decision(
                 $wp_user_id,
                 $clinic_id,
@@ -445,17 +437,18 @@ final class PatientAccess {
             );
         }
 
+        if ( self::MODE_PATIENT_RESOURCE === $mode && ( null === $patient_id || $patient_id <= 0 ) ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                $patient_id,
+                $link_id,
+                $mode,
+                $this->proof_failed_decision( 'patient_required', $primary_role )
+            );
+        }
+
         if ( null !== $link_id ) {
-            if ( $link_id <= 0 ) {
-                return $this->observe_decision(
-                    $wp_user_id,
-                    $clinic_id,
-                    $patient_id,
-                    $link_id,
-                    $mode,
-                    $this->proof_failed_decision( 'invalid_link_id', $primary_role )
-                );
-            }
             $target = self::MODE_BOOKING_APPOINTMENT === $mode
                 ? $this->resolve_booking_link_target( $wp_user_id, $link_id )
                 : $this->resolve_link_target( $wp_user_id, $link_id );
@@ -493,11 +486,42 @@ final class PatientAccess {
             $patient_id = $target['patient_id'];
         }
 
+        if ( self::MODE_ENROLL === $mode ) {
+            if ( null === $clinic_id || null !== $patient_id || null !== $link_id ) {
+                return $this->observe_decision(
+                    $wp_user_id,
+                    $clinic_id,
+                    $patient_id,
+                    $link_id,
+                    $mode,
+                    $this->proof_failed_decision( 'enroll_ineligible', $primary_role )
+                );
+            }
+            $has_full_session = self::LEVEL_FULL === $this->level( $wp_user_id, null, null, $now, $token );
+            $ok               = $has_full_session && $this->has_enrollment_eligibility( $wp_user_id, $clinic_id );
+            $decision         = $ok
+                ? $this->allow_decision( $primary_role )
+                : $this->proof_failed_decision( 'enroll_ineligible', $primary_role );
+
+            return $this->observe_decision( $wp_user_id, $clinic_id, $patient_id, $link_id, $mode, $decision );
+        }
+
+        if ( self::MODE_CLINICAL === $mode && null === $clinic_id && null !== $patient_id && null === $link_id ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                $patient_id,
+                $link_id,
+                $mode,
+                $this->proof_failed_decision( 'patient_without_clinic', $primary_role )
+            );
+        }
+
         $level = $this->level( $wp_user_id, $patient_id, $clinic_id, $now, $token );
         $ok    = match ( $mode ) {
-            self::MODE_CLINICAL, self::MODE_PATIENT_RESOURCE, self::MODE_ENROLL => self::LEVEL_FULL === $level,
-            self::MODE_BOOKING_APPOINTMENT, self::MODE_RECORDS_LIST            => in_array( $level, [ self::LEVEL_BOOKING, self::LEVEL_FULL ], true ),
-            default                                                            => false,
+            self::MODE_CLINICAL, self::MODE_PATIENT_RESOURCE => self::LEVEL_FULL === $level,
+            self::MODE_BOOKING_APPOINTMENT, self::MODE_RECORDS_LIST => in_array( $level, [ self::LEVEL_BOOKING, self::LEVEL_FULL ], true ),
+            default => false,
         };
 
         $decision = $ok
@@ -508,8 +532,83 @@ final class PatientAccess {
     }
 
     /**
+     * Evaluates an actor/selector gate for `POST /clinic/v1/patient/link-record`
+     * without requiring a pre-existing target-clinic binding (§6.2, §6.10).
+     *
+     * @return array{
+     *     allowed: bool,
+     *     http_status: int,
+     *     code: string,
+     *     message: string,
+     *     reason: string,
+     *     role: string
+     * }
+     */
+    public function authorize_link_record_request(
+        int $wp_user_id,
+        ?int $clinic_id = null,
+        bool $selector_invalid = false
+    ): array {
+        if ( $wp_user_id <= 0 ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                null,
+                null,
+                'link_record',
+                $this->proof_failed_decision( 'unauthenticated', 'anonymous' )
+            );
+        }
+
+        $user         = $this->read_user( $wp_user_id );
+        $primary_role = ( null !== $user && [] !== $user['roles'] ) ? $user['roles'][0] : 'unknown';
+
+        if ( null === $user || ! $user['exists'] ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                null,
+                null,
+                'link_record',
+                $this->proof_failed_decision( 'unauthenticated', 'anonymous' )
+            );
+        }
+
+        if ( ! $this->is_pure_patient_user( $user ) || $this->has_scoped_staff_authority( $wp_user_id ) ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                null,
+                null,
+                'link_record',
+                $this->proof_failed_decision( 'patient_role_required', $primary_role )
+            );
+        }
+
+        if ( $selector_invalid || null === $clinic_id || $clinic_id <= 0 ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                null,
+                null,
+                'link_record',
+                $this->proof_failed_decision( 'invalid_selector', $primary_role )
+            );
+        }
+
+        return $this->observe_decision(
+            $wp_user_id,
+            $clinic_id,
+            null,
+            null,
+            'link_record',
+            $this->allow_decision( $primary_role )
+        );
+    }
+
+    /**
      * Evaluates a patient REST request against authentication, patient-role
-     * separation, clinic binding, and optional patient/link selectors.
+     * separation, two-factor session proofs, active bindings, and selectors (D1).
      *
      * @return array{
      *     allowed: bool,
@@ -528,309 +627,14 @@ final class PatientAccess {
         string $mode = self::MODE_CLINICAL,
         bool $selector_invalid = false
     ): array {
-        $user = $this->read_user( $wp_user_id );
-        if ( null === $user || ! $user['exists'] ) {
-            return $this->observe_decision(
-                $wp_user_id,
-                $clinic_id,
-                $patient_id,
-                $link_id,
-                $mode,
-                [
-                    'allowed'     => false,
-                    'http_status' => 401,
-                    'code'        => self::UNAUTHORIZED_CODE,
-                    'message'     => self::UNAUTHORIZED_MESSAGE,
-                    'reason'      => 'unauthenticated',
-                    'role'        => 'anonymous',
-                ]
-            );
-        }
-
-        $roles        = $user['roles'];
-        $primary_role = isset( $roles[0] ) && is_string( $roles[0] ) ? $roles[0] : 'unknown';
-        if ( ! $this->is_pure_patient_user( $user ) || $this->has_scoped_staff_authority( $wp_user_id ) ) {
-            return $this->observe_decision(
-                $wp_user_id,
-                $clinic_id,
-                $patient_id,
-                $link_id,
-                $mode,
-                [
-                    'allowed'     => false,
-                    'http_status' => 403,
-                    'code'        => self::FORBIDDEN_CODE,
-                    'message'     => self::FORBIDDEN_MESSAGE,
-                    'reason'      => 'patient_role_required',
-                    'role'        => $primary_role,
-                ]
-            );
-        }
-
-        if (
+        return $this->authorize_two_proof_request(
+            $wp_user_id,
+            $clinic_id,
+            $patient_id,
+            $link_id,
+            $mode,
             $selector_invalid
-            || ( null !== $clinic_id && $clinic_id <= 0 )
-            || ( null !== $patient_id && $patient_id <= 0 )
-            || ( null !== $link_id && $link_id <= 0 )
-        ) {
-            return $this->observe_decision(
-                $wp_user_id,
-                $clinic_id,
-                $patient_id,
-                $link_id,
-                $mode,
-                $this->not_found_decision( 'invalid_selector', $primary_role )
-            );
-        }
-
-        if ( self::MODE_ENROLL === $mode ) {
-            if ( null === $clinic_id || ! $this->has_enrollment_eligibility( $wp_user_id, $clinic_id ) ) {
-                return $this->observe_decision(
-                    $wp_user_id,
-                    $clinic_id,
-                    $patient_id,
-                    $link_id,
-                    $mode,
-                    $this->not_found_decision( 'enroll_ineligible', $primary_role )
-                );
-            }
-
-            return $this->observe_decision(
-                $wp_user_id,
-                $clinic_id,
-                $patient_id,
-                $link_id,
-                $mode,
-                $this->allow_decision( $primary_role )
-            );
-        }
-
-        if ( self::MODE_RECORDS_LIST === $mode ) {
-            if ( null !== $link_id ) {
-                $target = $this->resolve_link_target( $wp_user_id, $link_id );
-                if ( null === $target || ( null !== $clinic_id && $target['clinic_id'] !== $clinic_id ) ) {
-                    return $this->observe_decision(
-                        $wp_user_id,
-                        $clinic_id,
-                        $patient_id,
-                        $link_id,
-                        $mode,
-                        $this->not_found_decision( 'link_not_bound', $primary_role )
-                    );
-                }
-            }
-            if ( null !== $clinic_id && ! $this->has_clinic_binding( $wp_user_id, $clinic_id ) ) {
-                return $this->observe_decision(
-                    $wp_user_id,
-                    $clinic_id,
-                    $patient_id,
-                    $link_id,
-                    $mode,
-                    $this->not_found_decision( 'clinic_not_bound', $primary_role )
-                );
-            }
-
-            return $this->observe_decision(
-                $wp_user_id,
-                $clinic_id,
-                $patient_id,
-                $link_id,
-                $mode,
-                $this->allow_decision( $primary_role )
-            );
-        }
-
-        if ( self::MODE_BOOKING_APPOINTMENT === $mode ) {
-            if ( null !== $link_id ) {
-                $target = $this->resolve_booking_link_target( $wp_user_id, $link_id );
-                if (
-                    null === $target
-                    || ( null !== $clinic_id && $target['clinic_id'] !== $clinic_id )
-                    || ( null !== $patient_id && $target['patient_id'] !== $patient_id )
-                    || ! $this->has_booking_clinic_binding( $wp_user_id, $target['clinic_id'] )
-                ) {
-                    return $this->observe_decision(
-                        $wp_user_id,
-                        $clinic_id,
-                        $patient_id,
-                        $link_id,
-                        $mode,
-                        $this->forbidden_decision( 'booking_link_required', $primary_role )
-                    );
-                }
-
-                return $this->observe_decision(
-                    $wp_user_id,
-                    $clinic_id,
-                    $patient_id,
-                    $link_id,
-                    $mode,
-                    $this->allow_decision( $primary_role )
-                );
-            }
-
-            if ( null !== $clinic_id ) {
-                $decision = $this->has_booking_clinic_binding( $wp_user_id, $clinic_id )
-                    ? $this->allow_decision( $primary_role )
-                    : $this->forbidden_decision( 'booking_link_required', $primary_role );
-
-                return $this->observe_decision( $wp_user_id, $clinic_id, $patient_id, $link_id, $mode, $decision );
-            }
-
-            $decision = $this->has_any_booking_binding( $wp_user_id )
-                ? $this->allow_decision( $primary_role )
-                : $this->forbidden_decision( 'booking_link_required', $primary_role );
-
-            return $this->observe_decision( $wp_user_id, $clinic_id, $patient_id, $link_id, $mode, $decision );
-        }
-
-        if ( self::MODE_PATIENT_RESOURCE === $mode ) {
-            if ( null === $patient_id || $patient_id <= 0 ) {
-                return $this->observe_decision(
-                    $wp_user_id,
-                    $clinic_id,
-                    $patient_id,
-                    $link_id,
-                    $mode,
-                    $this->not_found_decision( 'patient_required', $primary_role )
-                );
-            }
-
-            if ( null !== $link_id ) {
-                $target = $this->resolve_link_target( $wp_user_id, $link_id );
-                if (
-                    null === $target
-                    || ( null !== $clinic_id && $target['clinic_id'] !== $clinic_id )
-                    || $target['patient_id'] !== $patient_id
-                    || ! $this->has_patient_binding( $wp_user_id, $target['clinic_id'], $patient_id )
-                ) {
-                    return $this->observe_decision(
-                        $wp_user_id,
-                        $clinic_id,
-                        $patient_id,
-                        $link_id,
-                        $mode,
-                        $this->not_found_decision( 'patient_not_bound', $primary_role )
-                    );
-                }
-
-                return $this->observe_decision(
-                    $wp_user_id,
-                    $clinic_id,
-                    $patient_id,
-                    $link_id,
-                    $mode,
-                    $this->allow_decision( $primary_role )
-                );
-            }
-
-            $allowed_resource = null !== $clinic_id
-                ? $this->has_patient_binding( $wp_user_id, $clinic_id, $patient_id )
-                : $this->has_any_patient_binding( $wp_user_id, $patient_id );
-
-            $decision = $allowed_resource
-                ? $this->allow_decision( $primary_role )
-                : $this->not_found_decision( 'patient_not_bound', $primary_role );
-
-            return $this->observe_decision( $wp_user_id, $clinic_id, $patient_id, $link_id, $mode, $decision );
-        }
-
-        if ( self::MODE_CLINICAL !== $mode ) {
-            return $this->observe_decision(
-                $wp_user_id,
-                $clinic_id,
-                $patient_id,
-                $link_id,
-                $mode,
-                $this->not_found_decision( 'unsupported_mode', $primary_role )
-            );
-        }
-
-        if ( null !== $link_id ) {
-            $target = $this->resolve_link_target( $wp_user_id, $link_id );
-            if ( null === $target ) {
-                return $this->observe_decision(
-                    $wp_user_id,
-                    $clinic_id,
-                    $patient_id,
-                    $link_id,
-                    $mode,
-                    $this->not_found_decision( 'link_not_bound', $primary_role )
-                );
-            }
-            if ( null !== $clinic_id && $target['clinic_id'] !== $clinic_id ) {
-                return $this->observe_decision(
-                    $wp_user_id,
-                    $clinic_id,
-                    $patient_id,
-                    $link_id,
-                    $mode,
-                    $this->not_found_decision( 'link_clinic_mismatch', $primary_role )
-                );
-            }
-            if ( null !== $patient_id && $target['patient_id'] !== $patient_id ) {
-                return $this->observe_decision(
-                    $wp_user_id,
-                    $clinic_id,
-                    $patient_id,
-                    $link_id,
-                    $mode,
-                    $this->not_found_decision( 'link_patient_mismatch', $primary_role )
-                );
-            }
-            if ( ! $this->has_patient_binding( $wp_user_id, $target['clinic_id'], $target['patient_id'] ) ) {
-                return $this->observe_decision(
-                    $wp_user_id,
-                    $clinic_id,
-                    $patient_id,
-                    $link_id,
-                    $mode,
-                    $this->not_found_decision( 'patient_not_bound', $primary_role )
-                );
-            }
-
-            return $this->observe_decision(
-                $wp_user_id,
-                $clinic_id,
-                $patient_id,
-                $link_id,
-                $mode,
-                $this->allow_decision( $primary_role )
-            );
-        }
-
-        if ( null !== $clinic_id && null !== $patient_id ) {
-            $decision = $this->has_patient_binding( $wp_user_id, $clinic_id, $patient_id )
-                ? $this->allow_decision( $primary_role )
-                : $this->not_found_decision( 'patient_not_bound', $primary_role );
-
-            return $this->observe_decision( $wp_user_id, $clinic_id, $patient_id, $link_id, $mode, $decision );
-        }
-
-        if ( null !== $clinic_id ) {
-            $decision = $this->has_clinic_binding( $wp_user_id, $clinic_id )
-                ? $this->allow_decision( $primary_role )
-                : $this->not_found_decision( 'clinic_not_bound', $primary_role );
-
-            return $this->observe_decision( $wp_user_id, $clinic_id, $patient_id, $link_id, $mode, $decision );
-        }
-
-        if ( null !== $patient_id ) {
-            return $this->observe_decision(
-                $wp_user_id,
-                $clinic_id,
-                $patient_id,
-                $link_id,
-                $mode,
-                $this->not_found_decision( 'patient_without_clinic', $primary_role )
-            );
-        }
-
-        $decision = $this->has_any_clinical_binding( $wp_user_id )
-            ? $this->allow_decision( $primary_role )
-            : $this->not_found_decision( 'no_clinical_binding', $primary_role );
-
-        return $this->observe_decision( $wp_user_id, $clinic_id, $patient_id, $link_id, $mode, $decision );
+        );
     }
 
     private function is_authenticated_patient( int $wp_user_id ): bool {
@@ -1015,39 +819,6 @@ final class PatientAccess {
         return false;
     }
 
-    private function has_clinic_binding( int $wp_user_id, int $clinic_id ): bool {
-        if ( null !== $this->clinic_binding_checker ) {
-            return (bool) ( $this->clinic_binding_checker )( $wp_user_id, $clinic_id );
-        }
-        if ( null === $this->patients ) {
-            return false;
-        }
-
-        return $this->patients->user_has_clinical_access_to_clinic( $wp_user_id, $clinic_id );
-    }
-
-    private function has_patient_binding( int $wp_user_id, int $clinic_id, int $patient_id ): bool {
-        if ( null !== $this->patient_binding_checker ) {
-            return (bool) ( $this->patient_binding_checker )( $wp_user_id, $clinic_id, $patient_id );
-        }
-        if ( null === $this->patients ) {
-            return false;
-        }
-
-        return $this->patients->user_has_clinical_access_to_patient( $wp_user_id, $patient_id, $clinic_id );
-    }
-
-    private function has_any_clinical_binding( int $wp_user_id ): bool {
-        if ( null !== $this->any_binding_checker ) {
-            return (bool) ( $this->any_binding_checker )( $wp_user_id );
-        }
-        if ( null === $this->patients ) {
-            return false;
-        }
-
-        return $this->patients->user_has_any_clinical_access( $wp_user_id );
-    }
-
     /**
      * @return array{clinic_id: int, patient_id: int}|null
      */
@@ -1085,39 +856,6 @@ final class PatientAccess {
             'clinic_id'  => $clinic_id,
             'patient_id' => $patient_id,
         ];
-    }
-
-    private function has_any_patient_binding( int $wp_user_id, int $patient_id ): bool {
-        if ( null !== $this->any_patient_binding_checker ) {
-            return (bool) ( $this->any_patient_binding_checker )( $wp_user_id, $patient_id );
-        }
-        if ( null === $this->patients ) {
-            return false;
-        }
-
-        return $this->patients->user_has_clinical_access_to_patient_any_clinic( $wp_user_id, $patient_id );
-    }
-
-    private function has_booking_clinic_binding( int $wp_user_id, int $clinic_id ): bool {
-        if ( null !== $this->booking_clinic_binding_checker ) {
-            return (bool) ( $this->booking_clinic_binding_checker )( $wp_user_id, $clinic_id );
-        }
-        if ( null === $this->patients ) {
-            return false;
-        }
-
-        return $this->patients->user_has_booking_access_to_clinic( $wp_user_id, $clinic_id );
-    }
-
-    private function has_any_booking_binding( int $wp_user_id ): bool {
-        if ( null !== $this->any_booking_binding_checker ) {
-            return (bool) ( $this->any_booking_binding_checker )( $wp_user_id );
-        }
-        if ( null === $this->patients ) {
-            return false;
-        }
-
-        return $this->patients->user_has_any_booking_access( $wp_user_id );
     }
 
     /**
@@ -1187,48 +925,6 @@ final class PatientAccess {
             'code'        => '',
             'message'     => '',
             'reason'      => 'allowed',
-            'role'        => $role,
-        ];
-    }
-
-    /**
-     * @return array{
-     *     allowed: bool,
-     *     http_status: int,
-     *     code: string,
-     *     message: string,
-     *     reason: string,
-     *     role: string
-     * }
-     */
-    private function forbidden_decision( string $reason, string $role ): array {
-        return [
-            'allowed'     => false,
-            'http_status' => 403,
-            'code'        => self::FORBIDDEN_CODE,
-            'message'     => self::FORBIDDEN_MESSAGE,
-            'reason'      => $reason,
-            'role'        => $role,
-        ];
-    }
-
-    /**
-     * @return array{
-     *     allowed: bool,
-     *     http_status: int,
-     *     code: string,
-     *     message: string,
-     *     reason: string,
-     *     role: string
-     * }
-     */
-    private function not_found_decision( string $reason, string $role ): array {
-        return [
-            'allowed'     => false,
-            'http_status' => 404,
-            'code'        => self::NOT_FOUND_CODE,
-            'message'     => self::NOT_FOUND_MESSAGE,
-            'reason'      => $reason,
             'role'        => $role,
         ];
     }

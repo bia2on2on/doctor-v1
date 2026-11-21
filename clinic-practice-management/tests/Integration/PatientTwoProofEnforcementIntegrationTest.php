@@ -15,6 +15,8 @@ use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Domain\Otp\OtpPolicy;
+use ClinicCore\Domain\Sms\SmsEvents;
+use ClinicCore\Frontend\PortalLogin;
 use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use WP_REST_Request;
@@ -640,6 +642,157 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
 
         self::assertGreaterThan( 0, $faultCount );
         self::assertSame( $strictBefore, App::db()->is_strict() );
+    }
+
+    public function testLinkRecordRestEndpointPromotesBindingDispatchesVerificationSmsAndRejectsQueryIdentifiers(): void {
+        $proofStore     = new PatientSessionProofStore();
+        $token          = $proofStore->issue_non_persistent_auth_cookie( $this->patientUserA );
+        $previousCookie = $_COOKIE[ LOGGED_IN_COOKIE ] ?? null;
+
+        try {
+            $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie( $this->patientUserA, time() + 28800, 'logged_in', $token );
+            wp_set_current_user( $this->patientUserA );
+            $nonce = wp_create_nonce( 'wp_rest' );
+
+            // Query-string identifiers must be rejected fail-closed with 403 PROOF_FAILED_CODE.
+            $queryReject = new WP_REST_Request( 'POST', '/clinic/v1/patient/link-record' );
+            $queryReject->set_query_params(
+                [
+                    'national_id' => self::NID_A,
+                    'code'        => '554433',
+                    'mobile'      => self::MOBILE_A,
+                ]
+            );
+            $queryReject->set_header( 'X-WP-Nonce', $nonce );
+            $queryResp = rest_do_request( $queryReject );
+            self::assertSame( 403, $queryResp->get_status() );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $queryResp->get_data()['code'] ?? null );
+
+            // Missing clinic_id in JSON body must also fail closed.
+            $missingClinic = new WP_REST_Request( 'POST', '/clinic/v1/patient/link-record' );
+            $missingClinic->set_header( 'Content-Type', 'application/json' );
+            $missingClinic->set_header( 'X-WP-Nonce', $nonce );
+            $missingClinic->set_body(
+                (string) wp_json_encode(
+                    [
+                        'mobile'      => self::MOBILE_A,
+                        'national_id' => self::NID_A,
+                        'code'        => '554433',
+                    ]
+                )
+            );
+            $missingResp = rest_do_request( $missingClinic );
+            self::assertSame( 403, $missingResp->get_status() );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $missingResp->get_data()['code'] ?? null );
+
+            // Staff user cannot call /patient/link-record.
+            wp_set_current_user( $this->staffDocUser );
+            $staffReq = new WP_REST_Request( 'POST', '/clinic/v1/patient/link-record' );
+            $staffReq->set_header( 'Content-Type', 'application/json' );
+            $staffReq->set_header( 'X-WP-Nonce', wp_create_nonce( 'wp_rest' ) );
+            $staffReq->set_body(
+                (string) wp_json_encode(
+                    [
+                        'clinic_id'   => $this->clinicA,
+                        'mobile'      => self::MOBILE_A,
+                        'national_id' => self::NID_A,
+                        'code'        => '554433',
+                    ]
+                )
+            );
+            $staffResp = rest_do_request( $staffReq );
+            self::assertSame( 403, $staffResp->get_status() );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $staffResp->get_data()['code'] ?? null );
+
+            // Valid two-factor promotion through POST /clinic/v1/patient/link-record.
+            wp_set_current_user( $this->patientUserA );
+            $this->seedOtp( $this->clinicA, self::MOBILE_A, '554433', OtpService::PURPOSE_VERIFY_MOBILE );
+
+            $okReq = new WP_REST_Request( 'POST', '/clinic/v1/patient/link-record' );
+            $okReq->set_header( 'Content-Type', 'application/json' );
+            $okReq->set_header( 'X-WP-Nonce', $nonce );
+            $okReq->set_body(
+                (string) wp_json_encode(
+                    [
+                        'clinic_id'   => $this->clinicA,
+                        'mobile'      => self::MOBILE_A,
+                        'national_id' => self::NID_A,
+                        'code'        => '554433',
+                    ]
+                )
+            );
+            $okResp = rest_do_request( $okReq );
+            self::assertSame( 200, $okResp->get_status(), (string) wp_json_encode( $okResp->get_data() ) );
+            $payload = $okResp->get_data()['data'] ?? [];
+            self::assertSame( $this->patientA, (int) ( $payload['patient_id'] ?? 0 ) );
+            self::assertSame( $this->clinicA, (int) ( $payload['clinic_id'] ?? 0 ) );
+            self::assertSame( PatientAccess::LEVEL_FULL, App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, time(), $token ) );
+
+            // Immediate follow-up GET /patient/me succeeds with the stamped session proof.
+            $meReq = new WP_REST_Request( 'GET', '/clinic/v1/patient/me' );
+            $meReq->set_header( 'X-WP-Nonce', $nonce );
+            $meResp = rest_do_request( $meReq );
+            self::assertSame( 200, $meResp->get_status(), (string) wp_json_encode( $meResp->get_data() ) );
+            self::assertSame( $this->patientA, (int) ( $meResp->get_data()['data']['id'] ?? 0 ) );
+
+            // Verification notice SMS (PATIENT_BINDING_VERIFIED) was queued/recorded.
+            $smsRow = App::db()->fetchRow(
+                'SELECT event, context_type, context_id, clinic_id FROM ' . App::db()->table( 'cpms_sms_messages' )
+                . ' WHERE clinic_id = %d AND event = %s AND context_id = %d ORDER BY id DESC LIMIT 1',
+                [ $this->clinicA, SmsEvents::PATIENT_BINDING_VERIFIED, $this->patientA ]
+            );
+            self::assertIsArray( $smsRow );
+            self::assertSame( SmsEvents::PATIENT_BINDING_VERIFIED, (string) $smsRow['event'] );
+            self::assertSame( 'patient_binding', (string) $smsRow['context_type'] );
+        } finally {
+            if ( null === $previousCookie ) {
+                unset( $_COOKIE[ LOGGED_IN_COOKIE ] );
+            } else {
+                $_COOKIE[ LOGGED_IN_COOKIE ] = $previousCookie;
+            }
+        }
+    }
+
+    public function testMixedPatientDoctorAccountIsRejectedOnPortalLogin(): void {
+        $db  = App::db();
+        $now = $db->nowUtcSql();
+
+        // Pure doctor with active clinician + membership is authorized for doctor & staff portals.
+        $db->insert(
+            'cpms_clinicians',
+            [
+                'clinic_id'  => $this->clinicA,
+                'full_name'  => 'Dr Pure',
+                'wp_user_id' => $this->staffDocUser,
+                'is_active'  => 1,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]
+        );
+        self::assertTrue( PortalLogin::is_authorized( $this->staffDocUser, 'doctor' ) );
+        self::assertTrue( PortalLogin::is_authorized( $this->staffDocUser, 'staff' ) );
+
+        // Mixed-role user holding BOTH cpms_doctor AND cpms_patient must be rejected on PortalLogin.
+        $mixedUser = $this->makeUser( 'tp_mixed_doc_' . uniqid(), RolesAndCapabilities::ROLE_DOCTOR );
+        $userObj   = get_userdata( $mixedUser );
+        self::assertNotFalse( $userObj );
+        $userObj->add_role( RolesAndCapabilities::ROLE_PATIENT );
+        cpms_test_seed_membership( $mixedUser, $this->clinicA, RolesAndCapabilities::ROLE_DOCTOR );
+        $db->insert(
+            'cpms_clinicians',
+            [
+                'clinic_id'  => $this->clinicA,
+                'full_name'  => 'Dr Mixed',
+                'wp_user_id' => $mixedUser,
+                'is_active'  => 1,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]
+        );
+
+        self::assertFalse( PortalLogin::is_authorized( $mixedUser, 'doctor' ), 'Mixed patient+doctor account must be rejected on doctor portal login.' );
+        self::assertFalse( PortalLogin::is_authorized( $mixedUser, 'staff' ), 'Mixed patient+doctor account must be rejected on staff portal login.' );
+        self::assertFalse( PatientPortalPage::isPatientOnly( $mixedUser ), 'Mixed patient+doctor account must also be rejected on patient-only portal.' );
     }
 
     private function insertPatient( int $clinicId, string $mrn, string $mobile, ?string $nationalId ): int {

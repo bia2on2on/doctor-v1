@@ -38,6 +38,7 @@ use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_UnitTestCase;
 
@@ -79,10 +80,9 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         ScopeContext::clear();
         App::patient_session_scope()->reset_in_process_state();
-        unset($_COOKIE[LOGGED_IN_COOKIE]);
         App::resetScope();
         SystemClinicResolver::flush();
         Settings::flushCache();
@@ -169,7 +169,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         $uid = $this->makeUser('m11_logout', RolesAndCapabilities::ROLE_PATIENT);
         $scope = App::patient_session_scope();
 
-        cpms_test_seed_patient_session($uid, $this->clinicB);
+        $this->seedSessionWithProofs($uid, $this->clinicB);
         self::assertSame($this->clinicB, $scope->stamped_session_clinic_id($uid));
 
         // Logout: the browser drops the auth cookie, so the request no longer carries it.
@@ -208,7 +208,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         $this->assertScopeRequired(static fn () => $scope->require_clinic_for_read($multi));
         $this->assertScopeRequired(static fn () => $scope->require_clinic_for_write($multi));
 
-        cpms_test_seed_patient_session($multi, $this->clinicB);
+        $this->seedSessionWithProofs($multi, $this->clinicB);
         self::assertSame($this->clinicB, $scope->require_clinic_for_read($multi), 'stamped marker resolves a multi-link user.');
         self::assertSame($this->clinicB, $scope->require_clinic_matching($multi, $this->clinicB));
         $this->assertScopeRequired(fn () => $scope->require_clinic_matching($multi, $this->clinicA));
@@ -240,9 +240,9 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
 
         $zero = $this->makeUser('m5_rest_zero', RolesAndCapabilities::ROLE_PATIENT);
         wp_set_current_user($zero);
-        $ok = rest_do_request($this->mineRequest());
-        self::assertSame(200, $ok->get_status());
-        self::assertSame([], $ok->get_data()['data'] ?? null, '0 links returns an empty list, not an error.');
+        $zeroDenied = rest_do_request($this->mineRequest());
+        self::assertSame(403, $zeroDenied->get_status());
+        self::assertSame(\ClinicCore\Application\Auth\PatientAccess::PROOF_FAILED_CODE, (string) ($zeroDenied->get_data()['code'] ?? ''));
 
         $multi = $this->makeUser('m5_rest_multi', RolesAndCapabilities::ROLE_PATIENT);
         $patientA = $this->insertPatient($this->clinicA, 'RA');
@@ -257,10 +257,10 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         $apptB = $this->insertAppointment($this->clinicB, $this->locationB, $patientB, $this->clinicianB, $date, '11:00');
         wp_set_current_user($multi);
         $blocked = rest_do_request($this->mineRequest());
-        self::assertSame(400, $blocked->get_status());
-        self::assertSame('CLINIC_SCOPE_REQUIRED', (string) ($blocked->get_data()['code'] ?? ''));
+        self::assertSame(403, $blocked->get_status());
+        self::assertSame(\ClinicCore\Application\Auth\PatientAccess::PROOF_FAILED_CODE, (string) ($blocked->get_data()['code'] ?? ''));
 
-        cpms_test_seed_patient_session($multi, $this->clinicA);
+        $this->seedSessionWithProofs($multi, $this->clinicA);
         $scoped = rest_do_request($this->mineRequest());
         self::assertSame(200, $scoped->get_status(), 'stamped session resolves the multi-link user.');
         $ids = array_map(
@@ -294,16 +294,16 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         $service = App::bookingService();
 
         // (a) missing object.
-        cpms_test_seed_patient_session($ownerB, $this->clinicB);
+        $this->seedSessionWithProofs($ownerB, $this->clinicB);
         self::assertSame('CLINIC_NOT_FOUND', $this->errorCodeOf(static fn () => $service->cancelByPatient($ownerB, 999999991, null)));
 
         // (b) unowned: stranger has no active patient in Clinic B.
-        cpms_test_seed_patient_session($stranger, $this->clinicA);
+        $this->seedSessionWithProofs($stranger, $this->clinicA);
         self::assertSame('CLINIC_PERMISSION_DENIED', $this->errorCodeOf(static fn () => $service->cancelByPatient($stranger, $apptB, null)));
         self::assertSame('CLINIC_PERMISSION_DENIED', $this->errorCodeOf(static fn () => $service->patient_change_deadlines($stranger, $apptB)));
 
         // (c) owned, but the session is bound to Clinic A.
-        cpms_test_seed_patient_session($ownerB, $this->clinicA);
+        $this->seedSessionWithProofs($ownerB, $this->clinicA);
         self::assertSame('CLINIC_SCOPE_REQUIRED', $this->errorCodeOf(static fn () => $service->cancelByPatient($ownerB, $apptB, null)));
         self::assertSame('CLINIC_SCOPE_REQUIRED', $this->errorCodeOf(static fn () => $service->patient_change_deadlines($ownerB, $apptB)));
 
@@ -323,7 +323,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         $this->linkPatient($this->clinicA, $this->insertPatient($this->clinicA, 'DA'), $owner);
         $apptB = $this->insertAppointment($this->clinicB, $this->locationB, $patientB, $this->clinicianB, self::FUTURE_DATE, self::FUTURE_TIME);
 
-        cpms_test_seed_patient_session($owner, $this->clinicB);
+        $this->seedSessionWithProofs($owner, $this->clinicB);
         $deadlines = App::bookingService()->patient_change_deadlines($owner, $apptB);
 
         self::assertArrayHasKey('cancel_allowed', $deadlines);
@@ -348,7 +348,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         self::assertNotNull($notifA);
         self::assertNotNull($notifB);
 
-        cpms_test_seed_patient_session($uid, $this->clinicA);
+        $this->seedSessionWithProofs($uid, $this->clinicA);
         $ids = $this->inboxIds($uid);
         self::assertContains((int) $notifA, $ids);
         self::assertNotContains((int) $notifB, $ids, 'Clinic B notifications must not leak into a Clinic A session.');
@@ -380,7 +380,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         $notifA = (int) App::notificationService()->publishToPatient($this->clinicA, $patientA, 'appt_reminder', $this->apptVars(), null);
         $notifB = (int) App::notificationService()->publishToPatient($this->clinicB, $patientB, 'appt_reminder', $this->apptVars(), null);
 
-        cpms_test_seed_patient_session($uid, $this->clinicA);
+        $this->seedSessionWithProofs($uid, $this->clinicA);
         $rowBBefore = App::db()->fetchRow('SELECT * FROM ' . App::db()->table('cpms_notifications') . ' WHERE id = %d', [$notifB]);
 
         $changedForeign = App::notificationService()->markRead($uid, [$notifB], false);
@@ -405,7 +405,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         $notifA = (int) App::notificationService()->publishToPatient($this->clinicA, $patientA, 'appt_reminder', $this->apptVars(), null);
         $notifB = (int) App::notificationService()->publishToPatient($this->clinicB, $patientB, 'appt_reminder', $this->apptVars(), null);
 
-        cpms_test_seed_patient_session($uid, $this->clinicA);
+        $this->seedSessionWithProofs($uid, $this->clinicA);
         ScopeContext::set(ClinicScope::forClinic($this->clinicB));
         try {
             $ids = $this->inboxIds($uid);
@@ -440,7 +440,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         $service   = App::bookingService();
 
         // Refused: the session is stamped for Clinic B, the persisted slot is in Clinic A.
-        cpms_test_seed_patient_session($uid, $this->clinicB);
+        $this->seedSessionWithProofs($uid, $this->clinicB);
         $denied = $this->bookingExceptionOf(
             fn () => $service->hold($uid, $clinicianA, $date, '11:00', $slotId, null, $locationA)
         );
@@ -452,7 +452,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         );
 
         // Positive control: the same slot with a session stamped for Clinic A passes the guard.
-        cpms_test_seed_patient_session($uid, $this->clinicA);
+        $this->seedSessionWithProofs($uid, $this->clinicA);
         $hold = $service->hold($uid, $clinicianA, $date, '11:00', $slotId, null, $locationA);
         self::assertNotSame('', (string) ($hold['hold_token'] ?? ''), 'positive control: the matching-Clinic session creates the hold.');
         self::assertSame(1, (int) $this->slotRow($slotId)['held_count'], 'positive control: exactly one held unit.');
@@ -472,7 +472,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         $service = App::bookingService();
 
         // Refused: the appointment belongs to Clinic A, the session is stamped for Clinic B.
-        cpms_test_seed_patient_session($uid, $this->clinicB);
+        $this->seedSessionWithProofs($uid, $this->clinicB);
         $denied = $this->bookingExceptionOf(fn () => $service->reschedule_options($uid, $apptId));
         $this->assertScopeRequiredException($denied);
         self::assertSame(
@@ -482,7 +482,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         );
 
         // Positive control: the same appointment with a session stamped for Clinic A passes the guard.
-        cpms_test_seed_patient_session($uid, $this->clinicA);
+        $this->seedSessionWithProofs($uid, $this->clinicA);
         $options = $service->reschedule_options($uid, $apptId);
         self::assertSame($apptId, (int) ($options['appointment_id'] ?? 0), 'positive control: the matching-Clinic session returns the options for this appointment.');
     }
@@ -504,7 +504,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         $service      = App::bookingService();
 
         // Refused at the source-appointment preflight, before any idempotency claim.
-        cpms_test_seed_patient_session($uid, $this->clinicB);
+        $this->seedSessionWithProofs($uid, $this->clinicB);
         $denied = $this->bookingExceptionOf(
             fn () => $service->reschedule($uid, $apptId, $clinicianA, $date, '12:00', wp_generate_uuid4(), $destSlotId)
         );
@@ -516,7 +516,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         );
 
         // Positive control: the same reschedule with a session stamped for Clinic A passes the guard and moves the booking.
-        cpms_test_seed_patient_session($uid, $this->clinicA);
+        $this->seedSessionWithProofs($uid, $this->clinicA);
         $result = $service->reschedule($uid, $apptId, $clinicianA, $date, '12:00', wp_generate_uuid4(), $destSlotId);
         self::assertSame($apptId, (int) $result['previous_appointment_id'], 'positive control: the replacement points back at the source appointment.');
         self::assertNotSame($apptId, (int) $result['appointment_id'], 'positive control: a replacement appointment is created.');
@@ -667,7 +667,7 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         $nX  = $this->publishTo($this->clinicA, $unlinked);
 
         // Clinic resolved by the session marker (current: Clinic A is a live link).
-        cpms_test_seed_patient_session($uid, $this->clinicA);
+        $this->seedSessionWithProofs($uid, $this->clinicA);
         $changed = App::notificationService()->markRead($uid, [], true);
 
         // Documented behaviour: all active linked patients of the resolved Clinic, not only the primary one.
@@ -884,6 +884,26 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         ]);
 
         return App::db()->wpdb_last_insert_id();
+    }
+
+    private function seedSessionWithProofs(int $userId, int $clinicId): void
+    {
+        cpms_test_seed_patient_session($userId, $clinicId);
+        $links = App::db()->fetchAll(
+            'SELECT clinic_id, patient_id, mobile_at_link FROM ' . App::db()->table('cpms_patient_user_links') . ' WHERE wp_user_id = %d',
+            [$userId]
+        );
+        foreach ($links as $link) {
+            PatientTwoProofTestHelper::seed_patient_proof(
+                $userId,
+                (int) $link['clinic_id'],
+                (int) $link['patient_id'],
+                [
+                    'mobile'           => (string) ($link['mobile_at_link'] ?: '09121234567'),
+                    'set_current_user' => false,
+                ]
+            );
+        }
     }
 
     /**

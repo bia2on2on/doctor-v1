@@ -6,6 +6,7 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 /**
@@ -154,20 +155,30 @@ final class PatientFlowTest extends WP_UnitTestCase
                 $now
             )
         );
-
-        $result = $this->service()->updateMe($wpUserId, [
-            'first_name' => 'سارا',
-            'medical_history' => 'حرفه‌ای تزریق فیلد بالینی نیست!', // باید نادیده گرفته شود
-        ]);
-
-        $this->assertSame('سارا', $result['first_name']);
-        $this->assertArrayNotHasKey('medical_history', $result, 'C2 View فیلد بالینی ندارد');
-
-        $row = $wpdb->get_row(
-            $wpdb->prepare('SELECT medical_history FROM ' . $wpdb->prefix . 'cpms_patients WHERE id = %d', $patientId), // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-            ARRAY_A
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $wpUserId,
+            1,
+            $patientId,
+            ['mobile' => '09123334455', 'seed_session_scope' => true]
         );
-        $this->assertNull($row['medical_history'], 'فیلد خارج Whitelist نباید ذخیره شود');
+
+        try {
+            $result = $this->service()->updateMe($wpUserId, [
+                'first_name' => 'سارا',
+                'medical_history' => 'حرفه‌ای تزریق فیلد بالینی نیست!', // باید نادیده گرفته شود
+            ]);
+
+            $this->assertSame('سارا', $result['first_name']);
+            $this->assertArrayNotHasKey('medical_history', $result, 'C2 View فیلد بالینی ندارد');
+
+            $row = $wpdb->get_row(
+                $wpdb->prepare('SELECT medical_history FROM ' . $wpdb->prefix . 'cpms_patients WHERE id = %d', $patientId), // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                ARRAY_A
+            );
+            $this->assertNull($row['medical_history'], 'فیلد خارج Whitelist نباید ذخیره شود');
+        } finally {
+            PatientTwoProofTestHelper::reset();
+        }
     }
 
     public function testSearchAndGet(): void

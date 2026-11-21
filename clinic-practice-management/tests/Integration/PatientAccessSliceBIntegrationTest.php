@@ -8,6 +8,7 @@ use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use WP_REST_Request;
 use WP_REST_Response;
@@ -126,6 +127,25 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         $this->insertPatientLink( $this->clinicA, $this->patientArchivedA, $this->patientUserArchivedA, '09121010003' );
         $this->linkB = $this->insertPatientLink( $this->clinicB, $this->patientB, $this->patientUserB, '09121010004' );
 
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserA,
+            $this->clinicA,
+            $this->patientA,
+            [ 'mobile' => '09121010001', 'seed_session_scope' => true, 'set_current_user' => false ]
+        );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserOtherA,
+            $this->clinicA,
+            $this->patientOtherA,
+            [ 'mobile' => '09121010002', 'seed_session_scope' => true, 'set_current_user' => false ]
+        );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserB,
+            $this->clinicB,
+            $this->patientB,
+            [ 'mobile' => '09121010004', 'seed_session_scope' => true, 'set_current_user' => false ]
+        );
+
         // Multi-role, global-cap, and Clinic-scoped staff users holding ROLE_PATIENT + active Clinic A patient link.
         $this->multiRoleUser = $this->makeUser( 'sb_multi_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
         $multiObj            = get_userdata( $this->multiRoleUser );
@@ -155,12 +175,12 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         $this->insertPatientLink( $this->clinicA, $this->patientA, $this->explicitGrantUser, '09121010001' );
 
         $this->installSignedExpiration( time() + 30 * 86400 );
-        wp_set_current_user( 0 );
+        PatientTwoProofTestHelper::acting_as( 0 );
     }
 
     protected function tearDown(): void {
         remove_all_filters( 'cpms_license_public_key' );
-        wp_set_current_user( 0 );
+        PatientTwoProofTestHelper::reset();
         App::resetScope();
         parent::tearDown();
     }
@@ -192,44 +212,44 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
             self::NS . '/visits/' . $visitA,
             self::NS . '/prescriptions',
         ] as $route ) {
-            // Unauthenticated -> 401.
+            // Unauthenticated -> 403 PROOF_FAILED.
             $unauth = $this->dispatch( 'GET', $route, [], 0 );
-            self::assertSame( 401, $unauth->get_status(), $route );
-            self::assertSame( PatientAccess::UNAUTHORIZED_CODE, $unauth->get_data()['code'] ?? null );
+            self::assertSame( 403, $unauth->get_status(), $route );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $unauth->get_data()['code'] ?? null );
 
-            // Unlinked patient -> 404.
+            // Unlinked patient -> 403 PROOF_FAILED.
             $unlinked = $this->dispatch( 'GET', $route, [], $this->patientUserZero );
-            self::assertSame( 404, $unlinked->get_status(), $route );
-            self::assertSame( PatientAccess::NOT_FOUND_CODE, $unlinked->get_data()['code'] ?? null );
+            self::assertSame( 403, $unlinked->get_status(), $route );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $unlinked->get_data()['code'] ?? null );
 
-            // Inactive (archived) patient -> 404.
+            // Inactive (archived) patient -> 403 PROOF_FAILED.
             $archived = $this->dispatch( 'GET', $route, [], $this->patientUserArchivedA );
-            self::assertSame( 404, $archived->get_status(), $route );
-            self::assertSame( PatientAccess::NOT_FOUND_CODE, $archived->get_data()['code'] ?? null );
+            self::assertSame( 403, $archived->get_status(), $route );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $archived->get_data()['code'] ?? null );
 
-            // Foreign clinic link_id -> 404; client-supplied clinic_id is ignored (stays scoped to patientUserA's own Clinic A).
+            // Foreign clinic link_id -> 403 PROOF_FAILED; client-supplied clinic_id is enforced at gate.
             $crossLink = $this->dispatch( 'GET', $route, [ 'link_id' => $this->linkB ], $this->patientUserA );
-            self::assertSame( 404, $crossLink->get_status(), $route );
+            self::assertSame( 403, $crossLink->get_status(), $route );
 
-            // Multi-role, global-cap, and scoped-staff -> 403.
+            // Multi-role, global-cap, and scoped-staff -> 403 PROOF_FAILED.
             foreach ( [ $this->multiRoleUser, $this->globalCapUser, $this->scopedMembershipUser, $this->customRoleUser, $this->explicitGrantUser ] as $badActor ) {
                 $forbidden = $this->dispatch( 'GET', $route, [], $badActor );
                 self::assertSame( 403, $forbidden->get_status(), $route . ' actor=' . $badActor );
-                self::assertSame( PatientAccess::FORBIDDEN_CODE, $forbidden->get_data()['code'] ?? null );
+                self::assertSame( PatientAccess::PROOF_FAILED_CODE, $forbidden->get_data()['code'] ?? null );
             }
         }
 
         // Tampered patient_id / clinic_id in query must never disclose PatientOtherA's or Clinic B's records.
         $tamperVisits = $this->dispatch( 'GET', self::NS . '/visits', [ 'clinic_id' => $this->clinicB, 'patient_id' => $this->patientOtherA ], $this->patientUserA );
-        self::assertSame( 200, $tamperVisits->get_status() );
-        self::assertSame( [ $visitA ], array_column( $tamperVisits->get_data()['data']['visits'], 'id' ) );
+        self::assertSame( 403, $tamperVisits->get_status() );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $tamperVisits->get_data()['code'] ?? null );
 
         $tamperDetail = $this->dispatch( 'GET', self::NS . '/visits/' . $visitB, [ 'patient_id' => $this->patientOtherA ], $this->patientUserA );
-        self::assertSame( 404, $tamperDetail->get_status() );
+        self::assertSame( 403, $tamperDetail->get_status() );
 
         $tamperRx = $this->dispatch( 'GET', self::NS . '/prescriptions', [ 'clinic_id' => $this->clinicB, 'patient_id' => $this->patientOtherA ], $this->patientUserA );
-        self::assertSame( 200, $tamperRx->get_status() );
-        self::assertCount( 1, $tamperRx->get_data()['data']['prescriptions'] );
+        self::assertSame( 403, $tamperRx->get_status() );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $tamperRx->get_data()['code'] ?? null );
     }
 
     public function testFilesRoutesPositiveAndRequiredNegatives(): void {
@@ -255,44 +275,44 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         ];
 
         foreach ( $routes as [$method, $route, $isUpload] ) {
-            // Unauthenticated -> 401.
+            // Unauthenticated: shared stream -> 401; patient-only -> 403 PROOF_FAILED.
             $unauth = $isUpload ? $this->dispatchUpload( $route, 0 ) : $this->dispatch( $method, $route, [], 0 );
-            self::assertSame( 401, $unauth->get_status(), $method . ' ' . $route );
+            self::assertSame( str_contains( $route, '/stream' ) ? 401 : 403, $unauth->get_status(), $method . ' ' . $route );
 
-            // Unlinked patient -> 404.
+            // Unlinked patient -> 403 PROOF_FAILED.
             $unlinked = $isUpload ? $this->dispatchUpload( $route, $this->patientUserZero ) : $this->dispatch( $method, $route, [], $this->patientUserZero );
-            self::assertSame( 404, $unlinked->get_status(), $method . ' ' . $route );
+            self::assertSame( 403, $unlinked->get_status(), $method . ' ' . $route );
 
-            // Inactive (archived) patient -> 404.
+            // Inactive (archived) patient -> 403 PROOF_FAILED.
             $archivedRoute = str_contains( $route, '/patients/' ) ? self::NS . '/patients/' . $this->patientArchivedA . '/files' : $route;
             $archived      = $isUpload ? $this->dispatchUpload( $archivedRoute, $this->patientUserArchivedA ) : $this->dispatch( $method, $archivedRoute, [], $this->patientUserArchivedA );
-            self::assertSame( 404, $archived->get_status(), $method . ' ' . $archivedRoute );
+            self::assertSame( 403, $archived->get_status(), $method . ' ' . $archivedRoute );
 
-            // Link to another clinic -> 404 on patient-scoped routes; foreign user -> 404 on stream.
+            // Link to another clinic -> 403 on patient-scoped routes; foreign user -> 403 on stream.
             if ( str_contains( $route, '/patients/' ) ) {
                 $crossLink = $isUpload
                     ? $this->dispatchUpload( $route, $this->patientUserA, [ 'link_id' => $this->linkB ] )
                     : $this->dispatch( $method, $route, [ 'link_id' => $this->linkB ], $this->patientUserA );
-                self::assertSame( 404, $crossLink->get_status(), $method . ' ' . $route );
+                self::assertSame( 403, $crossLink->get_status(), $method . ' ' . $route );
             } else {
-                self::assertSame( 404, $this->dispatch( $method, $route, [], $this->patientUserB )->get_status(), $method . ' ' . $route );
+                self::assertSame( 403, $this->dispatch( $method, $route, [], $this->patientUserB )->get_status(), $method . ' ' . $route );
             }
 
-            // Multi-role, global-cap, and scoped-staff -> 403.
+            // Multi-role, global-cap, and scoped-staff -> 403 PROOF_FAILED.
             foreach ( [ $this->multiRoleUser, $this->globalCapUser, $this->scopedMembershipUser, $this->customRoleUser, $this->explicitGrantUser ] as $badActor ) {
                 $forbidden = $isUpload ? $this->dispatchUpload( $route, $badActor ) : $this->dispatch( $method, $route, [], $badActor );
                 self::assertSame( 403, $forbidden->get_status(), $method . ' ' . $route . ' actor=' . $badActor );
-                self::assertSame( PatientAccess::FORBIDDEN_CODE, $forbidden->get_data()['code'] ?? null );
+                self::assertSame( PatientAccess::PROOF_FAILED_CODE, $forbidden->get_data()['code'] ?? null );
             }
         }
 
-        // Tampered patient_id in path -> 404; cross-patient stream -> 404.
+        // Tampered patient_id in path -> 403; cross-patient stream -> 403.
         $tamperUpload = $this->dispatchUpload( self::NS . '/patients/' . $this->patientOtherA . '/files', $this->patientUserA );
-        self::assertSame( 404, $tamperUpload->get_status() );
+        self::assertSame( 403, $tamperUpload->get_status() );
         $tamperList = $this->dispatch( 'GET', self::NS . '/patients/' . $this->patientOtherA . '/files', [], $this->patientUserA );
-        self::assertSame( 404, $tamperList->get_status() );
+        self::assertSame( 403, $tamperList->get_status() );
         $tamperStream = $this->dispatch( 'GET', self::NS . '/files/' . $fileId . '/stream', [ 'patient_id' => $this->patientA ], $this->patientUserOtherA );
-        self::assertSame( 404, $tamperStream->get_status() );
+        self::assertSame( 403, $tamperStream->get_status() );
     }
 
     public function testBookingPatientRoutesPositiveAndRequiredNegatives(): void {
@@ -360,44 +380,41 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         ];
 
         foreach ( $bookingEndpoints as [$method, $route, $params, $headers] ) {
-            // Unauthenticated -> 401.
-            $unauth = $this->dispatch( $method, $route, $params, 0, $headers );
-            self::assertSame( 401, $unauth->get_status(), $method . ' ' . $route );
+            // Unauthenticated: shared appointment reschedule/cancel -> 401; patient-only booking -> 403 PROOF_FAILED.
+            $unauth       = $this->dispatch( $method, $route, $params, 0, $headers );
+            $expectUnauth = str_starts_with( $route, self::NS . '/appointments/' ) && ! str_ends_with( $route, '/reschedule-options' ) ? 401 : 403;
+            self::assertSame( $expectUnauth, $unauth->get_status(), $method . ' ' . $route );
 
             // Multi-role, global-cap, and scoped-staff -> 403.
             foreach ( [ $this->multiRoleUser, $this->globalCapUser, $this->scopedMembershipUser, $this->customRoleUser, $this->explicitGrantUser ] as $badActor ) {
                 $forbidden = $this->dispatch( $method, $route, $params, $badActor, $headers );
                 self::assertSame( 403, $forbidden->get_status(), $method . ' ' . $route . ' actor=' . $badActor );
                 if ( $badActor === $this->multiRoleUser && str_ends_with( $route, '/cancel' ) ) {
-                    self::assertContains( $forbidden->get_data()['code'] ?? null, [ PatientAccess::FORBIDDEN_CODE, 'CLINIC_SCOPE_UNAVAILABLE' ] );
+                    self::assertContains( $forbidden->get_data()['code'] ?? null, [ PatientAccess::PROOF_FAILED_CODE, 'CLINIC_SCOPE_UNAVAILABLE' ] );
                 } else {
-                    self::assertSame( PatientAccess::FORBIDDEN_CODE, $forbidden->get_data()['code'] ?? null );
+                    self::assertSame( PatientAccess::PROOF_FAILED_CODE, $forbidden->get_data()['code'] ?? null );
                 }
             }
         }
 
-        // Unlinked & inactive (archived) patient negatives on booking routes.
-        self::assertSame( 400, $this->dispatch( 'POST', self::NS . '/booking/hold', [ 'clinician_id' => $this->clinicianA, 'slot_date' => $date1, 'slot_time' => '10:00:00', 'slot_id' => $slot1 ], $this->patientUserZero )->get_status() );
-        self::assertSame( 404, $this->dispatch( 'POST', self::NS . '/booking/confirm', [ 'hold_token' => 'missing-tok' ], $this->patientUserZero, [ 'Idempotency-Key' => wp_generate_uuid4() ] )->get_status() );
-        self::assertSame( 404, $this->dispatch( 'GET', self::NS . '/booking/resume', [ 'hold_token' => 'missing-tok' ], $this->patientUserZero )->get_status() );
-        $mineZero = $this->dispatch( 'GET', self::NS . '/appointments/mine', [ 'from' => $date1, 'to' => $date2 ], $this->patientUserZero );
-        self::assertSame( 200, $mineZero->get_status() );
-        self::assertSame( [], $mineZero->get_data()['data'] ?? null );
+        // Unlinked & inactive (archived) patient negatives on booking routes fail at gate with 403 PROOF_FAILED.
+        self::assertSame( 403, $this->dispatch( 'POST', self::NS . '/booking/hold', [ 'clinician_id' => $this->clinicianA, 'slot_date' => $date1, 'slot_time' => '10:00:00', 'slot_id' => $slot1 ], $this->patientUserZero )->get_status() );
+        self::assertSame( 403, $this->dispatch( 'POST', self::NS . '/booking/confirm', [ 'hold_token' => 'missing-tok' ], $this->patientUserZero, [ 'Idempotency-Key' => wp_generate_uuid4() ] )->get_status() );
+        self::assertSame( 403, $this->dispatch( 'GET', self::NS . '/booking/resume', [ 'hold_token' => 'missing-tok' ], $this->patientUserZero )->get_status() );
+        self::assertSame( 403, $this->dispatch( 'GET', self::NS . '/appointments/mine', [ 'from' => $date1, 'to' => $date2 ], $this->patientUserZero )->get_status() );
         self::assertSame( 403, $this->dispatch( 'GET', self::NS . '/appointments/' . $liveAppt . '/reschedule-options', [], $this->patientUserZero )->get_status() );
         self::assertSame( 403, $this->dispatch( 'POST', self::NS . '/appointments/' . $liveAppt . '/reschedule', [ 'clinician_id' => $this->clinicianA, 'slot_date' => $date2, 'slot_time' => '11:00:00', 'slot_id' => $slot2 ], $this->patientUserZero, [ 'Idempotency-Key' => wp_generate_uuid4() ] )->get_status() );
         self::assertSame( 403, $this->dispatch( 'POST', self::NS . '/appointments/' . $liveAppt . '/cancel', [], $this->patientUserZero )->get_status() );
 
-        // Archived patient: hold with archived patient_id -> 400; mine -> 200 []; appt mutations -> 403.
-        self::assertSame( 400, $this->dispatch( 'POST', self::NS . '/booking/hold', [ 'clinician_id' => $this->clinicianA, 'slot_date' => $date1, 'slot_time' => '10:00:00', 'slot_id' => $slot1, 'patient_id' => $this->patientArchivedA ], $this->patientUserArchivedA )->get_status() );
-        $mineArch = $this->dispatch( 'GET', self::NS . '/appointments/mine', [ 'from' => $date1, 'to' => $date2 ], $this->patientUserArchivedA );
-        self::assertSame( 200, $mineArch->get_status() );
-        self::assertSame( [], $mineArch->get_data()['data'] ?? null );
+        // Archived patient: fails closed at gate with 403 PROOF_FAILED across all booking routes.
+        self::assertSame( 403, $this->dispatch( 'POST', self::NS . '/booking/hold', [ 'clinician_id' => $this->clinicianA, 'slot_date' => $date1, 'slot_time' => '10:00:00', 'slot_id' => $slot1, 'patient_id' => $this->patientArchivedA ], $this->patientUserArchivedA )->get_status() );
+        self::assertSame( 403, $this->dispatch( 'GET', self::NS . '/appointments/mine', [ 'from' => $date1, 'to' => $date2 ], $this->patientUserArchivedA )->get_status() );
         self::assertSame( 403, $this->dispatch( 'GET', self::NS . '/appointments/' . $liveAppt . '/reschedule-options', [], $this->patientUserArchivedA )->get_status() );
         self::assertSame( 403, $this->dispatch( 'POST', self::NS . '/appointments/' . $liveAppt . '/reschedule', [ 'clinician_id' => $this->clinicianA, 'slot_date' => $date2, 'slot_time' => '11:00:00', 'slot_id' => $slot2 ], $this->patientUserArchivedA, [ 'Idempotency-Key' => wp_generate_uuid4() ] )->get_status() );
         self::assertSame( 403, $this->dispatch( 'POST', self::NS . '/appointments/' . $liveAppt . '/cancel', [], $this->patientUserArchivedA )->get_status() );
 
         // Cross-clinic link (patientUserB linked ONLY to clinic B) & tampered patient_id in body.
-        self::assertSame( 400, $this->dispatch( 'POST', self::NS . '/booking/hold', [ 'clinician_id' => $this->clinicianA, 'slot_date' => $date1, 'slot_time' => '10:00:00', 'slot_id' => $slot1 ], $this->patientUserB )->get_status() );
+        self::assertSame( 403, $this->dispatch( 'POST', self::NS . '/booking/hold', [ 'clinician_id' => $this->clinicianA, 'slot_date' => $date1, 'slot_time' => '10:00:00', 'slot_id' => $slot1 ], $this->patientUserB )->get_status() );
         self::assertContains(
             $this->dispatch( 'POST', self::NS . '/booking/hold', [ 'clinician_id' => $this->clinicianA, 'slot_date' => $date1, 'slot_time' => '10:00:00', 'slot_id' => $slot1, 'patient_id' => $this->patientOtherA ], $this->patientUserA )->get_status(),
             [ 400, 422 ]
@@ -454,24 +471,24 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
                 $forbidden = $this->dispatch( $method, $route, $params, $badActor );
                 self::assertSame( 403, $forbidden->get_status(), $method . ' ' . $route . ' actor=' . $badActor );
                 if ( $badActor === $this->multiRoleUser ) {
-                    self::assertContains( $forbidden->get_data()['code'] ?? null, [ PatientAccess::FORBIDDEN_CODE, 'CLINIC_SCOPE_UNAVAILABLE' ] );
+                    self::assertContains( $forbidden->get_data()['code'] ?? null, [ PatientAccess::PROOF_FAILED_CODE, 'CLINIC_SCOPE_UNAVAILABLE' ] );
                 } else {
-                    self::assertSame( PatientAccess::FORBIDDEN_CODE, $forbidden->get_data()['code'] ?? null );
+                    self::assertSame( PatientAccess::PROOF_FAILED_CODE, $forbidden->get_data()['code'] ?? null );
                 }
             }
 
-            // Explicit foreign clinic_id or foreign link_id -> 404.
-            self::assertSame( 404, $this->dispatch( $method, $route, array_merge( $params, [ 'clinic_id' => $this->clinicB ] ), $this->patientUserA )->get_status(), $method . ' ' . $route );
-            self::assertSame( 404, $this->dispatch( $method, $route, array_merge( $params, [ 'link_id' => $this->linkB ] ), $this->patientUserA )->get_status(), $method . ' ' . $route );
+            // Explicit foreign clinic_id or foreign link_id -> 403 PROOF_FAILED.
+            self::assertSame( 403, $this->dispatch( $method, $route, array_merge( $params, [ 'clinic_id' => $this->clinicB ] ), $this->patientUserA )->get_status(), $method . ' ' . $route );
+            self::assertSame( 403, $this->dispatch( $method, $route, array_merge( $params, [ 'link_id' => $this->linkB ] ), $this->patientUserA )->get_status(), $method . ' ' . $route );
 
-            // Archived patient with explicit clinic_id -> 404.
-            self::assertSame( 404, $this->dispatch( $method, $route, array_merge( $params, [ 'clinic_id' => $this->clinicA ] ), $this->patientUserArchivedA )->get_status(), $method . ' ' . $route );
+            // Archived patient with explicit clinic_id -> 403 PROOF_FAILED.
+            self::assertSame( 403, $this->dispatch( $method, $route, array_merge( $params, [ 'clinic_id' => $this->clinicA ] ), $this->patientUserArchivedA )->get_status(), $method . ' ' . $route );
         }
 
-        // Unlinked patient without clinic_id gets empty 200 (never another patient's notifications); tampered patient_id cannot read/mark notifId.
+        // Unlinked patient without clinic_id fails at gate with 403 PROOF_FAILED; tampered patient_id cannot read/mark notifId.
         $zeroInbox = $this->dispatch( 'GET', self::NS . '/notifications', [ 'patient_id' => $this->patientA ], $this->patientUserZero );
-        self::assertSame( 200, $zeroInbox->get_status() );
-        self::assertSame( [], $zeroInbox->get_data()['data']['notifications'] ?? null );
+        self::assertSame( 403, $zeroInbox->get_status() );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $zeroInbox->get_data()['code'] ?? null );
 
         $otherRead = $this->dispatch( 'POST', self::NS . '/notifications/read', [ 'ids' => [ $notifId ], 'patient_id' => $this->patientA ], $this->patientUserOtherA );
         self::assertSame( 200, $otherRead->get_status() );
@@ -659,7 +676,7 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         self::assertSame( 1, $failMatches );
         self::assertSame( $witnessSeen, $failSeen );
         self::assertSame( 403, $deniedRes->get_status() );
-        self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedRes->get_data()['code'] ?? null );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedRes->get_data()['code'] ?? null );
         self::assertSame( $strictBefore, App::db()->is_strict() );
     }
 
@@ -907,7 +924,7 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
      * @param array<string, string> $headers
      */
     private function dispatch( string $method, string $route, array $params, int $userId, array $headers = [] ): WP_REST_Response {
-        wp_set_current_user( $userId );
+        PatientTwoProofTestHelper::acting_as( $userId );
         $request = new WP_REST_Request( $method, $route );
         foreach ( $params as $key => $value ) {
             $request->set_param( $key, $value );
@@ -924,7 +941,7 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
      * @param array<string, mixed> $params
      */
     private function dispatchUpload( string $route, int $userId, array $params = [] ): WP_REST_Response {
-        wp_set_current_user( $userId );
+        PatientTwoProofTestHelper::acting_as( $userId );
         $tmp = tempnam( sys_get_temp_dir(), 'sb_pdf_' );
         self::assertIsString( $tmp );
         file_put_contents( $tmp, "%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n" );

@@ -7,6 +7,7 @@ namespace ClinicCore\Tests\Integration;
 use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use WP_REST_Request;
 use WP_REST_Response;
@@ -85,32 +86,41 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
         // Even if a staff-only user has a row in cpms_patient_user_links, missing ROLE_PATIENT still fails closed.
         $this->insertPatientLink( $this->clinicA, $this->patientA, $this->staffWithDbLinkOnly, '09120010001' );
 
-        // Verified org identity for PatientUserA so enroll positive control into Clinic B works when desired.
-        $identityA = App::patient_identity_service()->create_identity( $this->orgId, '09120010001' );
-        App::patient_identity_service()->link_user( $this->orgId, $identityA, $this->patientUserA, '09120010001' );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserA,
+            $this->clinicA,
+            $this->patientA,
+            [ 'mobile' => '09120010001', 'set_current_user' => false ]
+        );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserB,
+            $this->clinicB,
+            $this->patientB,
+            [ 'mobile' => '09120020002', 'set_current_user' => false ]
+        );
 
         $this->installSignedExpiration( time() + 30 * 86400 );
-        wp_set_current_user( 0 );
+        PatientTwoProofTestHelper::acting_as( 0 );
     }
 
     protected function tearDown(): void {
         remove_all_filters( 'cpms_license_public_key' );
-        wp_set_current_user( 0 );
+        PatientTwoProofTestHelper::reset();
         parent::tearDown();
     }
 
     public function testUnauthenticatedRequestIsDeniedWithSameFixturePositiveControl(): void {
         $deniedGet = $this->dispatch( 'GET', self::NS . '/patient/me', [], 0 );
-        self::assertSame( 401, $deniedGet->get_status() );
-        self::assertSame( PatientAccess::UNAUTHORIZED_CODE, $deniedGet->get_data()['code'] ?? null );
+        self::assertSame( 403, $deniedGet->get_status() );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedGet->get_data()['code'] ?? null );
 
         $deniedPut = $this->dispatch( 'PUT', self::NS . '/patient/me', [ 'first_name' => 'Tamper' ], 0 );
-        self::assertSame( 401, $deniedPut->get_status() );
-        self::assertSame( PatientAccess::UNAUTHORIZED_CODE, $deniedPut->get_data()['code'] ?? null );
+        self::assertSame( 403, $deniedPut->get_status() );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedPut->get_data()['code'] ?? null );
 
         $deniedRecords = $this->dispatch( 'GET', self::NS . '/patient/my-records', [], 0 );
-        self::assertSame( 401, $deniedRecords->get_status() );
-        self::assertSame( PatientAccess::UNAUTHORIZED_CODE, $deniedRecords->get_data()['code'] ?? null );
+        self::assertSame( 403, $deniedRecords->get_status() );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedRecords->get_data()['code'] ?? null );
 
         // Same-fixture positive control: linked patient user A gets 200.
         $allowed = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->patientUserA );
@@ -122,19 +132,19 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
         foreach ( [ $this->secretaryUser, $this->staffWithDbLinkOnly ] as $staffId ) {
             $deniedGet = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $staffId );
             self::assertSame( 403, $deniedGet->get_status() );
-            self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedGet->get_data()['code'] ?? null );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedGet->get_data()['code'] ?? null );
 
             $deniedPut = $this->dispatch( 'PUT', self::NS . '/patient/me', [ 'first_name' => 'StaffEdit', 'clinic_id' => $this->clinicA ], $staffId );
             self::assertSame( 403, $deniedPut->get_status() );
-            self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedPut->get_data()['code'] ?? null );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedPut->get_data()['code'] ?? null );
 
             $deniedRecords = $this->dispatch( 'GET', self::NS . '/patient/my-records', [], $staffId );
             self::assertSame( 403, $deniedRecords->get_status() );
-            self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedRecords->get_data()['code'] ?? null );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedRecords->get_data()['code'] ?? null );
 
             $deniedEnroll = $this->dispatch( 'POST', self::NS . '/patient/enroll', [ 'clinic_id' => $this->clinicA, 'first_name' => 'S', 'last_name' => 'T', 'mobile' => '09129990001' ], $staffId );
             self::assertSame( 403, $deniedEnroll->get_status() );
-            self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedEnroll->get_data()['code'] ?? null );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedEnroll->get_data()['code'] ?? null );
         }
 
         // Verify patient record was untouched.
@@ -150,25 +160,25 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
     public function testPatientWithNoLinkAndStaffMembershipBypassAreDeniedWithSameFixturePositiveControl(): void {
         // PatientUserZero has ROLE_PATIENT but zero patient bindings.
         $deniedNoSelector = $this->dispatch( 'GET', self::NS . '/patient/me', [], $this->patientUserZero );
-        self::assertSame( 404, $deniedNoSelector->get_status() );
-        self::assertSame( PatientAccess::NOT_FOUND_CODE, $deniedNoSelector->get_data()['code'] ?? null );
+        self::assertSame( 403, $deniedNoSelector->get_status() );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedNoSelector->get_data()['code'] ?? null );
 
         $deniedWithClinic = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->patientUserZero );
-        self::assertSame( 404, $deniedWithClinic->get_status() );
-        self::assertSame( PatientAccess::NOT_FOUND_CODE, $deniedWithClinic->get_data()['code'] ?? null );
+        self::assertSame( 403, $deniedWithClinic->get_status() );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedWithClinic->get_data()['code'] ?? null );
 
         $deniedPut = $this->dispatch( 'PUT', self::NS . '/patient/me', [ 'first_name' => 'Ghost' ], $this->patientUserZero );
-        self::assertSame( 404, $deniedPut->get_status() );
-        self::assertSame( PatientAccess::NOT_FOUND_CODE, $deniedPut->get_data()['code'] ?? null );
+        self::assertSame( 403, $deniedPut->get_status() );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedPut->get_data()['code'] ?? null );
 
         // User holds ROLE_PATIENT + patient link in Clinic A + active secretary membership in Clinic B: denied (403) in ALL clinics.
         $deniedStaffClinic = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicB ], $this->patientWithScopedMembership );
         self::assertSame( 403, $deniedStaffClinic->get_status() );
-        self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedStaffClinic->get_data()['code'] ?? null );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedStaffClinic->get_data()['code'] ?? null );
 
         $deniedLinkedClinic = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->patientWithScopedMembership );
         self::assertSame( 403, $deniedLinkedClinic->get_status() );
-        self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedLinkedClinic->get_data()['code'] ?? null );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedLinkedClinic->get_data()['code'] ?? null );
 
         // Same-fixture positive control: PatientUserA succeeds in Clinic A where they hold a patient link.
         $allowed = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->patientUserA );
@@ -190,20 +200,20 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
         $unknownPut       = $this->dispatch( 'PUT', self::NS . '/patient/me', [ 'clinic_id' => 999999, 'first_name' => 'CrossEdit' ], $this->patientUserB );
 
         // Identical denial responses for unknown vs forbidden across every selector vector.
-        self::assertSame( 404, $forbiddenParam->get_status() );
-        self::assertSame( 404, $unknownParam->get_status() );
+        self::assertSame( 403, $forbiddenParam->get_status() );
+        self::assertSame( 403, $unknownParam->get_status() );
         self::assertSame( $unknownParam->get_data(), $forbiddenParam->get_data() );
 
-        self::assertSame( 404, $forbiddenHeader->get_status() );
+        self::assertSame( 403, $forbiddenHeader->get_status() );
         self::assertSame( $unknownHeader->get_data(), $forbiddenHeader->get_data() );
 
-        self::assertSame( 404, $forbiddenLink->get_status() );
+        self::assertSame( 403, $forbiddenLink->get_status() );
         self::assertSame( $unknownLink->get_data(), $forbiddenLink->get_data() );
 
-        self::assertSame( 404, $forbiddenRecords->get_status() );
+        self::assertSame( 403, $forbiddenRecords->get_status() );
         self::assertSame( $unknownRecords->get_data(), $forbiddenRecords->get_data() );
 
-        self::assertSame( 404, $forbiddenPut->get_status() );
+        self::assertSame( 403, $forbiddenPut->get_status() );
         self::assertSame( $unknownPut->get_data(), $forbiddenPut->get_data() );
 
         // Verify Patient A was never mutated.
@@ -237,8 +247,8 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
             [ 'clinic_id' => 999999, 'first_name' => 'Z', 'last_name' => 'Zero', 'mobile' => '09128887766' ],
             $this->patientUserZero
         );
-        self::assertSame( 404, $forbiddenEnroll->get_status() );
-        self::assertSame( 404, $unknownEnroll->get_status() );
+        self::assertSame( 403, $forbiddenEnroll->get_status() );
+        self::assertSame( 403, $unknownEnroll->get_status() );
         self::assertSame( $unknownEnroll->get_data(), $forbiddenEnroll->get_data() );
 
         // Same-fixture positive control: PatientUserA with verified org identity enrolls in Clinic B.
@@ -311,7 +321,7 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
 
         $baselineDenied = $this->dispatch( 'GET', self::NS . '/patient/me', [ 'clinic_id' => $this->clinicA ], $this->secretaryUser );
         self::assertSame( 403, $baselineDenied->get_status() );
-        self::assertSame( PatientAccess::FORBIDDEN_CODE, $baselineDenied->get_data()['code'] ?? null );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $baselineDenied->get_data()['code'] ?? null );
 
         // All three scoped staff authority kinds (built-in membership, custom role, explicit grant) must fail closed identically.
         foreach ( [ $this->patientWithScopedMembership, $patientWithCustomRole, $patientWithExplicitGrant ] as $scopedStaffId ) {
@@ -387,7 +397,7 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
         self::assertCount( 1, $failSeen );
         self::assertSame( $witnessSeen, $failSeen );
         self::assertSame( 403, $deniedOnDbError->get_status() );
-        self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedOnDbError->get_data()['code'] ?? null );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedOnDbError->get_data()['code'] ?? null );
         self::assertSame( $baselineDenied->get_data(), $deniedOnDbError->get_data() );
         self::assertSame( $strictBefore, App::db()->is_strict() );
 
@@ -499,7 +509,7 @@ final class PatientAccessRestIntegrationTest extends WP_UnitTestCase {
      * @param array<string, string> $headers
      */
     private function dispatch( string $method, string $route, array $params, int $userId, array $headers = [] ): WP_REST_Response {
-        wp_set_current_user( $userId );
+        PatientTwoProofTestHelper::acting_as( $userId );
         $request = new WP_REST_Request( $method, $route );
         foreach ( $params as $key => $value ) {
             $request->set_param( $key, $value );

@@ -14,9 +14,19 @@ final class SmsEventsTest extends TestCase
 {
     public function testAllRequiredEventsExist(): void
     {
-        foreach (['otp', 'appointment_confirmed', 'appointment_reminder', 'appointment_cancelled', 'appointment_rescheduled', 'follow_up_reminder'] as $id) {
+        foreach (['otp', 'appointment_confirmed', 'appointment_reminder', 'appointment_cancelled', 'appointment_rescheduled', 'follow_up_reminder', 'patient_binding_verified'] as $id) {
             $this->assertTrue(SmsEvents::exists($id), "رویداد {$id} وجود ندارد");
         }
+    }
+
+    public function testPatientBindingVerifiedEventUsesOnlyClinicName(): void
+    {
+        $info = SmsEvents::info(SmsEvents::PATIENT_BINDING_VERIFIED);
+
+        $this->assertNotNull($info);
+        $this->assertSame(['clinic_name'], $info['variables']);
+        $this->assertSame(['clinic_name'], $info['required']);
+        $this->assertStringContainsString('{{clinic_name}}', $info['default_text']);
     }
 
     public function testOtpEventUsesOnlyOtpCodeVariable(): void

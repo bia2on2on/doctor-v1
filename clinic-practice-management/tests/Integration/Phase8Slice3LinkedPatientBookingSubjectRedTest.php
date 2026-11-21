@@ -175,11 +175,13 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -231,7 +233,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         ScopeContext::clear();
         App::resetScope();
         SystemClinicResolver::flush();
@@ -404,11 +406,9 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         // Expect generic validation failure (not 500, not success). Currently will succeed via reuse => RED.
         self::assertNotSame(200, $response->get_status(), 'Same-mobile unlinked must NOT be silently reused — must fail closed with safe validation when uniqueness prevents creation. Body: ' . wp_json_encode($response->get_data()));
         $code = is_array($response->get_data()) ? (string) ($response->get_data()['code'] ?? '') : '';
-        self::assertSame('CLINIC_VALIDATION_FAILED', $code, 'Must be generic non-enumerating CLINIC_VALIDATION_FAILED.');
-        self::assertSame('پروفایل شما ناقص است — ابتدا موبایل خود را تأیید کنید (OTP)', (string) ($response->get_data()['message'] ?? ''), 'Uniform fail-closed message with names — the message checked here (round 14 OD-A F1).');
-        // B2 same-mobile duplicate is pure input validation (400 per error-codes.md registry; BookingService default 400).
-        self::assertSame(400, $response->get_status(), 'B2 same-mobile validation must be 400 (generic validation) per registry. Got: ' . $response->get_status() . ' Body: ' . wp_json_encode($response->get_data()));
-        self::assertSame(400, (int) ($response->get_data()['data']['status'] ?? 0), 'Envelope data.status must be 400.');
+        self::assertSame(PatientAccess::PROOF_FAILED_CODE, $code, 'Unproved zero-link caller must fail closed with patient proof error.');
+        self::assertSame(403, $response->get_status(), 'B2 zero-link unproved caller must be 403. Got: ' . $response->get_status() . ' Body: ' . wp_json_encode($response->get_data()));
+        self::assertSame(403, (int) ($response->get_data()['data']['status'] ?? 0), 'Envelope data.status must be 403.');
         // No side effects.
         self::assertStringNotContainsString('SQL', wp_json_encode($response->get_data()), 'Must never expose SQL.');
         self::assertStringNotContainsString('Duplicate', wp_json_encode($response->get_data()), 'Must never expose raw DB error.');
@@ -435,7 +435,20 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $userId = $this->createPatientUserWithLinks($this->clinicB, [
             ['id' => $patientB, 'mobile' => $this->mobileFor('t04'), 'primary' => 1],
         ]);
-        cpms_test_seed_patient_session($userId, $this->clinicA);
+        $proof = PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicB, $patientB, [
+            'mobile' => $this->mobileFor('t04'),
+            'full_identity' => false,
+            'seed_session_scope' => false,
+            'set_current_user' => false,
+        ]);
+        $manager = \WP_Session_Tokens::get_instance($userId);
+        $session = $manager->get($proof['token']);
+        if (is_array($session)) {
+            $manager->update(
+                $proof['token'],
+                array_merge($session, App::patient_session_scope()->session_marker_for($userId, $this->clinicA))
+            );
+        }
         // Booking slot is in Clinic A.
         $slotA = $this->seedSlot($this->clinicA, $this->locationA, $this->clinicianA, $this->ymdDaysAhead(5), '13:00:00', 1);
 
@@ -591,8 +604,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $attempt1 = $this->restPost(self::NS . self::CONFIRM_PATH, [
             'hold_token' => $holdToken,
         ], asUserId: $userId, withNonce: true, idempotencyKey: $this->uuid());
-        $this->assertClinicError($attempt1, 'CLINIC_VALIDATION_FAILED', 400, 'B2 for a 0-linked Historical-NULL Hold must fail closed.');
-        self::assertSame('پروفایل شما ناقص است — ابتدا موبایل خود را تأیید کنید (OTP)', (string) ($attempt1->get_data()['message'] ?? ''), 'Uniform fail-closed message.');
+        $this->assertClinicError($attempt1, PatientAccess::PROOF_FAILED_CODE, 403, 'B2 for a 0-linked Historical-NULL Hold must fail closed.');
         self::assertSame(0, $this->countPatientsForMobile($this->clinicA, $mobile), 'No Patient must be created on failure.');
         self::assertSame(0, $this->countRows('cpms_appointments'), 'No Appointment on failure.');
         $holdRow = $this->holdRowByToken($holdToken);
@@ -833,6 +845,13 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
             ['id' => $own, 'mobile' => $ownMobile, 'primary' => 1],
         ]);
         $dependentLink = $this->insertLink($this->clinicA, $dependent, $caregiver, $depMobile, 0);
+        PatientTwoProofTestHelper::seed_patient_proof($caregiver, $this->clinicA, $dependent, [
+            'mobile' => $depMobile,
+            'full_identity' => false,
+            'is_primary' => false,
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
 
         // The dependent owns a distinct Organization identity. The caregiver has
         // a Clinic booking-subject link only, never an identity/self link.
@@ -873,7 +892,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
             'created_at' => $now,
         ], ['%d', '%d', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%d', '%s'], 'dependent file');
 
-        wp_set_current_user($caregiver);
+        PatientTwoProofTestHelper::acting_as($caregiver);
         $records = App::patientService()->linked_records($caregiver);
         self::assertSame([$own], array_column($records, 'patient_id'), 'Booking-only dependent must not enter profile/clinical selectors.');
         self::assertSame(
@@ -907,12 +926,12 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $this->setRole($admin, 'administrator');
         foreach (['/appointments/mine', '/prescriptions'] as $path) {
             $adminDenied = $this->restGet(self::NS . $path, ['link_id' => $dependentLink], $admin, true);
-            $this->assertClinicError($adminDenied, 'CLINIC_PERMISSION_DENIED', 403, 'Administrator must not bypass patient REST role: ' . $path);
+            $this->assertClinicError($adminDenied, PatientAccess::PROOF_FAILED_CODE, 403, 'Administrator must not bypass patient REST role: ' . $path);
         }
 
         // Existing public-booking chooser still offers both explicitly linked
         // booking subjects; no patient is inferred from mobile or request data.
-        wp_set_current_user($caregiver);
+        PatientTwoProofTestHelper::acting_as($caregiver);
         $surface = $this->renderSurface($this->clinicA);
         self::assertStringContainsString('Caregiver Self', $surface);
         self::assertStringContainsString('Dependent Child', $surface);
@@ -1099,7 +1118,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $c0 = $this->restPost(self::NS . self::CONFIRM_PATH, [
             'hold_token' => $token0,
         ], asUserId: $user0, withNonce: true, idempotencyKey: $this->uuid());
-        $this->assertClinicError($c0, 'CLINIC_VALIDATION_FAILED', 400, '0 linked historical null must follow new-patient path.');
+        $this->assertClinicError($c0, PatientAccess::PROOF_FAILED_CODE, 403, '0 linked historical null must fail closed without proof.');
 
         // Case exactly 1 linked -> server may resolve that one linked Patient (no names).
         $patient1 = $this->insertPatient($this->clinicA, $this->mobileFor('t13b'), 'Hist', 'One');
@@ -1364,6 +1383,13 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $this->setRole($uid, 'cpms_patient');
         foreach ($specs as $s) {
             $this->insertLink($clinicId, (int) $s['id'], $uid, (string) $s['mobile'], (int) $s['primary']);
+            PatientTwoProofTestHelper::seed_patient_proof($uid, $clinicId, (int) $s['id'], [
+                'mobile' => (string) $s['mobile'],
+                'is_primary' => (int) $s['primary'] === 1,
+                'full_identity' => true,
+                'seed_session_scope' => true,
+                'set_current_user' => false,
+            ]);
         }
         return $uid;
     }
@@ -1414,7 +1440,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
      */
     private function restPost(string $route, array $body, ?int $asUserId = null, bool $withNonce = false, ?string $idempotencyKey = null): WP_REST_Response
     {
-        wp_set_current_user($asUserId !== null ? $asUserId : 0);
+        PatientTwoProofTestHelper::acting_as($asUserId !== null ? $asUserId : 0);
         $request = new WP_REST_Request('POST', $route);
         foreach ($body as $k => $v) {
             $request->set_param($k, $v);
@@ -1431,7 +1457,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
     /** @param array<string, mixed> $params */
     private function restGet(string $route, array $params, int $asUserId, bool $withNonce): WP_REST_Response
     {
-        wp_set_current_user($asUserId);
+        PatientTwoProofTestHelper::acting_as($asUserId);
         $request = new WP_REST_Request('GET', $route);
         foreach ($params as $key => $value) {
             $request->set_param($key, $value);

@@ -6,6 +6,7 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 /**
@@ -92,11 +93,18 @@ final class BookingFlowTest extends WP_UnitTestCase
         // کاربر دوم (بدون Patient — برای تست Auto-Creation)
         $this->otherUserId = (int) wp_create_user('patient_2', 'pass-12345', '09120000002@otp.cpms.local', ['role' => 'cpms_patient']);
         cpms_test_seed_patient_session($this->otherUserId, $this->clinicId);
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserId,
+            $this->clinicId,
+            $patientId,
+            ['mobile' => '09120000001', 'seed_session_scope' => true]
+        );
     }
 
     protected function tearDown(): void
     {
         $this->restoreAuditInserts();
+        PatientTwoProofTestHelper::reset();
         App::resetScope();
         parent::tearDown();
     }
@@ -360,10 +368,17 @@ final class BookingFlowTest extends WP_UnitTestCase
                 $now
             )
         );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->otherUserId,
+            $this->clinicId,
+            $otherPatientId,
+            ['mobile' => '09120000002', 'seed_session_scope' => true, 'set_current_user' => false]
+        );
         $slot = $this->makeSlot(3, '10:00', 1);
         $this->booking()->hold($this->patientUserId, $this->clinicianId, $slot['date'], $slot['time']);
 
         // Hold دوم (بیمار دیگر / کاربر دوم) باید SLOT_TAKEN باشد
+        PatientTwoProofTestHelper::acting_as($this->otherUserId);
         $this->expectException(BookingException::class);
         try {
             $this->booking()->hold($this->otherUserId, $this->clinicianId, $slot['date'], $slot['time']);
@@ -776,6 +791,12 @@ final class BookingFlowTest extends WP_UnitTestCase
                     $secondMobile,
                     $secondNow
                 )
+            );
+            PatientTwoProofTestHelper::seed_patient_proof(
+                $this->patientUserId,
+                $this->clinicId,
+                $secondPatientId,
+                ['mobile' => $secondMobile, 'seed_session_scope' => true]
             );
             $expectedLinks = 2;
         }

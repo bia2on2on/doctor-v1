@@ -16,6 +16,7 @@ use ClinicCore\Infrastructure\Licensing\VendorGateway;
 use ClinicCore\Infrastructure\Repository\AppointmentRepository;
 use ClinicCore\Infrastructure\Repository\LicenseRepository;
 use ClinicCore\Infrastructure\Repository\VisitRepository;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 /** Real signed-document/service regressions for the Owner post-expiration policy. */
@@ -90,6 +91,7 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
     {
         remove_all_filters('cpms_license_public_key');
         remove_all_filters('cpms_license_dev_mode');
+        PatientTwoProofTestHelper::reset();
         parent::tearDown();
     }
 
@@ -152,6 +154,12 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
                 $mobile,
                 $now
             )
+        );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $this->clinicId,
+            $patientId,
+            ['mobile' => $mobile, 'seed_session_scope' => true]
         );
     }
 

@@ -5,6 +5,7 @@ declare( strict_types=1 );
 namespace ClinicCore\Tests\Unit;
 
 use ClinicCore\Application\Auth\PatientAccess;
+use ClinicCore\Application\Auth\PatientSessionProofStore;
 use ClinicCore\Auth\RolesAndCapabilities;
 use PHPUnit\Framework\TestCase;
 
@@ -13,7 +14,7 @@ final class PatientAccessUnitTest extends TestCase {
     public function testUnauthenticatedAndMissingUsersAreDeniedWithPositiveControl(): void {
         $gate = $this->make_gate();
 
-        // Negative: user 0 and nonexistent user 999 fail closed.
+        // Negative: user 0 and nonexistent user 999 fail closed with 403 PROOF_FAILED.
         self::assertFalse( $gate->can_access_clinic( 0, 10 ) );
         self::assertFalse( $gate->can_access_clinic( 999, 10 ) );
         self::assertFalse( $gate->can_access_patient( 0, 10, 100 ) );
@@ -21,15 +22,15 @@ final class PatientAccessUnitTest extends TestCase {
 
         $unauthZero = $gate->authorize_request( 0, 10 );
         self::assertFalse( $unauthZero['allowed'] );
-        self::assertSame( 401, $unauthZero['http_status'] );
-        self::assertSame( PatientAccess::UNAUTHORIZED_CODE, $unauthZero['code'] );
+        self::assertSame( 403, $unauthZero['http_status'] );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $unauthZero['code'] );
 
         $unauthMissing = $gate->authorize_request( 999, 10 );
         self::assertFalse( $unauthMissing['allowed'] );
-        self::assertSame( 401, $unauthMissing['http_status'] );
-        self::assertSame( PatientAccess::UNAUTHORIZED_CODE, $unauthMissing['code'] );
+        self::assertSame( 403, $unauthMissing['http_status'] );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $unauthMissing['code'] );
 
-        // Positive control: authenticated linked patient user 1 in clinic 10 / patient 100.
+        // Positive control: authenticated linked patient user 1 in clinic 10 / patient 100 with live two-proof session.
         self::assertTrue( $gate->can_access_clinic( 1, 10 ) );
         self::assertTrue( $gate->can_access_patient( 1, 10, 100 ) );
         $allowed = $gate->authorize_request( 1, 10, 100 );
@@ -67,7 +68,7 @@ final class PatientAccessUnitTest extends TestCase {
             $denied = $gate->authorize_request( $staffUserId, 10, 100 );
             self::assertFalse( $denied['allowed'] );
             self::assertSame( 403, $denied['http_status'] );
-            self::assertSame( PatientAccess::FORBIDDEN_CODE, $denied['code'] );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $denied['code'] );
         }
 
         // Positive control: patient-role user 1 on the same clinic/patient succeeds.
@@ -76,7 +77,7 @@ final class PatientAccessUnitTest extends TestCase {
         self::assertTrue( $gate->authorize_request( 1, 10, 100 )['allowed'] );
     }
 
-    public function testUnlinkedAndCrossClinicPatientsAreDeniedWithIdenticalUnknownVsForbiddenResponses(): void {
+    public function testUnlinkedAndCrossClinicPatientsAreDeniedWithIdenticalResponses(): void {
         $gate = $this->make_gate();
 
         // Negative: patient user 5 has NO bindings anywhere.
@@ -100,9 +101,9 @@ final class PatientAccessUnitTest extends TestCase {
 
         foreach ( [ $noLinksNoClinic, $noLinksClinic10, $forbiddenClinic, $unknownClinic, $forbiddenLink, $unknownLink, $clinicMismatch ] as $denied ) {
             self::assertFalse( $denied['allowed'] );
-            self::assertSame( 404, $denied['http_status'] );
-            self::assertSame( PatientAccess::NOT_FOUND_CODE, $denied['code'] );
-            self::assertSame( PatientAccess::NOT_FOUND_MESSAGE, $denied['message'] );
+            self::assertSame( 403, $denied['http_status'] );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $denied['code'] );
+            self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $denied['message'] );
         }
 
         // Positive controls on the same fixture.
@@ -121,25 +122,25 @@ final class PatientAccessUnitTest extends TestCase {
             }
         );
 
-        // Negative: invalid/non-positive/conflicting selectors & unsupported mode fail closed.
+        // Negative: invalid/non-positive/conflicting selectors, 0-binding records list, & unsupported mode fail closed.
         self::assertFalse( $gate->can_access_clinic( 1, 0 ) );
         self::assertFalse( $gate->can_access_patient( 1, 10, -5 ) );
         $invalidFlag   = $gate->authorize_request( 1, 10, null, null, PatientAccess::MODE_CLINICAL, true );
         $badMode       = $gate->authorize_request( 1, 10, null, null, 'unknown_mode' );
         $patientNoCl   = $gate->authorize_request( 1, null, 100 );
         $badLink       = $gate->authorize_request( 1, null, null, 0 );
+        $recordsZero   = $gate->authorize_request( 5, null, null, null, PatientAccess::MODE_RECORDS_LIST );
         $recordsOther  = $gate->authorize_request( 1, 20, null, null, PatientAccess::MODE_RECORDS_LIST );
         $enrollDenied  = $gate->authorize_request( 1, 10, null, null, PatientAccess::MODE_ENROLL );
         $enrollNoCl    = $gate->authorize_request( 1, null, null, null, PatientAccess::MODE_ENROLL );
 
-        foreach ( [ $invalidFlag, $badMode, $patientNoCl, $badLink, $recordsOther, $enrollDenied, $enrollNoCl ] as $denied ) {
+        foreach ( [ $invalidFlag, $badMode, $patientNoCl, $badLink, $recordsZero, $recordsOther, $enrollDenied, $enrollNoCl ] as $denied ) {
             self::assertFalse( $denied['allowed'] );
-            self::assertSame( 404, $denied['http_status'] );
-            self::assertSame( PatientAccess::NOT_FOUND_CODE, $denied['code'] );
+            self::assertSame( 403, $denied['http_status'] );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $denied['code'] );
         }
 
-        // Positive controls for records_list (no clinic / bound clinic) and enroll (eligible clinic 20).
-        self::assertTrue( $gate->authorize_request( 5, null, null, null, PatientAccess::MODE_RECORDS_LIST )['allowed'] );
+        // Positive controls for records_list (bound clinic) and enroll (eligible clinic 20).
         self::assertTrue( $gate->authorize_request( 1, 10, null, null, PatientAccess::MODE_RECORDS_LIST )['allowed'] );
         self::assertTrue( $gate->can_enroll_in_clinic( 1, 20 ) );
         self::assertTrue( $gate->authorize_request( 1, 20, null, null, PatientAccess::MODE_ENROLL )['allowed'] );
@@ -211,8 +212,8 @@ final class PatientAccessUnitTest extends TestCase {
                 $denied = $gate->authorize_request( $mixedUserId, 10, 100, null, $mode );
                 self::assertFalse( $denied['allowed'] );
                 self::assertSame( 403, $denied['http_status'] );
-                self::assertSame( PatientAccess::FORBIDDEN_CODE, $denied['code'] );
-                self::assertSame( PatientAccess::FORBIDDEN_MESSAGE, $denied['message'] );
+                self::assertSame( PatientAccess::PROOF_FAILED_CODE, $denied['code'] );
+                self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $denied['message'] );
             }
         }
 
@@ -257,8 +258,8 @@ final class PatientAccessUnitTest extends TestCase {
                 $denied = $gate->authorize_request( $scopedOrFailedId, 10, 100, null, $mode );
                 self::assertFalse( $denied['allowed'] );
                 self::assertSame( 403, $denied['http_status'] );
-                self::assertSame( PatientAccess::FORBIDDEN_CODE, $denied['code'] );
-                self::assertSame( PatientAccess::FORBIDDEN_MESSAGE, $denied['message'] );
+                self::assertSame( PatientAccess::PROOF_FAILED_CODE, $denied['code'] );
+                self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $denied['message'] );
             }
         }
 
@@ -293,7 +294,8 @@ final class PatientAccessUnitTest extends TestCase {
 
         // MODE_PATIENT_RESOURCE negatives (unauthenticated, missing/unbound patient, wrong clinic/link).
         $resUnauth = $gate->authorize_request( 0, null, 100, null, PatientAccess::MODE_PATIENT_RESOURCE );
-        self::assertSame( 401, $resUnauth['http_status'] );
+        self::assertSame( 403, $resUnauth['http_status'] );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $resUnauth['code'] );
         foreach ( [
             $gate->authorize_request( 1, null, null, null, PatientAccess::MODE_PATIENT_RESOURCE ),
             $gate->authorize_request( 5, null, 100, null, PatientAccess::MODE_PATIENT_RESOURCE ),
@@ -303,15 +305,15 @@ final class PatientAccessUnitTest extends TestCase {
             $gate->authorize_request( 1, null, 999, 701, PatientAccess::MODE_PATIENT_RESOURCE ),
         ] as $deniedResource ) {
             self::assertFalse( $deniedResource['allowed'] );
-            self::assertSame( 404, $deniedResource['http_status'] );
-            self::assertSame( PatientAccess::NOT_FOUND_CODE, $deniedResource['code'] );
+            self::assertSame( 403, $deniedResource['http_status'] );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedResource['code'] );
         }
         // MODE_PATIENT_RESOURCE positive controls (path-only, with clinic, with link).
         self::assertTrue( $gate->authorize_request( 1, null, 100, null, PatientAccess::MODE_PATIENT_RESOURCE )['allowed'] );
         self::assertTrue( $gate->authorize_request( 1, 10, 100, null, PatientAccess::MODE_PATIENT_RESOURCE )['allowed'] );
         self::assertTrue( $gate->authorize_request( 1, null, 100, 701, PatientAccess::MODE_PATIENT_RESOURCE )['allowed'] );
 
-        // MODE_BOOKING_APPOINTMENT negatives (unlinked user 5, wrong clinic, foreign link) fail closed with 403.
+        // MODE_BOOKING_APPOINTMENT negatives (unlinked user 5, wrong clinic, foreign link) fail closed with 403 PROOF_FAILED.
         foreach ( [
             $gate->authorize_request( 5, null, null, null, PatientAccess::MODE_BOOKING_APPOINTMENT ),
             $gate->authorize_request( 1, 20, null, null, PatientAccess::MODE_BOOKING_APPOINTMENT ),
@@ -319,7 +321,7 @@ final class PatientAccessUnitTest extends TestCase {
         ] as $deniedBooking ) {
             self::assertFalse( $deniedBooking['allowed'] );
             self::assertSame( 403, $deniedBooking['http_status'] );
-            self::assertSame( PatientAccess::FORBIDDEN_CODE, $deniedBooking['code'] );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $deniedBooking['code'] );
         }
         // MODE_BOOKING_APPOINTMENT positive controls (including dependent-only user 6 without clinical access).
         self::assertTrue( $gate->authorize_request( 1, null, null, null, PatientAccess::MODE_BOOKING_APPOINTMENT )['allowed'] );
@@ -329,11 +331,40 @@ final class PatientAccessUnitTest extends TestCase {
         // MODE_RECORDS_LIST link_id validation rejects foreign/mismatched link_id while allowing valid/absent selectors.
         $badRecordsLink = $gate->authorize_request( 1, null, null, 702, PatientAccess::MODE_RECORDS_LIST );
         self::assertFalse( $badRecordsLink['allowed'] );
-        self::assertSame( 404, $badRecordsLink['http_status'] );
+        self::assertSame( 403, $badRecordsLink['http_status'] );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $badRecordsLink['code'] );
         $mismatchRecordsLink = $gate->authorize_request( 1, 20, null, 701, PatientAccess::MODE_RECORDS_LIST );
         self::assertFalse( $mismatchRecordsLink['allowed'] );
-        self::assertSame( 404, $mismatchRecordsLink['http_status'] );
+        self::assertSame( 403, $mismatchRecordsLink['http_status'] );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $mismatchRecordsLink['code'] );
         self::assertTrue( $gate->authorize_request( 1, 10, null, 701, PatientAccess::MODE_RECORDS_LIST )['allowed'] );
+    }
+
+    public function testAuthorizeLinkRecordRequestRejectsInvalidActorsAndSelectors(): void {
+        $gate = $this->make_gate(
+            users: [
+                1 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ] ],
+                2 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_DOCTOR, RolesAndCapabilities::ROLE_PATIENT ] ],
+                5 => [ 'exists' => true, 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ] ],
+            ]
+        );
+
+        foreach ( [
+            $gate->authorize_link_record_request( 0, 10 ),
+            $gate->authorize_link_record_request( 2, 10 ),
+            $gate->authorize_link_record_request( 5, null ),
+            $gate->authorize_link_record_request( 5, 0 ),
+            $gate->authorize_link_record_request( 5, 10, true ),
+        ] as $denied ) {
+            self::assertFalse( $denied['allowed'] );
+            self::assertSame( 403, $denied['http_status'] );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $denied['code'] );
+        }
+
+        // Pure patient user with valid target clinic passes actor/selector gate even before binding exists.
+        $allowed = $gate->authorize_link_record_request( 5, 10 );
+        self::assertTrue( $allowed['allowed'] );
+        self::assertSame( 200, $allowed['http_status'] );
     }
 
     /**
@@ -367,47 +398,190 @@ final class PatientAccessUnitTest extends TestCase {
         $booking_links           ??= $links;
         $enroll                    = [ '1:20' => true ];
 
+        // Build per-user live in-memory sessions + PatientSessionProofStore.
+        $managers    = [];
+        $bindingsMap = [];
+        $now         = time();
+        $verifiedAt  = gmdate( 'Y-m-d H:i:s.000', $now );
+        $proofStore  = new PatientSessionProofStore(
+            static function ( int $uid ) use ( &$managers ): object {
+                if ( ! isset( $managers[ $uid ] ) ) {
+                    $managers[ $uid ] = new class( [ 'tok-' . $uid => [ 'expiration' => time() + 28800 ] ] ) {
+                        /** @var array<string, array<string, mixed>> */
+                        public array $sessions;
+
+                        /** @param array<string, array<string, mixed>> $sessions */
+                        public function __construct( array $sessions ) {
+                            $this->sessions = $sessions;
+                        }
+
+                        /** @return array<string, mixed>|null */
+                        public function get( string $token ): ?array {
+                            return $this->sessions[ $token ] ?? null;
+                        }
+
+                        /** @param array<string, mixed> $session */
+                        public function update( string $token, array $session ): void {
+                            $this->sessions[ $token ] = $session;
+                        }
+
+                        public function destroy_all(): void {
+                            $this->sessions = [];
+                        }
+                    };
+                }
+
+                return $managers[ $uid ];
+            },
+            static fn (): string => ''
+        );
+
+        // Seed full-identity bindings from $patient_bindings.
+        $seq = 1;
+        foreach ( $patient_bindings as $key => $allowed ) {
+            if ( ! $allowed ) {
+                continue;
+            }
+            [ $uid, $cid, $pid ] = array_map( 'intval', explode( ':', $key ) );
+            $mobile              = sprintf( '0912%07d', $uid );
+            $bindingId           = $seq++;
+            $bindingsMap[ $uid ][ $cid . ':' . $pid ] = [
+                'binding_id'    => $bindingId,
+                'clinic_id'     => $cid,
+                'patient_id'    => $pid,
+                'verified_at'   => $verifiedAt,
+                'mobile'        => $mobile,
+                'full_identity' => true,
+            ];
+            $token = 'tok-' . $uid;
+            $proofStore->record_mobile_proof( $uid, $mobile, $now, $token );
+            $proofStore->record_binding_proof( $uid, $cid, $pid, $bindingId, $verifiedAt, $now, $token );
+        }
+
+        // Seed booking-only bindings from $booking_links / $booking_clinic_bindings.
+        foreach ( $booking_links as $key => $target ) {
+            [ $uid ] = array_map( 'intval', explode( ':', $key ) );
+            $cid     = (int) $target['clinic_id'];
+            $pid     = (int) $target['patient_id'];
+            if ( ! ( $booking_clinic_bindings[ $uid . ':' . $cid ] ?? false ) ) {
+                continue;
+            }
+            if ( isset( $bindingsMap[ $uid ][ $cid . ':' . $pid ] ) ) {
+                continue;
+            }
+            $mobile    = sprintf( '0912%07d', $uid );
+            $bindingId = $seq++;
+            $bindingsMap[ $uid ][ $cid . ':' . $pid ] = [
+                'binding_id'    => $bindingId,
+                'clinic_id'     => $cid,
+                'patient_id'    => $pid,
+                'verified_at'   => $verifiedAt,
+                'mobile'        => $mobile,
+                'full_identity' => false,
+            ];
+            $token = 'tok-' . $uid;
+            $proofStore->record_mobile_proof( $uid, $mobile, $now, $token );
+            $proofStore->record_binding_proof( $uid, $cid, $pid, $bindingId, $verifiedAt, $now, $token );
+        }
+
+        // Wrapper proof store that supplies `tok-{uid}` for each user when $token === null.
+        $userBoundProofs = new PatientSessionProofStore(
+            static function ( int $uid ) use ( &$managers ): object {
+                if ( ! isset( $managers[ $uid ] ) ) {
+                    $managers[ $uid ] = new class( [] ) {
+                        /** @var array<string, array<string, mixed>> */
+                        public array $sessions;
+
+                        /** @param array<string, array<string, mixed>> $sessions */
+                        public function __construct( array $sessions ) {
+                            $this->sessions = $sessions;
+                        }
+
+                        /** @return array<string, mixed>|null */
+                        public function get( string $token ): ?array {
+                            return $this->sessions[ $token ] ?? null;
+                        }
+
+                        /** @param array<string, mixed> $session */
+                        public function update( string $token, array $session ): void {
+                            $this->sessions[ $token ] = $session;
+                        }
+                    };
+                }
+
+                return $managers[ $uid ];
+            },
+            static function () use ( &$managers ): string {
+                return '';
+            }
+        );
+        unset( $userBoundProofs );
+
+        // Wait: level() calls $this->proofs->has_valid_binding_proof(..., $now, $token) with $token=null.
+        // We track the active user in $user_reader so token_resolver returns `tok-{uid}`!
+        $activeUid = 0;
+        $gateProofs = new PatientSessionProofStore(
+            static function ( int $uid ) use ( &$managers ): object {
+                if ( ! isset( $managers[ $uid ] ) ) {
+                    $managers[ $uid ] = new class( [] ) {
+                        /** @var array<string, array<string, mixed>> */
+                        public array $sessions;
+
+                        /** @param array<string, array<string, mixed>> $sessions */
+                        public function __construct( array $sessions ) {
+                            $this->sessions = $sessions;
+                        }
+
+                        /** @return array<string, mixed>|null */
+                        public function get( string $token ): ?array {
+                            return $this->sessions[ $token ] ?? null;
+                        }
+
+                        /** @param array<string, mixed> $session */
+                        public function update( string $token, array $session ): void {
+                            $this->sessions[ $token ] = $session;
+                        }
+                    };
+                }
+
+                return $managers[ $uid ];
+            },
+            static function () use ( &$activeUid ): string {
+                return $activeUid > 0 ? 'tok-' . $activeUid : '';
+            }
+        );
+
         return new PatientAccess(
             null,
             null,
-            static fn ( int $uid ): ?array => $users[ $uid ] ?? null,
-            static fn ( int $uid, int $cid ): bool => $clinic_bindings[ $uid . ':' . $cid ] ?? false,
-            static fn ( int $uid, int $cid, int $pid ): bool => $patient_bindings[ $uid . ':' . $cid . ':' . $pid ] ?? false,
-            static function ( int $uid ) use ( $clinic_bindings ): bool {
-                foreach ( $clinic_bindings as $key => $allowed ) {
-                    if ( $allowed && str_starts_with( $key, $uid . ':' ) ) {
-                        return true;
-                    }
-                }
+            static function ( int $uid ) use ( $users, &$activeUid ): ?array {
+                $activeUid = $uid;
 
-                return false;
+                return $users[ $uid ] ?? null;
             },
+            null,
+            null,
+            null,
             static fn ( int $uid, int $lid ): ?array => $links[ $uid . ':' . $lid ] ?? null,
             static fn ( int $uid, int $cid ): bool => $enroll[ $uid . ':' . $cid ] ?? false,
             $observer,
             $scoped_staff_checker ?? static fn ( int $uid ): bool => false,
             null,
             null,
-            static function ( int $uid, int $pid ) use ( $patient_bindings ): bool {
-                foreach ( $patient_bindings as $key => $allowed ) {
-                    if ( $allowed && str_starts_with( $key, $uid . ':' ) && str_ends_with( $key, ':' . $pid ) ) {
-                        return true;
-                    }
+            null,
+            null,
+            null,
+            static fn ( int $uid, int $lid ): ?array => $booking_links[ $uid . ':' . $lid ] ?? null,
+            null,
+            $gateProofs,
+            static function ( int $uid, ?int $cid = null ) use ( $bindingsMap ): array {
+                $rows = array_values( $bindingsMap[ $uid ] ?? [] );
+                if ( null !== $cid && $cid > 0 ) {
+                    return array_values( array_filter( $rows, static fn ( array $r ): bool => $r['clinic_id'] === $cid ) );
                 }
 
-                return false;
-            },
-            static fn ( int $uid, int $cid ): bool => $booking_clinic_bindings[ $uid . ':' . $cid ] ?? false,
-            static function ( int $uid ) use ( $booking_clinic_bindings ): bool {
-                foreach ( $booking_clinic_bindings as $key => $allowed ) {
-                    if ( $allowed && str_starts_with( $key, $uid . ':' ) ) {
-                        return true;
-                    }
-                }
-
-                return false;
-            },
-            static fn ( int $uid, int $lid ): ?array => $booking_links[ $uid . ':' . $lid ] ?? null
+                return $rows;
+            }
         );
     }
 }

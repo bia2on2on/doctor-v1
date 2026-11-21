@@ -385,7 +385,7 @@ final class App
 				( new OtpController( self::otpService() ) )->register_routes();
 				( new SmsController( self::smsService() ) )->register_routes();
 				( new BookingController( self::bookingService(), self::patient_session_scope() ) )->register_routes();
-				( new PatientController( self::patientService(), self::patient_access() ) )->register_routes();
+				( new PatientController( self::patientService(), self::patient_access(), self::patient_binding_promoter() ) )->register_routes();
 				( new QueueController( self::visitService() ) )->register_routes();
 				( new ScheduleController( self::scheduleService() ) )->register_routes();
 				( new ClinicalController( self::clinicalService() ) )->register_routes();
@@ -1979,7 +1979,25 @@ final class App
             self::patient_identity_service(),
             self::patient_identity_activator(),
             self::audit(),
-            self::op()
+            self::op(),
+            static function ( int $clinic_id, string $mobile, int $patient_id ): void {
+                $clinic_name = (string) ( self::db()->fetchValue(
+                    'SELECT name FROM ' . self::db()->table( 'cpms_clinics' ) . ' WHERE id = %d LIMIT 1',
+                    [ $clinic_id ]
+                ) ?? '' );
+                if ( '' === trim( $clinic_name ) ) {
+                    $clinic_name = 'مرکز درمانی';
+                }
+                self::smsService()->sendEvent(
+                    $clinic_id,
+                    \ClinicCore\Domain\Sms\SmsEvents::PATIENT_BINDING_VERIFIED,
+                    $mobile,
+                    [ 'clinic_name' => $clinic_name ],
+                    'patient_binding',
+                    $patient_id,
+                    false
+                );
+            }
         );
     }
 

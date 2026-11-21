@@ -13,6 +13,7 @@ use ClinicCore\Rest\ClinicalController;
 use ClinicCore\Rest\FilesController;
 use ClinicCore\Rest\NotificationsController;
 use ClinicCore\Rest\PatientController;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use PHPUnit\Framework\AssertionFailedError;
 use WP_REST_Request;
@@ -42,7 +43,8 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
 
     /** @var list<string> */
     private const GATED_PATIENT_ENDPOINTS = [
-        // Slice A (4 definitions -> 6 expanded pairs).
+        // Slice A + D4 (5 definitions -> 7 expanded pairs).
+        'POST /clinic/v1/patient/link-record',
         'POST /clinic/v1/patient/enroll',
         'GET /clinic/v1/patient/my-records',
         'GET /clinic/v1/patient/me',
@@ -121,6 +123,12 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
                 'linked_at'      => $now,
             ]
         );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserLinked,
+            1,
+            $this->patientA,
+            [ 'mobile' => '09123334455', 'set_current_user' => false ]
+        );
 
         $this->multiRoleUser = $this->makeUser( 'sbc_gcap_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
         $multiObj            = get_userdata( $this->multiRoleUser );
@@ -140,7 +148,7 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
             $wp_filter['rest_api_init'] = $this->savedRestInitHooks;
         }
         remove_all_filters( 'cpms_license_public_key' );
-        wp_set_current_user( 0 );
+        PatientTwoProofTestHelper::reset();
         App::resetScope();
         parent::tearDown();
     }
@@ -149,15 +157,15 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
         $routes        = rest_get_server()->get_routes();
         $enumerated    = $this->enumerateRouteMethods( $routes );
         $knownPatient  = array_flip( array_merge( self::ALLOWLISTED_PUBLIC_ENDPOINTS, self::GATED_PATIENT_ENDPOINTS ) );
-        $nonPublic22   = array_flip( self::GATED_PATIENT_ENDPOINTS );
+        $nonPublic23   = array_flip( self::GATED_PATIENT_ENDPOINTS );
 
-        // Verify all 22 gated + 5 public endpoints exist on the live server.
+        // Verify all 23 gated + 5 public endpoints exist on the live server.
         foreach ( array_merge( self::ALLOWLISTED_PUBLIC_ENDPOINTS, self::GATED_PATIENT_ENDPOINTS ) as $expected ) {
             self::assertContains( $expected, $enumerated, 'Expected route missing from live WP_REST_Server: ' . $expected );
         }
 
         // Every other /clinic/v1/* route+method must deny a pure ROLE_PATIENT caller (403, or 400 CLINIC_SCOPE_REQUIRED on scoped staff-only boundaries).
-        wp_set_current_user( $this->patientUserLinked );
+        PatientTwoProofTestHelper::acting_as( $this->patientUserLinked );
         foreach ( $enumerated as $pair ) {
             if ( isset( $knownPatient[ $pair ] ) ) {
                 continue;
@@ -182,7 +190,7 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
                 );
             }
         }
-        self::assertCount( 22, $nonPublic22 );
+        self::assertCount( 23, $nonPublic23 );
     }
 
     /**
@@ -397,7 +405,7 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
             $response = $server->dispatch( $request );
             self::assertSame( $before + 1, count( $gateEvents ), 'Route did not execute PatientAccess gate: ' . $pair );
             self::assertSame( 403, $response->get_status(), 'Multi-role user must be denied at gate before handler on ' . $pair );
-            self::assertSame( PatientAccess::FORBIDDEN_CODE, $response->get_data()['code'] ?? null, $pair );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $response->get_data()['code'] ?? null, $pair );
             self::assertFalse( (bool) $gateEvents[ $before ]['allowed'], $pair );
         }
     }
@@ -420,7 +428,9 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
     }
 
     private function populateSampleParams( WP_REST_Request $request, string $pattern ): void {
-        if ( str_contains( $pattern, '/patient/enroll' ) ) {
+        if ( str_contains( $pattern, '/patient/link-record' ) ) {
+            $request->set_param( 'clinic_id', 1 );
+        } elseif ( str_contains( $pattern, '/patient/enroll' ) ) {
             $request->set_param( 'clinic_id', 1 );
             $request->set_param( 'first_name', 'S' );
             $request->set_param( 'last_name', 'B' );

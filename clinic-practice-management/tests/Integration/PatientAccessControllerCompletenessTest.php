@@ -9,6 +9,7 @@ use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Rest\PatientController;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use PHPUnit\Framework\AssertionFailedError;
 use WP_REST_Request;
@@ -28,6 +29,7 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
     use SignedExpirationFixture;
 
     private const EXPECTED_PATIENT_ENDPOINTS = [
+        'POST /clinic/v1/patient/link-record',
         'POST /clinic/v1/patient/enroll',
         'GET /clinic/v1/patient/my-records',
         'GET /clinic/v1/patient/me',
@@ -82,14 +84,15 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
         $db->insert(
             'cpms_patients',
             [
-                'clinic_id'  => $this->clinicA,
-                'mrn'        => 'MR-COMP-' . uniqid(),
-                'first_name' => 'Comp',
-                'last_name'  => 'Patient',
-                'mobile'     => '09120030001',
-                'status'     => 'active',
-                'created_at' => $now,
-                'updated_at' => $now,
+                'clinic_id'   => $this->clinicA,
+                'mrn'         => 'MR-COMP-' . uniqid(),
+                'first_name'  => 'Comp',
+                'last_name'   => 'Patient',
+                'mobile'      => '09120030001',
+                'national_id' => '0010000003',
+                'status'      => 'active',
+                'created_at'  => $now,
+                'updated_at'  => $now,
             ]
         );
         $patientA = $db->wpdb_last_insert_id();
@@ -110,16 +113,23 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
         );
         $this->linkA = $db->wpdb_last_insert_id();
 
-        $identity = App::patient_identity_service()->create_identity( $this->orgId, '09120030001' );
-        App::patient_identity_service()->link_user( $this->orgId, $identity, $this->patientUserLinked, '09120030001' );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserLinked,
+            $this->clinicA,
+            $patientA,
+            [
+                'mobile'           => '09120030001',
+                'set_current_user' => false,
+            ]
+        );
 
         $this->installSignedExpiration( time() + 30 * 86400 );
-        wp_set_current_user( 0 );
+        PatientTwoProofTestHelper::acting_as( 0 );
     }
 
     protected function tearDown(): void {
         remove_all_filters( 'cpms_license_public_key' );
-        wp_set_current_user( 0 );
+        PatientTwoProofTestHelper::reset();
         App::resetScope();
         parent::tearDown();
     }
@@ -283,12 +293,16 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
                 }
                 $methods = array_keys( array_filter( (array) ( $endpoint['methods'] ?? [] ) ) );
                 foreach ( $methods as $method ) {
-                    // 1) Denied request (unlinked/wrong clinic) MUST hit PatientAccess and fail closed.
+                    // 1) Denied request (unlinked/wrong clinic/invalid selector) MUST hit PatientAccess and fail closed.
                     $beforeDeny = count( $gateEvents );
-                    wp_set_current_user( $this->patientUserZero );
+                    PatientTwoProofTestHelper::acting_as( $this->patientUserZero );
                     $denyReq = new WP_REST_Request( $method, $route );
                     $denyReq->set_header( 'X-WP-Nonce', wp_create_nonce( 'wp_rest' ) );
-                    $denyReq->set_param( 'clinic_id', $this->clinicB );
+                    if ( '/clinic/v1/patient/link-record' === $route ) {
+                        $denyReq->set_param( 'clinic_id', 0 );
+                    } else {
+                        $denyReq->set_param( 'clinic_id', $this->clinicB );
+                    }
                     if ( in_array( $method, [ 'POST', 'PUT', 'PATCH' ], true ) && '/clinic/v1/patient/me' === $route ) {
                         $denyReq->set_param( 'first_name', 'ShouldNotWrite' );
                     }
@@ -306,14 +320,26 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
                     );
                     $lastDenyEvent = $gateEvents[ count( $gateEvents ) - 1 ];
                     self::assertFalse( $lastDenyEvent['allowed'] );
-                    self::assertSame( 404, $denyRes->get_status(), $method . ' ' . $route . ' must fail closed for unlinked/wrong-clinic user.' );
+                    self::assertSame( 403, $denyRes->get_status(), $method . ' ' . $route . ' must fail closed with 403 PROOF_FAILED.' );
+                    self::assertSame( PatientAccess::PROOF_FAILED_CODE, $denyRes->get_data()['code'] ?? null );
 
                     // 2) Positive control (authorized linked/eligible user) MUST also pass through PatientAccess.
                     $beforeAllow = count( $gateEvents );
-                    wp_set_current_user( $this->patientUserLinked );
+                    PatientTwoProofTestHelper::acting_as( $this->patientUserLinked );
                     $allowReq = new WP_REST_Request( $method, $route );
                     $allowReq->set_header( 'X-WP-Nonce', wp_create_nonce( 'wp_rest' ) );
-                    if ( '/clinic/v1/patient/enroll' === $route ) {
+                    if ( '/clinic/v1/patient/link-record' === $route ) {
+                        $allowReq->set_header( 'Content-Type', 'application/json' );
+                        $allowReq->set_body(
+                            (string) wp_json_encode(
+                                [
+                                    'clinic_id'   => $this->clinicA,
+                                    'mobile'      => '09120030001',
+                                    'national_id' => '0010000003',
+                                ]
+                            )
+                        );
+                    } elseif ( '/clinic/v1/patient/enroll' === $route ) {
                         $allowReq->set_param( 'clinic_id', $this->clinicB );
                         $allowReq->set_param( 'first_name', 'Enrolled' );
                         $allowReq->set_param( 'last_name', 'Patient' );

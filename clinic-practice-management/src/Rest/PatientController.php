@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace ClinicCore\Rest;
 
 use ClinicCore\Application\Auth\PatientAccess;
+use ClinicCore\Application\Auth\PatientBindingPromoter;
+use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Application\Patients\PatientService;
 use ClinicCore\Auth\RolesAndCapabilities;
@@ -31,12 +33,29 @@ final class PatientController extends RestBase
 {
     public function __construct(
         private readonly PatientService $patients,
-        private readonly ?PatientAccess $patient_access = null
+        private readonly ?PatientAccess $patient_access = null,
+        private readonly ?PatientBindingPromoter $promoter = null
     ) {
     }
 
     public function register_routes(): void
     {
+        register_rest_route(
+            self::NS,
+            '/patient/link-record',
+            [
+                'methods'             => WP_REST_Server::CREATABLE,
+                'permission_callback' => fn ( WP_REST_Request $request ) => $this->require_patient_link_record_access( $request ),
+                'callback'            => fn ( WP_REST_Request $request ) => $this->link_record( $request ),
+                'args'                => [
+                    'clinic_id'   => [ 'required' => false, 'type' => 'integer' ],
+                    'mobile'      => [ 'required' => false, 'type' => 'string' ],
+                    'code'        => [ 'required' => false, 'type' => 'string' ],
+                    'national_id' => [ 'required' => false, 'type' => 'string' ],
+                ],
+            ]
+        );
+
         register_rest_route(
             self::NS,
             '/patient/enroll',
@@ -219,6 +238,50 @@ final class PatientController extends RestBase
             $fields,
             (int) $user->ID
         ));
+    }
+
+    /**
+     * Two-factor promotion of a target Clinic patient record into an active
+     * durable binding + live session proof (§6.2).
+     */
+    private function link_record( WP_REST_Request $request ): WP_REST_Response|WP_Error
+    {
+        $query = $request->get_query_params();
+        if (
+            is_array( $query )
+            && (
+                array_key_exists( 'national_id', $query )
+                || array_key_exists( 'code', $query )
+                || array_key_exists( 'mobile', $query )
+            )
+        ) {
+            return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );
+        }
+
+        $body        = $this->body_only( $request );
+        $clinic_raw  = $body['clinic_id'] ?? $request->get_header( 'X-CPMS-Clinic-Id' );
+        $clinic_id   = is_numeric( $clinic_raw ) ? (int) $clinic_raw : 0;
+        $raw_mobile  = is_string( $body['mobile'] ?? null ) ? (string) $body['mobile'] : '';
+        $raw_nid     = is_string( $body['national_id'] ?? null ) ? (string) $body['national_id'] : '';
+        $raw_code    = is_string( $body['code'] ?? null ) ? (string) $body['code'] : null;
+        $user_id     = (int) get_current_user_id();
+        $ip          = ClientIp::resolve() ?? '0.0.0.0';
+        $promoter    = $this->promoter ?? App::patient_binding_promoter();
+
+        if ( $clinic_id <= 0 ) {
+            return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );
+        }
+
+        return $this->wrap(
+            static fn (): array => $promoter->promote(
+                $user_id,
+                $clinic_id,
+                $raw_mobile,
+                $raw_nid,
+                $raw_code,
+                $ip
+            )
+        );
     }
 
     private function create(WP_REST_Request $request): WP_REST_Response|WP_Error
