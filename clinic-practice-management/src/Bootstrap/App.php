@@ -442,9 +442,7 @@ final class App
         // نمی‌شود تا فعال‌سازیِ ردشده هیچ رویدادِ `cpms_jobs_tick` روی سایت نگذارد؛
         // مسیرِ فعال‌سازیِ مجاز خودش در `activate()` آن را ثبت می‌کند و هر درخواستِ
         // عادیِ دیگر (غیرِ sandbox) مثل قبل اجرا می‌شود.
-        if ( ! ( defined( 'WP_SANDBOX_SCRAPING' ) && WP_SANDBOX_SCRAPING ) ) {
-            CronScheduleRepair::ensure_scheduled();
-        }
+        self::ensure_boot_cron();
 
         // ترمیمِ خودکارِ سمتِ مدیریت (throttle‌شده، حداکثر یک‌بار در ساعت):
         // فقط **شکست** لاگ می‌شود. ثبتِ یک «ترمیمِ موفق» در این مسیرِ خودکار
@@ -945,6 +943,12 @@ final class App
         // so the exception is scoped to exactly this statement.
         // phpcs:ignore WordPress.WP.CronInterval.CronSchedulesInterval
         add_filter( 'cron_schedules', array( self::class, 'filter_cron_schedules' ) );
+    }
+
+    private static function ensure_boot_cron(): void {
+        if ( ! ( defined( 'WP_SANDBOX_SCRAPING' ) && WP_SANDBOX_SCRAPING ) && ! \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
+            CronScheduleRepair::ensure_scheduled();
+        }
     }
 
     private static function ensureMigrated(): void

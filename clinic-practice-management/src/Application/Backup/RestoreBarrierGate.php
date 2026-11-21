@@ -10,11 +10,15 @@ use WP_User;
 
 /** Request-bound restrictions for a durable restore marker. */
 final class RestoreBarrierGate {
+    public const ERROR_CODE = 'cpms_restore_blocked';
+
     public static function register(): void {
         add_action( 'login_init', [ self::class, 'guard_login_action' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WordPress login entry point.
         add_action( 'init', [ self::class, 'guard_worker' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
         add_action( 'admin_init', [ self::class, 'guard_admin' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
         add_action( 'template_redirect', [ self::class, 'guard_frontend' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
+        add_filter( 'wp_authenticate_user', [ self::class, 'guard_login' ], PHP_INT_MIN ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core applies this before password rehash.
+        add_filter( 'wp_is_application_passwords_available_for_user', [ self::class, 'guard_application_passwords' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core checks availability before recording usage.
         add_filter( 'authenticate', [ self::class, 'guard_login' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
         add_filter( 'rest_authentication_errors', [ self::class, 'guard_rest' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
         add_filter( 'rest_pre_dispatch', [ self::class, 'guard_rest' ], PHP_INT_MAX ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Register on an existing WordPress core hook.
@@ -39,6 +43,10 @@ final class RestoreBarrierGate {
         }
 
         return $result instanceof WP_User && user_can( $result, 'manage_options' ) && user_can( $result, RolesAndCapabilities::CONFIG ) ? $result : self::error();
+    }
+
+    public static function guard_application_passwords( bool $available ): bool {
+        return $available && ! self::blocked();
     }
 
     public static function guard_shortcode( mixed $result ): mixed {
@@ -80,7 +88,7 @@ final class RestoreBarrierGate {
     }
 
     private static function error(): WP_Error {
-        return new WP_Error( 'cpms_restore_blocked', 'Site access is temporarily unavailable during restore.', [ 'status' => 503 ] );
+        return new WP_Error( self::ERROR_CODE, 'Site access is temporarily unavailable during restore.', [ 'status' => 503 ] );
     }
 
     private static function deny(): void {

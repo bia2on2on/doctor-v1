@@ -8208,3 +8208,6 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 
 ### [2026-11-21 UTC] — PR14-BARRIER-FIX-2: restore barrier review fixes
 - Added login action denial, guarded known bootstrap writers, required canonical staging for marker writes, used conditional marker/journal writes, and restored a shared safety-backup operation witness. Added RB-11–RB-15. The recovery identity contract remains pending; restoreApply and teardown still refuse before writes.
+
+### [2026-11-21 UTC] — PR14-BARRIER-FIX-3: boot cron and pre-rehash guards
+- Correction to FIX-2: the earlier “guarded known bootstrap writers” claim missed the eager boot cron scheduler and core pre-denial password rehash. Guarded those paths, restore-denial login accounting, core Application Password authentication while marked, and consumption of the recovery status notice. Added RB-16 and RB-17. No production marker writer, teardown clearance, or restore import was enabled.

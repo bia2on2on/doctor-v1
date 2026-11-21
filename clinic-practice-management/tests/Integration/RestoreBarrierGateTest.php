@@ -169,6 +169,101 @@ final class RestoreBarrierGateTest extends WP_UnitTestCase {
         self::assertSame($page, $allowed);
     }
 
+    /** RB-16: the boot scheduling path writes cron only without the marker. */
+    public function testBootCronWriteHasAbsentMarkerWitness(): void {
+        global $wpdb;
+        $hook = \ClinicCore\Application\System\CronScheduleRepair::HOOK;
+        $boot = new \ReflectionMethod(\ClinicCore\Bootstrap\App::class, 'ensure_boot_cron');
+        $old_cron = _get_cron_array();
+        wp_clear_scheduled_hook($hook);
+        self::assertFalse(wp_next_scheduled($hook));
+        $pattern = '/\AUPDATE `' . preg_quote($wpdb->options, '/') . "` SET `option_value` = '.*'(?:, `autoload` = '[^']+')? WHERE `option_name` = 'cron'\z/s";
+        $hits = 0;
+        $watch = static function (string $sql) use ($pattern, &$hits): string {
+            if (preg_match($pattern, $sql) === 1) {
+                ++$hits;
+            }
+            return $sql;
+        };
+        add_filter('query', $watch);
+        try {
+            self::assertTrue(add_option(RestoreBarrierStore::OPTION, 'test marker', '', false));
+            $boot->invoke(null);
+            $blocked_hits = $hits;
+            $blocked = wp_next_scheduled($hook);
+            delete_option(RestoreBarrierStore::OPTION);
+            $boot->invoke(null);
+            $scheduled = wp_next_scheduled($hook);
+        } finally {
+            remove_filter('query', $watch);
+            delete_option(RestoreBarrierStore::OPTION);
+            _set_cron_array($old_cron);
+        }
+        self::assertFalse($blocked);
+        self::assertSame(0, $blocked_hits);
+        self::assertIsInt($scheduled);
+        self::assertSame(1, $hits);
+    }
+
+    /** RB-17: real core authentication cannot rehash or account for a barrier denial. */
+    public function testCoreAuthenticationDoesNotWriteForDeniedUser(): void {
+        global $wpdb;
+        $db = \ClinicCore\Bootstrap\App::db();
+        $password = 'synthetic-restore-auth-witness';
+        $old_hash = md5($password);
+        $patient = self::factory()->user->create_and_get(['role' => 'subscriber']);
+        $manager = self::factory()->user->create_and_get(['role' => 'administrator']);
+        $manager->add_cap('cpms_config');
+        foreach ([$patient, $manager] as $user) {
+            self::assertSame(1, $wpdb->update($wpdb->users, ['user_pass' => $old_hash], ['ID' => $user->ID]));
+            clean_user_cache($user);
+        }
+        $snapshot = static fn (): array => [
+            $db->fetch_all_strict('SELECT * FROM %i ORDER BY window_key, window_id', [$db->table('rate_limits')]),
+            $db->fetch_all_strict('SELECT * FROM %i ORDER BY id', [$db->table('operational_logs')]),
+        ];
+        $before = $snapshot();
+        $pattern = '/\AUPDATE `' . preg_quote($wpdb->users, '/') . "` SET `user_pass` = '[^']+', `user_activation_key` = '' WHERE `ID` = " . $patient->ID . '\z/';
+        $hits = 0;
+        $watch = static function (string $sql) use ($pattern, &$hits): string {
+            if (preg_match($pattern, $sql) === 1) {
+                ++$hits;
+            }
+            return $sql;
+        };
+        add_filter('query', $watch);
+        try {
+            self::assertTrue(add_option(RestoreBarrierStore::OPTION, 'test marker', '', false));
+            $denied_login = wp_authenticate($patient->user_login, $password);
+            $denied_email = wp_authenticate($patient->user_email, $password);
+            $after = $snapshot();
+            $blocked_hash = $wpdb->get_var($wpdb->prepare('SELECT user_pass FROM %i WHERE ID = %d', $wpdb->users, $patient->ID));
+            $blocked_hits = $hits;
+            $app_password_allowed = apply_filters('wp_is_application_passwords_available_for_user', true, $patient);
+            $exempt = wp_authenticate($manager->user_login, $password);
+            delete_option(RestoreBarrierStore::OPTION);
+            $normal = wp_authenticate($patient->user_login, $password);
+            $normal_hash = $wpdb->get_var($wpdb->prepare('SELECT user_pass FROM %i WHERE ID = %d', $wpdb->users, $patient->ID));
+        } finally {
+            remove_filter('query', $watch);
+            delete_option(RestoreBarrierStore::OPTION);
+        }
+        self::assertInstanceOf(WP_Error::class, $denied_login);
+        self::assertInstanceOf(WP_Error::class, $denied_email);
+        self::assertSame(RestoreBarrierGate::ERROR_CODE, $denied_login->get_error_code());
+        self::assertSame(RestoreBarrierGate::ERROR_CODE, $denied_email->get_error_code());
+        self::assertSame($before, $after);
+        self::assertSame($old_hash, $blocked_hash);
+        self::assertSame(0, $blocked_hits);
+        self::assertFalse($app_password_allowed);
+        self::assertInstanceOf(\WP_User::class, $exempt);
+        self::assertSame($manager->ID, $exempt->ID);
+        self::assertInstanceOf(\WP_User::class, $normal);
+        self::assertSame($patient->ID, $normal->ID);
+        self::assertNotSame($old_hash, $normal_hash);
+        self::assertSame(1, $hits);
+    }
+
     private function denied(callable $guard): bool {
         try {
             $guard();

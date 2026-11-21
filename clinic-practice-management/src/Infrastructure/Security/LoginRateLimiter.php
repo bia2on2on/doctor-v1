@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Infrastructure\Security;
 
+use ClinicCore\Application\Backup\RestoreBarrierGate;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 
 /**
@@ -51,7 +52,7 @@ final class LoginRateLimiter
     {
         // اولویت 5: پیش از wp_authenticate_username_password (20).
         add_filter('authenticate', [$this, 'blockWhenThrottled'], 5, 3);
-        add_action('wp_login_failed', [$this, 'recordFailure'], 10, 1);
+        add_action( 'wp_login_failed', [ $this, 'recordFailure' ], 10, 2 );
     }
 
     /**
@@ -82,7 +83,9 @@ final class LoginRateLimiter
             return $user;
         }
 
-        $this->record('LOGIN_THROTTLED', $username, $ip);
+        if ( ! RestoreBarrierGate::blocked() ) {
+            $this->record( 'LOGIN_THROTTLED', $username, $ip );
+        }
 
         return new \WP_Error(
             'CLINIC_RATE_LIMITED',
@@ -94,8 +97,12 @@ final class LoginRateLimiter
     /**
      * فقط شکست‌ها شمرده می‌شوند.
      */
-    public function recordFailure(string $username): void
+    // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- Preserve the existing public callback.
+    public function recordFailure( string $username, ?\WP_Error $error = null ): void
     {
+        if ( null !== $error && RestoreBarrierGate::ERROR_CODE === $error->get_error_code() ) {
+            return;
+        }
         $ip = ClientIp::resolve();
         if ($ip !== null) {
             $this->rate->hit('login-ip:' . $ip, self::MAX_PER_IP, self::WINDOW_SEC);

@@ -131,7 +131,7 @@ final class SystemPage
         }
 
         $notice = get_transient(self::NOTICE_KEY);
-        if ($notice !== false) {
+        if ( false !== $notice && ! \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
             delete_transient(self::NOTICE_KEY);
         }
 
