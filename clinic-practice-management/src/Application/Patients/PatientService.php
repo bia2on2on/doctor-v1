@@ -173,11 +173,24 @@ final class PatientService
             }
         }
 
-        // D6 audit atomicity: profile write and mandatory audit commit/roll back together.
+        $close_bindings         = array_key_exists( 'national_id', $data )
+            && (string) ( $data['national_id'] ?? '' ) !== (string) ( $current['national_id'] ?? '' );
+        $affected_binding_users = [];
+
+        // D6 audit atomicity: profile write, binding closure (§7.6), and mandatory audit commit/roll back together.
         $this->db->transactional(
-            function () use ( $wp_user_id, $current, $data ) {
+            function () use ( $wp_user_id, $current, $data, $close_bindings, &$affected_binding_users ) {
                 $this->patients->update( (int) $current['id'], $data + [ 'updated_at' => $this->db->nowUtcSql() ] );
                 $this->assert_profile_write_succeeded( $current, $data );
+                if ( $close_bindings ) {
+                    $login_repo = new PatientLoginRepository( $this->db );
+                    if ( $login_repo->table_exists() ) {
+                        $affected_binding_users = $login_repo->close_bindings_for_patient(
+                            (int) $current['clinic_id'],
+                            (int) $current['id']
+                        );
+                    }
+                }
                 $updated = (array) $this->patients->find( (int) $current['id'] );
 
                 $this->audit->log(
@@ -193,6 +206,12 @@ final class PatientService
                 );
             }
         );
+        if ( [] !== $affected_binding_users ) {
+            $proof_store = new PatientSessionProofStore();
+            foreach ( $affected_binding_users as $affected_user_id ) {
+                $proof_store->destroy_all_sessions( $affected_user_id );
+            }
+        }
         $updated = (array) $this->patients->find( (int) $current['id'] );
         $this->op->info( 'patient.profile_updated', [ 'patient_id' => (int) $current['id'], 'fields' => array_keys( $data ) ] );
 

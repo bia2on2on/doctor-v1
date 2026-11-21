@@ -180,6 +180,7 @@ use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Settings\Settings;
 use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
@@ -624,6 +625,94 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $holdRow = $this->holdRowByToken($holdToken);
         self::assertSame('active', (string) $holdRow['status'], 'Hold must remain active/retryable.');
         self::assertSame(1, $this->heldCountOf($slot['slot_id']), 'Capacity still held.');
+    }
+
+    /**
+     * Witnessed service-boundary proof for BookingService::confirm() historical-NULL
+     * branch (0 / 1 / >1 proved subjects), independent of REST BookingController's gate.
+     */
+    public function testServiceBoundaryHistoricalNullHoldRejectsZeroAndMultipleProvedSubjectsAndAllowsSingleProvedSubject(): void {
+        $this->buildTwoClinicFixture();
+        $bookingService = App::bookingService();
+
+        // 1) Zero proved subjects (even with same-mobile unlinked Patient) -> 400 CLINIC_VALIDATION_FAILED, zero side effects.
+        $mobileZero     = $this->mobileFor( 'svc-null-0' );
+        $sameMobileZero = $this->insertPatient( $this->clinicA, $mobileZero, 'UnlinkedSvc', 'SameMobile' );
+        $userZero       = (int) wp_create_user( 'p8s3_svc_0_' . uniqid( '', false ), 'pass-not-used-123', $mobileZero . '@otp.cpms.local' );
+        self::assertGreaterThan( 0, $userZero );
+        $this->setRole( $userZero, 'cpms_patient' );
+        cpms_test_seed_patient_session( $userZero, $this->clinicA );
+        $slotZero      = $this->seedSlot( $this->clinicA, $this->locationA, $this->clinicianA, $this->ymdDaysAhead( 5 ), '16:00:00', 1 );
+        $holdTokenZero = $this->seedLegacyNullHoldRow( $this->clinicA, $slotZero['slot_id'], $userZero, $mobileZero );
+        $idemBefore    = $this->countRows( 'cpms_idempotency_keys' );
+
+        try {
+            $bookingService->confirm( $holdTokenZero, $userZero, null, $this->uuid(), 'سارا', 'احمدی' );
+            self::fail( 'Service boundary must reject 0-proved historical-NULL hold.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 'CLINIC_VALIDATION_FAILED', $e->errorCode );
+            self::assertSame( 400, $e->httpStatus );
+            self::assertSame( 'پروفایل شما ناقص است — ابتدا موبایل خود را تأیید کنید (OTP)', $e->getMessage() );
+        }
+
+        self::assertSame( 1, $this->countPatientsForMobile( $this->clinicA, $mobileZero ), 'No new Patient row may be created.' );
+        self::assertSame( 0, $this->countAppointmentsForPatient( $sameMobileZero ), 'Same-mobile unlinked Patient must gain no Appointment.' );
+        self::assertSame( 0, $this->countRows( 'cpms_appointments' ) );
+        self::assertSame( 0, $this->countPatientLinksForUser( $userZero ) );
+        self::assertSame( $idemBefore, $this->countRows( 'cpms_idempotency_keys' ), 'Rejection must occur before idempotency reservation.' );
+        $holdRowZero = $this->holdRowByToken( $holdTokenZero );
+        self::assertIsArray( $holdRowZero );
+        self::assertSame( 'active', (string) $holdRowZero['status'] );
+        self::assertSame( 1, $this->heldCountOf( $slotZero['slot_id'] ) );
+
+        // 2) >1 proved subjects with historical-NULL hold -> 422 CLINIC_PATIENT_SELECTION_REQUIRED, zero side effects.
+        $patientM1 = $this->insertPatient( $this->clinicA, $this->mobileFor( 'svc-null-m1' ), 'MultiOne', 'Proved' );
+        $patientM2 = $this->insertPatient( $this->clinicA, $this->mobileFor( 'svc-null-m2' ), 'MultiTwo', 'Proved' );
+        $userMulti = $this->createPatientUserWithLinks(
+            $this->clinicA,
+            [
+                [ 'id' => $patientM1, 'mobile' => $this->mobileFor( 'svc-null-m1' ), 'primary' => 1 ],
+                [ 'id' => $patientM2, 'mobile' => $this->mobileFor( 'svc-null-m2' ), 'primary' => 0 ],
+            ]
+        );
+        PatientTwoProofTestHelper::acting_as( $userMulti );
+        $slotMulti      = $this->seedSlot( $this->clinicA, $this->locationA, $this->clinicianA, $this->ymdDaysAhead( 5 ), '16:20:00', 1 );
+        $holdTokenMulti = $this->seedLegacyNullHoldRow( $this->clinicA, $slotMulti['slot_id'], $userMulti, $this->mobileFor( 'svc-null-m1' ) );
+
+        try {
+            $bookingService->confirm( $holdTokenMulti, $userMulti, null, $this->uuid(), null, null );
+            self::fail( 'Service boundary must reject >1-proved historical-NULL hold without selection.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 'CLINIC_PATIENT_SELECTION_REQUIRED', $e->errorCode );
+            self::assertSame( 422, $e->httpStatus );
+        }
+
+        self::assertSame( 0, $this->countAppointmentsForPatient( $patientM1 ) );
+        self::assertSame( 0, $this->countAppointmentsForPatient( $patientM2 ) );
+        $holdRowMulti = $this->holdRowByToken( $holdTokenMulti );
+        self::assertIsArray( $holdRowMulti );
+        self::assertSame( 'active', (string) $holdRowMulti['status'] );
+        self::assertSame( 1, $this->heldCountOf( $slotMulti['slot_id'] ) );
+
+        // 3) Positive witness control: 1 proved subject with historical-NULL hold confirms cleanly.
+        $patientOne = $this->insertPatient( $this->clinicA, $this->mobileFor( 'svc-null-1' ), 'Single', 'Proved' );
+        $userOne    = $this->createPatientUserWithLinks(
+            $this->clinicA,
+            [
+                [ 'id' => $patientOne, 'mobile' => $this->mobileFor( 'svc-null-1' ), 'primary' => 1 ],
+            ]
+        );
+        PatientTwoProofTestHelper::acting_as( $userOne );
+        $slotOne      = $this->seedSlot( $this->clinicA, $this->locationA, $this->clinicianA, $this->ymdDaysAhead( 5 ), '16:40:00', 1 );
+        $holdTokenOne = $this->seedLegacyNullHoldRow( $this->clinicA, $slotOne['slot_id'], $userOne, $this->mobileFor( 'svc-null-1' ) );
+
+        $confirmed = $bookingService->confirm( $holdTokenOne, $userOne, null, $this->uuid(), null, null );
+        self::assertSame( 'confirmed', $confirmed['status'] ?? null );
+        self::assertGreaterThan( 0, (int) ( $confirmed['appointment_id'] ?? 0 ) );
+        self::assertSame( 1, $this->countAppointmentsForPatient( $patientOne ) );
+        $holdRowOne = $this->holdRowByToken( $holdTokenOne );
+        self::assertIsArray( $holdRowOne );
+        self::assertSame( 'converted', (string) $holdRowOne['status'] );
     }
 
     // =================================================================

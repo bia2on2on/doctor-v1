@@ -10,6 +10,7 @@ use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientBindingPromoter;
 use ClinicCore\Application\Auth\PatientNidHmac;
 use ClinicCore\Application\Auth\PatientSessionProofStore;
+use ClinicCore\Application\Patients\PatientEnrollmentOptions;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
@@ -17,7 +18,9 @@ use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Domain\Otp\OtpPolicy;
 use ClinicCore\Domain\Sms\SmsEvents;
 use ClinicCore\Frontend\PortalLogin;
+use ClinicCore\Frontend\PublicBookingShortcode;
 use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use WP_REST_Request;
 use WP_Session_Tokens;
@@ -104,6 +107,7 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
     }
 
     protected function tearDown(): void {
+        PatientTwoProofTestHelper::reset();
         remove_all_filters( 'cpms_license_public_key' );
         wp_set_current_user( 0 );
         App::resetScope();
@@ -459,6 +463,606 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
             }
         }
         self::assertSame( PatientBindingPromoter::RATE_ACCOUNT_MAX + 2, $attemptsBlocked );
+
+        // Control at threshold: an otherwise-valid request (valid mobile, valid OTP, matching NID)
+        // on the throttled account MUST still fail closed and leave the OTP unconsumed.
+        $validMobile = '09128880009';
+        $validNid    = '0020000006';
+        $this->insertPatient( $this->clinicA, 'MR-TP-VALID-RL-' . uniqid(), $validMobile, $validNid );
+        $this->seedOtp( $this->clinicA, $validMobile, '441122', OtpService::PURPOSE_VERIFY_MOBILE );
+        try {
+            App::patient_binding_promoter()->promote(
+                $this->patientUserB,
+                $this->clinicA,
+                $validMobile,
+                $validNid,
+                '441122',
+                '198.51.100.23',
+                $now,
+                $tokenB
+            );
+            self::fail( 'Otherwise-valid attempt at account rate-limit threshold must fail closed.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 403, $e->httpStatus );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $e->errorCode );
+        }
+        $logins = new PatientLoginRepository( App::db() );
+        self::assertSame( [], $logins->find_active_bindings_for_user( $this->patientUserB ) );
+        $unconsumedOtp = (int) App::db()->fetchValue(
+            'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_otp_tokens' )
+            . ' WHERE mobile = %s AND consumed_at IS NULL',
+            [ $validMobile ]
+        );
+        self::assertSame( 1, $unconsumedOtp, 'Rate-limited valid control must not consume OTP.' );
+    }
+
+    public function testRateLimitBucketsAccountMobileNidAndPreviousKeyWithValidControls(): void {
+        $proofStore = new PatientSessionProofStore();
+        $logins     = new PatientLoginRepository( App::db() );
+        $now        = time();
+
+        // 0) Positive control below threshold: fresh user + valid OTP + matching NID succeeds.
+        $posMobile = '09128850001';
+        $posNid    = '0030000009';
+        $posPat    = $this->insertPatient( $this->clinicA, 'MR-RL-POS-' . uniqid(), $posMobile, $posNid );
+        $posUser   = $this->makeUser( 'tp_rl_pos_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $logins->insert_pending_account( $posUser, $posMobile, 'RL', 'Pos' );
+        $posToken = $proofStore->issue_non_persistent_auth_cookie( $posUser );
+        $this->seedOtp( $this->clinicA, $posMobile, '112233', OtpService::PURPOSE_VERIFY_MOBILE );
+        $posResult = App::patient_binding_promoter()->promote(
+            $posUser,
+            $this->clinicA,
+            $posMobile,
+            $posNid,
+            '112233',
+            '198.51.101.1',
+            $now,
+            $posToken
+        );
+        self::assertSame( $posPat, $posResult['patient_id'] );
+
+        // 1) Independent account bucket (`pl-acct:<uid>`): exhaust on fresh account, then valid inputs fail.
+        $acctMobile = '09128850002';
+        $acctNid    = '0040000001';
+        $this->insertPatient( $this->clinicA, 'MR-RL-ACCT-' . uniqid(), $acctMobile, $acctNid );
+        $acctUser = $this->makeUser( 'tp_rl_acct_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $logins->insert_pending_account( $acctUser, $acctMobile, 'RL', 'Acct' );
+        $acctToken = $proofStore->issue_non_persistent_auth_cookie( $acctUser );
+        for ( $i = 0; $i < PatientBindingPromoter::RATE_ACCOUNT_MAX; $i++ ) {
+            try {
+                App::patient_binding_promoter()->promote(
+                    $acctUser,
+                    $this->clinicA,
+                    $acctMobile,
+                    self::NID_WRONG,
+                    '999999',
+                    '198.51.101.' . ( 10 + $i ),
+                    $now,
+                    $acctToken
+                );
+                self::fail( 'Wrong credentials must fail closed.' );
+            } catch ( BookingException $e ) {
+                self::assertSame( 403, $e->httpStatus );
+            }
+        }
+        $this->seedOtp( $this->clinicA, $acctMobile, '223344', OtpService::PURPOSE_VERIFY_MOBILE );
+        try {
+            App::patient_binding_promoter()->promote(
+                $acctUser,
+                $this->clinicA,
+                $acctMobile,
+                $acctNid,
+                '223344',
+                '198.51.101.29',
+                $now,
+                $acctToken
+            );
+            self::fail( 'Account rate-limit bucket must block otherwise-valid attempt at threshold.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 403, $e->httpStatus );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $e->errorCode );
+        }
+        self::assertSame( [], $logins->find_active_bindings_for_user( $acctUser ) );
+
+        // 2) Independent mobile bucket (`pl-mob:<hmac>`): distinct accounts & NIDs & IPs exhaust one mobile.
+        $mobTarget = '09128870001';
+        $mobNid    = '0090000005';
+        $this->insertPatient( $this->clinicA, 'MR-RL-MOB-' . uniqid(), $mobTarget, $mobNid );
+        for ( $i = 0; $i < PatientBindingPromoter::RATE_MOBILE_MAX; $i++ ) {
+            $u = $this->makeUser( 'tp_rl_mob_' . $i . '_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+            $logins->insert_pending_account( $u, $mobTarget, 'RL', 'Mob' );
+            $t = $proofStore->issue_non_persistent_auth_cookie( $u );
+            try {
+                App::patient_binding_promoter()->promote(
+                    $u,
+                    $this->clinicA,
+                    $mobTarget,
+                    self::NID_WRONG,
+                    '999999',
+                    '198.51.102.' . ( 10 + $i ),
+                    $now,
+                    $t
+                );
+                self::fail( 'Wrong credentials must fail closed.' );
+            } catch ( BookingException $e ) {
+                self::assertSame( 403, $e->httpStatus );
+            }
+        }
+        $mobFreshUser  = $this->makeUser( 'tp_rl_mob_ok_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $logins->insert_pending_account( $mobFreshUser, $mobTarget, 'RL', 'MobOk' );
+        $mobFreshToken = $proofStore->issue_non_persistent_auth_cookie( $mobFreshUser );
+        $this->seedOtp( $this->clinicA, $mobTarget, '334455', OtpService::PURPOSE_VERIFY_MOBILE );
+        try {
+            App::patient_binding_promoter()->promote(
+                $mobFreshUser,
+                $this->clinicA,
+                $mobTarget,
+                $mobNid,
+                '334455',
+                '198.51.102.99',
+                $now,
+                $mobFreshToken
+            );
+            self::fail( 'Mobile rate-limit bucket must block otherwise-valid attempt from fresh account.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 403, $e->httpStatus );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $e->errorCode );
+        }
+        self::assertSame( [], $logins->find_active_bindings_for_user( $mobFreshUser ) );
+
+        // 3) Independent NID bucket (`nid:<hmac>`): distinct accounts, mobiles & IPs exhaust one NID.
+        $nidTarget = '0050000004';
+        for ( $i = 0; $i < PatientBindingPromoter::RATE_NID_MAX; $i++ ) {
+            $m = sprintf( '0912889%04d', $i + 1 );
+            $u = $this->makeUser( 'tp_rl_nid_' . $i . '_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+            $logins->insert_pending_account( $u, $m, 'RL', 'Nid' );
+            $t = $proofStore->issue_non_persistent_auth_cookie( $u );
+            try {
+                App::patient_binding_promoter()->promote(
+                    $u,
+                    $this->clinicA,
+                    $m,
+                    $nidTarget,
+                    '999999',
+                    '198.51.103.' . ( 10 + $i ),
+                    $now,
+                    $t
+                );
+                self::fail( 'Wrong OTP must fail closed.' );
+            } catch ( BookingException $e ) {
+                self::assertSame( 403, $e->httpStatus );
+            }
+        }
+        $nidFreshMobile = '09128890099';
+        $this->insertPatient( $this->clinicA, 'MR-RL-NID-' . uniqid(), $nidFreshMobile, $nidTarget );
+        $nidFreshUser  = $this->makeUser( 'tp_rl_nid_ok_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $logins->insert_pending_account( $nidFreshUser, $nidFreshMobile, 'RL', 'NidOk' );
+        $nidFreshToken = $proofStore->issue_non_persistent_auth_cookie( $nidFreshUser );
+        $this->seedOtp( $this->clinicA, $nidFreshMobile, '445566', OtpService::PURPOSE_VERIFY_MOBILE );
+        try {
+            App::patient_binding_promoter()->promote(
+                $nidFreshUser,
+                $this->clinicA,
+                $nidFreshMobile,
+                $nidTarget,
+                '445566',
+                '198.51.103.99',
+                $now,
+                $nidFreshToken
+            );
+            self::fail( 'NID HMAC rate-limit bucket must block otherwise-valid attempt from fresh account/mobile/IP.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 403, $e->httpStatus );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $e->errorCode );
+        }
+        self::assertSame( [], $logins->find_active_bindings_for_user( $nidFreshUser ) );
+
+        // 4) Previous-key overlap bucket (`cpms_nid_hmac_key_previous`): rotated key still enforces prior-window hits.
+        $prevActiveOpt   = get_option( PatientNidHmac::OPTION_KEY, null );
+        $prevPreviousOpt = get_option( PatientNidHmac::OPTION_PREVIOUS_KEY, null );
+        try {
+            $oldKey = 'old-hmac-key-material-32-bytes-01';
+            $newKey = 'new-hmac-key-material-32-bytes-02';
+            update_option( PatientNidHmac::OPTION_KEY, $oldKey, 'no' );
+            delete_option( PatientNidHmac::OPTION_PREVIOUS_KEY );
+
+            $rotNid      = '0060000007';
+            $rotMobile   = '09128860001';
+            $oldBucket   = ( new PatientNidHmac() )->rate_limit_key( $rotNid );
+            $rateLimiter = App::rateLimiter();
+            for ( $i = 0; $i < PatientBindingPromoter::RATE_NID_MAX; $i++ ) {
+                $rateLimiter->hit( $oldBucket, PatientBindingPromoter::RATE_NID_MAX, PatientBindingPromoter::RATE_WINDOW_SEC );
+            }
+
+            update_option( PatientNidHmac::OPTION_KEY, $newKey, 'no' );
+            update_option( PatientNidHmac::OPTION_PREVIOUS_KEY, $oldKey, 'no' );
+
+            $this->insertPatient( $this->clinicA, 'MR-RL-ROT-' . uniqid(), $rotMobile, $rotNid );
+            $rotUser  = $this->makeUser( 'tp_rl_rot_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+            $logins->insert_pending_account( $rotUser, $rotMobile, 'RL', 'Rot' );
+            $rotToken = $proofStore->issue_non_persistent_auth_cookie( $rotUser );
+            $this->seedOtp( $this->clinicA, $rotMobile, '556677', OtpService::PURPOSE_VERIFY_MOBILE );
+            try {
+                App::patient_binding_promoter()->promote(
+                    $rotUser,
+                    $this->clinicA,
+                    $rotMobile,
+                    $rotNid,
+                    '556677',
+                    '198.51.104.1',
+                    $now,
+                    $rotToken
+                );
+                self::fail( 'Previous-key overlap bucket must block otherwise-valid attempt after key rotation.' );
+            } catch ( BookingException $e ) {
+                self::assertSame( 403, $e->httpStatus );
+                self::assertSame( PatientAccess::PROOF_FAILED_CODE, $e->errorCode );
+            }
+            self::assertSame( [], $logins->find_active_bindings_for_user( $rotUser ) );
+        } finally {
+            if ( null === $prevActiveOpt || '' === $prevActiveOpt ) {
+                delete_option( PatientNidHmac::OPTION_KEY );
+            } else {
+                update_option( PatientNidHmac::OPTION_KEY, $prevActiveOpt, 'no' );
+            }
+            if ( null === $prevPreviousOpt || '' === $prevPreviousOpt ) {
+                delete_option( PatientNidHmac::OPTION_PREVIOUS_KEY );
+            } else {
+                update_option( PatientNidHmac::OPTION_PREVIOUS_KEY, $prevPreviousOpt, 'no' );
+            }
+        }
+    }
+
+    public function testPatientSelfUpdateMeNidChangeClosesBindingsAndDestroysSessionsWithControls(): void {
+        $proofStore = new PatientSessionProofStore();
+        $token      = $proofStore->issue_non_persistent_auth_cookie( $this->patientUserA );
+        $now        = time();
+
+        $this->seedOtp( $this->clinicA, self::MOBILE_A, '667700', OtpService::PURPOSE_VERIFY_MOBILE );
+        App::patient_binding_promoter()->promote(
+            $this->patientUserA,
+            $this->clinicA,
+            self::MOBILE_A,
+            self::NID_A,
+            '667700',
+            '198.51.105.1',
+            $now,
+            $token
+        );
+        self::assertSame( PatientAccess::LEVEL_FULL, App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 5, $token ) );
+
+        $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie( $this->patientUserA, $now + PatientSessionProofStore::SESSION_TTL_SECONDS, 'logged_in', $token );
+        wp_set_current_user( $this->patientUserA );
+        $logins = new PatientLoginRepository( App::db() );
+
+        // Control 1: non-NID update via updateMe() leaves active binding and session intact.
+        $updatedName = App::patientService()->updateMe( $this->patientUserA, [ 'first_name' => 'NoClosure' ] );
+        self::assertSame( 'NoClosure', $updatedName['first_name'] ?? null );
+        self::assertNotNull( $logins->find_binding( $this->patientUserA, $this->clinicA, $this->patientA, true ) );
+        self::assertIsArray( WP_Session_Tokens::get_instance( $this->patientUserA )->get( $token ) );
+        self::assertSame( PatientAccess::LEVEL_FULL, App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 5, $token ) );
+
+        // Control 2: duplicate-NID rejection in updateMe() leaves active binding and session intact.
+        $this->insertPatient( $this->clinicA, 'MR-DUP-' . uniqid(), '09128880099', '0070000001' );
+        try {
+            App::patientService()->updateMe( $this->patientUserA, [ 'national_id' => '0070000001' ] );
+            self::fail( 'Duplicate national_id in updateMe() must fail.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 'CLINIC_VALIDATION_FAILED', $e->errorCode );
+        }
+        self::assertNotNull( $logins->find_binding( $this->patientUserA, $this->clinicA, $this->patientA, true ) );
+        self::assertIsArray( WP_Session_Tokens::get_instance( $this->patientUserA )->get( $token ) );
+
+        // Positive closure: changing national_id via updateMe() closes binding and destroys sessions post-commit.
+        App::patientService()->updateMe( $this->patientUserA, [ 'national_id' => '0080000002' ] );
+        self::assertNull( $logins->find_binding( $this->patientUserA, $this->clinicA, $this->patientA, true ) );
+        $closedBinding = $logins->find_binding( $this->patientUserA, $this->clinicA, $this->patientA, false );
+        self::assertIsArray( $closedBinding );
+        self::assertSame( PatientLoginRepository::STATE_CLOSED, $closedBinding['state'] );
+        self::assertNull( $closedBinding['live_key'] );
+        self::assertNull( WP_Session_Tokens::get_instance( $this->patientUserA )->get( $token ), 'Patient sessions must be destroyed after updateMe() NID change.' );
+        self::assertSame( PatientAccess::LEVEL_NONE, App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 5, $token ) );
+    }
+
+    public function testHmacOptionWriteFailureFailsClosedWithSqlWitness(): void {
+        global $wpdb;
+
+        $prevOpt        = get_option( PatientNidHmac::OPTION_KEY, null );
+        $optionsTable   = preg_quote( $wpdb->options, '/' );
+        $exactInsertSql = '/^\s*INSERT\s+(?:IGNORE\s+)?INTO\s+`?' . $optionsTable . '`?\s*\([^)]*option_name[^)]*\)\s*VALUES\s*\(\s*\'' . preg_quote( PatientNidHmac::OPTION_KEY, '/' ) . '\'/i';
+
+        $witnessMatches = 0;
+        $witnessFilter  = static function ( $query ) use ( $exactInsertSql, &$witnessMatches ) {
+            if ( 1 === preg_match( $exactInsertSql, (string) $query ) ) {
+                ++$witnessMatches;
+            }
+
+            return $query;
+        };
+
+        $faultMatches = 0;
+        $faultFilter  = static function ( $query ) use ( $exactInsertSql, &$faultMatches ) {
+            if ( 1 === preg_match( $exactInsertSql, (string) $query ) ) {
+                ++$faultMatches;
+
+                return 'INSERT INTO cpms_nonexistent_hmac_options (x) VALUES (1)';
+            }
+
+            return $query;
+        };
+
+        $suppressBefore = $wpdb->suppress_errors;
+        try {
+            // 1) Witness pass: unblocked option insert hits exact SQL once and persists key.
+            delete_option( PatientNidHmac::OPTION_KEY );
+            wp_cache_delete( PatientNidHmac::OPTION_KEY, 'options' );
+            wp_cache_delete( 'notoptions', 'options' );
+            $hmac = new PatientNidHmac();
+            add_filter( 'query', $witnessFilter, 5 );
+            try {
+                $witnessKey = $hmac->rate_limit_key( self::NID_A );
+            } finally {
+                remove_filter( 'query', $witnessFilter, 5 );
+            }
+            self::assertSame( 1, $witnessMatches, 'Witness pass must observe exact option INSERT once.' );
+            self::assertStringStartsWith( 'nid:', $witnessKey );
+            self::assertNotSame( '', (string) get_option( PatientNidHmac::OPTION_KEY, '' ) );
+
+            // 2) Fault pass: block exact option INSERT -> fail closed (never return ephemeral key).
+            delete_option( PatientNidHmac::OPTION_KEY );
+            wp_cache_delete( PatientNidHmac::OPTION_KEY, 'options' );
+            wp_cache_delete( 'notoptions', 'options' );
+            $wpdb->suppress_errors( true );
+            $caughtHmac     = null;
+            $caughtPromoter = null;
+
+            add_filter( 'query', $faultFilter, 5 );
+            try {
+                try {
+                    $hmac->rate_limit_key( self::NID_A );
+                } catch ( \RuntimeException $e ) {
+                    $caughtHmac = $e;
+                }
+
+                $proofStore = new PatientSessionProofStore();
+                $token      = $proofStore->issue_non_persistent_auth_cookie( $this->patientUserA );
+                try {
+                    App::patient_binding_promoter()->promote(
+                        $this->patientUserA,
+                        $this->clinicA,
+                        self::MOBILE_A,
+                        self::NID_A,
+                        '999999',
+                        '198.51.106.1',
+                        time(),
+                        $token
+                    );
+                } catch ( BookingException $e ) {
+                    $caughtPromoter = $e;
+                }
+            } finally {
+                remove_filter( 'query', $faultFilter, 5 );
+                $wpdb->suppress_errors( $suppressBefore );
+            }
+
+            self::assertSame( 2, $faultMatches, 'Fault filter must match the exact option INSERT for both calls.' );
+            self::assertInstanceOf( \RuntimeException::class, $caughtHmac );
+            self::assertSame( 'Failed to persist HMAC key', $caughtHmac->getMessage() );
+            self::assertInstanceOf( BookingException::class, $caughtPromoter );
+            self::assertSame( 403, $caughtPromoter->httpStatus );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $caughtPromoter->errorCode );
+        } finally {
+            $wpdb->suppress_errors( $suppressBefore );
+            if ( null === $prevOpt || '' === $prevOpt ) {
+                delete_option( PatientNidHmac::OPTION_KEY );
+            } else {
+                update_option( PatientNidHmac::OPTION_KEY, $prevOpt, 'no' );
+            }
+            wp_cache_delete( 'alloptions', 'options' );
+            wp_cache_delete( PatientNidHmac::OPTION_KEY, 'options' );
+        }
+    }
+
+    public function testShortcodeAndPortalBookingSurfaceIntersectChooserWithProvedPatientsOnly(): void {
+        $db  = App::db();
+        $now = $db->nowUtcSql();
+        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', true );
+        $db->insert(
+            'cpms_clinicians',
+            [
+                'clinic_id'  => $this->clinicA,
+                'full_name'  => 'Dr Chooser Shortcode',
+                'is_active'  => 1,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]
+        );
+
+        $mob1 = '09128840001';
+        $mob2 = '09128840002';
+        $nid1 = '0020000006';
+        $nid2 = '0030000009';
+
+        $db->insert(
+            'cpms_patients',
+            [
+                'clinic_id'   => $this->clinicA,
+                'mrn'         => 'MR-CH-1-' . uniqid(),
+                'first_name'  => 'PatChooserOne',
+                'last_name'   => 'Proved',
+                'mobile'      => $mob1,
+                'national_id' => $nid1,
+                'status'      => 'active',
+                'created_at'  => $now,
+                'updated_at'  => $now,
+            ]
+        );
+        $p1 = $db->wpdb_last_insert_id();
+
+        $db->insert(
+            'cpms_patients',
+            [
+                'clinic_id'   => $this->clinicA,
+                'mrn'         => 'MR-CH-2-' . uniqid(),
+                'first_name'  => 'PatChooserTwo',
+                'last_name'   => 'Unproved',
+                'mobile'      => $mob2,
+                'national_id' => $nid2,
+                'status'      => 'active',
+                'created_at'  => $now,
+                'updated_at'  => $now,
+            ]
+        );
+        $p2 = $db->wpdb_last_insert_id();
+
+        $user   = $this->makeUser( 'tp_chooser_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $logins = new PatientLoginRepository( $db );
+        $logins->insert_pending_account( $user, $mob1, 'Chooser', 'User' );
+
+        foreach ( [ [ $p1, $mob1, 1 ], [ $p2, $mob2, 0 ] ] as $spec ) {
+            $db->insert(
+                'cpms_patient_user_links',
+                [
+                    'clinic_id'      => $this->clinicA,
+                    'patient_id'     => $spec[0],
+                    'wp_user_id'     => $user,
+                    'mobile_at_link' => $spec[1],
+                    'is_primary'     => $spec[2],
+                    'linked_at'      => $now,
+                ]
+            );
+        }
+
+        $token = cpms_test_seed_patient_session( $user, $this->clinicA );
+        $t0    = time();
+        wp_set_current_user( $user );
+
+        // 1) Negative control (0 of 2 proved): neither [cpms_public_booking] nor render_for_patient_portal() exposes chooser/names.
+        $scZero     = do_shortcode( '[cpms_public_booking clinic_id="' . $this->clinicA . '"]' );
+        $portalZero = PublicBookingShortcode::render_for_patient_portal( $this->clinicA );
+        foreach ( [ $scZero, $portalZero ] as $htmlZero ) {
+            self::assertStringNotContainsString( 'data-role="patient-chooser"', $htmlZero );
+            self::assertStringNotContainsString( 'PatChooserOne', $htmlZero );
+            self::assertStringNotContainsString( 'PatChooserTwo', $htmlZero );
+            self::assertStringNotContainsString( 'data-patient-id="' . $p1 . '"', $htmlZero );
+            self::assertStringNotContainsString( 'data-patient-id="' . $p2 . '"', $htmlZero );
+        }
+
+        // 2) Partial proof (1 of 2 proved): chooser still hidden; unproved patient does not leak.
+        $this->seedOtp( $this->clinicA, $mob1, '113355', OtpService::PURPOSE_VERIFY_MOBILE );
+        App::patient_binding_promoter()->promote( $user, $this->clinicA, $mob1, $nid1, '113355', '198.51.107.1', $t0, $token );
+        $scOne     = do_shortcode( '[cpms_public_booking clinic_id="' . $this->clinicA . '"]' );
+        $portalOne = PublicBookingShortcode::render_for_patient_portal( $this->clinicA );
+        foreach ( [ $scOne, $portalOne ] as $htmlOne ) {
+            self::assertStringNotContainsString( 'data-role="patient-chooser"', $htmlOne );
+            self::assertStringNotContainsString( 'PatChooserTwo', $htmlOne );
+            self::assertStringNotContainsString( 'data-patient-id="' . $p2 . '"', $htmlOne );
+        }
+
+        // 3) Positive control (2 of 2 proved): chooser renders BOTH proved patients on both surfaces.
+        $this->seedOtp( $this->clinicA, $mob2, '224466', OtpService::PURPOSE_VERIFY_MOBILE );
+        App::patient_binding_promoter()->promote( $user, $this->clinicA, $mob2, $nid2, '224466', '198.51.107.1', $t0, $token );
+        $scTwo     = do_shortcode( '[cpms_public_booking clinic_id="' . $this->clinicA . '"]' );
+        $portalTwo = PublicBookingShortcode::render_for_patient_portal( $this->clinicA );
+        foreach ( [ $scTwo, $portalTwo ] as $htmlTwo ) {
+            self::assertStringContainsString( 'data-role="patient-chooser"', $htmlTwo );
+            self::assertStringContainsString( 'data-patient-id="' . $p1 . '"', $htmlTwo );
+            self::assertStringContainsString( 'data-patient-id="' . $p2 . '"', $htmlTwo );
+            self::assertStringContainsString( 'PatChooserOne', $htmlTwo );
+            self::assertStringContainsString( 'PatChooserTwo', $htmlTwo );
+        }
+    }
+
+    public function testPatientPortalPageGatesEnrollmentOptionsOnFullTwoFactorProof(): void {
+        $db    = App::db();
+        $stamp = $db->nowUtcSql();
+        $orgId = (int) $db->fetchValue(
+            'SELECT organization_id FROM ' . $db->table( 'cpms_clinics' ) . ' WHERE id = %d LIMIT 1',
+            [ $this->clinicA ]
+        );
+        self::assertGreaterThan( 0, $orgId );
+
+        $db->insert(
+            'cpms_clinics',
+            [
+                'organization_id' => $orgId,
+                'name'            => 'Portal Enroll Dest',
+                'slug'            => 'portal-enroll-dest-' . uniqid(),
+                'timezone'        => 'UTC',
+                'created_at'      => $stamp,
+                'updated_at'      => $stamp,
+            ]
+        );
+        $destClinic = $db->wpdb_last_insert_id();
+        $db->insert(
+            'cpms_locations',
+            [
+                'clinic_id'  => $destClinic,
+                'name'       => 'Portal Enroll Dest Loc',
+                'slug'       => 'portal-enroll-dest-loc-' . uniqid(),
+                'timezone'   => 'UTC',
+                'is_primary' => 1,
+                'created_at' => $stamp,
+                'updated_at' => $stamp,
+            ]
+        );
+
+        $mob = '09128830001';
+        $nid = '0060000007';
+        $pat = $this->insertPatient( $this->clinicA, 'MR-ENROLL-GATE-' . uniqid(), $mob, $nid );
+        $uid = $this->makeUser( 'tp_enroll_gate_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $logins = new PatientLoginRepository( $db );
+        $logins->insert_pending_account( $uid, $mob, 'Enroll', 'Gate' );
+        $db->insert(
+            'cpms_patient_user_links',
+            [
+                'clinic_id'      => $this->clinicA,
+                'patient_id'     => $pat,
+                'wp_user_id'     => $uid,
+                'mobile_at_link' => $mob,
+                'is_primary'     => 1,
+                'linked_at'      => $stamp,
+            ]
+        );
+
+        $identityId = App::patient_identity_activator()->activate_for_new_patient( $this->clinicA, $pat, $mob, $uid );
+        App::patient_identity_service()->link_user( $orgId, $identityId, $uid, $mob );
+
+        $underlyingState = App::patient_enrollment_options()->for_user( $uid )['state'] ?? '';
+        self::assertNotSame( PatientEnrollmentOptions::STATE_UNVERIFIED, $underlyingState );
+
+        $proofStore                 = new PatientSessionProofStore();
+        $token                      = $proofStore->issue_non_persistent_auth_cookie( $uid );
+        $now                        = time();
+        $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie( $uid, $now + PatientSessionProofStore::SESSION_TTL_SECONDS, 'logged_in', $token );
+        wp_set_current_user( $uid );
+
+        // 1) LEVEL_NONE: PatientPortalPage must gate enrollment_options to STATE_UNVERIFIED.
+        ob_start();
+        PatientPortalPage::render();
+        $htmlNone = (string) ob_get_clean();
+        self::assertStringContainsString( 'data-role="enrollment-section" data-state="unverified"', $htmlNone );
+        self::assertStringNotContainsString( 'Portal Enroll Dest', $htmlNone );
+
+        // 2) LEVEL_MOBILE_OTP (OTP-only, no NID binding proof): must remain STATE_UNVERIFIED.
+        self::assertTrue( $proofStore->record_mobile_proof( $uid, $mob, $now, $token ) );
+        self::assertSame( PatientAccess::LEVEL_MOBILE_OTP, App::patient_access()->level( $uid, $pat, $this->clinicA, $now + 1, $token ) );
+        ob_start();
+        PatientPortalPage::render();
+        $htmlOtp = (string) ob_get_clean();
+        self::assertStringContainsString( 'data-role="enrollment-section" data-state="unverified"', $htmlOtp );
+        self::assertStringNotContainsString( 'Portal Enroll Dest', $htmlOtp );
+
+        // 3) LEVEL_FULL (after two-factor promote): PatientPortalPage unlocks underlying PatientEnrollmentOptions.
+        $this->seedOtp( $this->clinicA, $mob, '667788', OtpService::PURPOSE_VERIFY_MOBILE );
+        App::patient_binding_promoter()->promote( $uid, $this->clinicA, $mob, $nid, '667788', '198.51.108.1', $now, $token );
+        self::assertSame( PatientAccess::LEVEL_FULL, App::patient_access()->level( $uid, null, null, $now + 1, $token ) );
+
+        ob_start();
+        PatientPortalPage::render();
+        $htmlFull = (string) ob_get_clean();
+        self::assertStringNotContainsString( 'data-role="enrollment-section" data-state="unverified"', $htmlFull );
+        self::assertStringContainsString( 'data-role="enrollment-section" data-state="' . $underlyingState . '"', $htmlFull );
     }
 
     public function testStaffPatientSeparationAcrossAllAuthoritySourcesAndPortalSurfaces(): void {

@@ -299,34 +299,41 @@ final class PatientBindingPromoter {
         ?string $normalized_nid,
         string $ip
     ): void {
-        $acct_rl = $this->rate->hit( $this->hmac->account_rate_limit_key( $wp_user_id ), self::RATE_ACCOUNT_MAX, self::RATE_WINDOW_SEC );
-        $ip_rl   = $this->rate->hit( $this->hmac->ip_rate_limit_key( $ip ), self::RATE_IP_MAX, self::RATE_WINDOW_SEC );
-        if ( ! $acct_rl['allowed'] || ! $ip_rl['allowed'] ) {
-            $this->log_failure( 'rate_limited_account_or_ip', $wp_user_id, 0 );
-            throw $this->uniform_failure();
-        }
-
-        if ( null !== $mobile ) {
-            $mob_rl = $this->rate->hit( $this->hmac->mobile_rate_limit_key( $mobile ), self::RATE_MOBILE_MAX, self::RATE_WINDOW_SEC );
-            if ( ! $mob_rl['allowed'] ) {
-                $this->log_failure( 'rate_limited_mobile', $wp_user_id, 0 );
+        try {
+            $acct_rl = $this->rate->hit( $this->hmac->account_rate_limit_key( $wp_user_id ), self::RATE_ACCOUNT_MAX, self::RATE_WINDOW_SEC );
+            $ip_rl   = $this->rate->hit( $this->hmac->ip_rate_limit_key( $ip ), self::RATE_IP_MAX, self::RATE_WINDOW_SEC );
+            if ( ! $acct_rl['allowed'] || ! $ip_rl['allowed'] ) {
+                $this->log_failure( 'rate_limited_account_or_ip', $wp_user_id, 0 );
                 throw $this->uniform_failure();
             }
-        }
 
-        if ( null !== $normalized_nid ) {
-            $read_keys = $this->hmac->rate_limit_keys_for_read( $normalized_nid );
-            foreach ( $read_keys as $candidate_key ) {
-                if ( $this->rate->peek( $candidate_key, self::RATE_WINDOW_SEC ) >= self::RATE_NID_MAX ) {
+            if ( null !== $mobile ) {
+                $mob_rl = $this->rate->hit( $this->hmac->mobile_rate_limit_key( $mobile ), self::RATE_MOBILE_MAX, self::RATE_WINDOW_SEC );
+                if ( ! $mob_rl['allowed'] ) {
+                    $this->log_failure( 'rate_limited_mobile', $wp_user_id, 0 );
+                    throw $this->uniform_failure();
+                }
+            }
+
+            if ( null !== $normalized_nid ) {
+                $read_keys = $this->hmac->rate_limit_keys_for_read( $normalized_nid );
+                foreach ( $read_keys as $candidate_key ) {
+                    if ( $this->rate->peek( $candidate_key, self::RATE_WINDOW_SEC ) >= self::RATE_NID_MAX ) {
+                        $this->log_failure( 'rate_limited_nid', $wp_user_id, 0 );
+                        throw $this->uniform_failure();
+                    }
+                }
+                $nid_rl = $this->rate->hit( $this->hmac->rate_limit_key( $normalized_nid ), self::RATE_NID_MAX, self::RATE_WINDOW_SEC );
+                if ( ! $nid_rl['allowed'] ) {
                     $this->log_failure( 'rate_limited_nid', $wp_user_id, 0 );
                     throw $this->uniform_failure();
                 }
             }
-            $nid_rl = $this->rate->hit( $this->hmac->rate_limit_key( $normalized_nid ), self::RATE_NID_MAX, self::RATE_WINDOW_SEC );
-            if ( ! $nid_rl['allowed'] ) {
-                $this->log_failure( 'rate_limited_nid', $wp_user_id, 0 );
-                throw $this->uniform_failure();
-            }
+        } catch ( BookingException $e ) {
+            throw $e;
+        } catch ( Throwable ) {
+            $this->log_failure( 'rate_limit_key_failed', $wp_user_id, 0 );
+            throw $this->uniform_failure();
         }
     }
 

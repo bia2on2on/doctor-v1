@@ -1356,6 +1356,14 @@ final class PublicBookingShortcode
                     if ( ! is_array( $linked_patients ) ) {
                         continue;
                     }
+                    $proved_ids      = \ClinicCore\Bootstrap\App::patient_access()->proved_patient_ids( $uid, $choice_clinic_id );
+                    $proved_map      = array_flip( $proved_ids );
+                    $linked_patients = array_values(
+                        array_filter(
+                            $linked_patients,
+                            static fn ( $lp ): bool => is_array( $lp ) && isset( $proved_map[ (int) ( $lp['id'] ?? 0 ) ] )
+                        )
+                    );
                     if ( count( $linked_patients ) === 0 ) {
                         if ( $choice_clinic_id === $primary_clinic_id ) {
                             $is_first_patient = true;

@@ -1162,6 +1162,13 @@ final class PatientPortalPage
      */
     private static function enrollment_options( int $user_id ): array {
         try {
+            if ( \ClinicCore\Application\Auth\PatientAccess::LEVEL_FULL !== App::patient_access()->level( $user_id ) ) {
+                return [
+                    'state'   => \ClinicCore\Application\Patients\PatientEnrollmentOptions::STATE_UNVERIFIED,
+                    'clinics' => [],
+                ];
+            }
+
             return App::patient_enrollment_options()->for_user( $user_id );
         } catch ( \Throwable ) {
             return [

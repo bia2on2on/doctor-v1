@@ -130,8 +130,8 @@ final class PatientNidHmac {
                 return $existing;
             }
 
-            $generated = bin2hex( random_bytes( 32 ) );
             if ( function_exists( 'add_option' ) ) {
+                $generated = bin2hex( random_bytes( 32 ) );
                 if ( add_option( self::OPTION_KEY, $generated, '', 'no' ) ) {
                     return $generated;
                 }
@@ -141,7 +141,7 @@ final class PatientNidHmac {
                 }
             }
 
-            return $generated;
+            throw new \RuntimeException( 'Failed to persist HMAC key' );
         }
 
         throw new \RuntimeException( 'No HMAC key source available' );
