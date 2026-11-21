@@ -80,9 +80,9 @@ final class SmsEvents
                 'default_text' => 'یادآوری پیگیری: {{patient_name}} عزیز، ویزیت با {{doctor_name}} در {{appointment_date}} ساعت {{appointment_time}}.',
             ],
             self::PATIENT_BINDING_VERIFIED => [
-                'label' => 'تأیید اتصال پرونده بیمار',
-                'variables' => ['clinic_name'],
-                'required' => ['clinic_name'],
+                'label'        => 'تأیید اتصال پرونده بیمار',
+                'variables'    => ['clinic_name'],
+                'required'     => ['clinic_name'],
                 'default_text' => 'حساب شما در مرکز «{{clinic_name}}» با موفقیت تأیید و متصل شد.',
             ],
         ];

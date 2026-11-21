@@ -10,6 +10,7 @@ use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Application\Patients\PatientService;
 use ClinicCore\Auth\RolesAndCapabilities;
+use ClinicCore\Infrastructure\Security\ClientIp;
 use WP_Error;
 use WP_REST_Request;
 use WP_REST_Response;
@@ -244,8 +245,7 @@ final class PatientController extends RestBase
      * Two-factor promotion of a target Clinic patient record into an active
      * durable binding + live session proof (§6.2).
      */
-    private function link_record( WP_REST_Request $request ): WP_REST_Response|WP_Error
-    {
+    private function link_record( WP_REST_Request $request ): WP_REST_Response|WP_Error {
         $query = $request->get_query_params();
         if (
             is_array( $query )
@@ -258,15 +258,15 @@ final class PatientController extends RestBase
             return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );
         }
 
-        $body        = $this->body_only( $request );
-        $clinic_raw  = $body['clinic_id'] ?? $request->get_header( 'X-CPMS-Clinic-Id' );
-        $clinic_id   = is_numeric( $clinic_raw ) ? (int) $clinic_raw : 0;
-        $raw_mobile  = is_string( $body['mobile'] ?? null ) ? (string) $body['mobile'] : '';
-        $raw_nid     = is_string( $body['national_id'] ?? null ) ? (string) $body['national_id'] : '';
-        $raw_code    = is_string( $body['code'] ?? null ) ? (string) $body['code'] : null;
-        $user_id     = (int) get_current_user_id();
-        $ip          = ClientIp::resolve() ?? '0.0.0.0';
-        $promoter    = $this->promoter ?? App::patient_binding_promoter();
+        $body       = $this->body_only( $request );
+        $clinic_raw = $body['clinic_id'] ?? $request->get_header( 'X-CPMS-Clinic-Id' );
+        $clinic_id  = is_numeric( $clinic_raw ) ? (int) $clinic_raw : 0;
+        $raw_mobile = is_string( $body['mobile'] ?? null ) ? (string) $body['mobile'] : '';
+        $raw_nid    = is_string( $body['national_id'] ?? null ) ? (string) $body['national_id'] : '';
+        $raw_code   = is_string( $body['code'] ?? null ) ? (string) $body['code'] : null;
+        $user_id    = (int) get_current_user_id();
+        $ip         = ClientIp::resolve() ?? '0.0.0.0';
+        $promoter   = $this->promoter ?? App::patient_binding_promoter();
 
         if ( $clinic_id <= 0 ) {
             return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );

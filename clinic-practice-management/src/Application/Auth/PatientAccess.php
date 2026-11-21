@@ -109,53 +109,41 @@ final class PatientAccess {
     /**
      * Construct the central patient access gate.
      *
-     * @param CpmsDb|null                                                                                                                                      $db                             Database adapter.
-     * @param PatientRepository|null                                                                                                                           $patients                       Patient repository.
-     * @param (callable(int): ?array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>})|null                              $user_reader                    Optional user reader seam.
-     * @param (callable(int, int): bool)|null                                                                                                                  $clinic_binding_checker         Optional clinic binding seam.
-     * @param (callable(int, int, int): bool)|null                                                                                                             $patient_binding_checker        Optional patient binding seam.
-     * @param (callable(int): bool)|null                                                                                                                       $any_binding_checker            Optional any-binding seam.
-     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null                                                                               $link_resolver                  Optional link resolver seam.
-     * @param (callable(int, int): bool)|null                                                                                                                  $enroll_checker                 Optional enroll eligibility seam.
-     * @param (callable(array<string, mixed>): void)|null                                                                                                      $decision_observer              Optional decision observer seam.
-     * @param (callable(int): bool)|null                                                                                                                       $scoped_staff_checker           Optional scoped staff authority seam.
-     * @param MembershipRepository|null                                                                                                                        $memberships                    Membership repository.
-     * @param AuthorizationService|null                                                                                                                        $authorization                  Clinic-scoped authorization service.
-     * @param (callable(int, int): bool)|null                                                                                                                  $any_patient_binding_checker    Optional any-clinic patient seam.
-     * @param (callable(int, int): bool)|null                                                                                                                  $booking_clinic_binding_checker Optional booking clinic seam.
-     * @param (callable(int): bool)|null                                                                                                                       $any_booking_binding_checker    Optional any-booking seam.
-     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null                                                                               $booking_link_resolver          Optional booking link resolver seam.
-     * @param PatientLoginRepository|null                                                                                                                      $logins                         Patient login repository.
-     * @param PatientSessionProofStore|null                                                                                                                    $proofs                         Session proof store.
+     * @param CpmsDb|null                                                                                                                                      $db                         Database adapter.
+     * @param PatientRepository|null                                                                                                                           $patients                   Patient repository.
+     * @param (callable(int): ?array{exists: bool, roles: list<string>, has_staff_cap?: bool, caps?: array<string, mixed>})|null                              $user_reader                Optional user reader seam.
+     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null                                                                               $link_resolver              Optional link resolver seam.
+     * @param (callable(int, int): bool)|null                                                                                                                  $enroll_checker             Optional enroll eligibility seam.
+     * @param (callable(array<string, mixed>): void)|null                                                                                                      $decision_observer          Optional decision observer seam.
+     * @param (callable(int): bool)|null                                                                                                                       $scoped_staff_checker       Optional scoped staff authority seam.
+     * @param MembershipRepository|null                                                                                                                        $memberships                Membership repository.
+     * @param AuthorizationService|null                                                                                                                        $authorization              Clinic-scoped authorization service.
+     * @param (callable(int, int): ?array{clinic_id: int, patient_id: int})|null                                                                               $booking_link_resolver      Optional booking link resolver seam.
+     * @param PatientLoginRepository|null                                                                                                                      $logins                     Patient login repository.
+     * @param PatientSessionProofStore|null                                                                                                                    $proofs                     Session proof store.
      * @param (callable(int, ?int): list<array{binding_id: int, clinic_id: int, patient_id: int, verified_at: string, mobile: string, full_identity?: bool}>)|null $two_proof_bindings_reader  Optional pure-PHP unit test seam.
      */
     public function __construct(
         ?CpmsDb $db = null,
         ?PatientRepository $patients = null,
         ?callable $user_reader = null,
-        ?callable $clinic_binding_checker = null,
-        ?callable $patient_binding_checker = null,
-        ?callable $any_binding_checker = null,
         ?callable $link_resolver = null,
         ?callable $enroll_checker = null,
         ?callable $decision_observer = null,
         ?callable $scoped_staff_checker = null,
         ?MembershipRepository $memberships = null,
         ?AuthorizationService $authorization = null,
-        ?callable $any_patient_binding_checker = null,
-        ?callable $booking_clinic_binding_checker = null,
-        ?callable $any_booking_binding_checker = null,
         ?callable $booking_link_resolver = null,
         ?PatientLoginRepository $logins = null,
         ?PatientSessionProofStore $proofs = null,
         ?callable $two_proof_bindings_reader = null
     ) {
-        $this->db                             = $db;
-        $this->patients                       = $patients ?? ( null !== $db ? new PatientRepository( $db ) : null );
-        $this->memberships                    = $memberships ?? ( null !== $db ? new MembershipRepository( $db ) : null );
-        $this->authorization                  = $authorization ?? ( null !== $db && null !== $this->memberships ? new AuthorizationService( $this->memberships, new CustomRoleRepository( $db ) ) : null );
-        $this->logins                         = $logins ?? ( null !== $db ? new PatientLoginRepository( $db ) : null );
-        $this->proofs                         = $proofs ?? new PatientSessionProofStore();
+        $this->db                        = $db;
+        $this->patients                  = $patients ?? ( null !== $db ? new PatientRepository( $db ) : null );
+        $this->memberships               = $memberships ?? ( null !== $db ? new MembershipRepository( $db ) : null );
+        $this->authorization             = $authorization ?? ( null !== $db && null !== $this->memberships ? new AuthorizationService( $this->memberships, new CustomRoleRepository( $db ) ) : null );
+        $this->logins                    = $logins ?? ( null !== $db ? new PatientLoginRepository( $db ) : null );
+        $this->proofs                    = $proofs ?? new PatientSessionProofStore();
         $this->user_reader               = $user_reader;
         $this->link_resolver             = $link_resolver;
         $this->enroll_checker            = $enroll_checker;

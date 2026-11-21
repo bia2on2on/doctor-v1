@@ -552,29 +552,18 @@ final class PatientAccessUnitTest extends TestCase {
         );
 
         return new PatientAccess(
-            null,
-            null,
-            static function ( int $uid ) use ( $users, &$activeUid ): ?array {
+            user_reader: static function ( int $uid ) use ( $users, &$activeUid ): ?array {
                 $activeUid = $uid;
 
                 return $users[ $uid ] ?? null;
             },
-            null,
-            null,
-            null,
-            static fn ( int $uid, int $lid ): ?array => $links[ $uid . ':' . $lid ] ?? null,
-            static fn ( int $uid, int $cid ): bool => $enroll[ $uid . ':' . $cid ] ?? false,
-            $observer,
-            $scoped_staff_checker ?? static fn ( int $uid ): bool => false,
-            null,
-            null,
-            null,
-            null,
-            null,
-            static fn ( int $uid, int $lid ): ?array => $booking_links[ $uid . ':' . $lid ] ?? null,
-            null,
-            $gateProofs,
-            static function ( int $uid, ?int $cid = null ) use ( $bindingsMap ): array {
+            link_resolver: static fn ( int $uid, int $lid ): ?array => $links[ $uid . ':' . $lid ] ?? null,
+            enroll_checker: static fn ( int $uid, int $cid ): bool => $enroll[ $uid . ':' . $cid ] ?? false,
+            decision_observer: $observer,
+            scoped_staff_checker: $scoped_staff_checker ?? static fn ( int $uid ): bool => false,
+            booking_link_resolver: static fn ( int $uid, int $lid ): ?array => $booking_links[ $uid . ':' . $lid ] ?? null,
+            proofs: $gateProofs,
+            two_proof_bindings_reader: static function ( int $uid, ?int $cid = null ) use ( $bindingsMap ): array {
                 $rows = array_values( $bindingsMap[ $uid ] ?? [] );
                 if ( null !== $cid && $cid > 0 ) {
                     return array_values( array_filter( $rows, static fn ( array $r ): bool => $r['clinic_id'] === $cid ) );

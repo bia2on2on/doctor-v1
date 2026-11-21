@@ -1357,7 +1357,7 @@ final class BookingService
             $patient_id   = (int) $appt['patient_id'];
             $current_slot = (int) $appt['slot_id'];
 
-            $linked = $this->db->fetchRow(
+            $linked     = $this->db->fetchRow(
                 'SELECT 1 AS ok FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
                 . ' INNER JOIN ' . $this->db->table( 'cpms_patients' ) . ' p ON p.id = l.patient_id AND p.clinic_id = l.clinic_id'
                 . " WHERE l.wp_user_id = %d AND l.clinic_id = %d AND l.patient_id = %d AND p.status = 'active' LIMIT 1",
@@ -3180,7 +3180,7 @@ final class BookingService
         if ( null === $patient || (int) ( $patient['clinic_id'] ?? 0 ) !== $clinic_id ) {
             throw $this->invalid_patient_selection();
         }
-        $link = $this->db->fetchRow(
+        $link       = $this->db->fetchRow(
             'SELECT 1 AS ok FROM ' . $this->db->table( 'cpms_patient_user_links' )
             . ' WHERE wp_user_id = %d AND clinic_id = %d AND patient_id = %d LIMIT 1',
             [ $wp_user_id, $clinic_id, $patient_id ]
