@@ -179,7 +179,10 @@ scenario('S1', 'Patient: OTP request + booking hold→confirm', function () use 
     $proof_token = WP_Session_Tokens::get_instance( $patient_user_id )->create( time() + $session_ttl );
     $proof_store->record_mobile_proof( $patient_user_id, '09120009999', null, $proof_token );
     $proof_store->record_binding_proof( $patient_user_id, (int) $link_row['clinic_id'], (int) $link_row['patient_id'], (int) $binding['id'], (string) $binding['verified_at'], null, $proof_token );
-    $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie( $patient_user_id, time() + $session_ttl, 'logged_in', $proof_token );
+    $cookie_name = defined( 'LOGGED_IN_COOKIE' ) ? (string) constant( 'LOGGED_IN_COOKIE' ) : '';
+    if ( '' !== $cookie_name ) {
+        $_COOKIE[ $cookie_name ] = wp_generate_auth_cookie( $patient_user_id, time() + $session_ttl, 'logged_in', $proof_token );
+    }
     App::patient_session_scope()->set_in_process_session_token( $patient_user_id, $proof_token );
     wp_set_current_user( $patient_user_id );
     try {
@@ -197,7 +200,9 @@ scenario('S1', 'Patient: OTP request + booking hold→confirm', function () use 
             throw new RuntimeException( 'confirm status=' . ( $appt['status'] ?? '?' ) );
         }
     } finally {
-        unset( $_COOKIE[ LOGGED_IN_COOKIE ] );
+        if ( '' !== $cookie_name ) {
+            unset( $_COOKIE[ $cookie_name ] );
+        }
         App::patient_session_scope()->reset_in_process_state();
         wp_set_current_user( 0 );
     }

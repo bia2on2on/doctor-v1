@@ -97,7 +97,7 @@ final class BookingFlowTest extends WP_UnitTestCase
             $this->patientUserId,
             $this->clinicId,
             $patientId,
-            ['mobile' => '09120000001', 'seed_session_scope' => true]
+            ['mobile' => '09120000001', 'seed_session_scope' => true, 'full_identity' => false]
         );
     }
 

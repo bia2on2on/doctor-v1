@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Application\Booking;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Application\Notifications\NotificationService;
 use ClinicCore\Application\Notifications\SmsService;
@@ -96,7 +97,8 @@ final class BookingService
         private readonly ?NotificationService $notifications = null,
         ?MembershipRepository $memberships = null,
         ?PatientIdentityActivator $identities = null,
-        private readonly ?PatientSessionScope $session_scope = null
+        private readonly ?PatientSessionScope $session_scope = null,
+        private readonly ?PatientAccess $patient_access = null
     ) {
         $this->memberships = $memberships ?? new MembershipRepository( $this->db );
         // Organization Patient Identity activation is not optional on the
@@ -530,6 +532,7 @@ final class BookingService
         if ( ! $this->clinic_organization_is_active( $clinic_id ) ) {
             throw BookingException::of( 'CLINIC_NOT_FOUND', 'کلینیک یافت نشد', 404 );
         }
+        $this->assert_clinic_accepting_new_demand( $clinic_id );
 
         // B1 — policy از Clinicِ **پایدارِ همان پزشک** (requireClinician بالا).
         $settings = $this->settingsFor( $clinic_id );
@@ -882,6 +885,8 @@ final class BookingService
         }
 
         $this->assertLicense(LicenseGate::OP_APPOINTMENT_BOOK);
+        // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- established host variable.
+        $this->assert_clinic_accepting_new_demand( $holdClinicId );
 
         // Phase 8 Slice 3 — B2 subject resolution: frozen vs historical NULL compat.
         // Ownership and status proven before any Patient/link resolution — preserves 403 parity.
@@ -899,7 +904,7 @@ final class BookingService
                 'SELECT 1 AS ok FROM ' . $this->db->table('cpms_patient_user_links') . ' WHERE wp_user_id = %d AND clinic_id = %d AND patient_id = %d LIMIT 1',
                 [$wpUserId, $holdClinicId, $holdPatientId]
             );
-            $proved_ids = App::patient_access()->proved_patient_ids( $wpUserId, $holdClinicId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- existing host parameters.
+            $proved_ids = $this->patient_access()->proved_patient_ids( $wpUserId, $holdClinicId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- existing host parameters.
             if ( $link === null || ! in_array( $holdPatientId, $proved_ids, true ) ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- existing host parameter.
                 throw BookingException::of('CLINIC_VALIDATION_FAILED', 'پیوند بیمار با کاربر نامعتبر است', 422);
             }
@@ -1241,7 +1246,7 @@ final class BookingService
             return [];
         }
 
-        $proved_ids = App::patient_access()->proved_patient_ids( $wpUserId, $resolved_clinic_id ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- published public parameter.
+        $proved_ids = $this->patient_access()->proved_patient_ids( $wpUserId, $resolved_clinic_id ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- published public parameter.
         if ( [] === $proved_ids ) {
             return [];
         }
@@ -1363,7 +1368,7 @@ final class BookingService
                 . " WHERE l.wp_user_id = %d AND l.clinic_id = %d AND l.patient_id = %d AND p.status = 'active' LIMIT 1",
                 [ $actor_user_id, $clinic_id, $patient_id ]
             );
-            $proved_ids = App::patient_access()->proved_patient_ids( $actor_user_id, $clinic_id );
+            $proved_ids = $this->patient_access()->proved_patient_ids( $actor_user_id, $clinic_id );
             if ( null === $linked || ! in_array( $patient_id, $proved_ids, true ) ) {
                 $this->audit(
                     'FORBIDDEN_ACCESS_ATTEMPT',
@@ -1550,7 +1555,7 @@ final class BookingService
             }
             $this->assertAppointmentWithinExplicitScope( $scope_appt );
         } elseif ( $actor === 'patient' ) {
-            if ( ! $this->user_has_active_patient_in_clinic( $actor_user_id, (int) $scope_appt['patient_id'], (int) $scope_appt['clinic_id'] ) ) {
+            if ( ! $this->has_durable_patient_link( $actor_user_id, (int) $scope_appt['patient_id'], (int) $scope_appt['clinic_id'] ) ) {
                 throw BookingException::of( 'CLINIC_PERMISSION_DENIED', 'به این نوبت دسترسی ندارید', 403 );
             }
             $this->assert_patient_session_matches_clinic( $actor_user_id, (int) $scope_appt['clinic_id'] );
@@ -1563,6 +1568,9 @@ final class BookingService
             throw BookingException::of( 'CLINIC_NOT_FOUND', 'کلینیک یافت نشد', 404 );
         }
         $this->assert_clinic_accepting_new_demand( $idem_clinic_id );
+        if ( $actor === 'patient' && ! $this->user_has_active_patient_in_clinic( $actor_user_id, (int) $scope_appt['patient_id'], (int) $scope_appt['clinic_id'] ) ) {
+            throw BookingException::of( 'CLINIC_PERMISSION_DENIED', 'به این نوبت دسترسی ندارید', 403 );
+        }
         $this->assertLicense(LicenseGate::OP_APPOINTMENT_RESCHEDULE);
 
         // Claim only after role, tenant/object ownership and lifecycle gates.
@@ -3035,7 +3043,7 @@ final class BookingService
      * در دور ۳ حذف شد — تصمیم مالک A، ۲۰۲۶-۱۱-۰۹.)
      */
     private function mobile_for_user_in_clinic( int $wp_user_id, int $clinic_id ): ?string {
-        $proved_ids = App::patient_access()->proved_patient_ids( $wp_user_id, $clinic_id );
+        $proved_ids = $this->patient_access()->proved_patient_ids( $wp_user_id, $clinic_id );
         if ( [] === $proved_ids ) {
             return null;
         }
@@ -3072,6 +3080,10 @@ final class BookingService
         return $this->session_scope ?? App::patient_session_scope();
     }
 
+    private function patient_access(): PatientAccess {
+        return $this->patient_access ?? App::patient_access();
+    }
+
     private function assert_patient_session_matches_clinic( int $wp_user_id, int $expected_clinic_id ): void {
         try {
             $this->session_scope()->require_clinic_matching( $wp_user_id, $expected_clinic_id );
@@ -3087,7 +3099,7 @@ final class BookingService
      */
     private function linkedActivePatientsForClinic(int $wpUserId, int $clinicId): array
     {
-        $proved_ids = App::patient_access()->proved_patient_ids( $wpUserId, $clinicId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- existing host parameters.
+        $proved_ids = $this->patient_access()->proved_patient_ids( $wpUserId, $clinicId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- existing host parameters.
         if ( [] === $proved_ids ) {
             return [];
         }
@@ -3185,7 +3197,7 @@ final class BookingService
             . ' WHERE wp_user_id = %d AND clinic_id = %d AND patient_id = %d LIMIT 1',
             [ $wp_user_id, $clinic_id, $patient_id ]
         );
-        $proved_ids = App::patient_access()->proved_patient_ids( $wp_user_id, $clinic_id );
+        $proved_ids = $this->patient_access()->proved_patient_ids( $wp_user_id, $clinic_id );
         if ( null === $link || ! in_array( $patient_id, $proved_ids, true ) ) {
             throw $this->invalid_patient_selection();
         }
@@ -3254,12 +3266,8 @@ final class BookingService
         return mb_substr($clean, 0, 120);
     }
 
-    private function user_has_active_patient_in_clinic( int $wp_user_id, int $patient_id, int $clinic_id ): bool {
+    private function has_durable_patient_link( int $wp_user_id, int $patient_id, int $clinic_id ): bool {
         if ( $wp_user_id <= 0 || $patient_id <= 0 || $clinic_id <= 0 ) {
-            return false;
-        }
-        $proved_ids = App::patient_access()->proved_patient_ids( $wp_user_id, $clinic_id );
-        if ( ! in_array( $patient_id, $proved_ids, true ) ) {
             return false;
         }
 
@@ -3272,6 +3280,18 @@ final class BookingService
         );
 
         return null !== $v;
+    }
+
+    private function user_has_active_patient_in_clinic( int $wp_user_id, int $patient_id, int $clinic_id ): bool {
+        if ( $wp_user_id <= 0 || $patient_id <= 0 || $clinic_id <= 0 ) {
+            return false;
+        }
+        $proved_ids = $this->patient_access()->proved_patient_ids( $wp_user_id, $clinic_id );
+        if ( ! in_array( $patient_id, $proved_ids, true ) ) {
+            return false;
+        }
+
+        return $this->has_durable_patient_link( $wp_user_id, $patient_id, $clinic_id );
     }
 
     private function findActiveByUserSlot( int $wpUserId, int $slotId, int $clinicId ): ?array // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid,WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- established private helper.
@@ -3295,7 +3315,7 @@ final class BookingService
         if ( null === $row ) {
             return null;
         }
-        $proved_ids = App::patient_access()->proved_patient_ids( $wp_user_id, $clinic_id );
+        $proved_ids = $this->patient_access()->proved_patient_ids( $wp_user_id, $clinic_id );
         if ( ! in_array( (int) ( $row['patient_id'] ?? 0 ), $proved_ids, true ) ) {
             return null;
         }

@@ -1076,7 +1076,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $this->insertLink($this->clinicB, $crossClinic, $userN, $this->mobileFor('t12e'), 0);
         // Link archived patient (should be filtered out by UI because inactive)
         $this->insertLink($this->clinicA, $archived, $userN, $this->mobileFor('t12f'), 0);
-        cpms_test_seed_patient_session($userN, $this->clinicA);
+        PatientTwoProofTestHelper::acting_as($userN);
 
         wp_set_current_user($userN);
         $htmlN = $this->renderSurface($this->clinicA);

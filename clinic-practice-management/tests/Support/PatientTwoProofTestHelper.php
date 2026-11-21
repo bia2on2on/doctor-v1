@@ -76,10 +76,11 @@ final class PatientTwoProofTestHelper {
             throw new RuntimeException( "seed_patient_proof: patient {$patient_id} not found in clinic {$clinic_id}." );
         }
 
-        $raw_mobile = is_string( $options['mobile'] ?? null ) && '' !== (string) $options['mobile']
-            ? (string) $options['mobile']
-            : (string) ( $patient['mobile'] ?? '' );
-        $mobile     = MobileValidator::normalize( $raw_mobile );
+        $patient_mobile = MobileValidator::normalize( (string) ( $patient['mobile'] ?? '' ) );
+        $opt_mobile     = is_string( $options['mobile'] ?? null ) && '' !== (string) $options['mobile']
+            ? MobileValidator::normalize( (string) $options['mobile'] )
+            : null;
+        $mobile         = $patient_mobile ?? $opt_mobile;
         if ( null === $mobile ) {
             $mobile = sprintf( '0912%07d', $wp_user_id % 10000000 );
         }
@@ -182,6 +183,9 @@ final class PatientTwoProofTestHelper {
 
         if ( ! $proofs->record_mobile_proof( $wp_user_id, $mobile, $now_ts, $session_token ) ) {
             throw new RuntimeException( "seed_patient_proof: failed to record mobile proof for user {$wp_user_id}." );
+        }
+        if ( null !== $opt_mobile && $opt_mobile !== $mobile ) {
+            $proofs->record_mobile_proof( $wp_user_id, $opt_mobile, $now_ts, $session_token );
         }
         if ( ! $proofs->record_binding_proof( $wp_user_id, $clinic_id, $patient_id, $binding_id, (string) $binding['verified_at'], $now_ts, $session_token ) ) {
             throw new RuntimeException( "seed_patient_proof: failed to record binding proof for user {$wp_user_id}." );

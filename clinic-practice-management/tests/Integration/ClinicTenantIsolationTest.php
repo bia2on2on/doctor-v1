@@ -263,7 +263,7 @@ final class ClinicTenantIsolationTest extends WP_UnitTestCase
 
         PatientTwoProofTestHelper::acting_as($userA);
         $res = $this->call('GET', self::NS . '/patients/' . $patientB . '/files');
-        $this->assertSame(404, $res->get_status(), 'فهرست فایل بیمار دیگر: ' . $this->body($res));
+        $this->assertSame(403, $res->get_status(), 'فهرست فایل بیمار دیگر: ' . $this->body($res));
         $this->assertStringNotContainsString('list-b.pdf', $this->body($res));
     }
 

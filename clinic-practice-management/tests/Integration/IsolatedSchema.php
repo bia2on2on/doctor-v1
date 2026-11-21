@@ -72,15 +72,19 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\PatientAccess;
+use ClinicCore\Application\Auth\PatientSessionProofStore;
+use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Application\Booking\BookingService;
 use ClinicCore\Application\Notifications\SmsService;
-use ClinicCore\Application\Auth\PatientSessionScope;
+use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Domain\Licensing\ActiveLicenseGate;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 use ClinicCore\Infrastructure\Queue\JobQueue;
 use ClinicCore\Infrastructure\Repository\AppointmentRepository;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Infrastructure\Repository\SlotRepository;
 use ClinicCore\Infrastructure\Security\Idempotency;
@@ -110,6 +114,12 @@ trait IsolatedSchema
 
     /** @var array<int, array<string, mixed>> */
     private array $capturedSessions = [];
+
+    /** @var array<int, string> */
+    private array $capturedTokens = [];
+
+    /** @var array<int, string> */
+    private array $capturedCookies = [];
 
     /** @var string|null */
     private static ?string $migrationMirror = null;
@@ -345,10 +355,45 @@ trait IsolatedSchema
      */
     protected function seedSessions(array $userIds): void
     {
+        $db         = new CpmsDb($this->fixtureWpdb);
+        $logins     = new PatientLoginRepository($db);
+        $proofStore = new PatientSessionProofStore();
+        $now        = $db->nowUtcSql();
+
         foreach ($userIds as $userId) {
-            $token = cpms_test_seed_patient_session((int) $userId, $this->clinicId);
-            $manager = \WP_Session_Tokens::get_instance((int) $userId);
-            $this->capturedSessions[(int) $userId] = (array) $manager->get($token);
+            $uid = (int) $userId;
+            $u   = get_userdata($uid);
+            if ($u instanceof \WP_User && ([] === $u->roles || ['subscriber'] === array_values($u->roles))) {
+                $u->set_role(RolesAndCapabilities::ROLE_PATIENT);
+            }
+
+            $token   = cpms_test_seed_patient_session($uid, $this->clinicId);
+            $manager = \WP_Session_Tokens::get_instance($uid);
+
+            $linkRow = $db->fetchRow(
+                'SELECT l.patient_id, p.mobile FROM ' . $db->table('cpms_patient_user_links') . ' l'
+                . ' INNER JOIN ' . $db->table('cpms_patients') . ' p ON p.id = l.patient_id AND p.clinic_id = l.clinic_id'
+                . ' WHERE l.wp_user_id = %d AND l.clinic_id = %d ORDER BY l.is_primary DESC, l.id ASC LIMIT 1',
+                [$uid, $this->clinicId]
+            );
+            if (is_array($linkRow)) {
+                $patientId = (int) $linkRow['patient_id'];
+                $mobile    = (string) $linkRow['mobile'];
+                $account   = $logins->find_account_by_user_id($uid);
+                if (null === $account) {
+                    $acctId = $logins->insert_pending_account($uid, $mobile);
+                    $logins->activate_account_from_pending($acctId, $uid);
+                } elseif (PatientLoginRepository::STATE_ACTIVE !== (string) ($account['state'] ?? '')) {
+                    $logins->activate_account_from_pending((int) $account['id'], $uid);
+                }
+                $binding = $logins->upsert_active_binding($uid, $this->clinicId, $patientId, $now);
+                $proofStore->record_mobile_proof($uid, $mobile, null, $token);
+                $proofStore->record_binding_proof($uid, $this->clinicId, $patientId, (int) $binding['id'], (string) $binding['verified_at'], null, $token);
+            }
+
+            $this->capturedTokens[$uid]   = $token;
+            $this->capturedCookies[$uid]  = (string) ($_COOKIE[LOGGED_IN_COOKIE] ?? '');
+            $this->capturedSessions[$uid] = (array) $manager->get($token);
         }
     }
 
@@ -375,6 +420,8 @@ trait IsolatedSchema
 
     protected function dropDisposableSchema(): void
     {
+        unset($_COOKIE[LOGGED_IN_COOKIE]);
+        \ClinicCore\Bootstrap\App::resetScope();
         if ($this->fixtureWpdb instanceof \wpdb) {
             $this->fixtureWpdb->close();
             $this->fixtureWpdb = null;
@@ -477,6 +524,36 @@ trait IsolatedSchema
                 static fn (int $uid, ?string $token) => (null !== $childSession && $childUserId === $uid) ? $childSession : null,
                 static fn (int $uid): array => []
             );
+            $childToken = null !== $childUserId ? ($this->capturedTokens[$childUserId] ?? '') : '';
+            $proofStore = new PatientSessionProofStore(
+                static fn (int $uid): object => new class($childUserId, $childToken, $childSession) {
+                    /** @param array<string, mixed>|null $session */
+                    public function __construct(
+                        private readonly ?int $expectedUid,
+                        private readonly string $expectedToken,
+                        private readonly ?array $session
+                    ) {
+                    }
+
+                    /** @return array<string, mixed>|null */
+                    public function get(string $token): ?array
+                    {
+                        return (null !== $this->session && '' !== $this->expectedToken && $token === $this->expectedToken)
+                            ? $this->session
+                            : null;
+                    }
+
+                    /** @param array<string, mixed> $session */
+                    public function update(string $token, array $session): void
+                    {
+                    }
+
+                    public function destroy_all(): void
+                    {
+                    }
+                },
+                static fn (): string => $childToken
+            );
         } else {
             // License gate and session scope from production wiring write
             // nothing (gate is pure; session reads hit the harness connection
@@ -500,7 +577,15 @@ trait IsolatedSchema
             );
             $license = \ClinicCore\Bootstrap\App::licenseGate();
             $sessions = \ClinicCore\Bootstrap\App::patient_session_scope();
+            $proofStore = new PatientSessionProofStore();
         }
+
+        $patientAccess = new PatientAccess(
+            $db,
+            new PatientRepository($db),
+            logins: new PatientLoginRepository($db),
+            proofs: $proofStore
+        );
 
         $service = new BookingService(
             $db,
@@ -516,7 +601,8 @@ trait IsolatedSchema
             null,
             null,
             null,
-            $sessions
+            $sessions,
+            $patientAccess
         );
 
         return ['service' => $service, 'db' => $db];
