@@ -1598,12 +1598,13 @@ final class BookingService
                     $actor,
                     $idem_clinic_id
                 ): array {
-                    // Account lock is outermost on patient-initiated reschedule (§8);
-                    // the source Appointment row precedes the tenant prefix lock so
-                    // check-in cannot deadlock against this order.
-                    if ( $actor === 'patient' ) {
-                        $this->enforce_account_pending_appointment_cap( $actor_user_id, $appointment_id );
-                    }
+                    // The source Appointment row is the outermost lock: check-in
+                    // locks the Patient and Appointment before it inserts a Visit, and
+                    // that insert takes a shared FK lock on the Clinic row. Taking the
+                    // Organization/Clinic prefix first inverts that pair and produces a
+                    // genuine deadlock, so the tenant prefix is acquired only after the
+                    // source Appointment is locked and authorized.
+                    unset( $actor );
                     $appt = $this->appointments->findForUpdate( $appointment_id );
                     $this->assert_read_succeeded(
                         'reschedule_appointment',

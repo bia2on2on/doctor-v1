@@ -1606,7 +1606,11 @@
 			var nidInput = root.querySelector('[data-role="reg-national-id"]');
 			var birthInput = root.querySelector('[data-role="reg-birth-date"]');
 			var status = root.querySelector('[data-role="auth-status"]');
-			if (!mobileInput || !codeInput || !givenInput || !familyInput || !nidInput || !birthInput || busy || !isNonEmptyString(config.register_path)) {
+			var regStep = root.querySelector('[data-auth-step="otp-register"]');
+			var registerPath = (regStep && isNonEmptyString(regStep.getAttribute('data-register-path')))
+				? regStep.getAttribute('data-register-path')
+				: config.register_path;
+			if (!mobileInput || !codeInput || !givenInput || !familyInput || !nidInput || !birthInput || busy || !isNonEmptyString(registerPath)) {
 				return;
 			}
 
@@ -1650,7 +1654,7 @@
 			}
 
 			setBusy(true);
-			requestJson(config.rest_root + config.register_path, {
+			requestJson(config.rest_root + registerPath, {
 				method: 'POST',
 				credentials: 'same-origin',
 				headers: { Accept: 'application/json', 'Content-Type': 'application/json' },

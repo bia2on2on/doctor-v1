@@ -359,7 +359,6 @@ async function runTests() {
     quote_path: '/booking/quote',
     otp_request_path: '/otp/request',
     otp_verify_path: '/otp/verify',
-    register_path: '/patient/register',
   });
   var pbPanel = makeNode('DIV', { 'data-role': 'panel' });
   var pbClinicians = makeNode('DIV', { 'data-role': 'clinicians' });
@@ -369,7 +368,7 @@ async function runTests() {
   var pbContinue = makeNode('BUTTON', { 'data-role': 'continue-auth' });
   var pbStepMobile = makeNode('DIV', { 'data-auth-step': 'otp-mobile' });
   var pbStepCode = makeNode('DIV', { 'data-auth-step': 'otp-code', hidden: true });
-  var pbStepReg = makeNode('DIV', { 'data-auth-step': 'otp-register', hidden: true });
+  var pbStepReg = makeNode('DIV', { 'data-auth-step': 'otp-register', 'data-register-path': '/patient/register', hidden: true });
   var pbShowRegBtn = makeNode('BUTTON', { 'data-auth-action': 'show-register' });
   var pbShowLoginBtn = makeNode('BUTTON', { 'data-auth-action': 'show-login' });
   var pbRegOtpBtn = makeNode('BUTTON', { 'data-auth-action': 'reg-otp-request' });

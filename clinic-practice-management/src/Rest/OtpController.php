@@ -48,7 +48,7 @@ final class OtpController extends RestBase
                     'slot_date' => ['required' => false, 'type' => 'string'],
                     'slot_time' => ['required' => false, 'type' => 'string'],
 
-                    'clinic_id' => ['required' => false, 'type' => 'integer'],
+                    'clinic_id'    => ['required' => false, 'type' => 'integer'],
                 ],
             ],
         ]);

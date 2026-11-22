@@ -283,13 +283,29 @@ final class BookingFlowTest extends WP_UnitTestCase
         $first = $this->booking()->confirm($hold['hold_token'], $this->patientUserId, 'اول', $this->uuid());
         $prefix = 'AP-' . str_replace('-', '', $firstSlot['date']) . '-';
         global $wpdb;
+        $nowSql = App::db()->nowUtcSql();
+        $wpdb->query(
+            $wpdb->prepare(
+                'INSERT INTO ' . $wpdb->prefix . 'cpms_patients
+                     (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
+                 VALUES (%d, %s, "Legacy", "Ref", %s, "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                $this->clinicId,
+                'MR-LEG-' . uniqid(),
+                '09120000998',
+                $nowSql,
+                $nowSql
+            )
+        );
+        $legacyFixturePatientId = (int) $wpdb->insert_id;
+        self::assertGreaterThan(0, $legacyFixturePatientId);
         foreach ([$prefix . '07', $prefix . 'LEG'] as $reference) {
             $inserted = $wpdb->query($wpdb->prepare(
                 'INSERT INTO ' . $wpdb->prefix . 'cpms_appointments
                  (clinic_id, location_id, reference_code, patient_id, clinician_id, slot_id, slot_date, slot_time, duration_min, slot_end_time, status, is_walkin_express, booked_at, confirmed_at, created_at, updated_at)
-                 SELECT clinic_id, location_id, %s, patient_id, clinician_id, slot_id, slot_date, slot_time, duration_min, slot_end_time, status, is_walkin_express, booked_at, confirmed_at, created_at, updated_at
+                 SELECT clinic_id, location_id, %s, %d, clinician_id, slot_id, slot_date, slot_time, duration_min, slot_end_time, status, is_walkin_express, booked_at, confirmed_at, created_at, updated_at
                  FROM ' . $wpdb->prefix . 'cpms_appointments WHERE id = %d',
                 $reference,
+                $legacyFixturePatientId,
                 $first['appointment_id']
             ));
             self::assertSame(1, $inserted, 'Legacy reference fixture must persist: ' . $wpdb->last_error);

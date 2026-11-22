@@ -4,6 +4,7 @@ declare( strict_types=1 );
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\OtpPolicy;
 use ClinicCore\Application\Auth\OtpService;
 use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientCredentialGuard;
@@ -477,18 +478,24 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertStringContainsString( 'data-auth-step="otp-register"', $bookingHtml );
         self::assertStringContainsString( 'data-role="reg-national-id"', $bookingHtml );
         self::assertStringContainsString( 'data-role="reg-birth-date"', $bookingHtml );
-        self::assertStringContainsString( 'register_path', $bookingHtml );
+        self::assertStringContainsString( 'data-register-path="/patient/register"', $bookingHtml );
     }
 
     private function seedOtp( int $clinicId, string $mobile, string $code, string $purpose ): void {
+        $pepper = (string) get_option( 'cpms_otp_pepper', '' );
+        if ( '' === $pepper ) {
+            $pepper = bin2hex( random_bytes( 32 ) );
+            update_option( 'cpms_otp_pepper', $pepper, 'no' );
+        }
+
         App::db()->insert(
             'cpms_otp_tokens',
             [
                 'clinic_id'    => $clinicId,
                 'mobile'       => $mobile,
-                'code_hash'    => password_hash( $code, PASSWORD_DEFAULT ),
+                'code_hash'    => OtpPolicy::hashCode( $code, $pepper ),
                 'purpose'      => $purpose,
-                'expires_at'   => gmdate( 'Y-m-d H:i:s', time() + 300 ),
+                'expires_at'   => gmdate( 'Y-m-d H:i:s', time() + 300 ) . '.000',
                 'attempts'     => 0,
                 'max_attempts' => 5,
                 'created_at'   => App::db()->nowUtcSql(),
