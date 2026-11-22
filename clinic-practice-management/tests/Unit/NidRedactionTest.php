@@ -51,8 +51,8 @@ final class NidRedactionTest extends TestCase
             'an eleven-digit phone number is not an exact ten-digit NID candidate'
         );
         $this->assertSame(
-            '021[nid-redacted]x',
-            NationalIdValidator::redact_nid_candidates('021' . self::NID_ASCII . 'x'),
+            '021-[nid-redacted]x',
+            NationalIdValidator::redact_nid_candidates('021-' . self::NID_ASCII . 'x'),
             'a ten-digit run remains redacted when embedded in structured text'
         );
     }
