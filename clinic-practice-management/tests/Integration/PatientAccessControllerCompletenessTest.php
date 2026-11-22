@@ -331,24 +331,26 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
                     if ( '/clinic/v1/patient/register' === $route ) {
                         PatientTwoProofTestHelper::acting_as( 0 );
                         $nowSql = App::db()->nowUtcSql();
-                        $pepper = (string) get_option( 'cpms_otp_pepper', '' );
+                        $pepper = defined( 'CPMS_PEPPER' ) && '' !== (string) CPMS_PEPPER
+                            ? (string) CPMS_PEPPER
+                            : (string) get_option( 'cpms_otp_pepper', '' );
                         if ( '' === $pepper ) {
                             $pepper = bin2hex( random_bytes( 32 ) );
                             update_option( 'cpms_otp_pepper', $pepper, 'no' );
                         }
-                        App::db()->insert(
+                        $otpInserted = App::db()->insert(
                             'cpms_otp_tokens',
                             [
-                                'clinic_id'    => $this->clinicA,
-                                'mobile'       => '09120038888',
-                                'code_hash'    => OtpPolicy::hashCode( '445566', $pepper ),
-                                'purpose'      => 'verify_mobile',
-                                'expires_at'   => gmdate( 'Y-m-d H:i:s', time() + 300 ) . '.000',
-                                'attempts'     => 0,
-                                'max_attempts' => 5,
-                                'created_at'   => $nowSql,
+                                'clinic_id'  => $this->clinicA,
+                                'mobile'     => '09120038888',
+                                'code_hash'  => OtpPolicy::hashCode( '445566', $pepper ),
+                                'purpose'    => 'verify_mobile',
+                                'expires_at' => gmdate( 'Y-m-d H:i:s', time() + 300 ) . '.000',
+                                'attempts'   => 0,
+                                'created_at' => $nowSql,
                             ]
                         );
+                        self::assertTrue( (bool) $otpInserted );
                         $allowReq = new WP_REST_Request( $method, $route );
                         $allowReq->set_header( 'Content-Type', 'application/json' );
                         $allowReq->set_body(

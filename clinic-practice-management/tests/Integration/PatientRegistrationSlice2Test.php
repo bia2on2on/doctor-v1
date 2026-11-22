@@ -482,25 +482,27 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
     }
 
     private function seedOtp( int $clinicId, string $mobile, string $code, string $purpose ): void {
-        $pepper = (string) get_option( 'cpms_otp_pepper', '' );
+        $pepper = defined( 'CPMS_PEPPER' ) && '' !== (string) CPMS_PEPPER
+            ? (string) CPMS_PEPPER
+            : (string) get_option( 'cpms_otp_pepper', '' );
         if ( '' === $pepper ) {
             $pepper = bin2hex( random_bytes( 32 ) );
             update_option( 'cpms_otp_pepper', $pepper, 'no' );
         }
 
-        App::db()->insert(
+        $inserted = App::db()->insert(
             'cpms_otp_tokens',
             [
-                'clinic_id'    => $clinicId,
-                'mobile'       => $mobile,
-                'code_hash'    => OtpPolicy::hashCode( $code, $pepper ),
-                'purpose'      => $purpose,
-                'expires_at'   => gmdate( 'Y-m-d H:i:s', time() + 300 ) . '.000',
-                'attempts'     => 0,
-                'max_attempts' => 5,
-                'created_at'   => App::db()->nowUtcSql(),
+                'clinic_id'  => $clinicId,
+                'mobile'     => $mobile,
+                'code_hash'  => OtpPolicy::hashCode( $code, $pepper ),
+                'purpose'    => $purpose,
+                'expires_at' => gmdate( 'Y-m-d H:i:s', time() + 300 ) . '.000',
+                'attempts'   => 0,
+                'created_at' => App::db()->nowUtcSql(),
             ]
         );
+        self::assertTrue( (bool) $inserted );
     }
 
     private function insertPatient(
