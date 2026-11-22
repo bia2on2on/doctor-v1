@@ -249,36 +249,42 @@ final class AuditLogger
             }
             // B0-PR3: کد ملی هرگز (حتی Maskشده) در Audit نمی‌آید. برخلاف
             // MASK_KEYS که ۴ رقمِ آخر را نگه می‌دارند، این کلید کامل حذف می‌شود.
-            if (mb_strtolower($key) === 'national_id') {
+            if ( mb_strtolower( $key ) === 'national_id' ) {
                 // سیاست مالک: خودِ نام فیلد هم نباید وارد payload شود.
                 continue;
             }
-            if (in_array($key, self::MASK_KEYS, true) && is_string($v) && strlen($v) >= 4) {
+            $safe_key = NationalIdValidator::redact_digits( $key );
+            if ( in_array( $key, self::MASK_KEYS, true ) && is_string( $v ) && strlen( $v ) >= 4 ) {
                 // Phone/mobile values can be misfiled NIDs too. Prefer the
                 // fail-closed digit rule over retaining even a four-digit tail.
-                $safe = NationalIdValidator::redact_digits($v);
-                $out[$key] = $safe !== $v ? $safe : '***' . substr($v, -4);
+                $safe        = NationalIdValidator::redact_digits( $v );
+                $out[ $safe_key ] = $safe !== $v ? $safe : '***' . substr( $v, -4 );
                 continue;
             }
-            if (is_array($v)) {
-                $out[$key] = $this->sanitize($v);
+            if ( is_object( $v ) ) {
+                // Do not allow JsonSerializable properties to bypass recursion.
+                $class       = NationalIdValidator::redact_digits( get_class( $v ) );
+                $out[ $safe_key ] = '[object:' . $class . ']';
                 continue;
             }
-            if (is_string($v)) {
+            if ( is_array( $v ) ) {
+                $out[ $safe_key ] = $this->sanitize( $v );
+                continue;
+            }
+            if ( is_string( $v ) ) {
                 // B0-PR3: متنِ آزاد می‌تواند ارقامِ کد ملی را در خود داشته باشد
                 // (دلیل لغو، یادداشت، ...). قبل از هر ذخیره، ارقام را جمع‌بندی می‌کند.
-                $safe = NationalIdValidator::redact_digits($v);
-                $out[$key] = mb_strlen($safe) > 2000 ? mb_substr($safe, 0, 2000) . '…[truncated]' : $safe;
+                $safe        = NationalIdValidator::redact_digits( $v );
+                $out[ $safe_key ] = mb_strlen( $safe ) > 2000 ? mb_substr( $safe, 0, 2000 ) . '…[truncated]' : $safe;
                 continue;
             }
-            if (is_int($v) || is_float($v)) {
+            if ( is_int( $v ) || is_float( $v ) ) {
                 // ورودیِ عددیِ ۱۰ رقمی هم نباید از اسکنِ رشته‌ای عبور کند.
-                $numeric = (string) $v;
-                $safe = NationalIdValidator::redact_digits($numeric);
-                $out[$key] = $safe === $numeric ? $v : $safe;
+                $safe        = NationalIdValidator::redact_digits( (string) $v );
+                $out[ $safe_key ] = $safe === (string) $v ? $v : $safe;
                 continue;
             }
-            $out[$key] = $v;
+            $out[ $safe_key ] = $v;
         }
 
         return $out;

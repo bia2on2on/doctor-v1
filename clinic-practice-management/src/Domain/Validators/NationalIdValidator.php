@@ -105,9 +105,8 @@ final class NationalIdValidator
      *
      * @return string Text with long digit runs redacted.
      */
-    public static function redact_digits(string $value): string
-    {
-        $redacted = preg_replace('/[0-9۰-۹٠-٩]{10,}/u', '[nid-redacted]', $value);
+    public static function redact_digits( string $value ): string {
+        $redacted = preg_replace( '/[0-9۰-۹٠-٩]{10,}/u', '[nid-redacted]', $value );
 
         return $redacted ?? '';
     }

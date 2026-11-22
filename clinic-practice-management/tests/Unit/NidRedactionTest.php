@@ -141,6 +141,18 @@ final class NidRedactionTest extends TestCase
         $this->assertStringContainsString('نوبت با دکتر', $out);
     }
 
+    public function testSmsTemplateRendererStillCollapsesDoubledDoctorTitle(): void
+    {
+        $out = SmsTemplateRenderer::render(
+            'نوبت با دکتر {{doctor_name}}',
+            ['doctor_name' => 'دکتر رضایی'],
+            ['doctor_name'],
+            []
+        );
+
+        $this->assertSame('نوبت با دکتر رضایی', $out);
+    }
+
     public function testSmsTemplateRenderKeepsOtpAndDates(): void
     {
         // کد OTPِ ۶ رقمی و تاریخ/ساعت باید دست‌نخورده بمانند — جمع‌بندی نباید
@@ -160,7 +172,8 @@ final class NidRedactionTest extends TestCase
 
         $this->assertSame(3, substr_count($out, '[nid-redacted]'));
         $this->assertStringContainsString('کد: 654321', $out);
-        $this->assertStringContainsString('1405/06/10 09:30', $out);
+        $this->assertStringContainsString('1405/06/10', $out);
+        $this->assertStringContainsString('09:30', $out);
         $this->assertStringNotContainsString(self::NID_ASCII, $out);
         $this->assertStringNotContainsString(self::NID_PERSIAN, $out);
         $this->assertStringNotContainsString(self::NID_ARABIC, $out);

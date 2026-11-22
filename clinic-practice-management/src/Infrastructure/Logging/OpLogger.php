@@ -48,7 +48,7 @@ final class OpLogger
                     'level' => $level,
                     // B0-PR3: پیامِ لاگ هم متنِ آزاد است — ارقامِ کد ملی در
                     // هر سه شکلِ ASCII/فارسی/عربی قبل از ذخیره جمع‌بندی می‌شوند.
-                    'message' => mb_substr(NationalIdValidator::redact_digits($message), 0, 500),
+                    'message'      => mb_substr( NationalIdValidator::redact_digits( $message ), 0, 500 ),
                     'context_json' => json_encode($this->sanitize($context), JSON_UNESCAPED_UNICODE) ?: null,
                     'request_id' => $this->requestId(),
                     'created_at' => $this->db->nowUtcSql(),
@@ -59,7 +59,7 @@ final class OpLogger
         } catch (\Throwable) {
             // Log هرگز نباید Request را شکست بدهد
             // B0-PR3: مسیرِ جایگزین نباید پیامِ خام را به error_log بنویسد.
-            error_log('[cpms] op-log write failed');
+            error_log( '[cpms] op-log write failed' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- constant-only fallback; never includes request data.
         }
     }
 
@@ -78,17 +78,16 @@ final class OpLogger
                 $out[$key] = '[masked]';
                 continue;
             }
-            if (is_string($v)) {
+            if ( is_string( $v ) ) {
                 // B0-PR3: مقدارِ متنیِ آزاد (مثلاً `error` با پیامِ exception یا
                 // `reason` کاربر) می‌تواند ارقامِ کد ملی داشته باشد.
-                $safe = NationalIdValidator::redact_digits($v);
-                $out[$key] = mb_strlen($safe) > 200 ? mb_substr($safe, 0, 200) . '…' : $safe;
+                $safe        = NationalIdValidator::redact_digits( $v );
+                $out[ $key ] = mb_strlen( $safe ) > 200 ? mb_substr( $safe, 0, 200 ) . '…' : $safe;
                 continue;
             }
-            if (is_int($v) || is_float($v)) {
-                $numeric = (string) $v;
-                $safe = NationalIdValidator::redact_digits($numeric);
-                $out[$key] = $safe === $numeric ? $v : $safe;
+            if ( is_int( $v ) || is_float( $v ) ) {
+                $safe        = NationalIdValidator::redact_digits( (string) $v );
+                $out[ $key ] = $safe === (string) $v ? $v : $safe;
                 continue;
             }
             $out[$key] = is_scalar($v) || $v === null ? $v : gettype($v);

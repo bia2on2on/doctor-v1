@@ -129,8 +129,8 @@ final class NotificationEvents
         // B0-PR3: متنِ اعلان هم می‌تواند ارقامِ کد ملی را از یک متغیرِ آزاد
         // در خود داشته باشد؛ قبل از ذخیرهٔ payload جمع‌بندی می‌شود.
         return [
-            'title' => NationalIdValidator::redact_digits($sub($info['title'])),
-            'body' => NationalIdValidator::redact_digits($sub($info['body'])),
+            'title' => NationalIdValidator::redact_digits( $sub( $info['title'] ) ),
+            'body'  => NationalIdValidator::redact_digits( $sub( $info['body'] ) ),
         ];
     }
 }
