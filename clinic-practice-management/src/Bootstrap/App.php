@@ -192,6 +192,21 @@ final class App
     private const DB_ENGINE_LOG_WINDOW = 21600;
 
     private static ?CpmsDb $db = null;
+    /**
+     * PID that built the singleton `self::$db`. After `pcntl_fork()` the
+     * singleton wraps the pre-fork `$wpdb`: its mysqlnd socket file
+     * descriptor is copied into every child and stays unsynchronized across
+     * all of them and the parent. A forked child that issues a query on
+     * that shared frame (e.g. the license-gate evidence read on the write
+     * path) can interleave bytes with its siblings, tear the MySQL frames
+     * and park forever in poll(2) with an empty processlist (Integration
+     * Phase6ScheduleShiftConcurrencyRedTest::testConcurrentOverlappingCreates
+     * LeaveExactlyOneActiveRow — parent in waitpid, child in
+     * poll_schedule_timeout). Storing the builder PID lets db() rebuild a
+     * private connection in the forked process; unforked processes (the
+     * whole production request path) behave exactly as before.
+     */
+    private static ?int $dbPid = null;
     private static ?OpLogger $op = null;
     private static ?AuditLogger $audit = null;
     private static ?JobQueue $jobs = null;
@@ -2138,12 +2153,47 @@ final class App
 
     public static function db(): CpmsDb
     {
-        if (self::$db === null) {
-            global $wpdb;
+        $pid = (int) getmypid();
+        if (self::$db !== null && self::$dbPid === $pid) {
+            return self::$db;
+        }
+        global $wpdb;
+        if (self::$db !== null) {
+            // Forked process reusing the inherited pre-fork singleton. Give
+            // it a private connection (see $dbPid above); fall back to the
+            // inherited connection if a fresh one cannot be built, i.e.
+            // never worse than the pre-fix behavior.
+            self::$db = self::forkedDbCopy($wpdb) ?? new CpmsDb($wpdb);
+        } else {
             self::$db = new CpmsDb($wpdb);
         }
+        self::$dbPid = $pid;
 
         return self::$db;
+    }
+
+    /**
+     * Build a private CpmsDb for this process on a fresh connection, the
+     * same pattern the Integration fork helpers use for child connections.
+     * Returns null when the DB constants are unavailable or the fresh
+     * connection cannot be built.
+     */
+    private static function forkedDbCopy( \wpdb $inherited ): ?CpmsDb
+    {
+        if ( ! defined( 'DB_HOST' ) || ! defined( 'DB_USER' ) || ! defined( 'DB_NAME' ) ) {
+            return null;
+        }
+        try {
+            $fresh = new \wpdb( DB_USER, defined( 'DB_PASSWORD' ) ? DB_PASSWORD : '', DB_NAME, DB_HOST );
+            if ( ! method_exists( $fresh, 'set_prefix' ) ) {
+                return null;
+            }
+            $fresh->set_prefix( $inherited->prefix );
+
+            return new CpmsDb( $fresh );
+        } catch ( \Throwable ) {
+            return null;
+        }
     }
 
     public static function op(): OpLogger
