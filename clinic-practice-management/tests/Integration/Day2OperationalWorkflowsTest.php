@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\PatientAccess;
+use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
@@ -166,6 +168,7 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
         ]);
         self::assertSame(400, $mismatchedMine->get_status(), 'A Clinic-mismatched link invalidates the stamped session Clinic.');
         self::assertSame('CLINIC_SCOPE_REQUIRED', $this->errCode($mismatchedMine));
+        self::assertSame(PatientSessionScope::SCOPE_REQUIRED_MESSAGE, (string) ($mismatchedMine->get_data()['message'] ?? ''));
         $mismatchedOptions = $this->dispatch('GET', '/clinic/v1/appointments/' . $apptId . '/reschedule-options');
         self::assertSame(403, $mismatchedOptions->get_status());
         $mismatchedReschedule = $this->dispatch(
@@ -199,7 +202,12 @@ final class Day2OperationalWorkflowsTest extends WP_UnitTestCase
             'to'   => $dayAfter,
         ]);
         self::assertSame(403, $archivedMine->get_status(), 'An archived Patient must fail closed at PatientAccess gate.');
-        self::assertSame(403, $this->dispatch('POST', '/clinic/v1/appointments/' . $apptId . '/cancel')->get_status());
+        self::assertSame(PatientAccess::PROOF_FAILED_CODE, $this->errCode($archivedMine));
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($archivedMine->get_data()['message'] ?? ''));
+        $archivedCancel = $this->dispatch('POST', '/clinic/v1/appointments/' . $apptId . '/cancel');
+        self::assertSame(403, $archivedCancel->get_status());
+        self::assertSame(PatientAccess::PROOF_FAILED_CODE, $this->errCode($archivedCancel));
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($archivedCancel->get_data()['message'] ?? ''));
         self::assertSame(1, App::db()->update('cpms_patients', ['status' => 'active'], ['id' => $patientA]));
 
         // 3. Appointment with active Visit cannot load reschedule options (409 HAS_ACTIVE_VISIT).

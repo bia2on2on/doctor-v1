@@ -284,6 +284,9 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         $this->assertClinicError($foreignLinkResp, PatientAccess::PROOF_FAILED_CODE, 403,
             'positive control: foreign link_id fails closed on backend.'
         );
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($foreignLinkResp->get_data()['message'] ?? ''),
+            'positive control: foreign link_id must return exact PatientAccess::PROOF_FAILED_MESSAGE.'
+        );
         // Backend: explicit link_id selection works for both A and B.
         $selA = $this->dispatchRest('GET', self::ME_PATH, ['link_id' => $twoFx['link_a']], (int) $twoFx['fx']['user_id']);
         self::assertSame(200, $selA->get_status(), 'positive control: GET /patient/me?link_id=A returns 200.');
@@ -306,9 +309,15 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         $this->assertClinicError($zeroMe, PatientAccess::PROOF_FAILED_CODE, 403,
             'positive control: zero-link patient is proof-failed on /patient/me.'
         );
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($zeroMe->get_data()['message'] ?? ''),
+            'positive control: zero-link /patient/me must return exact PatientAccess::PROOF_FAILED_MESSAGE.'
+        );
         $zeroRecords = $this->dispatchRest('GET', self::MY_RECORDS_PATH, [], (int) $zeroFx['user_id']);
         $this->assertClinicError($zeroRecords, PatientAccess::PROOF_FAILED_CODE, 403,
             'positive control: zero-link patient is proof-failed on /patient/my-records.'
+        );
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($zeroRecords->get_data()['message'] ?? ''),
+            'positive control: zero-link /patient/my-records must return exact PatientAccess::PROOF_FAILED_MESSAGE.'
         );
 
         // Backend: single active link auto-selects (no CLINIC_SELECTION_REQUIRED).
@@ -836,6 +845,7 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         $zero = $this->buildZeroLinkFixture('g2c');
         $resp0 = $this->dispatchRest('GET', self::MY_RECORDS_PATH, [], (int) $zero['user_id']);
         $this->assertClinicError($resp0, PatientAccess::PROOF_FAILED_CODE, 403, 'Zero-link patient without proof fails closed on /patient/my-records.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($resp0->get_data()['message'] ?? ''), 'Zero-link /patient/my-records must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
     }
 
     /**
@@ -873,6 +883,9 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         $foreign = $this->dispatchRest('GET', self::ME_PATH, ['link_id' => $two['foreign_link_id']], (int) $two['fx']['user_id']);
         $this->assertClinicError($foreign, PatientAccess::PROOF_FAILED_CODE, 403,
             'Foreign link_id must fail closed (403).'
+        );
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($foreign->get_data()['message'] ?? ''),
+            'Foreign link_id must return exact PatientAccess::PROOF_FAILED_MESSAGE.'
         );
 
         $fx = $this->buildSingleLinkFixture('g4s');

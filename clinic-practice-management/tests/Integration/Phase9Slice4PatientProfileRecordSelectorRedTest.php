@@ -307,9 +307,11 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
 
         $wrongRole = $this->dispatch('GET', self::ME_PATH, [], $nonPatientUserId);
         $this->assertClinicError($wrongRole, PatientAccess::PROOF_FAILED_CODE, 403, 'Only the cpms_patient role can use patient self-service.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($wrongRole->get_data()['message'] ?? ''), 'Wrong-role caller must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
 
         $noLink = $this->dispatch('GET', self::ME_PATH, [], $noLinkUserId);
         $this->assertClinicError($noLink, PatientAccess::PROOF_FAILED_CODE, 403, 'A patient-role user without a durable link remains denied.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($noLink->get_data()['message'] ?? ''), 'No-link caller must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
 
         $patientCountBefore = $this->countRows('cpms_patients');
         $linkCountBefore = $this->countRows('cpms_patient_user_links');
@@ -318,12 +320,15 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
 
         $foreign = $this->dispatch('GET', self::ME_PATH, ['link_id' => $foreignLink], $callerUserId);
         $this->assertClinicError($foreign, PatientAccess::PROOF_FAILED_CODE, 403, 'A foreign user\'s link_id must fail closed without revealing it exists.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($foreign->get_data()['message'] ?? ''), 'Foreign link_id must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
 
         $inactive = $this->dispatch('GET', self::ME_PATH, ['link_id' => $inactiveLink], $callerUserId);
         $this->assertClinicError($inactive, PatientAccess::PROOF_FAILED_CODE, 403, 'A link to an archived Patient must fail closed without revealing it exists.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($inactive->get_data()['message'] ?? ''), 'Inactive link_id must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
 
         $nonexistent = $this->dispatch('GET', self::ME_PATH, ['link_id' => $foreignLink + 999999], $callerUserId);
         $this->assertClinicError($nonexistent, PatientAccess::PROOF_FAILED_CODE, 403, 'A nonexistent link_id must receive the same canonical denied response.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($nonexistent->get_data()['message'] ?? ''), 'Nonexistent link_id must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
 
         self::assertSame($foreign->get_data(), $inactive->get_data(), 'Foreign and inactive selectors must have the exact same non-enumerating envelope.');
         self::assertSame($foreign->get_data(), $nonexistent->get_data(), 'Foreign and nonexistent selectors must have the exact same non-enumerating envelope.');

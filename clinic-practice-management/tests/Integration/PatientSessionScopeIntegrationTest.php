@@ -29,6 +29,7 @@
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
@@ -242,7 +243,8 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         wp_set_current_user($zero);
         $zeroDenied = rest_do_request($this->mineRequest());
         self::assertSame(403, $zeroDenied->get_status());
-        self::assertSame(\ClinicCore\Application\Auth\PatientAccess::PROOF_FAILED_CODE, (string) ($zeroDenied->get_data()['code'] ?? ''));
+        self::assertSame(PatientAccess::PROOF_FAILED_CODE, (string) ($zeroDenied->get_data()['code'] ?? ''));
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($zeroDenied->get_data()['message'] ?? ''));
 
         $multi = $this->makeUser('m5_rest_multi', RolesAndCapabilities::ROLE_PATIENT);
         $patientA = $this->insertPatient($this->clinicA, 'RA');
@@ -258,7 +260,24 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
         wp_set_current_user($multi);
         $blocked = rest_do_request($this->mineRequest());
         self::assertSame(403, $blocked->get_status());
-        self::assertSame(\ClinicCore\Application\Auth\PatientAccess::PROOF_FAILED_CODE, (string) ($blocked->get_data()['code'] ?? ''));
+        self::assertSame(PatientAccess::PROOF_FAILED_CODE, (string) ($blocked->get_data()['code'] ?? ''));
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($blocked->get_data()['message'] ?? ''));
+
+        // Proved multi-clinic user WITHOUT a session clinic marker must still fail closed with CLINIC_SCOPE_REQUIRED.
+        PatientTwoProofTestHelper::seed_patient_proof($multi, $this->clinicA, $patientA, [
+            'mobile'             => '09121234567',
+            'seed_session_scope' => false,
+            'set_current_user'   => true,
+        ]);
+        PatientTwoProofTestHelper::seed_patient_proof($multi, $this->clinicB, $patientB, [
+            'mobile'             => '09121234567',
+            'seed_session_scope' => false,
+            'set_current_user'   => true,
+        ]);
+        $unmarkedProved = rest_do_request($this->mineRequest());
+        self::assertSame(400, $unmarkedProved->get_status(), 'Proved multi-link user without session clinic marker must fail closed with 400 CLINIC_SCOPE_REQUIRED.');
+        self::assertSame('CLINIC_SCOPE_REQUIRED', (string) ($unmarkedProved->get_data()['code'] ?? ''));
+        self::assertSame(PatientSessionScope::SCOPE_REQUIRED_MESSAGE, (string) ($unmarkedProved->get_data()['message'] ?? ''));
 
         $this->seedSessionWithProofs($multi, $this->clinicA);
         $scoped = rest_do_request($this->mineRequest());
