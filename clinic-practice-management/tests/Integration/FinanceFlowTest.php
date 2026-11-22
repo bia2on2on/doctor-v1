@@ -124,7 +124,14 @@ final class FinanceFlowTest extends WP_UnitTestCase
         // is closed too. The journey is now: Stage 2 (T0, one Gregorian month of
         // existing-care follow-through) → then T1+ (Stage 3) denies everything this
         // test used to expect success for.
+        // Both Visits are opened BEFORE the signed T0 is installed: from T0
+        // (Stage 2) on every new-business write (walk-in admission) is denied,
+        // so making a completed Visit mid-Stage-2 would throw CLINIC_LICENSE_BLOCKED.
         $visitId = $this->makeCompletedVisit();
+        // A second, still-open invoice on a separately completed visit — left unpaid
+        // so the Stage-3 payment attempt below reaches the license check, not a
+        // balance/transition rejection.
+        $openVisitId = $this->makeCompletedVisit();
 
         // Stage 2 — existing-care follow-through stays allowed under ordinary RBAC.
         $this->installSignedExpiration(time() - 86400); // T0 = yesterday → Stage 2
@@ -135,10 +142,6 @@ final class FinanceFlowTest extends WP_UnitTestCase
         $this->assertNotEmpty($invoice);
         $paid = $this->finance()->recordPayment($this->secretaryUserId, (int) $invoice['id'], ['amount' => 100000, 'method' => 'cash'], $this->uuid());
         $this->assertGreaterThan(0, (int) $paid['payment_id']);
-        // A second, still-open invoice on a separately completed visit — left unpaid
-        // so the Stage-3 payment attempt below reaches the license check, not a
-        // balance/transition rejection.
-        $openVisitId = $this->makeCompletedVisit();
         $openInvoice = $this->finance()->issueInvoice($this->secretaryUserId, [
             'visit_id' => $openVisitId,
             'items' => [['description' => 'Open balance to carry into Stage 3', 'unit_price' => 40000, 'quantity' => 1]],
