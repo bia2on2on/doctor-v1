@@ -7,6 +7,7 @@ namespace ClinicCore\Tests\Integration;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 /**
@@ -91,12 +92,19 @@ final class BookingAuditAtomicityTest extends WP_UnitTestCase
                 $now
             )
         );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserId,
+            1,
+            $this->patientId,
+            ['mobile' => '09121110001', 'seed_session_scope' => true]
+        );
         $this->otherUserId = (int) wp_create_user('ba_other_' . bin2hex(random_bytes(3)), 'pass-12345', 'ba2@test.local', ['role' => 'cpms_patient']);
     }
 
     protected function tearDown(): void
     {
         $this->restoreAuditInserts();
+        PatientTwoProofTestHelper::reset();
         App::resetScope();
         parent::tearDown();
     }

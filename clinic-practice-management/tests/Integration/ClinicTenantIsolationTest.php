@@ -8,6 +8,7 @@ use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -164,6 +165,7 @@ final class ClinicTenantIsolationTest extends WP_UnitTestCase
     protected function tearDown(): void
     {
         // fixture نباید هیچ Scope/Setting instance‌ای را به کلاس بعدی منتقل کند
+        PatientTwoProofTestHelper::reset();
         ScopeContext::clear();
         \ClinicCore\Settings\Settings::flushCache();
         App::resetScope();
@@ -231,7 +233,7 @@ final class ClinicTenantIsolationTest extends WP_UnitTestCase
         [$patientA, $userA] = $this->seedPatientWithUser(self::CLINIC_A, 'PatA');
         $fileA = $this->seedFile(self::CLINIC_A, $patientA, 'patient_visible', 'own-a.pdf');
 
-        wp_set_current_user($userA);
+        PatientTwoProofTestHelper::acting_as($userA);
         $res = $this->call('GET', self::NS . '/files/' . $fileA . '/stream');
 
         $this->assertSame(200, $res->get_status(), 'دسترسی بیمار به فایل خودش باید باز بماند: ' . $this->body($res));
@@ -245,7 +247,7 @@ final class ClinicTenantIsolationTest extends WP_UnitTestCase
         $patientB = $this->seedPatientWithUser(self::CLINIC_B, 'PatB2')[0];
         $fileB = $this->seedFile(self::CLINIC_B, $patientB, 'patient_visible', 'other-b.pdf');
 
-        wp_set_current_user($userA);
+        PatientTwoProofTestHelper::acting_as($userA);
         $res = $this->call('GET', self::NS . '/files/' . $fileB . '/stream');
 
         $this->assertSame(404, $res->get_status(), 'فایل بیمار دیگر نباید خوانده شود: ' . $this->body($res));
@@ -259,9 +261,9 @@ final class ClinicTenantIsolationTest extends WP_UnitTestCase
         [$patientB] = $this->seedPatientWithUser(self::CLINIC_B, 'PatB3');
         $this->seedFile(self::CLINIC_B, $patientB, 'patient_visible', 'list-b.pdf');
 
-        wp_set_current_user($userA);
+        PatientTwoProofTestHelper::acting_as($userA);
         $res = $this->call('GET', self::NS . '/patients/' . $patientB . '/files');
-        $this->assertSame(404, $res->get_status(), 'فهرست فایل بیمار دیگر: ' . $this->body($res));
+        $this->assertSame(403, $res->get_status(), 'فهرست فایل بیمار دیگر: ' . $this->body($res));
         $this->assertStringNotContainsString('list-b.pdf', $this->body($res));
     }
 
@@ -759,6 +761,9 @@ final class ClinicTenantIsolationTest extends WP_UnitTestCase
             'cpms_medical_attachments' => $pure,
             'cpms_visits' => $pure,
             'cpms_appointments' => $pure,
+            'cpms_patient_logins' => $pure,
+            'cpms_patient_identity_links' => 'WHERE identity_id IN (SELECT identity_id FROM ' . $wpdb->prefix . 'cpms_patients WHERE clinic_id >= 61000 AND identity_id IS NOT NULL)',
+            'cpms_patient_identities' => 'WHERE id IN (SELECT identity_id FROM ' . $wpdb->prefix . 'cpms_patients WHERE clinic_id >= 61000 AND identity_id IS NOT NULL)',
             'cpms_patient_user_links' => $pure,
             'cpms_patients' => $pure,
             'cpms_clinicians' => $pure,
@@ -970,6 +975,13 @@ final class ClinicTenantIsolationTest extends WP_UnitTestCase
             )
         );
         self::assertGreaterThan(0, (int) $wpdb->insert_id, 'پیش‌شرط: پیوند کاربر×بیمار');
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $clinicId,
+            $patientId,
+            ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => false]
+        );
+        $this->bindHarnessScope();
 
         // یک Clinician در همان Clinic (برای تست‌های ویزیت/پرونده) — بدون اتصال به کاربر
         $clinicianId = $this->insertClinician($clinicId, 0, 'Clinician ' . $lastName);
@@ -1123,7 +1135,7 @@ final class ClinicTenantIsolationTest extends WP_UnitTestCase
         $request = new WP_REST_Request($isPatient ? 'POST' : 'POST', $isPatient
             ? self::NS . '/patients/' . $patientId . '/files'
             : self::NS . '/files');
-        wp_set_current_user($actor);
+        PatientTwoProofTestHelper::acting_as($actor);
         $request->set_header('X-WP-Nonce', wp_create_nonce('wp_rest'));
         if (!$isPatient) {
             $request->set_param('patient_id', $patientId);
@@ -1140,7 +1152,7 @@ final class ClinicTenantIsolationTest extends WP_UnitTestCase
 
         $res = rest_do_request($request);
         $this->bindHarnessScope();
-        wp_set_current_user($original);
+        PatientTwoProofTestHelper::acting_as($original);
         if ($res instanceof \WP_Error) {
             $this->fail('پیش‌شرط: آپلود fixture با WP_Error: ' . $res->get_error_code() . ' — ' . $res->get_error_message());
         }

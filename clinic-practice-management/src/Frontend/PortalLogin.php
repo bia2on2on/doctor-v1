@@ -155,18 +155,18 @@ final class PortalLogin {
 			return false;
 		}
 
-		if ( 'doctor' === $portal ) {
-			return StaffPortalShell::doctor_module_eligible( $user_id );
-		}
-		if ( 'staff' !== $portal ) {
-			return false;
-		}
-
 		// A Patient is never admitted to an operational portal, including a
 		// mixed Patient/Staff account; staff eligibility must come from the
 		// existing module rules, and the patient role itself is not a module.
 		$user = get_userdata( $user_id );
 		if ( ! $user instanceof WP_User || in_array( RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true ) ) {
+			return false;
+		}
+
+		if ( 'doctor' === $portal ) {
+			return StaffPortalShell::doctor_module_eligible( $user_id );
+		}
+		if ( 'staff' !== $portal ) {
 			return false;
 		}
 

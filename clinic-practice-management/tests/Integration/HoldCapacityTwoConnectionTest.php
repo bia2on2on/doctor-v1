@@ -366,6 +366,7 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
         $confirmError = null;
         try {
             $this->transactionalCommit($this->fixtureWpdb, function () use ($holdId): void {
+                $_COOKIE[LOGGED_IN_COOKIE] = $this->capturedCookies[$this->userAId] ?? '';
                 $stack = $this->stackOn($this->fixtureWpdb, false);
                 $stack['service']->confirm($this->holdToken($holdId, $this->fixtureWpdb), $this->userAId, null, $this->uuid());
             });
@@ -548,6 +549,7 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
         $worker->query( 'START TRANSACTION' );
         $busyError = null;
         try {
+            $_COOKIE[LOGGED_IN_COOKIE] = $this->capturedCookies[$this->userAId] ?? '';
             $stack = $this->stackOn( $worker, false );
             $stack['service']->hold( $this->userAId, $this->clinicianId, $date, '09:00:00', $slotId );
             $worker->query( 'ROLLBACK' );
@@ -566,6 +568,7 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
         // A fresh production hold now succeeds and consumes the last unit.
         $winner = $connections[] = $this->newDisposableConnection();
         $winner->query( 'START TRANSACTION' );
+        $_COOKIE[LOGGED_IN_COOKIE] = $this->capturedCookies[$this->userAId] ?? '';
         $stack = $this->stackOn( $winner, false );
         $winnerResult = $stack['service']->hold( $this->userAId, $this->clinicianId, $date, '09:00:00', $slotId );
         $winner->query( 'COMMIT' );
@@ -577,6 +580,7 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
         $loser->query( 'START TRANSACTION' );
         $loserError = null;
         try {
+            $_COOKIE[LOGGED_IN_COOKIE] = $this->capturedCookies[$this->userBId] ?? '';
             $stack = $this->stackOn( $loser, false );
             $stack['service']->hold( $this->userBId, $this->clinicianId, $date, '09:00:00', $slotId );
             $loser->query( 'COMMIT' );
@@ -659,6 +663,7 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
         $confirmError = null;
         try {
             $this->transactionalCommit( $this->fixtureWpdb, function () use ( $holdId ): void {
+                $_COOKIE[LOGGED_IN_COOKIE] = $this->capturedCookies[$this->userAId] ?? '';
                 $stack = $this->stackOn( $this->fixtureWpdb, false );
                 $stack['service']->confirm( $this->holdToken( $holdId, $this->fixtureWpdb ), $this->userAId, null, $this->uuid() );
             } );
@@ -713,6 +718,7 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
                 $conn = $this->newDisposableConnection();
             }
             $token = $this->holdToken( $holdId, $conn );
+            $_COOKIE[LOGGED_IN_COOKIE] = $this->capturedCookies[$userId] ?? '';
             $stack = $this->stackOn( $conn, false );
             $conn->query( 'START TRANSACTION' );
             try {

@@ -48,6 +48,7 @@ use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Application\Visits\VisitService;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -85,7 +86,7 @@ final class Phase10DoctorPortalVisitWorkspaceRedTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         $_GET = []; $_POST = []; $_REQUEST = []; $_SERVER['REQUEST_METHOD'] = 'GET';
         ScopeContext::clear();
         App::resetScope();
@@ -396,7 +397,12 @@ final class Phase10DoctorPortalVisitWorkspaceRedTest extends WP_UnitTestCase
             'is_primary' => 1,
             'linked_at' => $now,
         ]);
-        wp_set_current_user($patientUser);
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $patientUser,
+            (int) $fx['clinic'],
+            $patient,
+            ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => true]
+        );
         $rPatientDetail = $this->dispatch('GET', '/' . self::REST_NS . '/visits/' . $visit);
         self::assertSame(200, $rPatientDetail->get_status(), 'G5: Established patient Visit Detail accessible to linked patient');
         $patientPayload = $this->payload($rPatientDetail);

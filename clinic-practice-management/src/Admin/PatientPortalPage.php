@@ -107,7 +107,8 @@ final class PatientPortalPage
             && ! in_array( RolesAndCapabilities::ROLE_ACCOUNTANT, $roles, true )
             && ! in_array( RolesAndCapabilities::ROLE_MANAGER, $roles, true )
             && ! user_can( $user, 'manage_options' )
-            && ! self::holds_any_cpms_capability( $user );
+            && ! self::holds_any_cpms_capability( $user )
+            && ! App::patient_access()->is_scoped_staff_actor( (int) $user->ID );
     }
 
     /**
@@ -1161,6 +1162,13 @@ final class PatientPortalPage
      */
     private static function enrollment_options( int $user_id ): array {
         try {
+            if ( \ClinicCore\Application\Auth\PatientAccess::LEVEL_FULL !== App::patient_access()->level( $user_id ) ) {
+                return [
+                    'state'   => \ClinicCore\Application\Patients\PatientEnrollmentOptions::STATE_UNVERIFIED,
+                    'clinics' => [],
+                ];
+            }
+
             return App::patient_enrollment_options()->for_user( $user_id );
         } catch ( \Throwable ) {
             return [

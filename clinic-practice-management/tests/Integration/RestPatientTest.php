@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Application\Auth\PatientAccess;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -62,19 +64,25 @@ final class RestPatientTest extends WP_UnitTestCase
                 $now
             )
         );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserId,
+            1,
+            $this->patientId,
+            ['mobile' => '09121220001', 'seed_session_scope' => true, 'set_current_user' => false]
+        );
 
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::acting_as(0);
     }
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         parent::tearDown();
     }
 
     public function testMeWithoutNonceRejected(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
 
         $request = new WP_REST_Request('GET', self::NS . '/patient/me');
         $response = rest_do_request($request);
@@ -85,7 +93,7 @@ final class RestPatientTest extends WP_UnitTestCase
 
     public function testMeReturnsOwnProfile(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
 
         $response = $this->dispatch('GET', self::NS . '/patient/me');
 
@@ -97,7 +105,7 @@ final class RestPatientTest extends WP_UnitTestCase
 
     public function testUpdateMeWhitelistBlocksClinicalFields(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
 
         $response = $this->dispatch('PUT', self::NS . '/patient/me', [
             'first_name' => 'Renamed',
@@ -116,7 +124,7 @@ final class RestPatientTest extends WP_UnitTestCase
 
     public function testPatientCannotSearchPatients(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
 
         $response = $this->dispatch('POST', self::NS . '/patients/search', ['q' => 'Rest']);
 
@@ -126,7 +134,7 @@ final class RestPatientTest extends WP_UnitTestCase
 
     public function testPatientCannotCreatePatient(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
 
         $response = $this->dispatch('POST', self::NS . '/patients', [
             'first_name' => 'X',
@@ -165,12 +173,12 @@ final class RestPatientTest extends WP_UnitTestCase
 
     public function testUnauthenticatedMeRejected(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::acting_as(0);
 
         $response = $this->dispatch('GET', self::NS . '/patient/me');
 
-        $this->assertSame(401, $response->get_status());
-        $this->assertClinicError($response, 'CLINIC_UNAUTHORIZED');
+        $this->assertSame(403, $response->get_status());
+        $this->assertClinicError($response, PatientAccess::PROOF_FAILED_CODE);
     }
 
     // ---------- Helpers ----------

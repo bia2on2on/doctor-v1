@@ -175,11 +175,18 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\PatientAccess;
+use ClinicCore\Application\Auth\PatientSessionProofStore;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Booking\BookingException;
+use ClinicCore\Frontend\PublicBookingShortcode;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
+use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -231,7 +238,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         ScopeContext::clear();
         App::resetScope();
         SystemClinicResolver::flush();
@@ -404,11 +411,10 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         // Expect generic validation failure (not 500, not success). Currently will succeed via reuse => RED.
         self::assertNotSame(200, $response->get_status(), 'Same-mobile unlinked must NOT be silently reused — must fail closed with safe validation when uniqueness prevents creation. Body: ' . wp_json_encode($response->get_data()));
         $code = is_array($response->get_data()) ? (string) ($response->get_data()['code'] ?? '') : '';
-        self::assertSame('CLINIC_VALIDATION_FAILED', $code, 'Must be generic non-enumerating CLINIC_VALIDATION_FAILED.');
-        self::assertSame('پروفایل شما ناقص است — ابتدا موبایل خود را تأیید کنید (OTP)', (string) ($response->get_data()['message'] ?? ''), 'Uniform fail-closed message with names — the message checked here (round 14 OD-A F1).');
-        // B2 same-mobile duplicate is pure input validation (400 per error-codes.md registry; BookingService default 400).
-        self::assertSame(400, $response->get_status(), 'B2 same-mobile validation must be 400 (generic validation) per registry. Got: ' . $response->get_status() . ' Body: ' . wp_json_encode($response->get_data()));
-        self::assertSame(400, (int) ($response->get_data()['data']['status'] ?? 0), 'Envelope data.status must be 400.');
+        self::assertSame(PatientAccess::PROOF_FAILED_CODE, $code, 'Unproved zero-link caller must fail closed with patient proof error.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($response->get_data()['message'] ?? ''), 'Unproved zero-link caller must receive exact PatientAccess::PROOF_FAILED_MESSAGE.');
+        self::assertSame(403, $response->get_status(), 'B2 zero-link unproved caller must be 403. Got: ' . $response->get_status() . ' Body: ' . wp_json_encode($response->get_data()));
+        self::assertSame(403, (int) ($response->get_data()['data']['status'] ?? 0), 'Envelope data.status must be 403.');
         // No side effects.
         self::assertStringNotContainsString('SQL', wp_json_encode($response->get_data()), 'Must never expose SQL.');
         self::assertStringNotContainsString('Duplicate', wp_json_encode($response->get_data()), 'Must never expose raw DB error.');
@@ -435,7 +441,20 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $userId = $this->createPatientUserWithLinks($this->clinicB, [
             ['id' => $patientB, 'mobile' => $this->mobileFor('t04'), 'primary' => 1],
         ]);
-        cpms_test_seed_patient_session($userId, $this->clinicA);
+        $proof = PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicB, $patientB, [
+            'mobile' => $this->mobileFor('t04'),
+            'full_identity' => false,
+            'seed_session_scope' => false,
+            'set_current_user' => false,
+        ]);
+        $manager = \WP_Session_Tokens::get_instance($userId);
+        $session = $manager->get($proof['token']);
+        if (is_array($session)) {
+            $manager->update(
+                $proof['token'],
+                array_merge($session, App::patient_session_scope()->session_marker_for($userId, $this->clinicA))
+            );
+        }
         // Booking slot is in Clinic A.
         $slotA = $this->seedSlot($this->clinicA, $this->locationA, $this->clinicianA, $this->ymdDaysAhead(5), '13:00:00', 1);
 
@@ -476,9 +495,9 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
             'patient_id' => $patientArchived,
         ], asUserId: $userId, withNonce: true);
 
-        // Positive control — live main already fails closed for inactive with 400 CLINIC_VALIDATION_FAILED.
-        // Keep contract: inactive must never be selectable, but do not artificially expect 422.
-        $this->assertClinicError($hold, 'CLINIC_VALIDATION_FAILED', 400, 'Inactive/archived Patient must be rejected with generic validation.');
+        // Two-proof gate rejects inactive/archived patient bindings before booking holds.
+        $this->assertClinicError($hold, PatientAccess::PROOF_FAILED_CODE, 403, 'Inactive/archived Patient must fail closed at two-proof gate.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($hold->get_data()['message'] ?? ''), 'Inactive/archived Patient must receive exact PatientAccess::PROOF_FAILED_MESSAGE.');
         self::assertSame(0, $this->countRows('cpms_slot_holds'), 'No Hold for inactive selector.');
         self::assertSame(0, $this->heldCountOf($slot['slot_id']), 'No capacity drift.');
         self::assertSame(0, $this->countAppointmentsForPatient($patientArchived), 'Inactive Patient must receive no Appointment.');
@@ -591,8 +610,8 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $attempt1 = $this->restPost(self::NS . self::CONFIRM_PATH, [
             'hold_token' => $holdToken,
         ], asUserId: $userId, withNonce: true, idempotencyKey: $this->uuid());
-        $this->assertClinicError($attempt1, 'CLINIC_VALIDATION_FAILED', 400, 'B2 for a 0-linked Historical-NULL Hold must fail closed.');
-        self::assertSame('پروفایل شما ناقص است — ابتدا موبایل خود را تأیید کنید (OTP)', (string) ($attempt1->get_data()['message'] ?? ''), 'Uniform fail-closed message.');
+        $this->assertClinicError($attempt1, PatientAccess::PROOF_FAILED_CODE, 403, 'B2 for a 0-linked Historical-NULL Hold must fail closed.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($attempt1->get_data()['message'] ?? ''), 'T8 attempt1 must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
         self::assertSame(0, $this->countPatientsForMobile($this->clinicA, $mobile), 'No Patient must be created on failure.');
         self::assertSame(0, $this->countRows('cpms_appointments'), 'No Appointment on failure.');
         $holdRow = $this->holdRowByToken($holdToken);
@@ -613,6 +632,94 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $holdRow = $this->holdRowByToken($holdToken);
         self::assertSame('active', (string) $holdRow['status'], 'Hold must remain active/retryable.');
         self::assertSame(1, $this->heldCountOf($slot['slot_id']), 'Capacity still held.');
+    }
+
+    /**
+     * Witnessed service-boundary proof for BookingService::confirm() historical-NULL
+     * branch (0 / 1 / >1 proved subjects), independent of REST BookingController's gate.
+     */
+    public function testServiceBoundaryHistoricalNullHoldRejectsZeroAndMultipleProvedSubjectsAndAllowsSingleProvedSubject(): void {
+        $this->buildTwoClinicFixture();
+        $bookingService = App::bookingService();
+
+        // 1) Zero proved subjects (even with same-mobile unlinked Patient) -> 400 CLINIC_VALIDATION_FAILED, zero side effects.
+        $mobileZero     = $this->mobileFor( 'svc-null-0' );
+        $sameMobileZero = $this->insertPatient( $this->clinicA, $mobileZero, 'UnlinkedSvc', 'SameMobile' );
+        $userZero       = (int) wp_create_user( 'p8s3_svc_0_' . uniqid( '', false ), 'pass-not-used-123', $mobileZero . '@otp.cpms.local' );
+        self::assertGreaterThan( 0, $userZero );
+        $this->setRole( $userZero, 'cpms_patient' );
+        cpms_test_seed_patient_session( $userZero, $this->clinicA );
+        $slotZero      = $this->seedSlot( $this->clinicA, $this->locationA, $this->clinicianA, $this->ymdDaysAhead( 5 ), '16:00:00', 1 );
+        $holdTokenZero = $this->seedLegacyNullHoldRow( $this->clinicA, $slotZero['slot_id'], $userZero, $mobileZero );
+        $idemBefore    = $this->countRows( 'cpms_idempotency_keys' );
+
+        try {
+            $bookingService->confirm( $holdTokenZero, $userZero, null, $this->uuid(), 'سارا', 'احمدی' );
+            self::fail( 'Service boundary must reject 0-proved historical-NULL hold.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 'CLINIC_VALIDATION_FAILED', $e->errorCode );
+            self::assertSame( 400, $e->httpStatus );
+            self::assertSame( 'پروفایل شما ناقص است — ابتدا موبایل خود را تأیید کنید (OTP)', $e->getMessage() );
+        }
+
+        self::assertSame( 1, $this->countPatientsForMobile( $this->clinicA, $mobileZero ), 'No new Patient row may be created.' );
+        self::assertSame( 0, $this->countAppointmentsForPatient( $sameMobileZero ), 'Same-mobile unlinked Patient must gain no Appointment.' );
+        self::assertSame( 0, $this->countRows( 'cpms_appointments' ) );
+        self::assertSame( 0, $this->countPatientLinksForUser( $userZero ) );
+        self::assertSame( $idemBefore, $this->countRows( 'cpms_idempotency_keys' ), 'Rejection must occur before idempotency reservation.' );
+        $holdRowZero = $this->holdRowByToken( $holdTokenZero );
+        self::assertIsArray( $holdRowZero );
+        self::assertSame( 'active', (string) $holdRowZero['status'] );
+        self::assertSame( 1, $this->heldCountOf( $slotZero['slot_id'] ) );
+
+        // 2) >1 proved subjects with historical-NULL hold -> 422 CLINIC_PATIENT_SELECTION_REQUIRED, zero side effects.
+        $patientM1 = $this->insertPatient( $this->clinicA, $this->mobileFor( 'svc-null-m1' ), 'MultiOne', 'Proved' );
+        $patientM2 = $this->insertPatient( $this->clinicA, $this->mobileFor( 'svc-null-m2' ), 'MultiTwo', 'Proved' );
+        $userMulti = $this->createPatientUserWithLinks(
+            $this->clinicA,
+            [
+                [ 'id' => $patientM1, 'mobile' => $this->mobileFor( 'svc-null-m1' ), 'primary' => 1 ],
+                [ 'id' => $patientM2, 'mobile' => $this->mobileFor( 'svc-null-m2' ), 'primary' => 0 ],
+            ]
+        );
+        PatientTwoProofTestHelper::acting_as( $userMulti );
+        $slotMulti      = $this->seedSlot( $this->clinicA, $this->locationA, $this->clinicianA, $this->ymdDaysAhead( 5 ), '16:20:00', 1 );
+        $holdTokenMulti = $this->seedLegacyNullHoldRow( $this->clinicA, $slotMulti['slot_id'], $userMulti, $this->mobileFor( 'svc-null-m1' ) );
+
+        try {
+            $bookingService->confirm( $holdTokenMulti, $userMulti, null, $this->uuid(), null, null );
+            self::fail( 'Service boundary must reject >1-proved historical-NULL hold without selection.' );
+        } catch ( BookingException $e ) {
+            self::assertSame( 'CLINIC_PATIENT_SELECTION_REQUIRED', $e->errorCode );
+            self::assertSame( 422, $e->httpStatus );
+        }
+
+        self::assertSame( 0, $this->countAppointmentsForPatient( $patientM1 ) );
+        self::assertSame( 0, $this->countAppointmentsForPatient( $patientM2 ) );
+        $holdRowMulti = $this->holdRowByToken( $holdTokenMulti );
+        self::assertIsArray( $holdRowMulti );
+        self::assertSame( 'active', (string) $holdRowMulti['status'] );
+        self::assertSame( 1, $this->heldCountOf( $slotMulti['slot_id'] ) );
+
+        // 3) Positive witness control: 1 proved subject with historical-NULL hold confirms cleanly.
+        $patientOne = $this->insertPatient( $this->clinicA, $this->mobileFor( 'svc-null-1' ), 'Single', 'Proved' );
+        $userOne    = $this->createPatientUserWithLinks(
+            $this->clinicA,
+            [
+                [ 'id' => $patientOne, 'mobile' => $this->mobileFor( 'svc-null-1' ), 'primary' => 1 ],
+            ]
+        );
+        PatientTwoProofTestHelper::acting_as( $userOne );
+        $slotOne      = $this->seedSlot( $this->clinicA, $this->locationA, $this->clinicianA, $this->ymdDaysAhead( 5 ), '16:40:00', 1 );
+        $holdTokenOne = $this->seedLegacyNullHoldRow( $this->clinicA, $slotOne['slot_id'], $userOne, $this->mobileFor( 'svc-null-1' ) );
+
+        $confirmed = $bookingService->confirm( $holdTokenOne, $userOne, null, $this->uuid(), null, null );
+        self::assertSame( 'confirmed', $confirmed['status'] ?? null );
+        self::assertGreaterThan( 0, (int) ( $confirmed['appointment_id'] ?? 0 ) );
+        self::assertSame( 1, $this->countAppointmentsForPatient( $patientOne ) );
+        $holdRowOne = $this->holdRowByToken( $holdTokenOne );
+        self::assertIsArray( $holdRowOne );
+        self::assertSame( 'converted', (string) $holdRowOne['status'] );
     }
 
     // =================================================================
@@ -833,6 +940,13 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
             ['id' => $own, 'mobile' => $ownMobile, 'primary' => 1],
         ]);
         $dependentLink = $this->insertLink($this->clinicA, $dependent, $caregiver, $depMobile, 0);
+        PatientTwoProofTestHelper::seed_patient_proof($caregiver, $this->clinicA, $dependent, [
+            'mobile' => $depMobile,
+            'full_identity' => false,
+            'is_primary' => false,
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
 
         // The dependent owns a distinct Organization identity. The caregiver has
         // a Clinic booking-subject link only, never an identity/self link.
@@ -873,7 +987,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
             'created_at' => $now,
         ], ['%d', '%d', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%d', '%s'], 'dependent file');
 
-        wp_set_current_user($caregiver);
+        PatientTwoProofTestHelper::acting_as($caregiver);
         $records = App::patientService()->linked_records($caregiver);
         self::assertSame([$own], array_column($records, 'patient_id'), 'Booking-only dependent must not enter profile/clinical selectors.');
         self::assertSame(
@@ -887,7 +1001,8 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         self::assertSame([$own], array_column((array) ($recordResponse->get_data()['data'] ?? []), 'patient_id'));
         foreach (['/patient/me', '/visits', '/prescriptions', '/patients/' . $dependent . '/files'] as $path) {
             $denied = $this->restGet(self::NS . $path, ['link_id' => $dependentLink], $caregiver, true);
-            $this->assertClinicError($denied, 'CLINIC_NOT_FOUND', 404, 'Dependent clinical selector must fail closed: ' . $path);
+            $this->assertClinicError($denied, PatientAccess::PROOF_FAILED_CODE, 403, 'Dependent clinical selector must fail closed: ' . $path);
+            self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($denied->get_data()['message'] ?? ''), 'Dependent clinical selector must return exact PatientAccess::PROOF_FAILED_MESSAGE: ' . $path);
         }
         $streamDenied = $this->restGet(self::NS . '/files/' . $dependentFile . '/stream', [], $caregiver, true);
         $this->assertClinicError($streamDenied, 'CLINIC_NOT_FOUND', 404, 'Direct file stream must enforce identity-backed clinical ownership before disk read.');
@@ -907,12 +1022,13 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $this->setRole($admin, 'administrator');
         foreach (['/appointments/mine', '/prescriptions'] as $path) {
             $adminDenied = $this->restGet(self::NS . $path, ['link_id' => $dependentLink], $admin, true);
-            $this->assertClinicError($adminDenied, 'CLINIC_PERMISSION_DENIED', 403, 'Administrator must not bypass patient REST role: ' . $path);
+            $this->assertClinicError($adminDenied, PatientAccess::PROOF_FAILED_CODE, 403, 'Administrator must not bypass patient REST role: ' . $path);
+            self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($adminDenied->get_data()['message'] ?? ''), 'Administrator refusal must return exact PatientAccess::PROOF_FAILED_MESSAGE: ' . $path);
         }
 
         // Existing public-booking chooser still offers both explicitly linked
         // booking subjects; no patient is inferred from mobile or request data.
-        wp_set_current_user($caregiver);
+        PatientTwoProofTestHelper::acting_as($caregiver);
         $surface = $this->renderSurface($this->clinicA);
         self::assertStringContainsString('Caregiver Self', $surface);
         self::assertStringContainsString('Dependent Child', $surface);
@@ -1055,9 +1171,56 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         ]);
         // Add cross-Clinic link for same user (different clinic)
         $this->insertLink($this->clinicB, $crossClinic, $userN, $this->mobileFor('t12e'), 0);
+        $crossProof = PatientTwoProofTestHelper::seed_patient_proof($userN, $this->clinicB, $crossClinic, [
+            'mobile' => $this->mobileFor('t12e'),
+            'link_user' => false,
+            'is_primary' => false,
+            'seed_session_scope' => false,
+            'set_current_user' => false,
+        ]);
         // Link archived patient (should be filtered out by UI because inactive)
         $this->insertLink($this->clinicA, $archived, $userN, $this->mobileFor('t12f'), 0);
-        cpms_test_seed_patient_session($userN, $this->clinicA);
+        $archivedProof = PatientTwoProofTestHelper::seed_patient_proof($userN, $this->clinicA, $archived, [
+            'mobile' => $this->mobileFor('t12f'),
+            'link_user' => false,
+            'is_primary' => false,
+            'seed_session_scope' => false,
+            'set_current_user' => false,
+        ]);
+        PatientTwoProofTestHelper::acting_as($userN);
+
+        $proofStore = new PatientSessionProofStore();
+        self::assertTrue(
+            $proofStore->has_valid_binding_proof(
+                $userN,
+                $this->clinicB,
+                $crossClinic,
+                $crossProof['binding_id'],
+                $crossProof['verified_at'],
+                $crossProof['mobile'],
+                null,
+                $crossProof['token']
+            ),
+            'Cross-Clinic decoy must hold a valid session/binding proof so only the clinic boundary excludes it.'
+        );
+        self::assertTrue(
+            $proofStore->has_valid_binding_proof(
+                $userN,
+                $this->clinicA,
+                $archived,
+                $archivedProof['binding_id'],
+                $archivedProof['verified_at'],
+                $archivedProof['mobile'],
+                null,
+                $archivedProof['token']
+            ),
+            'Archived decoy must hold a valid session/binding proof so inactive status excludes it.'
+        );
+        self::assertSame(
+            [$crossClinic],
+            App::patient_access()->proved_patient_ids($userN, $this->clinicB),
+            'Cross-Clinic decoy passes the proof gate inside its own clinic.'
+        );
 
         wp_set_current_user($userN);
         $htmlN = $this->renderSurface($this->clinicA);
@@ -1095,11 +1258,12 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         // anymore; the "historical 0 linked" case is by definition a Hold persisted
         // before that rule — seed the row of the historical shape directly.
         $token0 = $this->seedLegacyNullHoldRow($this->clinicA, $slot0['slot_id'], $user0, $mobile0);
-        // B2 without names must fail validation (new patient path).
+        // 0 linked historical null must fail closed without proof.
         $c0 = $this->restPost(self::NS . self::CONFIRM_PATH, [
             'hold_token' => $token0,
         ], asUserId: $user0, withNonce: true, idempotencyKey: $this->uuid());
-        $this->assertClinicError($c0, 'CLINIC_VALIDATION_FAILED', 400, '0 linked historical null must follow new-patient path.');
+        $this->assertClinicError($c0, PatientAccess::PROOF_FAILED_CODE, 403, '0 linked historical null must fail closed without proof.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($c0->get_data()['message'] ?? ''), 'T13 0-linked confirm must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
 
         // Case exactly 1 linked -> server may resolve that one linked Patient (no names).
         $patient1 = $this->insertPatient($this->clinicA, $this->mobileFor('t13b'), 'Hist', 'One');
@@ -1364,6 +1528,13 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $this->setRole($uid, 'cpms_patient');
         foreach ($specs as $s) {
             $this->insertLink($clinicId, (int) $s['id'], $uid, (string) $s['mobile'], (int) $s['primary']);
+            PatientTwoProofTestHelper::seed_patient_proof($uid, $clinicId, (int) $s['id'], [
+                'mobile' => (string) $s['mobile'],
+                'is_primary' => (int) $s['primary'] === 1,
+                'full_identity' => true,
+                'seed_session_scope' => true,
+                'set_current_user' => false,
+            ]);
         }
         return $uid;
     }
@@ -1414,7 +1585,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
      */
     private function restPost(string $route, array $body, ?int $asUserId = null, bool $withNonce = false, ?string $idempotencyKey = null): WP_REST_Response
     {
-        wp_set_current_user($asUserId !== null ? $asUserId : 0);
+        PatientTwoProofTestHelper::acting_as($asUserId !== null ? $asUserId : 0);
         $request = new WP_REST_Request('POST', $route);
         foreach ($body as $k => $v) {
             $request->set_param($k, $v);
@@ -1431,7 +1602,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
     /** @param array<string, mixed> $params */
     private function restGet(string $route, array $params, int $asUserId, bool $withNonce): WP_REST_Response
     {
-        wp_set_current_user($asUserId);
+        PatientTwoProofTestHelper::acting_as($asUserId);
         $request = new WP_REST_Request('GET', $route);
         foreach ($params as $key => $value) {
             $request->set_param($key, $value);
@@ -1666,6 +1837,358 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
         $b[6] = chr((ord($b[6]) & 0x0f) | 0x40);
         $b[8] = chr((ord($b[8]) & 0x3f) | 0x80);
         return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($b), 4));
+    }
+
+    /**
+     * Positive-control witnesses for F3: when the original chooser filters
+     * hold (same clinic / active status), proved decoys ARE rendered; changing
+     * only the clinic boundary or patient status excludes them while the
+     * session proof and binding remain intact.
+     */
+    public function testUiChooserOriginalFiltersExcludeProvedDecoysWithPositiveWitnesses(): void
+    {
+        $this->buildTwoClinicFixture();
+        App::settingsFactory()->forClinic($this->clinicB)->set('public.listing_opt_in', true);
+        Settings::flushCache();
+
+        $patientA1 = $this->insertPatient($this->clinicA, $this->mobileFor('f3w-a1'), 'Witness', 'Alpha');
+        $patientA2 = $this->insertPatient($this->clinicA, $this->mobileFor('f3w-a2'), 'Witness', 'Beta');
+        $archTarget = $this->insertPatient($this->clinicA, $this->mobileFor('f3w-arch'), 'Witness', 'ArchTarget');
+        $crossTarget = $this->insertPatient($this->clinicB, $this->mobileFor('f3w-b1'), 'Witness', 'CrossTarget');
+        $crossPeer = $this->insertPatient($this->clinicB, $this->mobileFor('f3w-b2'), 'Witness', 'CrossPeer');
+
+        $userId = $this->createPatientUserWithLinks($this->clinicA, [
+            ['id' => $patientA1, 'mobile' => $this->mobileFor('f3w-a1'), 'primary' => 1],
+            ['id' => $patientA2, 'mobile' => $this->mobileFor('f3w-a2'), 'primary' => 0],
+            ['id' => $archTarget, 'mobile' => $this->mobileFor('f3w-arch'), 'primary' => 0],
+        ]);
+        $this->insertLink($this->clinicB, $crossTarget, $userId, $this->mobileFor('f3w-b1'), 0);
+        $crossProof = PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicB, $crossTarget, [
+            'mobile' => $this->mobileFor('f3w-b1'),
+            'link_user' => false,
+            'is_primary' => false,
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
+        $this->insertLink($this->clinicB, $crossPeer, $userId, $this->mobileFor('f3w-b2'), 0);
+        PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicB, $crossPeer, [
+            'mobile' => $this->mobileFor('f3w-b2'),
+            'link_user' => false,
+            'is_primary' => false,
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
+        PatientTwoProofTestHelper::acting_as($userId);
+
+        // Positive witness 1: in Clinic B, crossTarget IS rendered in the chooser.
+        $htmlClinicB = $this->renderSurface($this->clinicB);
+        self::assertStringContainsString('data-role="patient-chooser"', $htmlClinicB, 'Witness Clinic B must render chooser for N=2 proved patients.');
+        self::assertStringContainsString('data-patient-id="' . $crossTarget . '"', $htmlClinicB, 'Witness: proved cross-clinic subject IS visible inside its own clinic chooser.');
+        self::assertStringContainsString('data-patient-id="' . $crossPeer . '"', $htmlClinicB, 'Witness: peer patient in Clinic B IS visible.');
+        self::assertStringNotContainsString('data-patient-id="' . $patientA1 . '"', $htmlClinicB, 'Clinic A patient must not appear inside Clinic B chooser.');
+
+        // Switch session scope marker to Clinic A while keeping Clinic B proofs intact.
+        $archProof = PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicA, $archTarget, [
+            'mobile' => $this->mobileFor('f3w-arch'),
+            'link_user' => false,
+            'is_primary' => false,
+            'seed_session_scope' => true,
+            'set_current_user' => true,
+        ]);
+
+        // Positive witness 2: while active in Clinic A, archTarget IS rendered in Clinic A chooser; crossTarget is excluded.
+        $htmlClinicAWitness = $this->renderSurface($this->clinicA);
+        self::assertStringContainsString('data-role="patient-chooser"', $htmlClinicAWitness, 'Witness Clinic A must render chooser.');
+        self::assertStringContainsString('data-patient-id="' . $patientA1 . '"', $htmlClinicAWitness);
+        self::assertStringContainsString('data-patient-id="' . $patientA2 . '"', $htmlClinicAWitness);
+        self::assertStringContainsString('data-patient-id="' . $archTarget . '"', $htmlClinicAWitness, 'Witness: active proved subject IS visible in Clinic A chooser before archival.');
+        self::assertStringNotContainsString('data-patient-id="' . $crossTarget . '"', $htmlClinicAWitness, 'Proved cross-clinic subject must be excluded from Clinic A chooser.');
+
+        // Flip ONLY patient status to archived, keeping active binding & session proof intact.
+        self::assertSame(1, App::db()->update('cpms_patients', ['status' => 'archived'], ['id' => $archTarget]));
+        $proofStore = new PatientSessionProofStore();
+        self::assertTrue(
+            $proofStore->has_valid_binding_proof(
+                $userId,
+                $this->clinicA,
+                $archTarget,
+                $archProof['binding_id'],
+                $archProof['verified_at'],
+                $archProof['mobile'],
+                null,
+                $archProof['token']
+            ),
+            'Session binding proof for archived target must remain valid so archival status is what excludes it.'
+        );
+        self::assertTrue(
+            $proofStore->has_valid_binding_proof(
+                $userId,
+                $this->clinicB,
+                $crossTarget,
+                $crossProof['binding_id'],
+                $crossProof['verified_at'],
+                $crossProof['mobile'],
+                null,
+                $crossProof['token']
+            ),
+            'Session binding proof for cross-clinic target must remain valid.'
+        );
+
+        $htmlClinicAAfterArchive = $this->renderSurface($this->clinicA);
+        self::assertStringContainsString('data-role="patient-chooser"', $htmlClinicAAfterArchive);
+        self::assertStringContainsString('data-patient-id="' . $patientA1 . '"', $htmlClinicAAfterArchive);
+        self::assertStringContainsString('data-patient-id="' . $patientA2 . '"', $htmlClinicAAfterArchive);
+        self::assertStringNotContainsString('data-patient-id="' . $archTarget . '"', $htmlClinicAAfterArchive, 'Archived subject with intact proof must be excluded from chooser.');
+        self::assertStringNotContainsString('ArchTarget', $htmlClinicAAfterArchive, 'Archived subject name must not appear in chooser.');
+        self::assertStringNotContainsString('data-patient-id="' . $crossTarget . '"', $htmlClinicAAfterArchive, 'Proved cross-clinic subject must stay excluded from Clinic A chooser.');
+    }
+
+    /**
+     * Task 3 (F3 isolation): exercise the ORIGINAL PublicBookingShortcode chooser
+     * SQL filters (PublicBookingShortcode.php:1354-1356) independently of BOTH
+     * PatientLoginRepository filters and the proof intersection (:1360-1367).
+     * By bypassing p.status = 'active' and b.clinic_id = %d on the repository
+     * bindings query in test code, App::patient_access()->proved_patient_ids()
+     * returns ALL four IDs (positive witnesses + cross-clinic + archived decoys),
+     * so ONLY the original chooser SQL filters exclude the decoys.
+     */
+    public function testOriginalChooserFiltersIsolateCrossClinicAndArchivedWithProvedDecoys(): void
+    {
+        $this->buildTwoClinicFixture();
+        App::settingsFactory()->forClinic($this->clinicB)->set('public.listing_opt_in', true);
+        Settings::flushCache();
+
+        $patientA1 = $this->insertPatient($this->clinicA, $this->mobileFor('f3iso-a1'), 'IsoWitness', 'Alpha');
+        $patientA2 = $this->insertPatient($this->clinicA, $this->mobileFor('f3iso-a2'), 'IsoWitness', 'Beta');
+        $archTarget = $this->insertPatient($this->clinicA, $this->mobileFor('f3iso-arch'), 'IsoWitness', 'ArchIso');
+        $crossTarget = $this->insertPatient($this->clinicB, $this->mobileFor('f3iso-b1'), 'IsoWitness', 'CrossIso');
+
+        $userId = $this->createPatientUserWithLinks($this->clinicA, [
+            ['id' => $patientA1, 'mobile' => $this->mobileFor('f3iso-a1'), 'primary' => 1],
+            ['id' => $patientA2, 'mobile' => $this->mobileFor('f3iso-a2'), 'primary' => 0],
+            ['id' => $archTarget, 'mobile' => $this->mobileFor('f3iso-arch'), 'primary' => 0],
+        ]);
+        $this->insertLink($this->clinicB, $crossTarget, $userId, $this->mobileFor('f3iso-b1'), 0);
+        PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicB, $crossTarget, [
+            'mobile' => $this->mobileFor('f3iso-b1'),
+            'link_user' => false,
+            'is_primary' => false,
+            'seed_session_scope' => false,
+            'set_current_user' => false,
+        ]);
+        PatientTwoProofTestHelper::acting_as($userId);
+
+        // Positive witness before archival: archTarget IS rendered in Clinic A chooser.
+        $htmlBeforeArchive = $this->renderSurface($this->clinicA);
+        self::assertStringContainsString('data-patient-id="' . $archTarget . '"', $htmlBeforeArchive, 'Witness before archival: active target must appear in chooser.');
+
+        // Archive archTarget while keeping its active cpms_patient_logins binding & session proof intact.
+        self::assertSame(1, App::db()->update('cpms_patients', ['status' => 'archived'], ['id' => $archTarget]));
+
+        // Bypass repository status and clinic filters on find_active_bindings_for_user()
+        // so proved_patient_ids($userId, $clinicA) returns ALL four IDs, including decoys.
+        $interceptCount = 0;
+        $queryFilter = static function (string $sql) use (&$interceptCount): string {
+            if (
+                str_contains($sql, 'SELECT b.id AS binding_id, b.wp_user_id, b.clinic_id, b.patient_id')
+                && str_contains($sql, "AND p.status = 'active'")
+            ) {
+                ++$interceptCount;
+                $sql = str_replace("AND p.status = 'active'", 'AND 1 = 1', $sql);
+                $sql = preg_replace('/\s+AND\s+b\.clinic_id\s*=\s*\d+/', '', $sql) ?? $sql;
+            }
+            return $sql;
+        };
+
+        $provedIds = [];
+        $htmlShortcode = '';
+        $htmlPortal = '';
+        $linkedRecords = [];
+        add_filter('query', $queryFilter);
+        try {
+            $provedIds = App::patient_access()->proved_patient_ids($userId, $this->clinicA);
+            $htmlShortcode = $this->renderSurface($this->clinicA);
+            $htmlPortal = PublicBookingShortcode::render_for_patient_portal($this->clinicA);
+            $linkedRecords = App::patientService()->linked_records($userId);
+        } finally {
+            remove_filter('query', $queryFilter);
+        }
+
+        // Assertions outside callback: proved_patient_ids() returned ALL four IDs.
+        self::assertGreaterThanOrEqual(4, $interceptCount, 'Repository bindings query must have been intercepted for proved_patient_ids, shortcode, portal, and linked_records.');
+        self::assertContains($patientA1, $provedIds);
+        self::assertContains($patientA2, $provedIds);
+        self::assertContains($archTarget, $provedIds, 'With repository status filter bypassed, proved_patient_ids() MUST include the archived decoy.');
+        self::assertContains($crossTarget, $provedIds, 'With repository clinic filter bypassed, proved_patient_ids() MUST include the cross-clinic decoy.');
+
+        // Only PublicBookingShortcode's original SQL filter (l.clinic_id = %d AND p.status = %s AND p.clinic_id = %d)
+        // remains to exclude crossTarget and archTarget from shortcode and patient-portal choosers.
+        foreach (['shortcode' => $htmlShortcode, 'portal' => $htmlPortal] as $surface => $html) {
+            self::assertStringContainsString('data-role="patient-chooser"', $html, $surface . ': positive witness chooser must render.');
+            self::assertStringContainsString('data-patient-id="' . $patientA1 . '"', $html, $surface . ': positive witness A1 must render.');
+            self::assertStringContainsString('data-patient-id="' . $patientA2 . '"', $html, $surface . ': positive witness A2 must render.');
+            self::assertStringNotContainsString('data-patient-id="' . $crossTarget . '"', $html, $surface . ': original chooser clinic filter must exclude proved cross-clinic decoy.');
+            self::assertStringNotContainsString('CrossIso', $html, $surface . ': cross-clinic decoy name must not appear.');
+            self::assertStringNotContainsString('data-patient-id="' . $archTarget . '"', $html, $surface . ': original chooser status filter must exclude proved archived decoy.');
+            self::assertStringNotContainsString('ArchIso', $html, $surface . ': archived decoy name must not appear.');
+        }
+
+        // PatientService::linked_records() with proved_patient_ids() containing archTarget
+        // must still exclude archTarget via PatientRepository::active_linked_records_for_user().
+        $linkedPatientIds = array_column($linkedRecords, 'patient_id');
+        self::assertContains($patientA1, $linkedPatientIds, 'linked_records positive witness A1 must be present.');
+        self::assertContains($patientA2, $linkedPatientIds, 'linked_records positive witness A2 must be present.');
+        self::assertContains($crossTarget, $linkedPatientIds, 'linked_records positive witness CrossIso (active in clinicB) must be present.');
+        self::assertNotContains($archTarget, $linkedPatientIds, 'linked_records original repository status filter must exclude archived decoy even when proved_patient_ids() includes it.');
+
+        // Session-scope chooser guard (PublicBookingShortcode.php:1332-1334): when session marker
+        // is stamped to Clinic B, rendering Clinic A must NOT expose Clinic A's chooser.
+        PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicB, $crossTarget, [
+            'mobile' => $this->mobileFor('f3iso-b1'),
+            'link_user' => false,
+            'is_primary' => false,
+            'seed_session_scope' => true,
+            'set_current_user' => true,
+        ]);
+        $htmlMismatchedScope = $this->renderSurface($this->clinicA);
+        self::assertStringNotContainsString('data-role="patient-chooser"', $htmlMismatchedScope, 'Mismatched session clinic must not render Clinic A chooser.');
+        self::assertStringNotContainsString('data-patient-id="' . $patientA1 . '"', $htmlMismatchedScope, 'Mismatched session clinic must not leak Clinic A patient options.');
+    }
+
+    /**
+     * Task 3 (original PatientRepository & PatientService filters):
+     * Exercise PatientRepository::active_linked_records_for_user() and
+     * active_booking_clinics_for_user() directly (without session proofs /
+     * PatientAccess), AND exercise PatientService::linked_records() /
+     * booking_clinics() proof filters on unproved active cross-clinic subjects.
+     */
+    public function testPatientRepositoryOriginalFiltersIsolateCrossClinicAndArchived(): void
+    {
+        $this->buildTwoClinicFixture();
+        $now = App::db()->nowUtcSql();
+        $clinicC = $this->insertClinic('Clinic C P8S3 ' . uniqid('', false), 'clinic-c-p8s3-' . uniqid('', false), $now);
+
+        $patientA1 = $this->insertPatient($this->clinicA, $this->mobileFor('repo-a1'), 'Repo', 'AllowedA');
+        $patientArchB = $this->insertPatient($this->clinicB, $this->mobileFor('repo-archb'), 'Repo', 'ArchB');
+        $patientMismatch = $this->insertPatient($this->clinicA, $this->mobileFor('repo-mm'), 'Repo', 'Mismatch');
+        $patientUnprovedB = $this->insertPatient($this->clinicB, $this->mobileFor('repo-unp'), 'Repo', 'UnprovedB');
+
+        $userId = $this->createPatientUserWithLinks($this->clinicA, [
+            ['id' => $patientA1, 'mobile' => $this->mobileFor('repo-a1'), 'primary' => 1],
+        ]);
+        // Active in clinicB, seeded while active then archived (binding + identity remain active).
+        $this->insertLink($this->clinicB, $patientArchB, $userId, $this->mobileFor('repo-archb'), 0);
+        PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicB, $patientArchB, [
+            'mobile' => $this->mobileFor('repo-archb'),
+            'link_user' => false,
+            'is_primary' => false,
+            'seed_session_scope' => false,
+            'set_current_user' => false,
+        ]);
+        self::assertSame(1, App::db()->update('cpms_patients', ['status' => 'archived'], ['id' => $patientArchB]));
+
+        // Clinic-mismatched link: l.clinic_id = clinicC, while p.clinic_id = clinicA,
+        // with active identity edge and active binding for (userId, clinicC, patientMismatch).
+        PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicA, $patientMismatch, [
+            'mobile' => $this->mobileFor('repo-mm'),
+            'link_user' => false,
+            'is_primary' => false,
+            'seed_session_scope' => false,
+            'set_current_user' => false,
+        ]);
+        $this->insertLink($clinicC, $patientMismatch, $userId, $this->mobileFor('repo-mm'), 0);
+        (new PatientLoginRepository(App::db()))->upsert_active_binding($userId, $clinicC, $patientMismatch, $now);
+
+        // Unproved active patient in clinicB: active binding + identity exist, NO session proof.
+        $this->insertLink($this->clinicB, $patientUnprovedB, $userId, $this->mobileFor('repo-unp'), 0);
+        PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicB, $patientUnprovedB, [
+            'mobile' => $this->mobileFor('repo-unp'),
+            'link_user' => false,
+            'is_primary' => false,
+            'seed_session_scope' => false,
+            'set_current_user' => false,
+        ]);
+        // Reset session proofs so ONLY patientA1 has a valid session proof; repository DB state stays intact.
+        PatientTwoProofTestHelper::reset();
+        $sessionA1 = PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicA, $patientA1, [
+            'mobile' => $this->mobileFor('repo-a1'),
+            'link_user' => false,
+            'is_primary' => true,
+            'seed_session_scope' => true,
+            'set_current_user' => true,
+        ]);
+        // Clear any leftover session proofs from WP_Session_Tokens and keep ONLY patientA1's proof.
+        $manager = \WP_Session_Tokens::get_instance($userId);
+        $sessionData = $manager->get($sessionA1['token']);
+        self::assertIsArray($sessionData);
+        unset($sessionData['cpms_proofs']['' . $this->clinicB . ':' . $patientArchB]);
+        unset($sessionData['cpms_proofs']['' . $this->clinicB . ':' . $patientUnprovedB]);
+        $manager->update($sessionA1['token'], $sessionData);
+
+        $repo = new PatientRepository(App::db());
+        $repoRecords = $repo->active_linked_records_for_user($userId);
+        $repoRecordPatientIds = array_map('intval', array_column($repoRecords, 'patient_id'));
+        // Direct repository assertions (independent of PatientAccess proof filter):
+        self::assertContains($patientA1, $repoRecordPatientIds, 'Repository positive witness A1 must be returned.');
+        self::assertContains($patientUnprovedB, $repoRecordPatientIds, 'Repository positive witness active UnprovedB must be returned regardless of session proof.');
+        self::assertNotContains($patientArchB, $repoRecordPatientIds, 'Repository original filter (p.status = active) must exclude archived ArchB.');
+        self::assertNotContains($patientMismatch, $repoRecordPatientIds, 'Repository original filter (p.clinic_id = l.clinic_id) must exclude clinic-mismatched link.');
+
+        $repoClinics = array_column($repo->active_booking_clinics_for_user($userId), 'id');
+        self::assertContains($this->clinicA, $repoClinics, 'Repository booking_clinics must include Clinic A.');
+        self::assertContains($this->clinicB, $repoClinics, 'Repository booking_clinics must include Clinic B (via active UnprovedB).');
+        self::assertNotContains($clinicC, $repoClinics, 'Repository booking_clinics original filter (p.clinic_id = l.clinic_id) must exclude clinic-mismatched Clinic C.');
+
+        // Proof-filter assertions on PatientService (cross-clinic active unproved subject):
+        $serviceRecords = array_column(App::patientService()->linked_records($userId), 'patient_id');
+        self::assertContains($patientA1, $serviceRecords, 'PatientService::linked_records positive witness A1 must be returned.');
+        self::assertNotContains($patientUnprovedB, $serviceRecords, 'PatientService::linked_records proof filter must exclude unproved active cross-clinic patient.');
+
+        $serviceClinics = array_column(App::patientService()->booking_clinics($userId), 'id');
+        self::assertContains($this->clinicA, $serviceClinics, 'PatientService::booking_clinics positive witness Clinic A must be returned.');
+        self::assertNotContains($this->clinicB, $serviceClinics, 'PatientService::booking_clinics proof filter must exclude Clinic B whose only active patient lacks session proof.');
+    }
+
+    /**
+     * Task 4 (Mutation column c): isolate PatientLoginRepository::find_active_bindings_for_user()
+     * clinic filter (:167-170) and status filter (:157) via PatientAccess.
+     */
+    public function testPatientLoginRepositoryAndAccessIsolateCrossClinicAndArchivedBindings(): void
+    {
+        $this->buildTwoClinicFixture();
+
+        $patientA1 = $this->insertPatient($this->clinicA, $this->mobileFor('loginr-a1'), 'RepoLogin', 'AllowedA');
+        $archTarget = $this->insertPatient($this->clinicA, $this->mobileFor('loginr-arch'), 'RepoLogin', 'ArchivedA');
+        $crossTarget = $this->insertPatient($this->clinicB, $this->mobileFor('loginr-b1'), 'RepoLogin', 'CrossB');
+
+        $userId = $this->createPatientUserWithLinks($this->clinicA, [
+            ['id' => $patientA1, 'mobile' => $this->mobileFor('loginr-a1'), 'primary' => 1],
+            ['id' => $archTarget, 'mobile' => $this->mobileFor('loginr-arch'), 'primary' => 0],
+        ]);
+        $this->insertLink($this->clinicB, $crossTarget, $userId, $this->mobileFor('loginr-b1'), 0);
+        PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicB, $crossTarget, [
+            'mobile' => $this->mobileFor('loginr-b1'),
+            'link_user' => false,
+            'is_primary' => false,
+            'seed_session_scope' => false,
+            'set_current_user' => false,
+        ]);
+        PatientTwoProofTestHelper::acting_as($userId);
+
+        // Positive witnesses before archiving archTarget:
+        self::assertSame([$crossTarget], App::patient_access()->proved_patient_ids($userId, $this->clinicB), 'Witness: crossTarget is proved in Clinic B.');
+        self::assertSame(PatientAccess::LEVEL_FULL, App::patient_access()->level($userId, $archTarget, $this->clinicA), 'Witness: archTarget has LEVEL_FULL before archival.');
+
+        // Archive archTarget while keeping active cpms_patient_logins binding & session proof intact.
+        self::assertSame(1, App::db()->update('cpms_patients', ['status' => 'archived'], ['id' => $archTarget]));
+
+        // PatientLoginRepository::find_active_bindings_for_user() + PatientAccess must exclude BOTH:
+        $provedInA = App::patient_access()->proved_patient_ids($userId, $this->clinicA);
+        self::assertSame([$patientA1], $provedInA, 'PatientLoginRepository must restrict proved_patient_ids($userId, $clinicA) to active patients in Clinic A only.');
+        self::assertNotContains($crossTarget, $provedInA, 'PatientLoginRepository b.clinic_id filter (:167-170) must exclude proved cross-clinic binding.');
+        self::assertNotContains($archTarget, $provedInA, 'PatientLoginRepository p.status=active filter (:157) must exclude archived binding.');
+        self::assertSame(PatientAccess::LEVEL_FULL, App::patient_access()->level($userId, $patientA1, $this->clinicA));
+        self::assertSame(PatientAccess::LEVEL_NONE, App::patient_access()->level($userId, $archTarget, $this->clinicA), 'Archived patient binding must yield LEVEL_NONE.');
     }
 
     private function setRole(int $userId, string $role): void

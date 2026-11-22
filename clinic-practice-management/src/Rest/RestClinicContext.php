@@ -335,6 +335,7 @@ final class RestClinicContext
             '#^/clinic/v1/patient/me$#',
             '#^/clinic/v1/patient/enroll$#', // Patient-self authorization, not staff membership.
             '#^/clinic/v1/patient/my-records$#',
+            '#^/clinic/v1/patient/link-record$#', // Patient-self two-factor binding promotion.
             '#^/clinic/v1/files/\d+/stream$#',
             '#^/clinic/v1/patients/\d+/files$#',
             '#^/clinic/v1/prescriptions$#',

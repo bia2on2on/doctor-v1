@@ -10,6 +10,7 @@ use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Visits\VisitException;
+use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use WP_Error;
 use WP_REST_Request;
 use WP_REST_Response;
@@ -229,7 +230,10 @@ final class FinanceController extends RestBase
                     null,
                     fn () => $this->finance->listServices($this->userId($r), $r->get_param('scope') !== 'all')
                 ),
-                'permission_callback' => fn (WP_REST_Request $r) => $this->permAuthenticated($r),
+                'permission_callback' => fn ( WP_REST_Request $r ) => $this->perm_any_clinic_or_global_cap(
+                    $r,
+                    [ RolesAndCapabilities::INVOICE_READ, RolesAndCapabilities::CONFIG ]
+                ),
                 'args' => [
                     'scope' => ['required' => false, 'type' => 'string', 'enum' => ['active', 'all'], 'default' => 'active'],
                 ],
@@ -404,6 +408,77 @@ final class FinanceController extends RestBase
         return $global_check instanceof WP_Error
             ? $this->error( 'CLINIC_PERMISSION_DENIED', 403, 'دسترسی ندارید' )
             : true;
+    }
+
+    /**
+     * Nonce + OR capability check across scoped Clinic authority and WordPress
+     * capabilities (used by `GET /config/services`, where either
+     * `cpms_invoice_read` or `cpms_config` authorizes the request).
+     *
+     * @param list<string> $capabilities
+     */
+    private function perm_any_clinic_or_global_cap( WP_REST_Request $r, array $capabilities ): bool|WP_Error {
+        $nonce = $this->requireNonce( $r );
+        if ( $nonce instanceof WP_Error ) {
+            return $nonce;
+        }
+
+        $user_id = (int) get_current_user_id();
+        $user    = $user_id > 0 ? get_userdata( $user_id ) : false;
+        if ( false === $user || ! $user->exists() ) {
+            return $this->error( 'CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید' );
+        }
+
+        $scope_context = ScopeContext::tryGet();
+        $clinic_id     = null;
+        if ( null !== $scope_context ) {
+            $clinic_id = (int) $scope_context->clinicId; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- ClinicScope::$clinicId is the existing published scope API.
+        } else {
+            $raw = $r->get_header( 'X-CPMS-Clinic-Id' );
+            if ( ! is_scalar( $raw ) || '' === trim( (string) $raw ) ) {
+                $raw = $r->get_param( 'clinic_id' );
+            }
+            if ( is_int( $raw ) && $raw > 0 ) {
+                $clinic_id = $raw;
+            } elseif ( is_string( $raw ) && preg_match( '/^[1-9][0-9]{0,18}$/', $raw ) === 1 ) {
+                $clinic_id = (int) $raw;
+            }
+        }
+
+        if ( null !== $clinic_id && $clinic_id > 0 ) {
+            foreach ( $capabilities as $capability ) {
+                $decision = App::authorization_service()->scoped_decision( $user_id, $clinic_id, $capability );
+                if ( true === $decision ) {
+                    return true;
+                }
+                if ( null === $decision && $user->has_cap( $capability ) ) {
+                    return true;
+                }
+            }
+
+            return $this->error( 'CLINIC_PERMISSION_DENIED', 403, 'دسترسی ندارید' );
+        }
+
+        foreach ( $capabilities as $capability ) {
+            if ( $user->has_cap( $capability ) ) {
+                return true;
+            }
+        }
+
+        $memberships = ( new MembershipRepository( App::db() ) )->active_for_user( $user_id );
+        foreach ( $memberships as $membership ) {
+            $member_clinic_id = (int) ( $membership['clinic_id'] ?? 0 );
+            if ( $member_clinic_id <= 0 ) {
+                continue;
+            }
+            foreach ( $capabilities as $capability ) {
+                if ( true === App::authorization_service()->scoped_decision( $user_id, $member_clinic_id, $capability ) ) {
+                    return true;
+                }
+            }
+        }
+
+        return $this->error( 'CLINIC_PERMISSION_DENIED', 403, 'دسترسی ندارید' );
     }
 
     /**

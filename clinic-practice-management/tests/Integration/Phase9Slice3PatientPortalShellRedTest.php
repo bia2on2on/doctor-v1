@@ -125,6 +125,7 @@ use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Notifications\NotificationEvents;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 require_once __DIR__ . '/P3S6RedirectExitSimulatedException.php';
@@ -194,7 +195,7 @@ final class Phase9Slice3PatientPortalShellRedTest extends WP_UnitTestCase
 		if ( $this->originalTheme !== '' && (string) get_stylesheet() !== $this->originalTheme ) {
 			switch_theme( $this->originalTheme );
 		}
-		wp_set_current_user( 0 );
+		PatientTwoProofTestHelper::reset();
 		$_GET             = [];
 		$_POST            = [];
 		$_REQUEST         = [];
@@ -216,7 +217,7 @@ final class Phase9Slice3PatientPortalShellRedTest extends WP_UnitTestCase
 		$this->assertFixtureAndExistingPortalContent( $fx );
 
 		// Positive control: the authenticated WordPress session is the pure patient.
-		wp_set_current_user( (int) $fx['user_id'] );
+		PatientTwoProofTestHelper::acting_as( (int) $fx['user_id'] );
 		self::assertSame( (int) $fx['user_id'], get_current_user_id(), 'positive control: WordPress session is the pure patient.' );
 		self::assertTrue( is_user_logged_in(), 'positive control: login/session works.' );
 		self::assertTrue( PatientPortalPage::isPatientOnly( (int) $fx['user_id'] ), 'positive control: isPatientOnly accepts the pure patient.' );
@@ -708,6 +709,16 @@ final class Phase9Slice3PatientPortalShellRedTest extends WP_UnitTestCase
 			[ '%d', '%d', '%d', '%s', '%d', '%s' ],
 			'patient_user_link'
 		);
+		PatientTwoProofTestHelper::seed_patient_proof(
+			$user_id,
+			$clinic_id,
+			$patient_id,
+			[
+				'mobile'             => $mobile,
+				'seed_session_scope' => true,
+				'set_current_user'   => false,
+			]
+		);
 
 		$slot_date       = $this->ymdDaysOffset( 5 );
 		$slot_time       = '10:00:00';
@@ -813,6 +824,7 @@ final class Phase9Slice3PatientPortalShellRedTest extends WP_UnitTestCase
 		self::assertSame( (int) $fx['user_id'], (int) $link['wp_user_id'] );
 		self::assertSame( (int) $fx['clinic_id'], (int) $link['clinic_id'] );
 
+		PatientTwoProofTestHelper::acting_as( (int) $fx['user_id'] );
 		$rows = App::bookingService()->listMine(
 			(int) $fx['user_id'],
 			gmdate( 'Y-m-d', strtotime( '-365 days' ) ),
@@ -911,7 +923,7 @@ final class Phase9Slice3PatientPortalShellRedTest extends WP_UnitTestCase
 
 	private function renderLegacyPortalContentAs( int $user_id ): string
 	{
-		wp_set_current_user( $user_id );
+		PatientTwoProofTestHelper::acting_as( $user_id );
 		ob_start();
 		try {
 			PatientPortalPage::render();
@@ -929,7 +941,7 @@ final class Phase9Slice3PatientPortalShellRedTest extends WP_UnitTestCase
 	 */
 	private function renderProductionFrontendPortalAs( int $user_id, string $frontend_url ): string
 	{
-		wp_set_current_user( $user_id );
+		PatientTwoProofTestHelper::acting_as( $user_id );
 
 		$path = (string) ( wp_parse_url( $frontend_url, PHP_URL_PATH ) ?? '/' );
 		$query = (string) ( wp_parse_url( $frontend_url, PHP_URL_QUERY ) ?? '' );

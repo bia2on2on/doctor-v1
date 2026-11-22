@@ -62,7 +62,9 @@ use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Frontend\PatientPortalShell;
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -187,7 +189,7 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         if ($this->originalTheme !== '' && (string) get_stylesheet() !== $this->originalTheme) {
             switch_theme($this->originalTheme);
         }
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         $_GET = [];
         $_POST = [];
         $_REQUEST = [];
@@ -277,10 +279,13 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         $this->assertClinicError($noSel, 'CLINIC_SELECTION_REQUIRED', 422,
             'positive control: N>1 requires explicit link_id on backend.'
         );
-        // Backend: foreign link_id ⇒ 404 closed.
+        // Backend: foreign link_id ⇒ 403 closed.
         $foreignLinkResp = $this->dispatchRest('GET', self::ME_PATH, ['link_id' => $twoFx['foreign_link_id']], (int) $twoFx['fx']['user_id']);
-        $this->assertClinicError($foreignLinkResp, 'CLINIC_NOT_FOUND', 404,
+        $this->assertClinicError($foreignLinkResp, PatientAccess::PROOF_FAILED_CODE, 403,
             'positive control: foreign link_id fails closed on backend.'
+        );
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($foreignLinkResp->get_data()['message'] ?? ''),
+            'positive control: foreign link_id must return exact PatientAccess::PROOF_FAILED_MESSAGE.'
         );
         // Backend: explicit link_id selection works for both A and B.
         $selA = $this->dispatchRest('GET', self::ME_PATH, ['link_id' => $twoFx['link_a']], (int) $twoFx['fx']['user_id']);
@@ -297,17 +302,22 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         self::assertIsArray($recordsBody);
         self::assertCount(2, (array) $recordsBody['data'], 'positive control: my-records lists exactly 2 active linked records.');
 
-        // Backend: zero-link patient is 404 on /patient/me, my-records empty list.
+        // Backend: zero-link patient is 403 proof-failed on /patient/me and /patient/my-records.
         $zeroFx = $this->buildZeroLinkFixture('r2-zero');
         $this->assertShellGuard($zeroFx);
         $zeroMe = $this->dispatchRest('GET', self::ME_PATH, [], (int) $zeroFx['user_id']);
-        $this->assertClinicError($zeroMe, 'CLINIC_NOT_FOUND', 404,
-            'positive control: zero-link patient is CLINIC_NOT_FOUND on /patient/me.'
+        $this->assertClinicError($zeroMe, PatientAccess::PROOF_FAILED_CODE, 403,
+            'positive control: zero-link patient is proof-failed on /patient/me.'
+        );
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($zeroMe->get_data()['message'] ?? ''),
+            'positive control: zero-link /patient/me must return exact PatientAccess::PROOF_FAILED_MESSAGE.'
         );
         $zeroRecords = $this->dispatchRest('GET', self::MY_RECORDS_PATH, [], (int) $zeroFx['user_id']);
-        self::assertSame(200, $zeroRecords->get_status());
-        self::assertSame([], (array) $zeroRecords->get_data()['data'],
-            'positive control: my-records is an empty list for zero-link patients.'
+        $this->assertClinicError($zeroRecords, PatientAccess::PROOF_FAILED_CODE, 403,
+            'positive control: zero-link patient is proof-failed on /patient/my-records.'
+        );
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($zeroRecords->get_data()['message'] ?? ''),
+            'positive control: zero-link /patient/my-records must return exact PatientAccess::PROOF_FAILED_MESSAGE.'
         );
 
         // Backend: single active link auto-selects (no CLINIC_SELECTION_REQUIRED).
@@ -603,6 +613,14 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         self::assertSame(200, $validEdit->get_status(),
             'positive control: valid unique National ID update succeeds via PUT /patient/me.'
         );
+        // Changing national_id closes active bindings and destroys WP sessions (B1 / §7.6);
+        // re-verify the user session before rendering the authenticated portal below.
+        PatientTwoProofTestHelper::acting_as(0);
+        PatientTwoProofTestHelper::seed_patient_proof((int) $fx['user_id'], (int) $fx['clinic_id'], (int) $fx['patient_id'], [
+            'mobile' => (string) $fx['mobile'],
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
 
         // ---- INTENDED RED (UI-4): save wiring is absent on live main. ----
         $html = $this->renderProductionFrontendPortalAs((int) $fx['user_id']);
@@ -826,8 +844,8 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
 
         $zero = $this->buildZeroLinkFixture('g2c');
         $resp0 = $this->dispatchRest('GET', self::MY_RECORDS_PATH, [], (int) $zero['user_id']);
-        self::assertSame(200, $resp0->get_status());
-        self::assertSame([], (array) $resp0->get_data()['data']);
+        $this->assertClinicError($resp0, PatientAccess::PROOF_FAILED_CODE, 403, 'Zero-link patient without proof fails closed on /patient/my-records.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($resp0->get_data()['message'] ?? ''), 'Zero-link /patient/my-records must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
     }
 
     /**
@@ -863,8 +881,11 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         );
 
         $foreign = $this->dispatchRest('GET', self::ME_PATH, ['link_id' => $two['foreign_link_id']], (int) $two['fx']['user_id']);
-        $this->assertClinicError($foreign, 'CLINIC_NOT_FOUND', 404,
-            'Foreign link_id must fail closed (404).'
+        $this->assertClinicError($foreign, PatientAccess::PROOF_FAILED_CODE, 403,
+            'Foreign link_id must fail closed (403).'
+        );
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($foreign->get_data()['message'] ?? ''),
+            'Foreign link_id must return exact PatientAccess::PROOF_FAILED_MESSAGE.'
         );
 
         $fx = $this->buildSingleLinkFixture('g4s');
@@ -1099,6 +1120,11 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
             'is_primary' => 1,
             'linked_at' => $now,
         ], ['%d', '%d', '%d', '%s', '%d', '%s'], 'patient_user_link');
+        PatientTwoProofTestHelper::seed_patient_proof($user_id, $clinic_id, $patient_id, [
+            'mobile' => $mobile,
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
 
         // One future confirmed appointment so Slice 1/2 existing content renders inside the shell.
         $slot_date = $this->ymdDaysOffset(5);
@@ -1220,6 +1246,18 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
             'is_primary' => 0,
             'linked_at' => $now,
         ], ['%d', '%d', '%d', '%s', '%d', '%s'], 'linkB');
+        PatientTwoProofTestHelper::seed_patient_proof($user_id, $clinicA, $patientA, [
+            'mobile' => $this->mobileFor($tag . 'a'),
+            'is_primary' => true,
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
+        PatientTwoProofTestHelper::seed_patient_proof($user_id, $clinicB, $patientB, [
+            'mobile' => $this->mobileFor($tag . 'b'),
+            'is_primary' => false,
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
 
         // Foreign user + foreign link (must not appear in caller's selector).
         $foreignUser = (int) wp_create_user(
@@ -1244,6 +1282,11 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
             'is_primary' => 1,
             'linked_at' => $now,
         ], ['%d', '%d', '%d', '%s', '%d', '%s'], 'foreignLink');
+        PatientTwoProofTestHelper::seed_patient_proof($foreignUser, $clinicA, $foreignPatient, [
+            'mobile' => $this->mobileFor($tag . 'f'),
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
 
         // Inactive (archived) patient link for caller — must not be selectable.
         $inactivePatient = $this->insertPatient($clinicB,
@@ -1453,7 +1496,7 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
      */
     private function dispatchRest(string $method, string $route, array $params, int $userId, bool $withNonce = true): WP_REST_Response
     {
-        wp_set_current_user($userId);
+        PatientTwoProofTestHelper::acting_as($userId);
         $request = new WP_REST_Request($method, $route);
         foreach ($params as $k => $v) {
             $request->set_param($k, $v);
@@ -1480,7 +1523,7 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
 
     private function renderProductionFrontendPortalAs(int $user_id): string
     {
-        wp_set_current_user($user_id);
+        PatientTwoProofTestHelper::acting_as($user_id);
         $frontend_url = PatientPortalShell::portal_url();
         self::assertStringNotContainsString('/wp-admin/', $frontend_url,
             'render guard: portal URL must not be under /wp-admin/.'
