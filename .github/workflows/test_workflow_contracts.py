@@ -680,7 +680,7 @@ class WorkflowContractTests(unittest.TestCase):
             snapshot_run.index('mysql("CREATE TABLE '),
         )
 
-        tree = ast.parse(snapshot_run)
+        tree = ast.parse(snapshot_run.split("cat > /tmp/cpms-restore-snapshot.py <<'PYEOF'\n", 1)[1].split("\nPYEOF", 1)[0])
         schema_snapshot = next(
             node for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name == "schema_snapshot"
