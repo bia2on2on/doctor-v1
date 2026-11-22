@@ -209,7 +209,7 @@ final class LoginRateLimiter
     {
         $this->log?->warning($action, [
             // نام کاربری خام لاگ نمی‌شود (Enumeration/PII)
-            'username_hash' => $this->user_key($username),
+            'username_hash' => $this->user_key( $username ),
             'ip' => $ip,
         ]);
     }
