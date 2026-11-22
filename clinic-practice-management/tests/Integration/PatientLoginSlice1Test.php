@@ -409,7 +409,7 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
         self::assertStringContainsString( 'data-role="link-record-form"', $portalHtml );
         self::assertStringContainsString( 'data-role="link-record-clinic"', $portalHtml );
         self::assertStringContainsString( 'data-role="link-record-national-id"', $portalHtml );
-        self::assertStringContainsString( '"/patient/link-record"', $portalHtml );
+        self::assertStringContainsString( '"/patient/link-record"', str_replace( '\\/', '/', $portalHtml ) );
         // Security/privacy checks on rendered HTML:
         self::assertStringNotContainsString( 'data-clinic-id=', $portalHtml );
         self::assertStringNotContainsString( '"clinic_id":', $portalHtml );
@@ -486,7 +486,8 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
             $qsReq->set_header( 'Content-Type', 'application/json' );
             $qsReq->set_body( (string) wp_json_encode( [ 'clinic_id' => $this->clinicA, 'national_id' => self::NID_PENDING ] ) );
             $qsResp = rest_do_request( $qsReq );
-            self::assertSame( 400, $qsResp->get_status() );
+            self::assertSame( 403, $qsResp->get_status() );
+            self::assertSame( 'CLINIC_PATIENT_PROOF_FAILED', (string) ( $qsResp->get_data()['code'] ?? '' ) );
         } );
 
         // 3. Denied actors: anonymous, pure staff, mixed patient+staff, closed patient.

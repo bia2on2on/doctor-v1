@@ -265,6 +265,9 @@ final class PatientController extends RestBase
         $raw_nid    = is_string( $body['national_id'] ?? null ) ? (string) $body['national_id'] : '';
         $raw_code   = is_string( $body['code'] ?? null ) ? (string) $body['code'] : null;
         $user_id    = (int) get_current_user_id();
+        $ip         = ClientIp::resolve() ?? '0.0.0.0';
+        $promoter   = $this->promoter ?? App::patient_binding_promoter();
+
         if ( '' === trim( $raw_mobile ) && ( null === $raw_code || '' === trim( $raw_code ) ) && $user_id > 0 ) {
             try {
                 $login_repo = new PatientLoginRepository( App::db() );
@@ -281,8 +284,6 @@ final class PatientController extends RestBase
                 $raw_mobile = '';
             }
         }
-        $ip         = ClientIp::resolve() ?? '0.0.0.0';
-        $promoter   = $this->promoter ?? App::patient_binding_promoter();
 
         if ( $clinic_id <= 0 ) {
             return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );
