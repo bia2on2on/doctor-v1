@@ -363,4 +363,44 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
         $this->assertSame('nested_val', $ctx['nested']['inner_[nid-redacted]'] ?? null);
         $this->assertSame('ok', $ctx['reason'] ?? null);
     }
+
+    public function testCorrelationIdRejectsNidRunsInBothSinksAndKeepsAuditChainValid(): void
+    {
+        $hadServer = array_key_exists('HTTP_X_CPMS_CORRELATION_ID', $_SERVER);
+        $prevServer = $_SERVER['HTTP_X_CPMS_CORRELATION_ID'] ?? null;
+        try {
+            $_SERVER['HTTP_X_CPMS_CORRELATION_ID'] = self::NID_ASCII;
+            $resolved = cpms_request_id();
+            $this->assertIsString($resolved);
+            $this->assertDoesNotMatchRegularExpression('/[0-9۰-۹٠-٩]{10,}/u', $resolved);
+
+            App::op()->warning('B0_PR3_CORR_OP', ['ok' => 'yes']);
+            App::audit()->log('B0_PR3_CORR_AUDIT', ['wp_user_id' => 1, 'role' => 'system'], 'test_resource', 4);
+        } finally {
+            if ($hadServer) {
+                $_SERVER['HTTP_X_CPMS_CORRELATION_ID'] = $prevServer;
+            } else {
+                unset($_SERVER['HTTP_X_CPMS_CORRELATION_ID']);
+            }
+        }
+
+        $opRow = App::db()->fetchRow(
+            'SELECT request_id FROM ' . App::db()->table('cpms_operational_logs')
+            . ' WHERE message = %s ORDER BY id DESC LIMIT 1',
+            ['B0_PR3_CORR_OP']
+        );
+        $this->assertIsArray($opRow);
+        $this->assertDoesNotMatchRegularExpression('/[0-9۰-۹٠-٩]{10,}/u', (string) ($opRow['request_id'] ?? ''));
+
+        $auditRow = App::db()->fetchRow(
+            'SELECT request_id FROM ' . App::db()->table('cpms_audit_logs')
+            . ' WHERE action = %s ORDER BY id DESC LIMIT 1',
+            ['B0_PR3_CORR_AUDIT']
+        );
+        $this->assertIsArray($auditRow);
+        $this->assertDoesNotMatchRegularExpression('/[0-9۰-۹٠-٩]{10,}/u', (string) ($auditRow['request_id'] ?? ''));
+
+        $chain = App::audit()->verifyChain();
+        $this->assertTrue((bool) ($chain['ok'] ?? false), 'audit chain remains valid after correlation-id logging');
+    }
 }

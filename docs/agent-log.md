@@ -8353,3 +8353,8 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 - FIX: `OpLogger::sanitize()` now evaluates sensitive-key detection on the original key first, redacts 10+-digit ASCII/Persian/Arabic-Indic runs in keys via `NationalIdValidator::redact_digits()`, recurses into nested arrays, and appends deterministic `~2`/`~3` suffixes on key collisions.
 - TESTS: Added persisted-row integration test `testOpLogRedactsNidInContextKeysNestedKeysAndCollisions()` in `NidAuditMaskingTest.php` covering ASCII/Persian/Arabic-Indic NID keys, nested keys, collision suffixing, and positive `reason` witness.
 - LIMITATION: PHP is unavailable in the sandbox; PHP lint, PHPCS, PHPUnit, and PHPStan require CI.
+### [2026-11-22 UTC] — PR17-CORRELATION-FIX — CorrelationId 10+-digit run rejection
+- OBSERVED: Confirmed reader 2 finding at `CorrelationId.php:19,24-27` -> `clinic-practice-management.php:50-56` -> `OpLogger.php:47-53` and `AuditLogger.php:101-115`: `CorrelationId::PATTERN` accepted 10+-digit runs such as `0012345673` as `request_id`.
+- FIX: `CorrelationId::isValid()` now requires `NationalIdValidator::redact_digits($value) === $value` in addition to `PATTERN`; `CorrelationId::generate()` regenerates if `bin2hex(random_bytes(8))` ever produces a 10+-digit run.
+- TESTS: Added `CorrelationIdTest::testRejectsTenPlusDigitRunsAndKeepsValidTracingIds()` and `NidAuditMaskingTest::testCorrelationIdRejectsNidRunsInBothSinksAndKeepsAuditChainValid()`.
+- LIMITATION: PHP is unavailable in the sandbox; PHP lint, PHPCS, PHPUnit, and PHPStan require CI.
