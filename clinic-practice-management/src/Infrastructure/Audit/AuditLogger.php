@@ -8,6 +8,7 @@ namespace ClinicCore\Infrastructure\Audit;
 
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 
@@ -246,6 +247,12 @@ final class AuditLogger
             if (in_array(mb_strtolower($key), self::FORBIDDEN_KEYS, true)) {
                 continue; // حذف کامل — تطبیق دقیق نام کلید (case-insensitive) — F1-8
             }
+            // B0-PR3: کد ملی هرگز (حتی Maskشده) در Audit نمی‌آید. برخلاف
+            // MASK_KEYS که ۴ رقمِ آخر را نگه می‌دارند، این کلید کامل حذف می‌شود.
+            if (mb_strtolower($key) === 'national_id') {
+                $out[$key] = '[redacted:national_id]';
+                continue;
+            }
             if (in_array($key, self::MASK_KEYS, true) && is_string($v) && strlen($v) >= 4) {
                 $out[$key] = '***' . substr($v, -4);
                 continue;
@@ -254,8 +261,11 @@ final class AuditLogger
                 $out[$key] = $this->sanitize($v);
                 continue;
             }
-            if (is_string($v) && mb_strlen($v) > 2000) {
-                $out[$key] = mb_substr($v, 0, 2000) . '…[truncated]';
+            if (is_string($v)) {
+                // B0-PR3: متنِ آزاد می‌تواند ارقامِ کد ملی را در خود داشته باشد
+                // (دلیل لغو، یادداشت، ...). قبل از هر ذخیره، ارقام را جمع‌بندی می‌کند.
+                $safe = NationalIdValidator::redact_digits($v);
+                $out[$key] = mb_strlen($safe) > 2000 ? mb_substr($safe, 0, 2000) . '…[truncated]' : $safe;
                 continue;
             }
             $out[$key] = $v;

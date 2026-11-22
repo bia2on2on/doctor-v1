@@ -84,4 +84,29 @@ final class NationalIdValidator
 
         return strlen($clean) >= 4 ? '***' . substr($clean, -4) : '***';
     }
+
+    /**
+     * Redact NID digits inside arbitrary text — B0-PR3 (Audit/Log/اعلان).
+     *
+     * سیاست مالک: کد ملی هرگز در Audit، Log عملیاتی، متن اعلان یا کلید
+     * Rate-Limit ثبت نمی‌شود — نه خام و نه Maskشده. چون متنِ آزاد (دلیل لغو،
+     * یادداشت، متن پیام) می‌تواند ارقامِ کد ملی را در خود داشته باشد، کلِ
+     * رشته اسکن می‌شود، نه فقط فیلدِ `national_id`.
+     *
+     * ابتدا ارقامِ فارسی (U+06F0..U+06F9) و عربی-هندی (U+0660..U+0669) به
+     * ASCII تبدیل می‌شوند؛ سپس هر رشتهٔ پیوستهٔ ۱۰ رقم یا بیشتر با
+     * `[nid-redacted]` جایگزین می‌شود. بنابراین «۰۰۱۲۳۴۵۶۷۳»، «٠٠١٢٣٤٥٦٧٣»،
+     * «0012345673» و «کد ملی 0012345673 است» همه حتی یک رقم باقی نمی‌گذارند.
+     *
+     * False positiveِ پذیرفته‌شده (fail-closed): هر رشتهٔ عددیِ ۱۰ رقمی یا
+     * بلندتر — مثلاً تلفنِ ۱۱ رقمی، شناسهٔ عددیِ بلند یا Timestamp — هم
+     * جایگزین می‌شود. مقدارِ غیررشتهای (int/bool) دست نمی‌خورد؛ کد ملی همیشه
+     * رشته است و کلیدِ `national_id` جداگانه و کامل حذف می‌شود.
+     */
+    public static function redact_digits(string $value): string
+    {
+        $folded = strtr($value, self::DIGIT_FOLD);
+
+        return (string) preg_replace('/\d{10,}/', '[nid-redacted]', $folded);
+    }
 }

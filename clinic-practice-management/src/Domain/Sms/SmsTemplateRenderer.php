@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ClinicCore\Domain\Sms;
 
 use ClinicCore\Domain\Clinical\DoctorDisplayName;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 
 /**
  * رندر Template SMS با متغیرهای داخلی {{var}} (خالص — ADR-0025، الزام §12/§15).
@@ -54,7 +55,11 @@ final class SmsTemplateRenderer
 
         // خروجی هرگز «دکتر دکتر» ندارد: Templateهای قدیمیِ ذخیره‌شده خودشان
         // «دکتر {{doctor_name}}» را در متن دارند و مقدار هم اکنون عنوان‌دار است.
-        return DoctorDisplayName::collapse_doubled_title( $rendered );
+        $rendered = DoctorDisplayName::collapse_doubled_title( $rendered );
+
+        // B0-PR3: متنِ SMS هم یک مخزنِ مستقل است — اگر متغیری ارقامِ کد ملی
+        // داشته باشد، قبل از ذخیره/ارسال جمع‌بندی می‌شود (fail-closed).
+        return NationalIdValidator::redact_digits( $rendered );
     }
 
     /**
