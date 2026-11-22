@@ -183,7 +183,7 @@ final class BackupStorageBoundaryTest extends WP_UnitTestCase
 
     /**
      * db.sql را خالی و هش مانیفست را هم‌ساز می‌کند تا restoreApply دقیقاً
-     * بعد از Safety Backup و قبل از هر DDL متوقف شود.
+     * قبل از هر خروجی Safety Backup و هر DDL متوقف شود.
      */
     private function makeArtifactAbortBeforeDdl(string $backupDir): void
     {
@@ -372,7 +372,7 @@ final class BackupStorageBoundaryTest extends WP_UnitTestCase
         self::assertTrue($pre['restore_safe'], 'preflight باید از مبدأ legacy پاس شود.');
         self::assertSame('legacy', $pre['source']);
 
-        $before = $this->privateRootBackupDirs();
+        $before = $this->backupRootSnapshot($this->legacyProbe);
 
         try {
             $unsafe->restoreApply($id, true);
@@ -381,28 +381,8 @@ final class BackupStorageBoundaryTest extends WP_UnitTestCase
             self::assertSame('CLINIC_BACKUP_IO', $e->getErrorCode());
         }
 
-        // Safety Backup فقط در ریشهٔ خصوصی ساخته شد
-        $after = $this->privateRootBackupDirs();
-        $new = array_values(array_diff($after, $before));
-        self::assertCount(1, $new, 'دقیقاً یک Safety Backup باید ساخته شود.');
-        $safetyDir = $new[0];
-        self::assertFileExists($safetyDir . '/manifest.json');
-
-        $safetyManifest = json_decode((string) file_get_contents($safetyDir . '/manifest.json'), true);
-        self::assertIsArray($safetyManifest);
-        self::assertStringStartsWith(
-            'pre-restore-safety-',
-            (string) $safetyManifest['note'],
-            'بکاپ ساخته‌شده باید Safety Backupِ restore باشد.'
-        );
-
-        // مقصد Safety هرگز مبدأ legacy نیست و در webroot چیزی نوشته نشد
-        self::assertSame(ProtectedBackupStore::defaultBasePath(), dirname($safetyDir));
-        self::assertSame(
-            [$id],
-            array_map('basename', (array) glob($this->legacyProbe . '/cpms-backup-*')),
-            'هیچ بکاپ جدیدی داخل webroot نباید ساخته شود — فقط بکاپ مبدأ آنجاست.'
-        );
+        self::assertSame($before, $this->backupRootSnapshot($this->legacyProbe));
+        self::assertFalse(get_option('cpms_restore_barrier'));
 
         // DB دست‌نخورده ماند (متوقف‌شدن قبل از تراکنش مخرب)
         self::assertSame(1, (int) App::db()->fetchValue('SELECT 1'));
@@ -421,7 +401,7 @@ final class BackupStorageBoundaryTest extends WP_UnitTestCase
         $this->moveDir($this->tmp . '/staging/' . $id, $active->basePath() . '/' . $id);
         $this->makeArtifactAbortBeforeDdl($active->dirOf($id));
 
-        $before = count((array) glob($active->basePath() . '/cpms-backup-*'));
+        $before = $this->backupRootSnapshot($active->basePath());
 
         try {
             $service->restoreApply($id, true);
@@ -430,9 +410,8 @@ final class BackupStorageBoundaryTest extends WP_UnitTestCase
             self::assertSame('CLINIC_BACKUP_IO', $e->getErrorCode());
         }
 
-        $after = count((array) glob($active->basePath() . '/cpms-backup-*'));
-        self::assertSame($before + 1, $after, 'Safety Backup باید در مخزن فعال نوشته شود.');
-        self::assertSame([], $this->privateRootBackupDirs(), 'وقتی مخزن فعال امن است، مقصد خصوصی جدا لازم نیست.');
+        self::assertSame($before, $this->backupRootSnapshot($active->basePath()));
+        self::assertFalse(get_option('cpms_restore_barrier'));
     }
 
     /**
@@ -595,5 +574,74 @@ final class BackupStorageBoundaryTest extends WP_UnitTestCase
         self::assertNotNull($row);
         self::assertSame(SystemHealthService::FAIL, $row['status']);
         self::assertSame(SystemHealthService::HOST_UNSUPPORTED, $report['host']['status']);
+    }
+
+    /** Inventory backup roots including nested files, not just backup IDs. */
+    private function backupRootSnapshot(string $extra): array
+    {
+        $snapshot = [];
+        foreach (array_unique([$extra, ProtectedBackupStore::defaultBasePath(), ProtectedBackupStore::legacyBasePath()]) as $root) {
+            $snapshot[$root] = null;
+            if (!is_dir($root)) {
+                continue;
+            }
+            $entries = [];
+            foreach (new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($root, \FilesystemIterator::SKIP_DOTS), \RecursiveIteratorIterator::SELF_FIRST) as $entry) {
+                $entries[$entry->getPathname()] = $entry->isFile() ? hash_file('sha256', $entry->getPathname()) : $entry->getType();
+            }
+            ksort($entries);
+            $snapshot[$root] = $entries;
+        }
+
+        return $snapshot;
+    }
+
+    public function testSafetyBackupDestinationsWithValidSource(): void
+    {
+        $id = $this->seedBackupOutside($this->legacyProbe);
+        self::assertNotEmpty(file_get_contents($this->legacyProbe . '/' . $id . '/db.sql'));
+        $service = $this->service(ProtectedBackupStore::legacySource($this->legacyProbe));
+        $create = new ReflectionMethod(BackupService::class, 'create_restore_safety_backup');
+        $before = $this->privateRootBackupDirs();
+        $create->invoke($service, $id);
+        // Safety Backup فقط در ریشهٔ خصوصی ساخته شد
+        $after = $this->privateRootBackupDirs();
+        $new = array_values(array_diff($after, $before));
+        self::assertCount(1, $new, 'دقیقاً یک Safety Backup باید ساخته شود.');
+        $safetyDir = $new[0];
+        self::assertFileExists($safetyDir . '/manifest.json');
+
+        $safetyManifest = json_decode((string) file_get_contents($safetyDir . '/manifest.json'), true);
+        self::assertIsArray($safetyManifest);
+        self::assertStringStartsWith(
+            'pre-restore-safety-',
+            (string) $safetyManifest['note'],
+            'بکاپ ساخته‌شده باید Safety Backupِ restore باشد.'
+        );
+
+        // مقصد Safety هرگز مبدأ legacy نیست و در webroot چیزی نوشته نشد
+        self::assertSame(ProtectedBackupStore::defaultBasePath(), dirname($safetyDir));
+        self::assertSame(
+            [$id],
+            array_map('basename', (array) glob($this->legacyProbe . '/cpms-backup-*')),
+            'هیچ بکاپ جدیدی داخل webroot نباید ساخته شود — فقط بکاپ مبدأ آنجاست.'
+        );
+
+        $this->rmrf($safetyDir);
+        $active = ProtectedBackupStore::active($this->tmp . '/active-safety-witness');
+        $service = $this->service($active);
+        $before = count((array) glob($active->basePath() . '/cpms-backup-*'));
+        $create->invoke($service, $id);
+        $after = count((array) glob($active->basePath() . '/cpms-backup-*'));
+        self::assertSame($before + 1, $after, 'Safety Backup باید در مخزن فعال نوشته شود.');
+        self::assertSame([], $this->privateRootBackupDirs(), 'وقتی مخزن فعال امن است، مقصد خصوصی جدا لازم نیست.');
+    }
+
+    public function testRestoreTeardownRefusesBarrierClearance(): void
+    {
+        $service = $this->service(ProtectedBackupStore::active($this->tmp . '/teardown'));
+        $this->expectException(BackupException::class);
+        $this->expectExceptionMessage('Restore teardown cannot clear the barrier.');
+        $service->restore_teardown();
     }
 }

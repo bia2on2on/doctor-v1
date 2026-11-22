@@ -34,11 +34,10 @@ SHELL_ROOT = "#cpms-patient-portal-shell, .cpms-patient-portal-shell, [data-cpms
 ME_ROUTE = "/clinic/v1/patient/me"
 FORBIDDEN_KEYS = {"mobile", "clinic_id", "patient_id", "organization_id", "role", "roles"}
 EDITABLE_KEYS = {
-    "first_name", "last_name", "national_id", "birth_date", "gender",
+    "first_name", "last_name", "birth_date", "gender",
     "address", "phone", "emergency_contact_name", "emergency_contact_phone",
 }
 SAVE_TOKEN = "ADDR-SYN-OK"
-INVALID_NID = "0000000000"
 PERSIAN_RE = re.compile(r"[\u0600-\u06FF]")
 
 VIEWPORTS = [
@@ -502,8 +501,8 @@ def run_one_readonly(browser, run):
         if address != patient_col(ONE["patient_id"], "address"):
             raise RuntimeError("existing profile address was not populated")
         nid = page.locator('[data-field="national_id"]')
-        if nid.count() != 1 or not nid.is_enabled() or nid.get_attribute("readonly") is not None:
-            raise RuntimeError("national id must be visible and editable")
+        if nid.count() != 0:
+            raise RuntimeError("national_id must not appear in the self-service Profile form")
         mobile = page.locator('[data-role="profile-login-mobile"]')
         if mobile.count() != 1 or not mobile.is_visible():
             raise RuntimeError("login mobile display missing")
@@ -525,7 +524,7 @@ def run_one_readonly(browser, run):
         assert_quiet(state, "one-record")
         save_shot(page, f"portal-profile-{run['vp']}-one.png")
         ok(key, "one-record Profile is auto-resolved, populated, and authority-free",
-           f"shell=True rtl=True form=1 selector=0 clinic_match=True populated=True mobile_readonly=True nid_editable=True profile_fetches=0 sw={sw} iw={iw} focus={focus_role} touch_h={int(save_box.get('height', 0))}")
+           f"shell=True rtl=True form=1 selector=0 clinic_match=True populated=True mobile_readonly=True nid_absent=True profile_fetches=0 sw={sw} iw={iw} focus={focus_role} touch_h={int(save_box.get('height', 0))}")
     except Exception as exc:
         try:
             save_shot(page, f"portal-profile-{run['vp']}-one-FAIL.png")
@@ -546,7 +545,6 @@ def run_one_mutation(browser):
         login(page, ONE["login"], ONE["password"])
         open_profile(page)
         before_addr = patient_col(ONE["patient_id"], "address")
-        before_nid = patient_col(ONE["patient_id"], "national_id")
         other_addr = patient_col(MULTI["patient_b"], "address")
         audits_before = profile_audits(ONE["patient_id"])
         stage = "save"
@@ -586,7 +584,8 @@ def run_one_mutation(browser):
 
         stage = "invalid"
         audits_after_ok = profile_audits(ONE["patient_id"])
-        page.locator('[data-field="national_id"]').fill(INVALID_NID)
+        before_first = patient_col(ONE["patient_id"], "first_name")
+        page.locator('[data-field="first_name"]').fill("")
         with page.expect_response(lambda r: r.request.method == "PUT" and wp_route(r.url).endswith("/patient/me"), timeout=20000) as bad:
             page.locator('[data-role="profile-save"]').click()
         bad_resp = bad.value
@@ -604,12 +603,12 @@ def run_one_mutation(browser):
         )
         if err.get_attribute("role") != "alert":
             raise RuntimeError("error region is not role=alert")
-        if page.locator('[data-field="national_id"]').input_value() != INVALID_NID:
+        if page.locator('[data-field="first_name"]').input_value() != "":
             raise RuntimeError("invalid entry was cleared")
         if page.locator('[data-field="address"]').input_value() != SAVE_TOKEN:
             raise RuntimeError("other entered values were cleared")
-        if patient_col(ONE["patient_id"], "national_id") != before_nid:
-            raise RuntimeError("invalid save mutated national id")
+        if patient_col(ONE["patient_id"], "first_name") != before_first:
+            raise RuntimeError("invalid save mutated first name")
         if patient_col(ONE["patient_id"], "address") != SAVE_TOKEN:
             raise RuntimeError("invalid save reverted or changed the previous field")
         if profile_audits(ONE["patient_id"]) != audits_after_ok:
@@ -625,7 +624,7 @@ def run_one_mutation(browser):
         if me_calls != [("PUT", ME_ROUTE, 200), ("PUT", ME_ROUTE, 400)]:
             raise RuntimeError(f"unexpected profile traffic {me_calls}")
         save_shot(page, "portal-profile-save-invalid.png")
-        ok(key + "-invalid", "invalid national id is rejected without mutation",
+        ok(key + "-invalid", "empty first_name is rejected without mutation",
            "status=400 code=CLINIC_VALIDATION_FAILED persian_alert=True values_kept=True db_unchanged=True audit_unchanged=True button_enabled=True focus=profile-save")
     except Exception as exc:
         try:
