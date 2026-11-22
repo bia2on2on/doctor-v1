@@ -33,6 +33,7 @@ use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use DateTimeImmutable;
 use DateTimeZone;
 use WP_REST_Request;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 /**
@@ -736,7 +737,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
                 fclose($bookingParent);
                 fclose($bookingChild);
                 $this->locationTimezoneWriterChild($writerChild, $this->locNewYork);
-                exit(2);
+                ForkChildExit::terminate(2);
             }
             if ($writerFork < 1) {
                 self::fail('pcntl_fork failed for the independent Location writer');
@@ -764,7 +765,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
                     $time,
                     $slotId
                 );
-                exit(2);
+                ForkChildExit::terminate(2);
             }
             if ($bookingFork < 1) {
                 self::fail('pcntl_fork failed for the independent BookingService actor');
@@ -828,8 +829,8 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
             $bookingStatus = $this->waitForChildExit($bookingPid, self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS);
             self::assertIsInt($writerStatus, 'writer must exit within the bounded cleanup window');
             self::assertIsInt($bookingStatus, 'booking actor must exit within the bounded cleanup window');
-            self::assertTrue(pcntl_wifexited($writerStatus) && pcntl_wexitstatus($writerStatus) === 0, 'writer must commit its intended Location timezone update');
-            self::assertTrue(pcntl_wifexited($bookingStatus) && pcntl_wexitstatus($bookingStatus) === 0, 'booking actor must terminate cleanly after the rejection');
+            self::assertTrue(ForkChildExit::childTerminatedCleanly($writerStatus), 'writer must commit its intended Location timezone update');
+            self::assertTrue(ForkChildExit::childTerminatedCleanly($bookingStatus), 'booking actor must terminate cleanly after the rejection');
 
             self::assertSame('America/New_York', $this->locationTimezone($this->locNewYork), 'final validation must consume the writer-committed authoritative timezone');
             self::assertSame($before['appointments'], (int) $wpdb->get_var($wpdb->prepare(
@@ -1361,7 +1362,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
             if (!$updated) {
                 @fwrite($pipe, "writer_error\n");
                 $mysqli->rollback();
-                exit(2);
+                ForkChildExit::terminate(2);
             }
             @fwrite($pipe, 'writer_locked:' . $mysqli->thread_id . "\n");
             // The writer is already locked when this wait starts. Thirty seconds
@@ -1372,16 +1373,16 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
             $command = $this->readSynchronizationLine($pipe, self::RACE_WRITER_COMMAND_TIMEOUT_SECONDS);
             if ($command === 'commit') {
                 $mysqli->commit();
-                exit(0);
+                ForkChildExit::terminate(0);
             }
             $mysqli->rollback();
-            exit(3);
+            ForkChildExit::terminate(3);
         } catch (\Throwable $e) {
             @fwrite($pipe, "writer_error\n");
             if ($mysqli instanceof \mysqli) {
                 @$mysqli->rollback();
             }
-            exit(2);
+            ForkChildExit::terminate(2);
         } finally {
             if ($mysqli instanceof \mysqli) {
                 @$mysqli->close();
@@ -1458,13 +1459,13 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
             $outcome['connection_id'] = $connectionId;
             $outcome['own_wpdb_connected'] = true;
             @fwrite($pipe, json_encode($outcome, JSON_UNESCAPED_UNICODE) . "\n");
-            exit(0);
+            ForkChildExit::terminate(0);
         } catch (\Throwable $e) {
             @fwrite($pipe, json_encode([
                 'result' => 'fatal',
                 'detail' => get_class($e) . ': ' . $e->getMessage(),
             ], JSON_UNESCAPED_UNICODE) . "\n");
-            exit(2);
+            ForkChildExit::terminate(2);
         } finally {
             ScopeContext::clear();
             if ($wdb instanceof \wpdb) {

@@ -120,6 +120,7 @@ use DateTimeZone;
 use Throwable;
 use WP_REST_Request;
 use WP_REST_Response;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
@@ -2046,7 +2047,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                         VisitService::setTestNowUtc( $race_anchor );
                     }
                     $this->raceWorker($worker['role'], (float) $worker['offset'], $appointmentId, $patientId, $attempt, $i);
-                    exit(1); // backstop — a returning child is a harness fault, not a pass
+                    ForkChildExit::terminate(1); // backstop — a returning child is a harness fault, not a pass
                 }
                 $pids[$i] = $pid;
             }
@@ -2103,7 +2104,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                         continue;
                     }
                     unset($pids[$idx]); // reaped here: never signal this pid again
-                    if (!pcntl_wifexited($poll['status']) || pcntl_wexitstatus($poll['status']) !== 0) {
+                    if (!ForkChildExit::childTerminatedCleanly($poll['status'])) {
                         $detail  = '';
                         $rawFile = $this->fileTag . '-outcome-' . $attempt . '-' . $idx;
                         if (is_file($rawFile)) {
@@ -2326,7 +2327,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         // unexpected Throwable therefore becomes a fatal outcome + exit(1).
         try {
             $this->raceWorkerBody($role, $offset, $appointmentId, $patientId, $attempt, $index);
-            exit(0); // child-only — unreachable
+            ForkChildExit::terminate(0); // child-only — unreachable
         } catch (Throwable $e) {
             @file_put_contents(
                 $this->fileTag . '-outcome-' . $attempt . '-' . $index,
@@ -2337,7 +2338,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                         . ' @ ' . basename((string) $e->getFile()) . ':' . $e->getLine(),
                 ])
             );
-            exit(1); // child-only — non-zero = harness fatal (not a product error)
+            ForkChildExit::terminate(1); // child-only — non-zero = harness fatal (not a product error)
         }
     }
 
@@ -2360,7 +2361,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                 $this->fileTag . '-outcome-' . $attempt . '-' . $index,
                 json_encode(['role' => $role, 'result' => 'fatal', 'error' => 'wpdb connection failed in child'])
             );
-            exit(1); // non-zero = harness fatal (not a product error)
+            ForkChildExit::terminate(1); // non-zero = harness fatal (not a product error)
         }
 
         ScopeContext::set(ClinicScope::forClinic($this->clinicA));
@@ -2440,7 +2441,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                         'detail' => 'child never saw the barrier within ' . self::RACE_CHILD_BARRIER_DEADLINE_SEC . ' s',
                     ])
                 );
-                exit(1); // child-only — the parent reports an abnormal exit, never a pass
+                ForkChildExit::terminate(1); // child-only — the parent reports an abnormal exit, never a pass
             }
             usleep(250);
         }

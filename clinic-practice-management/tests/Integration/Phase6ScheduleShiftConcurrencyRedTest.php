@@ -17,6 +17,7 @@ use ClinicCore\Infrastructure\Queue\JobQueue;
 use ClinicCore\Infrastructure\Repository\LocationRepository;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use ClinicCore\Infrastructure\Repository\ScheduleRepository;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 /**
@@ -396,7 +397,7 @@ final class Phase6ScheduleShiftConcurrencyRedTest extends WP_UnitTestCase
                 /*
                  * Child: an escaped exception would make the copied PHPUnit
                  * CONTINUE and re-run the whole suite inside the child.
-                 * childWorker() therefore ALWAYS ends with exit().
+                 * childWorker() therefore ALWAYS ends via the fork-child lifetime guard.
                  */
                 $this->childWorker($fireAt, $files[$i], $worker);
             }
@@ -405,7 +406,7 @@ final class Phase6ScheduleShiftConcurrencyRedTest extends WP_UnitTestCase
 
         foreach ($pids as $i => $pid) {
             pcntl_waitpid($pid, $status);
-            if (!pcntl_wifexited($status) || pcntl_wexitstatus($status) !== 0) {
+            if (!ForkChildExit::childTerminatedCleanly($status)) {
                 $crashed[] = $i;
             }
         }
@@ -430,7 +431,7 @@ final class Phase6ScheduleShiftConcurrencyRedTest extends WP_UnitTestCase
     /**
      * Child body: fresh connection -> scope -> real service -> barrier ->
      * one production mutation inside a REAL transaction boundary ->
-     * outcome file -> exit(). NEVER returns.
+     * outcome file -> fork-child lifetime-guard termination. NEVER returns.
      *
      * @param array{kind: string, day?: int, start: string, end: string, id?: int} $worker
      */
@@ -442,7 +443,7 @@ final class Phase6ScheduleShiftConcurrencyRedTest extends WP_UnitTestCase
             $wdb = new \wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
             $wdb->query('SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
             if (!method_exists($wdb, 'set_prefix')) {
-                exit(9);
+                ForkChildExit::terminate(9);
             }
             $wdb->set_prefix($wpdb->prefix);
             $wpdb = $wdb;
@@ -528,7 +529,7 @@ final class Phase6ScheduleShiftConcurrencyRedTest extends WP_UnitTestCase
         if ($wdb instanceof \wpdb) {
             @$wdb->close();
         }
-        exit(0);
+        ForkChildExit::terminate(0);
     }
 
     // ==================================================================
