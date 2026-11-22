@@ -596,6 +596,129 @@ class WorkflowContractTests(unittest.TestCase):
             with self.subTest(contract=contract):
                 self.assertIn(contract, snapshot_run)
 
+    def test_restore_snapshot_comparator_pins_cleanup_probes_and_table_options(self):
+        document = _ci_document(workflow("closure-gate.yml"))
+        job = document["jobs"]["restore-apply"]
+        self.assertEqual(job["env"]["CPMS_RESTORE_SUCCESS_STAGE"], "false")
+        snapshot_run = {
+            step.get("name"): step for step in job["steps"]
+        }["Snapshot comparator self-test"]["run"]
+
+        for contract in (
+            "SNAPSHOT_SELF_TEST_VIEW_ALREADY_EXISTS",
+            "DROP VIEW IF EXISTS ",
+            "INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = ",
+            "SNAPSHOT_SELF_TEST_VIEW_REMAINS",
+            "remaining_view = mysql(",
+            "SNAPSHOT_SELF_TEST_SCHEMA_REVERT_FAILED",
+            "uuid.uuid4().hex",
+            "SNAPSHOT_SELF_TEST_PRIVATE_STORAGE_ROOT_MISSING",
+            "SNAPSHOT_SELF_TEST_DIRECTORY_MODE_ALREADY_EXISTS",
+            'if "modes" not in differences(directory_before, changed)',
+            "changed_directory_mode = original_directory_mode ^ stat.S_IWUSR",
+            "os.chmod(directory_path, changed_directory_mode)",
+            "os.chmod(directory_path, original_directory_mode)",
+            "os.rmdir(directory_path)",
+            "SNAPSHOT_SELF_TEST_DIRECTORY_MODE_REVERT_FAILED",
+            "SNAPSHOT_SELF_TEST_TABLE_ALREADY_EXISTS",
+            "remaining_table = mysql(",
+            "SNAPSHOT_SELF_TEST_TABLE_REMAINS",
+            "SNAPSHOT_SELF_TEST_TABLE_OPTIONS_REVERT_FAILED",
+            "SNAPSHOT_SELF_TEST_TABLE_OPTIONS_DIFFERENCE_DETECTED_AND_REVERTED",
+            "ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+            "ROW_FORMAT=COMPACT",
+            'if "schema" not in differences(dynamic_snapshot, compact_snapshot)',
+            "DROP TABLE IF EXISTS ",
+            "INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ",
+            "DDL causes implicit commits; do not wrap this probe in a transaction.",
+            "AUTO_INCREMENT-only changes are deliberately not detected; guarantee = DB_MAIN schema/rows + three roots.",
+            "AUTO_INCREMENT, UPDATE_TIME, CREATE_TIME, CHECK_TIME",
+            "TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH, DATA_FREE, AVG_ROW_LENGTH",
+            "for label, (catalog, schema_column, fields, ordering) in catalogs.items():",
+            '" = " + sql_literal(DB) + " ORDER BY " + ", ".join(ordering)',
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, snapshot_run)
+
+        self.assertNotIn("if view_created", snapshot_run)
+        self.assertNotIn("if table_created", snapshot_run)
+        self.assertIn(
+            '''    finally:
+        try:
+            mysql("DROP VIEW IF EXISTS " + qualified(view_name))''',
+            snapshot_run,
+        )
+        self.assertIn(
+            '''    finally:
+        if os.path.lexists(directory_path):
+            try:''',
+            snapshot_run,
+        )
+        directory_cleanup = snapshot_run.split(
+            '''    finally:
+        if os.path.lexists(directory_path):''', 1
+        )[1].split(''',
+    reverted = snapshot()''', 1)[0]
+        self.assertIn("os.chmod(directory_path, original_directory_mode)", directory_cleanup)
+        self.assertIn("os.rmdir(directory_path)", directory_cleanup)
+        self.assertIn(
+            '''    finally:
+        try:
+            mysql("DROP TABLE IF EXISTS " + qualified(table_name))''',
+            snapshot_run,
+        )
+        self.assertLess(
+            snapshot_run.index("SNAPSHOT_SELF_TEST_VIEW_ALREADY_EXISTS"),
+            snapshot_run.index('mysql("CREATE VIEW '),
+        )
+        self.assertLess(
+            snapshot_run.index("SNAPSHOT_SELF_TEST_DIRECTORY_MODE_ALREADY_EXISTS"),
+            snapshot_run.index("os.mkdir(directory_path)"),
+        )
+        self.assertLess(
+            snapshot_run.index("SNAPSHOT_SELF_TEST_TABLE_ALREADY_EXISTS"),
+            snapshot_run.index('mysql("CREATE TABLE '),
+        )
+
+        tree = ast.parse(snapshot_run)
+        schema_snapshot = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "schema_snapshot"
+        )
+        catalog_assignment = next(
+            statement for statement in schema_snapshot.body
+            if isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "catalogs"
+                    for target in statement.targets)
+        )
+        catalogs = ast.literal_eval(catalog_assignment.value)
+        for name, catalog in (
+            ("columns", "COLUMNS"),
+            ("indexes", "STATISTICS"),
+            ("views", "VIEWS"),
+            ("triggers", "TRIGGERS"),
+            ("routines", "ROUTINES"),
+            ("routine_parameters", "PARAMETERS"),
+        ):
+            with self.subTest(catalog=name):
+                self.assertEqual(catalogs[name][0], catalog)
+                self.assertEqual(catalogs[name][1], {
+                    "columns": "TABLE_SCHEMA",
+                    "indexes": "TABLE_SCHEMA",
+                    "views": "TABLE_SCHEMA",
+                    "triggers": "TRIGGER_SCHEMA",
+                    "routines": "ROUTINE_SCHEMA",
+                    "routine_parameters": "SPECIFIC_SCHEMA",
+                }[name])
+        self.assertEqual(
+            catalogs["table_options"],
+            (
+                "TABLES", "TABLE_SCHEMA",
+                ("TABLE_NAME", "TABLE_TYPE", "ENGINE", "ROW_FORMAT", "TABLE_COLLATION"),
+                ("TABLE_NAME",),
+            ),
+        )
+
     def test_disposable_demo_lane_is_path_scoped_to_its_own_files(self):
         """The lane must not act as a global gate: it runs only for changes to
         its own files, and its isolation decision is made by an executable,

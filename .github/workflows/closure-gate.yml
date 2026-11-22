@@ -457,10 +457,12 @@ jobs:
           import stat
           import subprocess
           import sys
+          import uuid
           from pathlib import Path
 
           # Guarantee: DB_MAIN plus the three watched roots only. It does not cover other
           # databases, /tmp, or external writers.
+          # AUTO_INCREMENT-only changes are deliberately not detected; guarantee = DB_MAIN schema/rows + three roots.
           DB = os.environ["DB_MAIN"]
           BARRIER_OPTION = "cpms_restore_barrier"
           # Empty by design: no option is excluded from the before/after comparison.
@@ -598,6 +600,14 @@ jobs:
                        "COLUMN_NAME", "EXPRESSION", "COLLATION", "SUB_PART", "NULLABLE",
                        "INDEX_TYPE", "COMMENT", "INDEX_COMMENT", "IS_VISIBLE"),
                       ("TABLE_NAME", "INDEX_NAME", "SEQ_IN_INDEX"),
+                  ),
+                  # AUTO_INCREMENT, UPDATE_TIME, CREATE_TIME, CHECK_TIME,
+                  # TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH, DATA_FREE, AVG_ROW_LENGTH are deliberately excluded
+                  # as volatile or estimates.
+                  "table_options": (
+                      "TABLES", "TABLE_SCHEMA",
+                      ("TABLE_NAME", "TABLE_TYPE", "ENGINE", "ROW_FORMAT", "TABLE_COLLATION"),
+                      ("TABLE_NAME",),
                   ),
                   "views": (
                       "VIEWS", "TABLE_SCHEMA",
@@ -761,7 +771,10 @@ jobs:
 
           def self_test():
               before = snapshot()
-              marker = Path(os.environ["STORAGE_OUT"]) / ".cpms-restore-snapshot-self-test"
+              private_storage_root = Path(os.environ["STORAGE_OUT"])
+              if not before["files"]["private_storage"]["exists"]:
+                  raise SystemExit("SNAPSHOT_SELF_TEST_PRIVATE_STORAGE_ROOT_MISSING")
+              marker = private_storage_root / ".cpms-restore-snapshot-self-test"
               if os.path.lexists(marker):
                   raise SystemExit("SNAPSHOT_SELF_TEST_MARKER_ALREADY_EXISTS")
               try:
@@ -810,6 +823,63 @@ jobs:
                   raise SystemExit(mode_failure)
               print("SNAPSHOT_SELF_TEST_MODE_DIFFERENCE_DETECTED_AND_REVERTED")
 
+              directory_name = ".cpms-restore-snapshot-directory-mode-" + uuid.uuid4().hex
+              directory_path = private_storage_root / directory_name
+              if os.path.lexists(directory_path):
+                  raise SystemExit("SNAPSHOT_SELF_TEST_DIRECTORY_MODE_ALREADY_EXISTS")
+              original_directory_mode = None
+              directory_failure = None
+              directory_cleanup_failure = None
+              try:
+                  os.mkdir(directory_path)
+                  original_directory_mode = stat.S_IMODE(os.lstat(directory_path).st_mode)
+                  directory_before = snapshot()
+                  changed_directory_mode = original_directory_mode ^ stat.S_IWUSR
+                  os.chmod(directory_path, changed_directory_mode)
+                  changed = snapshot()
+                  if "modes" not in differences(directory_before, changed):
+                      directory_failure = "SNAPSHOT_SELF_TEST_DID_NOT_DETECT_DIRECTORY_MODE_CHANGE"
+              except (SystemExit, Exception) as error:
+                  directory_failure = str(error) or "SNAPSHOT_SELF_TEST_DIRECTORY_MODE_PROBE_FAILED"
+              finally:
+                  if os.path.lexists(directory_path):
+                      try:
+                          directory_stat = os.lstat(directory_path).st_mode
+                          if not stat.S_ISDIR(directory_stat):
+                              directory_cleanup_failure = "SNAPSHOT_SELF_TEST_DIRECTORY_PROBE_NOT_DIRECTORY"
+                          elif original_directory_mode is not None:
+                              os.chmod(directory_path, original_directory_mode)
+                      except (SystemExit, Exception) as error:
+                          directory_cleanup_failure = (
+                              str(error) or "SNAPSHOT_SELF_TEST_DIRECTORY_MODE_RESTORE_FAILED"
+                          )
+                      try:
+                          if os.path.lexists(directory_path):
+                              directory_stat = os.lstat(directory_path).st_mode
+                              if stat.S_ISDIR(directory_stat):
+                                  os.rmdir(directory_path)
+                              else:
+                                  directory_cleanup_failure = (
+                                      directory_cleanup_failure
+                                      or "SNAPSHOT_SELF_TEST_DIRECTORY_PROBE_NOT_DIRECTORY"
+                                  )
+                      except (SystemExit, Exception) as error:
+                          directory_cleanup_failure = directory_cleanup_failure or (
+                              str(error) or "SNAPSHOT_SELF_TEST_DIRECTORY_REMOVE_FAILED"
+                          )
+              reverted = snapshot()
+              reverted_sections = differences(before, reverted)
+              directory_failures = [failure for failure in
+                                    (directory_failure, directory_cleanup_failure) if failure]
+              if reverted_sections:
+                  directory_failures.append(
+                      "SNAPSHOT_SELF_TEST_DIRECTORY_MODE_REVERT_FAILED: "
+                      + ",".join(reverted_sections)
+                  )
+              if directory_failures:
+                  raise SystemExit("; ".join(directory_failures))
+              print("SNAPSHOT_SELF_TEST_DIRECTORY_MODE_DIFFERENCE_DETECTED_AND_REVERTED")
+
               view_name = "cpms_restore_snapshot_self_test_view"
               existing_view = mysql(
                   "SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = "
@@ -817,31 +887,97 @@ jobs:
               ).strip()
               if existing_view != "0":
                   raise SystemExit("SNAPSHOT_SELF_TEST_VIEW_ALREADY_EXISTS")
-              view_created = False
               schema_failure = None
+              view_cleanup_failure = None
               try:
                   mysql("CREATE VIEW " + qualified(view_name)
                         + " AS SELECT 1 AS self_test_probe")
-                  view_created = True
                   changed = snapshot()
                   if "schema" not in differences(before, changed):
                       schema_failure = "SNAPSHOT_SELF_TEST_DID_NOT_DETECT_SCHEMA_CHANGE"
               except (SystemExit, Exception) as error:
                   schema_failure = str(error) or "SNAPSHOT_SELF_TEST_SCHEMA_PROBE_FAILED"
               finally:
-                  if view_created:
-                      try:
-                          mysql("DROP VIEW IF EXISTS " + qualified(view_name))
-                      except (SystemExit, Exception) as error:
-                          schema_failure = schema_failure or str(error) or "SNAPSHOT_SELF_TEST_VIEW_DROP_FAILED"
+                  try:
+                      mysql("DROP VIEW IF EXISTS " + qualified(view_name))
+                  except (SystemExit, Exception) as error:
+                      view_cleanup_failure = (
+                          str(error) or "SNAPSHOT_SELF_TEST_VIEW_DROP_FAILED"
+                      )
+                  try:
+                      remaining_view = mysql(
+                          "SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = "
+                          + sql_literal(DB) + " AND TABLE_NAME = " + sql_literal(view_name)
+                      ).strip()
+                      if remaining_view != "0":
+                          view_cleanup_failure = "SNAPSHOT_SELF_TEST_VIEW_REMAINS"
+                  except (SystemExit, Exception) as error:
+                      view_cleanup_failure = (
+                          str(error) or "SNAPSHOT_SELF_TEST_VIEW_ABSENCE_CHECK_FAILED"
+                      )
               reverted = snapshot()
               reverted_sections = differences(before, reverted)
+              schema_failures = [failure for failure in (schema_failure, view_cleanup_failure)
+                                 if failure]
               if reverted_sections:
-                  raise SystemExit("SNAPSHOT_SELF_TEST_SCHEMA_REVERT_FAILED: "
-                                   + ",".join(reverted_sections))
-              if schema_failure:
-                  raise SystemExit(schema_failure)
+                  schema_failures.append(
+                      "SNAPSHOT_SELF_TEST_SCHEMA_REVERT_FAILED: "
+                      + ",".join(reverted_sections)
+                  )
+              if schema_failures:
+                  raise SystemExit("; ".join(schema_failures))
               print("SNAPSHOT_SELF_TEST_SCHEMA_DIFFERENCE_DETECTED_AND_REVERTED")
+
+              table_name = "cpms_restore_snapshot_self_test_table"
+              existing_table = mysql(
+                  "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = "
+                  + sql_literal(DB) + " AND TABLE_NAME = " + sql_literal(table_name)
+              ).strip()
+              if existing_table != "0":
+                  raise SystemExit("SNAPSHOT_SELF_TEST_TABLE_ALREADY_EXISTS")
+              table_failure = None
+              table_cleanup_failure = None
+              # DDL causes implicit commits; do not wrap this probe in a transaction.
+              try:
+                  mysql("CREATE TABLE " + qualified(table_name)
+                        + " (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB ROW_FORMAT=DYNAMIC")
+                  dynamic_snapshot = snapshot()
+                  mysql("ALTER TABLE " + qualified(table_name) + " ROW_FORMAT=COMPACT")
+                  compact_snapshot = snapshot()
+                  if "schema" not in differences(dynamic_snapshot, compact_snapshot):
+                      table_failure = "SNAPSHOT_SELF_TEST_DID_NOT_DETECT_TABLE_OPTIONS_CHANGE"
+              except (SystemExit, Exception) as error:
+                  table_failure = str(error) or "SNAPSHOT_SELF_TEST_TABLE_OPTIONS_PROBE_FAILED"
+              finally:
+                  try:
+                      mysql("DROP TABLE IF EXISTS " + qualified(table_name))
+                  except (SystemExit, Exception) as error:
+                      table_cleanup_failure = (
+                          str(error) or "SNAPSHOT_SELF_TEST_TABLE_DROP_FAILED"
+                      )
+                  try:
+                      remaining_table = mysql(
+                          "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = "
+                          + sql_literal(DB) + " AND TABLE_NAME = " + sql_literal(table_name)
+                      ).strip()
+                      if remaining_table != "0":
+                          table_cleanup_failure = "SNAPSHOT_SELF_TEST_TABLE_REMAINS"
+                  except (SystemExit, Exception) as error:
+                      table_cleanup_failure = (
+                          str(error) or "SNAPSHOT_SELF_TEST_TABLE_ABSENCE_CHECK_FAILED"
+                      )
+              reverted = snapshot()
+              reverted_sections = differences(before, reverted)
+              table_failures = [failure for failure in (table_failure, table_cleanup_failure)
+                                if failure]
+              if reverted_sections:
+                  table_failures.append(
+                      "SNAPSHOT_SELF_TEST_TABLE_OPTIONS_REVERT_FAILED: "
+                      + ",".join(reverted_sections)
+                  )
+              if table_failures:
+                  raise SystemExit("; ".join(table_failures))
+              print("SNAPSHOT_SELF_TEST_TABLE_OPTIONS_DIFFERENCE_DETECTED_AND_REVERTED")
 
           if __name__ == "__main__":
               if len(sys.argv) == 2 and sys.argv[1] == "self-test":
