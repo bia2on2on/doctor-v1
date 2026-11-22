@@ -121,9 +121,9 @@ final class LoginRateLimiter
     private function count_failure( string $username ): void {
         $ip = ClientIp::resolve();
         // تلاش ردشده در سقفی که به آن رسیده یا از آن گذشته است، آن سبد را
-        // بیشتر نمی‌افزاید: شمارندهٔ هر سبد ≤ سقف (IP ≤ ۲۰، نام کاربری ≤ ۱۰)
-        // و با چرخش پنجرهٔ ۹۰۰ ثانیه‌ای باز می‌شود — قفل کاربر قانونی هرگز
-        // نامحدود رشد نمی‌کند.
+        // بیشتر نمی‌افزاید: شمارندهٔ هر سبد نزدیک سقف (IP ≈ ۲۰، نام کاربری
+        // ≈ ۱۰) می‌ماند — درخواست‌های همزمان بین peek و hit می‌توانند آن را
+        // اندکی از سقف عبور دهند — و با چرخش پنجرهٔ ۹۰۰ ثانیه‌ای باز می‌شود.
         if ( $ip !== null && ! $this->isOver( 'login-ip:' . $ip, self::MAX_PER_IP ) ) {
             $this->rate->hit( 'login-ip:' . $ip, self::MAX_PER_IP, self::WINDOW_SEC );
         }

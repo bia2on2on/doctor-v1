@@ -75,11 +75,39 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
         }
 
         $result = wp_authenticate($username, $password);
-        $signon = wp_signon([
-            'user_login'    => $username,
-            'user_password' => $password,
-            'remember'      => false,
-        ], false);
+
+        // COOKIE WITNESS: count the core actions set_auth_cookie and
+        // set_logged_in_cookie fired by the DENIED wp_signon. These actions are
+        // do_action()-driven inside wp_set_auth_cookie (wp-includes/pluggable.php,
+        // 7.1.3: set_auth_cookie at :1154, set_logged_in_cookie at :1171).
+        // The send_auth_cookies filter (pluggable.php:1189) suppresses only the
+        // setcookie() calls — the actions fire BEFORE that filter runs, so the
+        // spy stays live while real header output is suppressed.
+        $authCookieCount = 0;
+        $loggedInCookieCount = 0;
+        $cookieSpy = function () use (&$authCookieCount): void {
+            $authCookieCount++;
+        };
+        $loggedInCookieSpy = function () use (&$loggedInCookieCount): void {
+            $loggedInCookieCount++;
+        };
+        $suppressCookies = static function (): bool {
+            return false;
+        };
+        add_action('set_auth_cookie', $cookieSpy, 10, 6);
+        add_action('set_logged_in_cookie', $loggedInCookieSpy, 10, 6);
+        add_filter('send_auth_cookies', $suppressCookies, 10, 1);
+        try {
+            $signon = wp_signon([
+                'user_login'    => $username,
+                'user_password' => $password,
+                'remember'      => false,
+            ], false);
+        } finally {
+            remove_action('set_auth_cookie', $cookieSpy, 10);
+            remove_action('set_logged_in_cookie', $loggedInCookieSpy, 10);
+            remove_filter('send_auth_cookies', $suppressCookies, 10);
+        }
 
         wp_set_current_user(0);
 
@@ -92,10 +120,14 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
         self::assertGreaterThan(0, $user_id);
         self::assertInstanceOf(WP_Error::class, $result);
         self::assertSame('CLINIC_RATE_LIMITED', $result->get_error_code());
-        self::assertSame(429, $result->get_error_data()['status'] ?? 0);
+        $resultData = $result->get_error_data();
+        self::assertArrayHasKey('status', $resultData);
+        self::assertSame(429, $resultData['status']);
         self::assertInstanceOf(WP_Error::class, $signon);
         self::assertSame('CLINIC_RATE_LIMITED', $signon->get_error_code());
         self::assertSame(0, get_current_user_id());
+        self::assertSame(0, $authCookieCount, 'set_auth_cookie must not fire on a denied sign-on.');
+        self::assertSame(0, $loggedInCookieCount, 'set_logged_in_cookie must not fire on a denied sign-on.');
         self::assertSame([], WP_Session_Tokens::get_instance($user_id)->get_all());
         self::assertCount(1, $rows);
         self::assertSame(LoginRateLimiter::MAX_PER_USERNAME, (int) $rows[0]['hits']);
@@ -305,5 +337,188 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
             $keys[] = $key;
         }
         self::assertCount(2, array_unique($keys), 'Distinct usernames map to distinct keys.');
+    }
+
+    /** (12) Cookie-action spy — positive witness: a SUCCESSFUL sign-on below the ceiling fires both core actions. */
+    public function testSuccessfulSignonBelowCeilingFiresBothCookieActionsAndASessionToken(): void
+    {
+        $password = 'e2e-password-123';
+        $username = 'lrl_e2e_cookie_' . bin2hex(random_bytes(4));
+        $user_id  = wp_create_user($username, $password, $username . '@e2e.test');
+
+        for ($i = 0; $i < LoginRateLimiter::MAX_PER_USERNAME - 1; $i++) {
+            wp_authenticate($username, 'wrong-password-' . $i);
+        }
+
+        $authCookieCount = 0;
+        $loggedInCookieCount = 0;
+        $cookieSpy = function () use (&$authCookieCount): void {
+            $authCookieCount++;
+        };
+        $loggedInCookieSpy = function () use (&$loggedInCookieCount): void {
+            $loggedInCookieCount++;
+        };
+        $suppressCookies = static function (): bool {
+            return false;
+        };
+        add_action('set_auth_cookie', $cookieSpy, 10, 6);
+        add_action('set_logged_in_cookie', $loggedInCookieSpy, 10, 6);
+        add_filter('send_auth_cookies', $suppressCookies, 10, 1);
+        try {
+            $signon = wp_signon([
+                'user_login'    => $username,
+                'user_password' => $password,
+                'remember'      => false,
+            ], false);
+        } finally {
+            remove_action('set_auth_cookie', $cookieSpy, 10);
+            remove_action('set_logged_in_cookie', $loggedInCookieSpy, 10);
+            remove_filter('send_auth_cookies', $suppressCookies, 10);
+        }
+
+        self::assertGreaterThan(0, $user_id);
+        self::assertInstanceOf(\WP_User::class, $signon);
+        self::assertSame($user_id, $signon->ID);
+        self::assertGreaterThanOrEqual(1, $authCookieCount, 'spy alive: set_auth_cookie must fire on a successful sign-on.');
+        self::assertGreaterThanOrEqual(1, $loggedInCookieCount, 'spy alive: set_logged_in_cookie must fire on a successful sign-on.');
+        self::assertNotEmpty(
+            WP_Session_Tokens::get_instance($user_id)->get_all(),
+            'a successful sign-on issues a session token.'
+        );
+    }
+
+    /** (13) Counters: a SUCCESSFUL sign-on below the ceiling must leave BOTH buckets EXACTLY unchanged. */
+    public function testSuccessfulSignonBelowCeilingLeavesBothBucketsUnchanged(): void
+    {
+        $password = 'e2e-password-123';
+        $username = 'lrl_e2e_ctr_' . bin2hex(random_bytes(4));
+        $user_id  = wp_create_user($username, $password, $username . '@e2e.test');
+
+        // One failure establishes a non-zero baseline: IP bucket 1, username bucket 1.
+        wp_authenticate($username, 'wrong-password-only');
+
+        $db    = App::db();
+        $table = $db->table('cpms_rate_limits');
+        $rowsBefore = $db->fetchAll('SELECT window_key, hits FROM ' . $table . " WHERE window_key LIKE 'login-ip:%' OR window_key LIKE 'login-user:%'", []);
+        self::assertSame(2, count($rowsBefore), 'expected one IP and one username row after one failure');
+
+        $insertCount = 0;
+        $selectCount = 0;
+        $insertPattern = '/\AINSERT INTO .*' . preg_quote($table, '/') . '/';
+        $selectPattern = '/\ASELECT .*FROM .*' . preg_quote($table, '/i') . '/';
+        $watch = static function (string $sql) use ($insertPattern, $selectPattern, &$insertCount, &$selectCount): string {
+            if (preg_match($insertPattern, $sql) === 1) {
+                $insertCount++;
+            }
+            if (preg_match($selectPattern, $sql) === 1) {
+                $selectCount++;
+            }
+            return $sql;
+        };
+
+        add_filter('query', $watch);
+        try {
+            $signon = wp_signon([
+                'user_login'    => $username,
+                'user_password' => $password,
+                'remember'      => false,
+            ], false);
+        } finally {
+            remove_filter('query', $watch);
+        }
+
+        self::assertGreaterThan(0, $user_id);
+        self::assertInstanceOf(\WP_User::class, $signon);
+        self::assertSame($user_id, $signon->ID);
+        self::assertSame(0, $insertCount, 'a successful sign-on must not grow the rate-limit buckets.');
+        self::assertGreaterThanOrEqual(1, $selectCount, 'spy must observe the peek reads of the successful sign-on.');
+
+        $rowsAfter = $db->fetchAll('SELECT window_key, hits FROM ' . $table . " WHERE window_key LIKE 'login-ip:%' OR window_key LIKE 'login-user:%'", []);
+        self::assertSame($rowsBefore, $rowsAfter, 'a successful sign-on must leave both buckets exactly unchanged.');
+
+        // Positive witness (same spy shape): driving a failure grows BOTH rows by exactly one.
+        $insertCount = 0;
+        $selectCount = 0;
+        add_filter('query', $watch);
+        try {
+            $failing = wp_signon([
+                'user_login'    => $username,
+                'user_password' => 'wrong-password-only',
+                'remember'      => false,
+            ], false);
+        } finally {
+            remove_filter('query', $watch);
+        }
+
+        self::assertInstanceOf(WP_Error::class, $failing);
+        self::assertSame('incorrect_password', $failing->get_error_code());
+        self::assertGreaterThanOrEqual(1, $insertCount, 'spy must observe bucket growth on a failure.');
+        self::assertGreaterThanOrEqual(1, $selectCount, 'spy must observe reads on a failure.');
+        $failedRows = $db->fetchAll('SELECT window_key, hits FROM ' . $table . " WHERE window_key LIKE 'login-ip:%' OR window_key LIKE 'login-user:%'", []);
+        self::assertCount(2, $failedRows);
+        $ipRow = null;
+        $usernameRow = null;
+        foreach ($failedRows as $row) {
+            if (strpos((string) $row['window_key'], 'login-ip:') === 0) {
+                $ipRow = $row;
+            } else {
+                $usernameRow = $row;
+            }
+        }
+        self::assertIsArray($ipRow);
+        self::assertIsArray($usernameRow);
+        self::assertSame(2, (int) $ipRow['hits']);
+        self::assertSame(2, (int) $usernameRow['hits']);
+    }
+
+    /** (14) THROTTLED IP + both credentials empty: input passes through, no counter growth. */
+    public function testThrottledIpWithBothCredentialsEmptyPassesThroughAndDoesNotGrow(): void
+    {
+        for ($i = 0; $i < LoginRateLimiter::MAX_PER_IP; $i++) {
+            wp_authenticate('lrl_e2e_empty_' . $i . '_' . bin2hex(random_bytes(4)), 'wrong-password-' . $i);
+        }
+
+        $db    = App::db();
+        $table = $db->table('cpms_rate_limits');
+        $rowsBefore = $db->fetchAll('SELECT window_key, hits FROM ' . $table . " WHERE window_key LIKE 'login-ip:%'", []);
+        self::assertCount(1, $rowsBefore, 'expected one IP row at the ceiling');
+        self::assertSame(LoginRateLimiter::MAX_PER_IP, (int) $rowsBefore[0]['hits']);
+
+        $result = wp_authenticate('', '');
+
+        $rowsAfter = $db->fetchAll('SELECT window_key, hits FROM ' . $table . " WHERE window_key LIKE 'login-ip:%'", []);
+
+        self::assertInstanceOf(WP_Error::class, $result);
+        self::assertNotSame('CLINIC_RATE_LIMITED', $result->get_error_code());
+        self::assertSame('empty_username', $result->get_error_code());
+        self::assertSame($rowsBefore, $rowsAfter, 'empty-credential requests must not grow the IP bucket.');
+    }
+
+    /** (15) Username present + password empty + username bucket at ceiling: throttled, username bucket does not grow. */
+    public function testUsernamePresentEmptyPasswordAtUsernameCeilingIsRateLimitedAndDoesNotGrow(): void
+    {
+        $password = 'e2e-password-123';
+        $username = 'lrl_e2e_single_' . bin2hex(random_bytes(4));
+        wp_create_user($username, $password, $username . '@e2e.test');
+
+        for ($i = 0; $i < LoginRateLimiter::MAX_PER_USERNAME; $i++) {
+            wp_authenticate($username, 'wrong-password-' . $i);
+        }
+
+        $db    = App::db();
+        $table = $db->table('cpms_rate_limits');
+        $usernameRowsBefore = $db->fetchAll('SELECT window_key, hits FROM ' . $table . " WHERE window_key LIKE 'login-user:%'", []);
+        self::assertCount(1, $usernameRowsBefore);
+
+        $result = wp_authenticate($username, '');
+
+        $usernameRowsAfter = $db->fetchAll('SELECT window_key, hits FROM ' . $table . " WHERE window_key LIKE 'login-user:%'", []);
+        $ipRowsAfter = $db->fetchAll('SELECT window_key, hits FROM ' . $table . " WHERE window_key LIKE 'login-ip:%'", []);
+
+        self::assertInstanceOf(WP_Error::class, $result);
+        self::assertSame('CLINIC_RATE_LIMITED', $result->get_error_code());
+        self::assertSame($usernameRowsBefore, $usernameRowsAfter, 'the username bucket is at ceiling and must not grow.');
+        self::assertCount(1, $ipRowsAfter);
+        self::assertSame(LoginRateLimiter::MAX_PER_USERNAME + 1, (int) $ipRowsAfter[0]['hits'], 'the IP bucket grows by exactly one failure.');
     }
 }
