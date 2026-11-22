@@ -382,7 +382,7 @@ final class OtpService
      *
      * @throws OtpException
      */
-    public function verify(string $rawMobile, string $code, string $purpose = self::PURPOSE_LOGIN, ?string $ip = null): array
+    public function verify(string $rawMobile, string $code, string $purpose = self::PURPOSE_LOGIN, ?string $ip = null, ?int $expected_clinic_id = null): array
     {
         $mobile = MobileValidator::normalize($rawMobile);
         if ($mobile === null || !preg_match('/^\d{6}$/', $code)) {
@@ -422,6 +422,9 @@ final class OtpService
         // هرگز استثنای فراری، هرگز 500. کلیدهای Cooldown/Lockout هویت‌سطح
         // می‌مانند (AD-15 — بدون بازطراحی).
         $rowClinicId = (isset($row['clinic_id']) && $row['clinic_id'] !== null) ? (int) $row['clinic_id'] : null;
+        if ( null !== $expected_clinic_id && $expected_clinic_id > 0 && null !== $rowClinicId && $rowClinicId !== $expected_clinic_id ) {
+            throw new OtpException( 'CLINIC_OTP_INVALID', 'کد واردشده معتبر نیست' );
+        }
         try {
             $settings = $rowClinicId !== null
                 ? $this->settingsFactory->forClinic($rowClinicId)
@@ -450,7 +453,7 @@ final class OtpService
         try {
             $verify_outcome = $this->db->transactional(
                 // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy local naming preserved.
-                function () use ( $row, $rowClinicId, $mobile, $code, $purpose, $ip, $clinic_id, $policy, $outer_tx_depth ): array {
+                function () use ( $row, $rowClinicId, $mobile, $code, $purpose, $ip, $clinic_id, $policy, $outer_tx_depth, $expected_clinic_id ): array {
                     // One current read serializes failures and successful consumes
                     // on this challenge. Recheck expiry/lock AFTER any lock wait:
                     // stale pre-transaction state cannot lose failed attempts or
@@ -464,6 +467,7 @@ final class OtpService
                     }
                     $locked_clinic = $locked !== null && isset( $locked['clinic_id'] ) ? (int) $locked['clinic_id'] : null;
                     if ( $locked === null || $locked_clinic !== $rowClinicId
+                        || ( null !== $expected_clinic_id && $expected_clinic_id > 0 && null !== $locked_clinic && $locked_clinic !== $expected_clinic_id )
                         || (string) $locked['mobile'] !== $mobile || (string) $locked['purpose'] !== $purpose
                         || $locked['consumed_at'] !== null ) {
                         return [ 'error' => new OtpException( 'CLINIC_OTP_INVALID', 'این کد قبلاً استفاده شده است' ) ];

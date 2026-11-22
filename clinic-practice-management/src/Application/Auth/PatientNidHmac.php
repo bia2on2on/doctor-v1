@@ -109,6 +109,58 @@ final class PatientNidHmac {
         return 'pl-ip:' . hash( 'sha256', '' !== $clean ? $clean : 'unknown' );
     }
 
+    /**
+     * Domain-separated active rate-limit bucket key for a normalized national ID.
+     */
+    public function rate_limit_key_with_domain( string $prefix, string $domain, string $normalized_nid ): string {
+        $normalized = self::normalize( $normalized_nid );
+        if ( null === $normalized ) {
+            throw new \InvalidArgumentException( 'Invalid normalized national ID' );
+        }
+
+        return $prefix . ':' . hash_hmac( 'sha256', $domain . ':' . $normalized, $this->active_key() );
+    }
+
+    /**
+     * Domain-separated candidate rate-limit keys for read checks during key-rotation overlap.
+     *
+     * @return list<string>
+     */
+    public function rate_limit_keys_for_read_with_domain( string $prefix, string $domain, string $normalized_nid ): array {
+        $normalized = self::normalize( $normalized_nid );
+        if ( null === $normalized ) {
+            throw new \InvalidArgumentException( 'Invalid normalized national ID' );
+        }
+
+        $payload  = $domain . ':' . $normalized;
+        $keys     = [ $prefix . ':' . hash_hmac( 'sha256', $payload, $this->active_key() ) ];
+        $previous = $this->previous_key();
+        if ( null !== $previous && '' !== $previous ) {
+            $prev_bucket = $prefix . ':' . hash_hmac( 'sha256', $payload, $previous );
+            if ( $prev_bucket !== $keys[0] ) {
+                $keys[] = $prev_bucket;
+            }
+        }
+
+        return $keys;
+    }
+
+    /**
+     * Domain-separated rate-limit bucket key for mobile attempts (keyed HMAC).
+     */
+    public function mobile_rate_limit_key_with_domain( string $prefix, string $domain, string $normalized_mobile ): string {
+        return $prefix . ':' . hash_hmac( 'sha256', $domain . ':' . $normalized_mobile, $this->active_key() );
+    }
+
+    /**
+     * Domain-separated rate-limit bucket key for client IP attempts.
+     */
+    public function ip_rate_limit_key_with_domain( string $prefix, string $ip ): string {
+        $clean = trim( $ip );
+
+        return $prefix . ':' . hash( 'sha256', '' !== $clean ? $clean : 'unknown' );
+    }
+
     private function active_key(): string {
         if ( null !== $this->key_provider ) {
             $provided = (string) ( $this->key_provider )();

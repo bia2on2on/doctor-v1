@@ -150,6 +150,7 @@ final class PublicBookingShortcode
      */
     private const OTP_REQUEST_PATH = '/otp/request';
     private const OTP_VERIFY_PATH = '/otp/verify';
+    private const REGISTER_PATH = '/patient/register';
     private const HOLD_PATH = '/booking/hold';
     private const CONFIRM_PATH = '/booking/confirm';
 
@@ -763,10 +764,10 @@ final class PublicBookingShortcode
             ? self::resolve_patient_session_clinic_id()
             : null;
         if ( self::CONTINUATION_ANONYMOUS === $continuation ) {
-            $lines[] = self::render_auth_continuation( $surface_id, false );
+            $lines[] = self::render_auth_continuation( $surface_id, false, true );
         } elseif ( self::CONTINUATION_PATIENT === $continuation ) {
             if ( $is_discovery || $session_clinic_id !== $clinic_id ) {
-                $lines[] = self::render_auth_continuation( $surface_id, true );
+                $lines[] = self::render_auth_continuation( $surface_id, true, false );
             }
             $lines[] = self::render_patient_continuation( $surface_id, $clinic_ids, $session_clinic_id );
         }
@@ -1231,7 +1232,7 @@ final class PublicBookingShortcode
      * hold/confirm و بدون هیچ PHI — ورود فقط با شمارهٔ موبایل و کدِ پیامکی
      * روی مسیرهای موجودِ A2/A3 انجام می‌شود.
      */
-    private static function render_auth_continuation( string $surface_id, bool $hidden = false ): string
+    private static function render_auth_continuation( string $surface_id, bool $hidden = false, bool $allow_register = false ): string
     {
         $b = self::ROOT_CLASS;
         // Child ids use their own `cpms-auth-` namespace, not the root's
@@ -1274,6 +1275,13 @@ final class PublicBookingShortcode
             esc_attr( $b . '__btn' ),
             esc_html( 'دریافت کد تأیید' )
         );
+        if ( $allow_register ) {
+            $lines[] = sprintf(
+                '<button type="button" class="%1$s" data-auth-action="show-register">%2$s</button>',
+                esc_attr( $b . '__link-btn' ),
+                esc_html( 'بیمار جدید هستید؟ ثبت‌نام کنید' )
+            );
+        }
         $lines[] = '</div>';
 
         $lines[] = sprintf( '<div class="%1$s" data-auth-step="otp-code" hidden>', esc_attr( $b . '__auth-step' ) );
@@ -1298,6 +1306,80 @@ final class PublicBookingShortcode
             esc_html( 'تغییر شماره موبایل' )
         );
         $lines[] = '</div>';
+
+        if ( $allow_register ) {
+            $reg_mobile_id = $auth_ns . '-reg-mobile';
+            $reg_code_id   = $auth_ns . '-reg-code';
+            $reg_given_id  = $auth_ns . '-reg-given';
+            $reg_family_id = $auth_ns . '-reg-family';
+            $reg_nid_id    = $auth_ns . '-reg-nid';
+            $reg_birth_id  = $auth_ns . '-reg-birth';
+
+            $lines[] = sprintf( '<div class="%1$s" data-auth-step="otp-register" hidden>', esc_attr( $b . '__auth-step' ) );
+            $lines[] = sprintf(
+                '<label class="%1$s" for="%2$s">%3$s</label>',
+                esc_attr( $b . '__label' ),
+                esc_attr( $reg_mobile_id ),
+                esc_html( 'شماره موبایل (۱۱ رقم با پیش‌شماره ۰۹)' )
+            );
+            $lines[] = sprintf(
+                '<input type="tel" class="%1$s" id="%2$s" data-role="reg-mobile" inputmode="tel" maxlength="11" autocomplete="tel" placeholder="09XXXXXXXXX" dir="ltr">',
+                esc_attr( $b . '__input' ),
+                esc_attr( $reg_mobile_id )
+            );
+            $lines[] = sprintf(
+                '<div class="%1$s"><button type="button" class="%2$s" data-auth-action="reg-otp-request">%3$s</button>'
+                . '<button type="button" class="%4$s" data-auth-action="show-login">%5$s</button></div>',
+                esc_attr( $b . '__auth-actions' ),
+                esc_attr( $b . '__btn' ),
+                esc_html( 'دریافت کد تأیید ثبت‌نام' ),
+                esc_attr( $b . '__link-btn' ),
+                esc_html( 'قبلاً ثبت‌نام کرده‌اید؟ ورود با کد تأیید' )
+            );
+            $lines[] = '<div data-role="reg-details" hidden>';
+            $lines[] = sprintf(
+                '<label class="%1$s" for="%2$s">%3$s</label><input type="text" class="%4$s" id="%2$s" data-role="reg-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" dir="ltr">',
+                esc_attr( $b . '__label' ),
+                esc_attr( $reg_code_id ),
+                esc_html( 'کد ۶ رقمی پیامک‌شده' ),
+                esc_attr( $b . '__input' )
+            );
+            $lines[] = sprintf(
+                '<label class="%1$s" for="%2$s">%3$s</label><input type="text" class="%4$s" id="%2$s" data-role="reg-given-name" maxlength="120" autocomplete="given-name">',
+                esc_attr( $b . '__label' ),
+                esc_attr( $reg_given_id ),
+                esc_html( 'نام' ),
+                esc_attr( $b . '__input' )
+            );
+            $lines[] = sprintf(
+                '<label class="%1$s" for="%2$s">%3$s</label><input type="text" class="%4$s" id="%2$s" data-role="reg-family-name" maxlength="120" autocomplete="family-name">',
+                esc_attr( $b . '__label' ),
+                esc_attr( $reg_family_id ),
+                esc_html( 'نام خانوادگی' ),
+                esc_attr( $b . '__input' )
+            );
+            $lines[] = sprintf(
+                '<label class="%1$s" for="%2$s">%3$s</label><input type="text" class="%4$s" id="%2$s" data-role="reg-national-id" inputmode="numeric" maxlength="10" dir="ltr">',
+                esc_attr( $b . '__label' ),
+                esc_attr( $reg_nid_id ),
+                esc_html( 'کد ملی (۱۰ رقم)' ),
+                esc_attr( $b . '__input' )
+            );
+            $lines[] = sprintf(
+                '<label class="%1$s" for="%2$s">%3$s</label><input type="text" class="%4$s" id="%2$s" data-role="reg-birth-date" inputmode="numeric" maxlength="10" placeholder="YYYY-MM-DD" dir="ltr" autocomplete="bday">',
+                esc_attr( $b . '__label' ),
+                esc_attr( $reg_birth_id ),
+                esc_html( 'تاریخ تولد (میلادی YYYY-MM-DD)' ),
+                esc_attr( $b . '__input' )
+            );
+            $lines[] = sprintf(
+                '<button type="button" class="%1$s" data-auth-action="reg-submit">%2$s</button>',
+                esc_attr( $b . '__btn' ),
+                esc_html( 'تکمیل ثبت‌نام و ادامه رزرو' )
+            );
+            $lines[] = '</div>';
+            $lines[] = '</div>';
+        }
 
         // پیامِ وضعیتِ احراز — فقط متنِ خودِ سرور (envelope A2/A3) اینجا نشسته
         // می‌شود؛ هیچ تفسیر یا رشتهٔ جدیدی در مرورگر ساخته نمی‌شود.
@@ -1839,6 +1921,7 @@ final class PublicBookingShortcode
         if ( self::CONTINUATION_ANONYMOUS === $continuation ) {
             $config['otp_request_path'] = self::OTP_REQUEST_PATH;
             $config['otp_verify_path']  = self::OTP_VERIFY_PATH;
+            $config['register_path']    = self::REGISTER_PATH;
         } elseif ( self::CONTINUATION_PATIENT === $continuation ) {
             // فقط برای بیمارِ واردشده — CSRF با wp_rest nonce (همان مرزِ B1/B2).
             $config['nonce']        = wp_create_nonce( 'wp_rest' );

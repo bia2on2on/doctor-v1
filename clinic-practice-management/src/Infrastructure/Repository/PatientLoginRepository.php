@@ -180,7 +180,11 @@ final class PatientLoginRepository {
      *
      * @param list<int> $patient_ids
      */
-    public function count_active_future_appointments_for_patients( array $patient_ids, string $today_date ): int {
+    public function count_active_future_appointments_for_patients(
+        array $patient_ids,
+        string $today_date,
+        ?int $exclude_appointment_id = null
+    ): int {
         $clean_ids = array_values(
             array_unique(
                 array_filter(
@@ -195,14 +199,18 @@ final class PatientLoginRepository {
 
         $placeholders = implode( ',', array_fill( 0, count( $clean_ids ), '%d' ) );
         $params       = array_merge( $clean_ids, [ $today_date ] );
-        $rows         = $this->db->fetch_all_strict(
-            'SELECT COUNT(*) AS cnt FROM ' . $this->db->table( 'cpms_appointments' )
+        $sql          = 'SELECT COUNT(*) AS cnt FROM ' . $this->db->table( 'cpms_appointments' )
             . " WHERE patient_id IN ({$placeholders})"
             . " AND status IN ('pending','confirmed')"
             . ' AND rescheduled_to IS NULL'
-            . ' AND slot_date >= %s',
-            $params
-        );
+            . ' AND slot_date >= %s';
+
+        if ( null !== $exclude_appointment_id && $exclude_appointment_id > 0 ) {
+            $sql     .= ' AND id <> %d';
+            $params[] = $exclude_appointment_id;
+        }
+
+        $rows = $this->db->fetch_all_strict( $sql, $params );
 
         return (int) ( $rows[0]['cnt'] ?? 0 );
     }

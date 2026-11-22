@@ -637,6 +637,63 @@ final class PatientAccess {
     }
 
     /**
+     * Evaluates an actor/selector gate for `POST /clinic/v1/patient/register`.
+     *
+     * Only unauthenticated guests (`$wp_user_id === 0`) with a valid positive
+     * `clinic_id` selector may enter registration; any authenticated user (staff,
+     * multi-role, or already-authenticated patient) is denied with the uniform
+     * §6.10 failure envelope.
+     *
+     * @return array{
+     *     allowed: bool,
+     *     http_status: int,
+     *     code: string,
+     *     message: string,
+     *     reason: string,
+     *     role: string
+     * }
+     */
+    public function authorize_register_request(
+        int $wp_user_id,
+        ?int $clinic_id = null,
+        bool $selector_invalid = false
+    ): array {
+        if ( $wp_user_id > 0 ) {
+            $user         = $this->read_user( $wp_user_id );
+            $primary_role = ( null !== $user && [] !== $user['roles'] ) ? $user['roles'][0] : 'unknown';
+
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                null,
+                null,
+                'register',
+                $this->proof_failed_decision( 'authenticated_not_allowed', $primary_role )
+            );
+        }
+
+        if ( $selector_invalid || null === $clinic_id || $clinic_id <= 0 ) {
+            return $this->observe_decision(
+                0,
+                $clinic_id,
+                null,
+                null,
+                'register',
+                $this->proof_failed_decision( 'invalid_selector', 'anonymous' )
+            );
+        }
+
+        return $this->observe_decision(
+            0,
+            $clinic_id,
+            null,
+            null,
+            'register',
+            $this->allow_decision( 'anonymous' )
+        );
+    }
+
+    /**
      * Evaluates a patient REST request against authentication, patient-role
      * separation, two-factor session proofs, active bindings, and selectors (D1).
      *

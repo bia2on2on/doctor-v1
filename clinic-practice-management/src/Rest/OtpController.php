@@ -47,6 +47,7 @@ final class OtpController extends RestBase
                     'slot_id' => ['required' => false, 'type' => 'integer'],
                     'slot_date' => ['required' => false, 'type' => 'string'],
                     'slot_time' => ['required' => false, 'type' => 'string'],
+                    'clinic_id' => ['required' => false, 'type' => 'integer'],
                 ],
             ],
         ]);
@@ -191,6 +192,13 @@ final class OtpController extends RestBase
         $has_selection = self::hasValue( $clinician_id ) || self::hasValue( $slot_id )
             || self::hasValue( $slot_date ) || self::hasValue( $slot_time );
         if ( ! $has_selection ) {
+            if ( OtpService::PURPOSE_VERIFY_MOBILE === (string) $request->get_param( 'purpose' ) ) {
+                $raw_clinic_id = (int) $request->get_param( 'clinic_id' );
+                if ( $raw_clinic_id > 0 && $this->isTrustedPublicRegistrationClinic( $raw_clinic_id ) ) {
+                    return $raw_clinic_id;
+                }
+            }
+
             return null;
         }
 
@@ -281,6 +289,36 @@ final class OtpController extends RestBase
     private static function hasValue(mixed $value): bool
     {
         return $value !== null && $value !== '';
+    }
+
+    private function isTrustedPublicRegistrationClinic( int $clinic_id ): bool
+    {
+        if ( $clinic_id <= 0 ) {
+            return false;
+        }
+
+        $db  = App::db();
+        $row = $db->fetchRow(
+            'SELECT c.id FROM ' . $db->table( 'cpms_clinics' ) . ' c'
+            . ' INNER JOIN ' . $db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
+            . " WHERE c.id = %d AND c.status = 'active' AND o.status = 'active' LIMIT 1",
+            [ $clinic_id ]
+        );
+        if ( null === $row ) {
+            return false;
+        }
+
+        if ( ( new PublicClinicDirectory() )->is_listed( $clinic_id ) ) {
+            return true;
+        }
+
+        $active_ids = $db->fetchAll(
+            'SELECT c.id FROM ' . $db->table( 'cpms_clinics' ) . ' c'
+            . ' INNER JOIN ' . $db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
+            . " WHERE c.status = 'active' AND o.status = 'active' ORDER BY c.id ASC LIMIT 2"
+        );
+
+        return 1 === count( $active_ids ) && (int) ( $active_ids[0]['id'] ?? 0 ) === $clinic_id;
     }
 
     /**

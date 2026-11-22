@@ -1545,6 +1545,144 @@
 			});
 		}
 
+		function regOtpRequest() {
+			var input = root.querySelector('[data-role="reg-mobile"]');
+			var status = root.querySelector('[data-role="auth-status"]');
+			if (!input || busy || !isNonEmptyString(config.otp_request_path)) {
+				return;
+			}
+			var mobile = digitsOnly(input.value);
+			if (!/^09\d{9}$/.test(mobile)) {
+				input.setAttribute('aria-invalid', 'true');
+				setNodeMessage(status, 'شماره موبایل معتبر ۱۱ رقمی با پیش‌شماره ۰۹ وارد کنید.');
+				input.focus();
+				return;
+			}
+			input.removeAttribute('aria-invalid');
+
+			var regSelection = validSelection(lastSelection) || readStoredSelection();
+			var clinicId = (regSelection && toInt(regSelection.clinic_id) > 0)
+				? toInt(regSelection.clinic_id)
+				: currentClinicId();
+			var payload = { mobile: mobile, purpose: 'verify_mobile' };
+			if (clinicId > 0) {
+				payload.clinic_id = clinicId;
+			}
+
+			setBusy(true);
+			requestJson(config.rest_root + config.otp_request_path, {
+				method: 'POST',
+				credentials: 'same-origin',
+				headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+				body: JSON.stringify(payload)
+			}).then(function (result) {
+				setBusy(false);
+				if (result.ok && result.body && result.body.data && result.body.data.sms_sent === true) {
+					setNodeMessage(status, '');
+					var details = root.querySelector('[data-role="reg-details"]');
+					if (details) {
+						details.hidden = false;
+					}
+					var codeInput = root.querySelector('[data-role="reg-code"]');
+					if (codeInput) {
+						codeInput.removeAttribute('aria-invalid');
+						codeInput.focus();
+					}
+					return;
+				}
+				input.setAttribute('aria-invalid', 'true');
+				setNodeMessage(status, serverMessage(result) || 'ارسال کد تأیید انجام نشد. لطفاً دوباره تلاش کنید.');
+			}, function () {
+				setBusy(false);
+				setNodeMessage(status, 'ارتباط با سرور برقرار نشد. لطفاً اتصال اینترنت را بررسی و دوباره تلاش کنید.');
+			});
+		}
+
+		function regSubmit() {
+			var mobileInput = root.querySelector('[data-role="reg-mobile"]');
+			var codeInput = root.querySelector('[data-role="reg-code"]');
+			var givenInput = root.querySelector('[data-role="reg-given-name"]');
+			var familyInput = root.querySelector('[data-role="reg-family-name"]');
+			var nidInput = root.querySelector('[data-role="reg-national-id"]');
+			var birthInput = root.querySelector('[data-role="reg-birth-date"]');
+			var status = root.querySelector('[data-role="auth-status"]');
+			if (!mobileInput || !codeInput || !givenInput || !familyInput || !nidInput || !birthInput || busy || !isNonEmptyString(config.register_path)) {
+				return;
+			}
+
+			var mobile = digitsOnly(mobileInput.value);
+			var code = digitsOnly(codeInput.value);
+			var givenName = String(givenInput.value || '').trim();
+			var familyName = String(familyInput.value || '').trim();
+			var nationalId = digitsOnly(nidInput.value);
+			var birthDate = String(birthInput.value || '').trim()
+				.replace(/[\u06F0-\u06F9]/g, function (d) { return String(d.charCodeAt(0) - 0x06F0); })
+				.replace(/[\u0660-\u0669]/g, function (d) { return String(d.charCodeAt(0) - 0x0660); });
+			var regSelection = validSelection(lastSelection) || readStoredSelection();
+			var clinicId = (regSelection && toInt(regSelection.clinic_id) > 0)
+				? toInt(regSelection.clinic_id)
+				: currentClinicId();
+
+			if (clinicId <= 0 || !/^09\d{9}$/.test(mobile)) {
+				setNodeMessage(status, 'شماره موبایل معتبر وارد کنید.');
+				mobileInput.focus();
+				return;
+			}
+			if (!/^\d{6}$/.test(code)) {
+				setNodeMessage(status, 'کد تأیید ۶ رقمی را وارد کنید.');
+				codeInput.focus();
+				return;
+			}
+			if (!givenName || !familyName) {
+				setNodeMessage(status, 'نام و نام خانوادگی را وارد کنید.');
+				(!givenName ? givenInput : familyInput).focus();
+				return;
+			}
+			if (!/^\d{10}$/.test(nationalId)) {
+				setNodeMessage(status, 'کد ملی ۱۰ رقمی معتبر وارد کنید.');
+				nidInput.focus();
+				return;
+			}
+			if (!/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) {
+				setNodeMessage(status, 'تاریخ تولد را به صورت YYYY-MM-DD وارد کنید.');
+				birthInput.focus();
+				return;
+			}
+
+			setBusy(true);
+			requestJson(config.rest_root + config.register_path, {
+				method: 'POST',
+				credentials: 'same-origin',
+				headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					clinic_id: clinicId,
+					mobile: mobile,
+					code: code,
+					given_name: givenName,
+					family_name: familyName,
+					national_id: nationalId,
+					birth_date: birthDate
+				})
+			}).then(function (result) {
+				setBusy(false);
+				var payload = result.body && result.body.data ? result.body.data : null;
+				if (result.ok && payload && payload.registered === true && payload.session_issued === true) {
+					codeInput.value = '';
+					nidInput.value = '';
+					if (lastSelection) {
+						storeSelection(lastSelection);
+					}
+					window.location.reload();
+					return;
+				}
+				setNodeMessage(status, serverMessage(result) || 'ثبت‌نام انجام نشد. اطلاعات را بررسی کنید.');
+				codeInput.focus();
+			}, function () {
+				setBusy(false);
+				setNodeMessage(status, 'ارتباط با سرور برقرار نشد. لطفاً دوباره تلاش کنید.');
+			});
+		}
+
 		/* ---------- patient: Hold → Confirm روی مسیرهای موجود B1/B2 ---------- */
 
 		function continueMessageNode() {
@@ -2097,6 +2235,26 @@
 					if (mobileNode) {
 						mobileNode.focus();
 					}
+				} else if (action === 'show-register') {
+					var regStatus = root.querySelector('[data-role="auth-status"]');
+					setNodeMessage(regStatus, '');
+					showAuthStep('otp-register');
+					var regMobileNode = root.querySelector('[data-role="reg-mobile"]');
+					if (regMobileNode) {
+						regMobileNode.focus();
+					}
+				} else if (action === 'show-login') {
+					var loginStatus = root.querySelector('[data-role="auth-status"]');
+					setNodeMessage(loginStatus, '');
+					showAuthStep('otp-mobile');
+					var loginMobileNode = root.querySelector('[data-role="otp-mobile"]');
+					if (loginMobileNode) {
+						loginMobileNode.focus();
+					}
+				} else if (action === 'reg-otp-request') {
+					regOtpRequest();
+				} else if (action === 'reg-submit') {
+					regSubmit();
 				}
 				return;
 			}
