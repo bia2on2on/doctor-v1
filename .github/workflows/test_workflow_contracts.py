@@ -534,6 +534,46 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("name: Closure Gate (GO-LIVE evidence closure)", workflow("closure-gate.yml"))
         self.assertIn("name: Pilot/Staging Readiness Gate", workflow("pilot-gate.yml"))
 
+    def test_restore_apply_closure_lane_pins_refusal_snapshot_and_success_stage(self):
+        text = workflow("closure-gate.yml")
+        document = _ci_document(text)
+        events = document.get("on", document.get(True))
+        self.assertEqual(events, {
+            "workflow_dispatch": None,
+            "pull_request": {"branches": ["main"]},
+            "push": {"branches": ["main"]},
+        })
+        job = document["jobs"]["restore-apply"]
+        self.assertEqual(job["name"], "Closure — destructive restoreApply (isolated)")
+        self.assertEqual(job["env"]["CPMS_RESTORE_SUCCESS_STAGE"], "false")
+        steps = {step.get("name"): step for step in job["steps"]}
+        snapshot_step = steps["Snapshot comparator self-test"]
+        snapshot_run = snapshot_step["run"]
+        for contract in (
+            "CHECKSUM TABLE", "COUNT(*)", "OPTIONS_EXCLUSIONS = ()",
+            "assert BARRIER_OPTION not in OPTIONS_EXCLUSIONS", "JSON_ARRAY(",
+            "wp-content", "sha256", "SNAPSHOT_SELF_TEST_DIFFERENCE_DETECTED_AND_REVERTED",
+        ):
+            self.assertIn(contract, snapshot_run)
+        active_negative = steps["Negative restore refusals — corrupt SQL and manifest snapshots"]
+        self.assertEqual(active_negative["if"], "env.CPMS_RESTORE_SUCCESS_STAGE == 'false'")
+        self.assertIn("assert_refusal_unchanged", active_negative["run"])
+        refusal = steps["Snapshot and assert populated-target RestoreApply refusal"]
+        self.assertEqual(refusal["if"], "env.CPMS_RESTORE_SUCCESS_STAGE == 'false'")
+        for contract in (
+            "RESTORE_TARGET_NOT_EMPTY", "Restore requires a prepared empty target.",
+            "assert-identical", "RESTORE CREATED A SAFETY BACKUP",
+        ):
+            self.assertIn(contract, refusal["run"])
+        legacy = steps["Mutate to state B + RestoreApply (destructive) + verify state A"]
+        self.assertEqual(legacy["if"], "env.CPMS_RESTORE_SUCCESS_STAGE == 'true'")
+        self.assertIn("grep -q 'Restore applied' /tmp/restore-apply.log", legacy["run"])
+        self.assertIn("[ \"$RC\" -eq 0 ]", legacy["run"])
+        self.assertIn("[ \"$LISTN\" -ge 2 ]", legacy["run"])
+        old_negative = steps["Negative — corrupt db.sql / tampered manifest rejection"]
+        self.assertEqual(old_negative["if"], "env.CPMS_RESTORE_SUCCESS_STAGE == 'true'")
+        self.assertIn("[ \"$LISTN\" -eq 4 ]", old_negative["run"])
+
     def test_disposable_demo_lane_is_path_scoped_to_its_own_files(self):
         """The lane must not act as a global gate: it runs only for changes to
         its own files, and its isolation decision is made by an executable,

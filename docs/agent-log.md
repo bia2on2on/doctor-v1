@@ -8214,3 +8214,6 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 
 ### [2026-11-21 UTC] — PR14-BARRIER-FIX-4: account for exempt login failures
 - Marked recovery logins now share the existing canonical-login throttle across username/email, checked before core password verification. The same outward denial covers failed, throttled, non-exempt and unknown attempts; only gate-issued errors are eligible for marker-specific accounting. RB-18 exercises the actual core dispatch and bounded failure accounting. No change to the recovery exemption policy or restore wiring.
+
+### [2026-11-20 UTC] — PR14-CLOSURE-LANE-FIX-5: fail-closed restore closure lane
+- Preserved the populated-target full-success stage behind an explicit job flag that is false today. The active stage snapshots all database table checksums/counts, complete options content, account rows, and private/upload/backup files; exercises comparator failure/revert; and asserts exact preflight refusal plus unchanged state/no safety backup for plain and corrupt restore inputs. Added structural workflow pins; production code and schema were untouched.
