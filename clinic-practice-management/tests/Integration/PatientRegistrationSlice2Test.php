@@ -4,7 +4,6 @@ declare( strict_types=1 );
 
 namespace ClinicCore\Tests\Integration;
 
-use ClinicCore\Application\Auth\OtpPolicy;
 use ClinicCore\Application\Auth\OtpService;
 use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientCredentialGuard;
@@ -14,6 +13,7 @@ use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
+use ClinicCore\Domain\Otp\OtpPolicy;
 use ClinicCore\Frontend\PatientOtpLogin;
 use ClinicCore\Frontend\PublicBookingShortcode;
 use ClinicCore\Infrastructure\Repository\PatientLoginRepository;

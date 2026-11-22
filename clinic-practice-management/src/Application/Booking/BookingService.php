@@ -1604,7 +1604,6 @@ final class BookingService
                     // Organization/Clinic prefix first inverts that pair and produces a
                     // genuine deadlock, so the tenant prefix is acquired only after the
                     // source Appointment is locked and authorized.
-                    unset( $actor );
                     $appt = $this->appointments->findForUpdate( $appointment_id );
                     $this->assert_read_succeeded(
                         'reschedule_appointment',

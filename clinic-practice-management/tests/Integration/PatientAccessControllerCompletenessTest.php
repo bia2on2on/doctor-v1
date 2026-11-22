@@ -4,10 +4,10 @@ declare( strict_types=1 );
 
 namespace ClinicCore\Tests\Integration;
 
-use ClinicCore\Application\Auth\OtpPolicy;
 use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Otp\OtpPolicy;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Rest\PatientController;
 use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
