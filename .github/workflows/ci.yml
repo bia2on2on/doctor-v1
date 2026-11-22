@@ -968,14 +968,27 @@ jobs:
                   time.sleep(POLL_SECONDS)
 
           # Fire phase (~740 s mark, 40 s before the wrapper sends TERM).
+          # ps filter: keep the header plus rows whose command involves PHP,
+          # MySQL/MariaDB or WP tooling (the interesting actors); pure kernel
+          # threads are useless at this capture. If nothing matches, fall back
+          # to the youngest 25 rows. At most 25 lines are written.
           try:
               result = subprocess.run(
-                  ['ps', '-eo', 'pid,ppid,etimes,stat,wchan:20,args'],
+                  ['ps', '-eo', 'pid,ppid,etimes,stat,wchan:20,args', '--sort=-etimes'],
                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15,
               )
-              ps_lines = result.stdout.decode('utf-8', errors='replace').splitlines()[:25]
+              ps_lines = result.stdout.decode('utf-8', errors='replace').splitlines()
+              keep = ps_lines[:1]
+              for ps_line in ps_lines[1:]:
+                  if re.search(r'php|mysql|maria|wp-|cpms|cron', ps_line, re.IGNORECASE):
+                      keep.append(ps_line)
+                  if len(keep) >= 25:
+                      break
+              if len(keep) <= 1:
+                  keep = ps_lines[-25:]
+              keep = keep[:25]
               with open(PS_PATH, 'w', encoding='utf-8') as ps_out:
-                  for ps_line in ps_lines:
+                  for ps_line in keep:
                       ps_line = re.sub(r'--password[ =]\S*', '--password=[n]', ps_line)
                       ps_out.write(ps_line[:400] + '\n')
           except Exception:
