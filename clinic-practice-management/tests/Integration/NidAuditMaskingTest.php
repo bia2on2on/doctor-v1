@@ -403,4 +403,93 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
         $chain = App::audit()->verifyChain();
         $this->assertTrue((bool) ($chain['ok'] ?? false), 'audit chain remains valid after correlation-id logging');
     }
+
+    public function testCorrelationIdFromHeaderRejectsNidVariantsWithoutMemoBypass(): void
+    {
+        $valid = 'req-valid-12345678';
+        $this->assertSame($valid, \ClinicCore\Infrastructure\Logging\CorrelationId::fromHeader($valid));
+
+        foreach ([self::NID_ASCII, self::NID_PERSIAN, self::NID_ARABIC] as $nid) {
+            $resolved = \ClinicCore\Infrastructure\Logging\CorrelationId::fromHeader($nid);
+            $this->assertNotSame($nid, $resolved);
+            $this->assertSame(1, preg_match('/^cpms-[0-9a-f]{16}$/', $resolved));
+            $this->assertDoesNotMatchRegularExpression('/[0-9۰-۹٠-٩]{10,}/u', $resolved);
+        }
+
+        App::op()->warning('B0_PR3_CORR_DIRECT_OP', ['ok' => 'yes']);
+        App::audit()->log('B0_PR3_CORR_DIRECT_AUDIT', ['wp_user_id' => 1, 'role' => 'system'], 'test_resource', 5, null, null, null);
+
+        $opRow = App::db()->fetchRow(
+            'SELECT request_id FROM ' . App::db()->table('cpms_operational_logs')
+            . ' WHERE message = %s ORDER BY id DESC LIMIT 1',
+            ['B0_PR3_CORR_DIRECT_OP']
+        );
+        $this->assertIsArray($opRow);
+        $this->assertArrayHasKey('request_id', $opRow);
+        $this->assertDoesNotMatchRegularExpression('/[0-9۰-۹٠-٩]{10,}/u', (string) $opRow['request_id']);
+
+        $auditRow = App::db()->fetchRow(
+            'SELECT request_id FROM ' . App::db()->table('cpms_audit_logs')
+            . ' WHERE action = %s ORDER BY id DESC LIMIT 1',
+            ['B0_PR3_CORR_DIRECT_AUDIT']
+        );
+        $this->assertIsArray($auditRow);
+        $this->assertArrayHasKey('request_id', $auditRow);
+        $this->assertDoesNotMatchRegularExpression('/[0-9۰-۹٠-٩]{10,}/u', (string) $auditRow['request_id']);
+
+        $chain = App::audit()->verifyChain();
+        $this->assertArrayHasKey('ok', $chain);
+        $this->assertTrue((bool) $chain['ok']);
+    }
+
+    public function testAuditLoggerKeyCollisionsPreserveValuesAndCapIterations(): void
+    {
+        $many = [];
+        for ($i = 0; $i < 102; $i++) {
+            $many['k_' . str_pad((string) $i, 10, '0', STR_PAD_LEFT)] = 'v' . $i;
+        }
+        App::audit()->log(
+            'B0_PR3_AUDIT_COLLISION',
+            ['wp_user_id' => 1, 'role' => 'system'],
+            'test_resource',
+            6,
+            null,
+            ['field_' . self::NID_ASCII => 'first', 'field_[nid-redacted]' => 'second', 'reason' => 'ok'],
+            ['nested' => ['k_' . self::NID_PERSIAN => 'n1', 'k_' . self::NID_ARABIC => 'n2']],
+            $many
+        );
+
+        $row = App::db()->fetchRow(
+            'SELECT before_json, after_json, meta_json FROM ' . App::db()->table('cpms_audit_logs')
+            . ' WHERE action = %s ORDER BY id DESC LIMIT 1',
+            ['B0_PR3_AUDIT_COLLISION']
+        );
+        $this->assertIsArray($row);
+        $before = json_decode((string) $row['before_json'], true);
+        $after  = json_decode((string) $row['after_json'], true);
+        $meta   = json_decode((string) $row['meta_json'], true);
+
+        $this->assertIsArray($before);
+        $this->assertArrayHasKey('field_[nid-redacted]', $before);
+        $this->assertArrayHasKey('field_[nid-redacted]~2', $before);
+        $this->assertArrayHasKey('reason', $before);
+        $this->assertSame('first', $before['field_[nid-redacted]']);
+        $this->assertSame('second', $before['field_[nid-redacted]~2']);
+        $this->assertSame('ok', $before['reason']);
+
+        $this->assertIsArray($after);
+        $this->assertArrayHasKey('nested', $after);
+        $this->assertArrayHasKey('k_[nid-redacted]', $after['nested']);
+        $this->assertArrayHasKey('k_[nid-redacted]~2', $after['nested']);
+        $this->assertSame('n1', $after['nested']['k_[nid-redacted]']);
+        $this->assertSame('n2', $after['nested']['k_[nid-redacted]~2']);
+
+        $this->assertIsArray($meta);
+        $this->assertArrayHasKey('k_[nid-redacted]~101', $meta);
+        $this->assertArrayHasKey('[collision-overflow]', $meta);
+
+        $chain = App::audit()->verifyChain();
+        $this->assertArrayHasKey('ok', $chain);
+        $this->assertTrue((bool) $chain['ok']);
+    }
 }

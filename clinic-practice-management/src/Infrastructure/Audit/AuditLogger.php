@@ -253,7 +253,16 @@ final class AuditLogger
                 // سیاست مالک: خودِ نام فیلد هم نباید وارد payload شود.
                 continue;
             }
-            $safe_key = NationalIdValidator::redact_digits( $key );
+            $base_key = NationalIdValidator::redact_digits( $key );
+            $safe_key = $base_key;
+            $suffix   = 2;
+            while ( array_key_exists( $safe_key, $out ) && $suffix <= 101 ) {
+                $safe_key = $base_key . '~' . $suffix;
+                ++$suffix;
+            }
+            if ( array_key_exists( $safe_key, $out ) ) {
+                $safe_key = '[collision-overflow]';
+            }
             if ( in_array( $key, self::MASK_KEYS, true ) && is_string( $v ) && strlen( $v ) >= 4 ) {
                 // `phone` is a structured field: redact exact NID-shaped runs,
                 // but preserve the legacy tail mask for longer phone numbers.

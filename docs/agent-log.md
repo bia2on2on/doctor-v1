@@ -8460,3 +8460,7 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 - OBSERVED: Integration failed at `AuditLogger.php:44` because `NidAuditMaskingTest::testCorrelationIdRejectsNidRunsInBothSinksAndKeepsAuditChainValid()` passed 4 arguments to `AuditLogger::log()`, which requires 7 (`$patientId, $before, $after` have no defaults).
 - FIX: Passed `null, null, null` for `$patientId, $before, $after` in `NidAuditMaskingTest.php:378`. Added `CorrelationIdTest::testUuidWithTenPlusDigitRunIsRejectedWhileEightDigitUuidIsValid()` pinning the accepted 10+-digit UUID limitation.
 - LIMITATION: PHP is unavailable in the sandbox; GitHub CI is the only PHP gate.
+### [2026-11-22 UTC] — PR17-REVIEW-FIX — AuditLogger bounded key-collision handling and non-memoized CorrelationId test
+- OBSERVED: Confirmed reader blockers: (1) `cpms_request_id()` memoizes in `static $id` (`clinic-practice-management.php:49-60`), making `$_SERVER` mutation in `NidAuditMaskingTest` vacuous; (2) `AuditLogger::sanitize()` (`AuditLogger.php:256-290`) overwrote colliding redacted keys.
+- FIX: Added bounded (`~2..~101`, fail-closed `[collision-overflow]`) collision-safe key allocation in `AuditLogger::sanitize()`. Added `testCorrelationIdFromHeaderRejectsNidVariantsWithoutMemoBypass()` and `testAuditLoggerKeyCollisionsPreserveValuesAndCapIterations()` in `NidAuditMaskingTest.php`.
+- LIMITATION: PHP is unavailable in the sandbox; GitHub CI is the only PHP gate.
