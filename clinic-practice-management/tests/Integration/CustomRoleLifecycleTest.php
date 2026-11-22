@@ -1342,6 +1342,17 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
         foreach ($clinicIds as $clinicId) {
             $db->query('DELETE FROM ' . $db->table('cpms_clinics') . ' WHERE id = %d', [$clinicId]);
         }
+
+        // 5) Durable: the parent test transaction was COMMITted durably above
+        // (raw COMMIT on the harness connection), so this cleanup's DELETEs sit
+        // in a fresh transaction that tearDown()'s ROLLBACK would undo —
+        // resurrecting the committed Clinic/user/membership rows for every
+        // later suite in the shared database (same pattern and comment as
+        // InterruptedSetupRecoveryTest.php and CustomRoleArchivalConcurrencyTest.php).
+        global $wpdb;
+        if ($wpdb->query('COMMIT') === false) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+            self::fail('cleanup must commit its fixture removal durably (tearDown rolls back the harness transaction)');
+        }
     }
 
     private function makeClinic(int $organizationId, string $prefix): int

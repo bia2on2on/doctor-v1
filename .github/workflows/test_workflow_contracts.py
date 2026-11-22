@@ -7268,6 +7268,32 @@ class EnrollmentStep23VisibilityContractTests(unittest.TestCase):
         # The enrollment PYENROLL gate must stay byte-identical in intent.
         self.assertIn("all enrollment tests must execute without skip/failure/error", run)
 
+    def test_step_runs_both_suites_and_gates_pyenroll_on_both_passing(self):
+        run = self._step().get("run") or ""
+        self.assertIn("enrollment_failed=0", run)
+        self.assertIn("enrollment_failed=1", run)
+        guard = 'if [ "$enrollment_failed" -ne 0 ]; then'
+        self.assertIn(guard, run)
+        # Both suites execute even when the first fails; the failure verdict
+        # is deferred to after the loop; PYENROLL runs only when both passed.
+        self.assertIn("for suite in PatientEnrollmentOptionsTest.php PatientEnrollmentUiTest.php; do", run)
+        self.assertLess(run.index("enrollment_failed=1"), run.index(guard))
+        self.assertLess(run.index(guard), run.index("python3 - <<'PYENROLL'"))
+        self.assertIn("all enrollment tests must execute without skip/failure/error", run)
+
+    def test_step_emits_up_to_three_sanitized_annotations_from_phpunit_excerpt(self):
+        run = self._step().get("run") or ""
+        match = re.search(r"<<'SANITIZE'\n(.*?)\n\s*SANITIZE\n", run, re.S)
+        self.assertIsNotNone(match, "SANITIZE heredoc not found in step 23")
+        body = match.group(1)
+        # Per-test failure blocks built from the excerpt keep PHPUnit's
+        # array-diff / size lines; at most 3 annotations per failing suite.
+        self.assertIn("r'^([0-9]+)\\)\\s'", body)
+        self.assertIn("if len(current) >= 40", body)
+        self.assertIn("blocks[:3]", body)
+        self.assertIn("::error title={0}-failure-{1}::", body)
+        self.assertIn("FAILURES!", body)
+
     def test_sanitizer_masks_urls_and_long_digit_runs(self):
         run = self._step().get("run") or ""
         match = re.search(r"<<'SANITIZE'\n(.*?)\n\s*SANITIZE\n", run, re.S)
