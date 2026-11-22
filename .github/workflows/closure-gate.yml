@@ -440,6 +440,8 @@ jobs:
           import sys
           from pathlib import Path
 
+          # Guarantee: DB_MAIN plus the three watched roots only. It does not cover other
+          # databases, /tmp, or external writers.
           DB = os.environ["DB_MAIN"]
           BARRIER_OPTION = "cpms_restore_barrier"
           # Empty by design: no option is excluded from the before/after comparison.
@@ -474,14 +476,19 @@ jobs:
                       digest.update(chunk)
               return digest.hexdigest()
 
+          def octal_mode(path):
+              return format(stat.S_IMODE(os.lstat(path).st_mode), "04o")
+
           def directory_snapshot(root):
               if not os.path.lexists(root):
-                  return {"exists": False, "directories": [], "files": []}
+                  return ({"exists": False, "directories": [], "files": []},
+                          {".": "MISSING"})
               root_mode = os.lstat(root).st_mode
               if not stat.S_ISDIR(root_mode):
                   raise SystemExit("SNAPSHOT_ROOT_NOT_DIRECTORY")
               directories = []
               files = []
+              modes = {".": format(stat.S_IMODE(root_mode), "04o")}
 
               def walk_error(error):
                   raise error
@@ -495,20 +502,25 @@ jobs:
                       directories.append(relative_dir.replace(os.sep, "/"))
                   for name in names:
                       path = os.path.join(current, name)
-                      if not stat.S_ISDIR(os.lstat(path).st_mode):
+                      mode = os.lstat(path).st_mode
+                      if not stat.S_ISDIR(mode):
                           raise SystemExit("SNAPSHOT_NON_DIRECTORY_ENTRY")
+                      relative = os.path.relpath(path, root).replace(os.sep, "/")
+                      modes[relative] = octal_mode(path)
                   for name in filenames:
                       path = os.path.join(current, name)
                       mode = os.lstat(path).st_mode
                       if not stat.S_ISREG(mode):
                           raise SystemExit("SNAPSHOT_NON_REGULAR_FILE")
+                      relative = os.path.relpath(path, root).replace(os.sep, "/")
+                      modes[relative] = octal_mode(path)
                       files.append({
-                          "name": os.path.relpath(path, root).replace(os.sep, "/"),
+                          "name": relative,
                           "size": os.path.getsize(path),
                           "sha256": file_sha256(path),
                       })
-              return {"exists": True, "directories": sorted(directories),
-                      "files": sorted(files, key=lambda item: item["name"])}
+              return ({"exists": True, "directories": sorted(directories),
+                       "files": sorted(files, key=lambda item: item["name"])}, modes)
 
           def exact_row_hash(table):
               columns = mysql("SHOW COLUMNS FROM " + qualified(table)).splitlines()
@@ -535,6 +547,100 @@ jobs:
               for row in rows:
                   digest.update(row.encode("ascii") + b"\n")
               return {"row_count": len(rows), "rows_sha256": digest.hexdigest()}
+
+          def sql_literal(value):
+              return "'" + value.replace("'", "''") + "'"
+
+          def schema_snapshot():
+              if IDENTIFIER.fullmatch(DB) is None:
+                  raise SystemExit("SNAPSHOT_UNSAFE_DATABASE_NAME")
+
+              # Sources: INFORMATION_SCHEMA.COLUMNS, INFORMATION_SCHEMA.STATISTICS (indexes),
+              # INFORMATION_SCHEMA.VIEWS, INFORMATION_SCHEMA.TRIGGERS,
+              # INFORMATION_SCHEMA.ROUTINES, INFORMATION_SCHEMA.PARAMETERS (routine signatures).
+              # These catalog rows describe persistent DDL, not runtime contents.
+              # Exclude STATISTICS.CARDINALITY (a cached estimate), COLUMNS.PRIVILEGES
+              # (login-dependent), TRIGGERS.CREATED and ROUTINES.CREATED/LAST_ALTERED
+              # (timestamps); catalog/schema identity columns are fixed by DB_MAIN.
+              catalogs = {
+                  "columns": (
+                      "COLUMNS", "TABLE_SCHEMA",
+                      ("TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT",
+                       "IS_NULLABLE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH",
+                       "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE",
+                       "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME",
+                       "COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "COLUMN_COMMENT",
+                       "GENERATION_EXPRESSION", "SRS_ID"),
+                      ("TABLE_NAME", "ORDINAL_POSITION", "COLUMN_NAME"),
+                  ),
+                  "indexes": (
+                      "STATISTICS", "TABLE_SCHEMA",
+                      ("TABLE_NAME", "INDEX_NAME", "NON_UNIQUE", "SEQ_IN_INDEX",
+                       "COLUMN_NAME", "EXPRESSION", "COLLATION", "SUB_PART", "NULLABLE",
+                       "INDEX_TYPE", "COMMENT", "INDEX_COMMENT", "IS_VISIBLE"),
+                      ("TABLE_NAME", "INDEX_NAME", "SEQ_IN_INDEX"),
+                  ),
+                  "views": (
+                      "VIEWS", "TABLE_SCHEMA",
+                      ("TABLE_NAME", "VIEW_DEFINITION", "CHECK_OPTION", "IS_UPDATABLE",
+                       "DEFINER", "SECURITY_TYPE", "CHARACTER_SET_CLIENT",
+                       "COLLATION_CONNECTION"),
+                      ("TABLE_NAME",),
+                  ),
+                  "triggers": (
+                      "TRIGGERS", "TRIGGER_SCHEMA",
+                      ("TRIGGER_NAME", "EVENT_MANIPULATION", "EVENT_OBJECT_TABLE",
+                       "ACTION_ORDER", "ACTION_STATEMENT", "ACTION_ORIENTATION",
+                       "ACTION_TIMING", "SQL_MODE", "DEFINER", "CHARACTER_SET_CLIENT",
+                       "COLLATION_CONNECTION", "DATABASE_COLLATION"),
+                      ("TRIGGER_NAME",),
+                  ),
+                  "routines": (
+                      "ROUTINES", "ROUTINE_SCHEMA",
+                      ("SPECIFIC_NAME", "ROUTINE_NAME", "ROUTINE_TYPE", "DATA_TYPE",
+                       "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH",
+                       "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION",
+                       "CHARACTER_SET_NAME", "COLLATION_NAME", "DTD_IDENTIFIER",
+                       "ROUTINE_BODY", "ROUTINE_DEFINITION", "EXTERNAL_LANGUAGE",
+                       "PARAMETER_STYLE", "IS_DETERMINISTIC", "SQL_DATA_ACCESS", "SQL_PATH",
+                       "SECURITY_TYPE", "SQL_MODE", "ROUTINE_COMMENT", "DEFINER",
+                       "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION", "DATABASE_COLLATION"),
+                      ("SPECIFIC_NAME", "ROUTINE_TYPE"),
+                  ),
+                  "routine_parameters": (
+                      "PARAMETERS", "SPECIFIC_SCHEMA",
+                      ("SPECIFIC_NAME", "ROUTINE_TYPE", "ORDINAL_POSITION", "PARAMETER_MODE",
+                       "PARAMETER_NAME", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH",
+                       "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE",
+                       "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME",
+                       "DTD_IDENTIFIER"),
+                      ("SPECIFIC_NAME", "ORDINAL_POSITION"),
+                  ),
+              }
+              digest = hashlib.sha256()
+              row_counts = {}
+              for label, (catalog, schema_column, fields, ordering) in catalogs.items():
+                  expression = (
+                      "REPLACE(REPLACE(TO_BASE64(CAST(JSON_ARRAY("
+                      + ", ".join(fields)
+                      + ") AS CHAR CHARACTER SET utf8mb4)), CHAR(10), ''), CHAR(13), '')"
+                  )
+                  sql = (
+                      "SELECT " + expression + " FROM INFORMATION_SCHEMA."
+                      + quote_identifier(catalog) + " WHERE " + quote_identifier(schema_column)
+                      + " = " + sql_literal(DB) + " ORDER BY " + ", ".join(ordering)
+                  )
+                  rows = mysql(sql).splitlines()
+                  if label == "columns" and not rows:
+                      raise SystemExit("SNAPSHOT_SCHEMA_COLUMNS_EMPTY")
+                  digest.update(label.encode("ascii") + b"\\0")
+                  digest.update(len(rows).to_bytes(8, "big"))
+                  for row in rows:
+                      encoded = row.encode("ascii")
+                      digest.update(len(encoded).to_bytes(8, "big"))
+                      digest.update(encoded)
+                  row_counts[label] = len(rows)
+              return {"sha256": digest.hexdigest(), "row_counts": row_counts}
 
           def snapshot():
               assert BARRIER_OPTION not in OPTIONS_EXCLUSIONS
@@ -609,15 +715,21 @@ jobs:
                   "uploads": os.path.join(os.environ["WP_DIR"], "wp-content", "uploads"),
                   "backup_directory": os.environ["BACKUP_OUT"],
               }
+              files_snapshot = {}
+              modes_snapshot = {}
+              for label, path in roots.items():
+                  files_snapshot[label], modes_snapshot[label] = directory_snapshot(path)
               return {
                   "database": {"table_count": len(tables), "tables": table_snapshot},
+                  "schema": schema_snapshot(),
                   "wp_options": {
                       "table": options_table, "row_count": len(options_rows),
                       "option_name_value_sha256": options_digest.hexdigest(),
                       "excluded_names": list(OPTIONS_EXCLUSIONS),
                   },
                   "users_usermeta": account_snapshot,
-                  "files": {label: directory_snapshot(path) for label, path in roots.items()},
+                  "files": files_snapshot,
+                  "modes": modes_snapshot,
               }
 
           def differences(before, after):
@@ -647,6 +759,70 @@ jobs:
               if differences(before, reverted):
                   raise SystemExit("SNAPSHOT_SELF_TEST_REVERT_FAILED")
               print("SNAPSHOT_SELF_TEST_DIFFERENCE_DETECTED_AND_REVERTED")
+
+              mode_entries = before["files"]["private_storage"]["files"]
+              if not mode_entries:
+                  raise SystemExit("SNAPSHOT_SELF_TEST_NO_WATCHED_FILE_FOR_MODE")
+              mode_path = Path(os.environ["STORAGE_OUT"]) / mode_entries[0]["name"]
+              original_mode = stat.S_IMODE(os.lstat(mode_path).st_mode)
+              changed_mode = original_mode ^ stat.S_IXUSR
+              mode_failure = None
+              try:
+                  os.chmod(mode_path, changed_mode)
+                  changed = snapshot()
+                  if "modes" not in differences(before, changed):
+                      mode_failure = "SNAPSHOT_SELF_TEST_DID_NOT_DETECT_MODE_CHANGE"
+              except (SystemExit, Exception) as error:
+                  mode_failure = str(error) or "SNAPSHOT_SELF_TEST_MODE_PROBE_FAILED"
+              finally:
+                  try:
+                      if os.path.lexists(mode_path):
+                          os.chmod(mode_path, original_mode)
+                      else:
+                          mode_failure = mode_failure or "SNAPSHOT_SELF_TEST_MODE_FILE_MISSING"
+                  except (SystemExit, Exception) as error:
+                      mode_failure = mode_failure or str(error) or "SNAPSHOT_SELF_TEST_MODE_RESTORE_FAILED"
+              reverted = snapshot()
+              reverted_sections = differences(before, reverted)
+              if reverted_sections:
+                  raise SystemExit("SNAPSHOT_SELF_TEST_MODE_REVERT_FAILED: "
+                                   + ",".join(reverted_sections))
+              if mode_failure:
+                  raise SystemExit(mode_failure)
+              print("SNAPSHOT_SELF_TEST_MODE_DIFFERENCE_DETECTED_AND_REVERTED")
+
+              view_name = "cpms_restore_snapshot_self_test_view"
+              existing_view = mysql(
+                  "SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = "
+                  + sql_literal(DB) + " AND TABLE_NAME = " + sql_literal(view_name)
+              ).strip()
+              if existing_view != "0":
+                  raise SystemExit("SNAPSHOT_SELF_TEST_VIEW_ALREADY_EXISTS")
+              view_created = False
+              schema_failure = None
+              try:
+                  mysql("CREATE VIEW " + qualified(view_name)
+                        + " AS SELECT 1 AS self_test_probe")
+                  view_created = True
+                  changed = snapshot()
+                  if "schema" not in differences(before, changed):
+                      schema_failure = "SNAPSHOT_SELF_TEST_DID_NOT_DETECT_SCHEMA_CHANGE"
+              except (SystemExit, Exception) as error:
+                  schema_failure = str(error) or "SNAPSHOT_SELF_TEST_SCHEMA_PROBE_FAILED"
+              finally:
+                  if view_created:
+                      try:
+                          mysql("DROP VIEW IF EXISTS " + qualified(view_name))
+                      except (SystemExit, Exception) as error:
+                          schema_failure = schema_failure or str(error) or "SNAPSHOT_SELF_TEST_VIEW_DROP_FAILED"
+              reverted = snapshot()
+              reverted_sections = differences(before, reverted)
+              if reverted_sections:
+                  raise SystemExit("SNAPSHOT_SELF_TEST_SCHEMA_REVERT_FAILED: "
+                                   + ",".join(reverted_sections))
+              if schema_failure:
+                  raise SystemExit(schema_failure)
+              print("SNAPSHOT_SELF_TEST_SCHEMA_DIFFERENCE_DETECTED_AND_REVERTED")
 
           if __name__ == "__main__":
               if len(sys.argv) == 2 and sys.argv[1] == "self-test":

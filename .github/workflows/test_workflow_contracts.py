@@ -574,6 +574,28 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(old_negative["if"], "env.CPMS_RESTORE_SUCCESS_STAGE == 'true'")
         self.assertIn("[ \"$LISTN\" -eq 4 ]", old_negative["run"])
 
+    def test_restore_snapshot_comparator_pins_modes_schema_probes_and_scope(self):
+        snapshot_run = {
+            step.get("name"): step
+            for step in _ci_document(workflow("closure-gate.yml"))["jobs"]["restore-apply"]["steps"]
+        }["Snapshot comparator self-test"]["run"]
+        for contract in (
+            "INFORMATION_SCHEMA.COLUMNS", "INFORMATION_SCHEMA.STATISTICS",
+            "INFORMATION_SCHEMA.VIEWS", "INFORMATION_SCHEMA.TRIGGERS",
+            "INFORMATION_SCHEMA.ROUTINES", "INFORMATION_SCHEMA.PARAMETERS",
+            "STATISTICS.CARDINALITY", "TRIGGERS.CREATED", "ROUTINES.CREATED/LAST_ALTERED",
+            "COLUMNS.PRIVILEGES", "def octal_mode(path)", "stat.S_IMODE",
+            "modes_snapshot", '"private_storage"', '"uploads"', '"backup_directory"',
+            '"modes" not in differences(before, changed)', "os.chmod(mode_path, changed_mode)",
+            "os.chmod(mode_path, original_mode)", "SNAPSHOT_SELF_TEST_MODE_REVERT_FAILED",
+            '"schema" not in differences(before, changed)', "CREATE VIEW ",
+            "DROP VIEW IF EXISTS ", "SNAPSHOT_SELF_TEST_SCHEMA_REVERT_FAILED",
+            "finally:", "DB_MAIN plus the three watched roots only",
+            "databases, /tmp, or external writers.",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, snapshot_run)
+
     def test_disposable_demo_lane_is_path_scoped_to_its_own_files(self):
         """The lane must not act as a global gate: it runs only for changes to
         its own files, and its isolation decision is made by an executable,
