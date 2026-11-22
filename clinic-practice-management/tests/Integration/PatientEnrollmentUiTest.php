@@ -17,6 +17,43 @@ use WP_UnitTestCase;
  */
 final class PatientEnrollmentUiTest extends WP_UnitTestCase
 {
+    /**
+     * STEP-23 DIAGNOSTIC PROBE (TEMPORARY — removed before the final head).
+     * Re-emits any test failure/error as a GitHub workflow-command annotation
+     * so CI can name the failing suite, assertion and location for step 23.
+     * Every run of 10+ digits is masked; no environment value, secret, token
+     * or URL is ever printed. This override adds diagnostics only; it never
+     * changes what the test asserts.
+     *
+     * @param \Throwable $t The failure being reported.
+     */
+    protected function onNotSuccessfulTest( \Throwable $t ): void
+    {
+        $loc = 'unknown:0';
+        foreach ( $t->getTrace() as $frame ) {
+            $f = (string) ( $frame['file'] ?? '' );
+            $p = strpos( $f, 'clinic-practice-management/' );
+            if ( false !== $p && false !== strpos( $f, '/tests/Integration/' ) ) {
+                $loc = substr( $f, $p ) . ':' . (int) ( $frame['line'] ?? 0 );
+                break;
+            }
+        }
+        if ( 'unknown:0' === $loc ) {
+            $f = (string) $t->getFile();
+            $p = strpos( $f, 'clinic-practice-management/' );
+            if ( false !== $p ) {
+                $loc = substr( $f, $p ) . ':' . (int) $t->getLine();
+            }
+        }
+        $message = (string) $t->getMessage();
+        $message = (string) preg_replace( '/\d{10,}/', '[n]', $message );
+        $message = (string) preg_replace( '/https?:\/\/\S+/i', '[url]', $message );
+        $message = str_replace( array( "\r", "\n" ), ' ', $message );
+        $message = mb_substr( $message, 0, 300 );
+        fwrite( STDERR, '::error title=step23-probe::' . get_class( $t ) . ' ' . $loc . ' ' . $message . PHP_EOL );
+        parent::onNotSuccessfulTest( $t );
+    }
+
     /** @return array{state:string, clinics:list<array{id:int, name:string}>} */
     private static function options( string $state, array $clinics = [] ): array
     {

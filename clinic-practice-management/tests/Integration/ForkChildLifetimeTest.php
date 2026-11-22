@@ -18,9 +18,12 @@
  *     fork-child lifetime guard, the parent's session is the SAME one it
  *     held before the fork — with the same durable Clinic roster and no
  *     driver error. No destructor or shutdown handler runs in the child.
- *  2. The pre-fix behavior is a live hazard, not a theory: a child that
- *     ends with plain exit(0) DOES run its shutdown handlers (this is the
- *     teardown path that destroys the inherited socket).
+ *  2. The pre-fix behavior is a live hazard, not a theory: a plain
+ *     exit(0) DOES run registered PHP shutdown handlers. The control is
+ *     executed in a FRESH, socket-free PHP process via exec(); it never
+ *     forks the harness process, because a plain-exit child there would
+ *     close the inherited MySQL session and poison every later test in
+ *     the same PHPUnit process.
  *
  * What these tests deliberately do NOT claim: they do not re-prove server-side
  * socket teardown (no deterministic way to do that inside one PHPUnit
@@ -134,36 +137,31 @@ final class ForkChildLifetimeTest extends WP_UnitTestCase
 	}
 
 	/**
-	 * Negative control (the pre-fix behavior): a child that ends with plain
-	 * exit(0) DOES run its shutdown handlers — exactly the path that
-	 * destroys the inherited socket on the way out. This test does not
-	 * touch the database at all; it only documents the mechanism.
+	 * Negative control (the pre-fix behavior): a plain exit(0) DOES run
+	 * registered PHP shutdown handlers — exactly the path that destroys the
+	 * inherited socket on the way out. This control runs in a FRESH,
+	 * socket-free PHP process via exec(); it deliberately does NOT fork the
+	 * harness process, because a plain-exit fork child would close the
+	 * inherited MySQL session and poison every test that runs after it in
+	 * the same PHPUnit process (the parent's $wpdb handle is shared after
+	 * pcntl_fork). It documents the mechanism without touching the database
+	 * at all.
 	 */
 	public function testGracefulChildExitRunsShutdownHandlers(): void
 	{
-		if (!function_exists('pcntl_fork') || !function_exists('pcntl_waitpid')) {
-			self::markTestSkipped('pcntl fork/wait not available.');
-		}
+		$marker = tempnam( sys_get_temp_dir(), 'cpms-forkchild-graceful-' );
+		self::assertNotFalse( $marker, 'a temp marker path is required for the control.' );
+		@unlink( $marker );
 
-		$tag = bin2hex(random_bytes(6));
-		$marker_file = sys_get_temp_dir() . '/cpms-forkchild-' . $tag . '-graceful-marker';
-		@unlink($marker_file);
+		$php    = ( defined( 'PHP_BINARY' ) && '' !== PHP_BINARY ) ? PHP_BINARY : 'php';
+		$script = 'register_shutdown_function( static function () { file_put_contents( '
+			. var_export( $marker, true )
+			. ', \'shutdown-ran\' ); } ); exit(0);';
+		exec( escapeshellarg( $php ) . ' -r ' . escapeshellarg( $script ) . ' 2>&1', $out, $rc );
 
-		$pid = pcntl_fork();
-		if ($pid === -1) {
-			self::fail('pcntl_fork failed.');
-		}
-		if ($pid === 0) {
-			register_shutdown_function(static function () use ($marker_file): void {
-				@file_put_contents($marker_file, 'shutdown-ran');
-			});
-			exit(0);
-		}
+		self::assertSame( 0, $rc, 'the control process must exit normally.' );
+		self::assertFileExists( $marker, 'plain exit() runs PHP shutdown handlers — the teardown path the lifetime guard removes.' );
 
-		pcntl_waitpid($pid, $status);
-		self::assertTrue(pcntl_wifexited($status) && 0 === pcntl_wexitstatus($status), 'control child must exit normally.');
-		self::assertFileExists($marker_file, 'plain exit() runs the child shutdown handlers — the teardown path the lifetime guard removes.');
-
-		@unlink($marker_file);
+		@unlink( $marker );
 	}
 }
