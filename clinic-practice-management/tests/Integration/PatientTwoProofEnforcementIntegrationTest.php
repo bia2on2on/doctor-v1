@@ -765,8 +765,12 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
 
         // Positive closure: staff changing national_id via PatientService::update() closes binding and destroys sessions post-commit.
         cpms_test_seed_membership( $this->staffDocUser, $this->clinicA, RolesAndCapabilities::ROLE_DOCTOR );
-        App::scope()->clinicId = $this->clinicA;
-        $staffUpdated = App::patientService()->update( $this->patientA, [ 'national_id' => '0080000002' ], $this->staffDocUser );
+        App::replaceExplicitScope( ClinicScope::forClinic( $this->clinicA, $this->locationA ) );
+        try {
+            $staffUpdated = App::patientService()->update( $this->patientA, [ 'national_id' => '0080000002' ], $this->staffDocUser );
+        } finally {
+            App::resetScope();
+        }
         self::assertArrayNotHasKey( 'national_id', $staffUpdated, 'P2: staffView must not project national_id.' );
         self::assertNull( $logins->find_binding( $this->patientUserA, $this->clinicA, $this->patientA, true ) );
         $closedBinding = $logins->find_binding( $this->patientUserA, $this->clinicA, $this->patientA, false );

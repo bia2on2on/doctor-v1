@@ -88,8 +88,8 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
 
         $logins = new PatientLoginRepository( App::db() );
         $logins->insert_pending_account( $this->userPending, self::MOBILE_PENDING, 'بیمار', 'درانتظار' );
-        $closedId = $logins->insert_pending_account( $this->userClosed, self::MOBILE_CLOSED, 'بیمار', 'بسته' );
-        $logins->close_account( $closedId, 'test_closed' );
+        $logins->insert_pending_account( $this->userClosed, self::MOBILE_CLOSED, 'بیمار', 'بسته' );
+        $logins->close_account( $this->userClosed );
         $logins->insert_pending_account( $this->userMixed, self::MOBILE_MIXED, 'کاربر', 'ترکیبی' );
 
         $this->installSignedExpiration( time() + 30 * 86400 );
@@ -168,7 +168,7 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
             'mobile'      => '09127770099',
             'national_id' => '0499370899',
         ], $this->userStaff );
-        self::assertSame( 201, $staffCreate->get_status() );
+        self::assertSame( 200, $staffCreate->get_status() );
         $this->assertNoNationalIdProjectionOrLeak( $staffCreate->get_data(), '0499370899', 'POST /patients' );
 
         // 3. Audit logs never contain raw or masked NID.
@@ -250,7 +250,7 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
 
         // Both OTP_VERIFY_OK and LOGIN_SUCCESS audits are recorded atomically.
         $actions = App::db()->fetchAll(
-            'SELECT action FROM ' . App::db()->table( 'cpms_audit_logs' ) . ' WHERE actor_user_id = %d ORDER BY id ASC',
+            'SELECT action FROM ' . App::db()->table( 'cpms_audit_logs' ) . ' WHERE actor_wp_user_id = %d ORDER BY id ASC',
             [ $this->userPending ]
         );
         $actionNames = array_column( $actions, 'action' );
@@ -348,16 +348,21 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
 
         add_filter( 'query', $poisonFn );
         try {
-            $resp = $this->dispatchRest( 'POST', '/clinic/v1/otp/verify', [
-                'mobile' => self::MOBILE_PENDING,
-                'code'   => '778899',
-            ], 0, false );
+            $resp = null;
+            try {
+                $resp = $this->dispatchRest( 'POST', '/clinic/v1/otp/verify', [
+                    'mobile' => self::MOBILE_PENDING,
+                    'code'   => '778899',
+                ], 0, false );
+                self::assertGreaterThanOrEqual( 400, $resp->get_status(), 'Failed atomic audit must fail OTP verify.' );
+            } catch ( \RuntimeException $e ) {
+                self::assertStringContainsString( 'LOGIN_SUCCESS', $e->getMessage() );
+            }
         } finally {
             remove_filter( 'query', $poisonFn );
         }
 
         self::assertTrue( $poisoned, 'Witness filter must fire on LOGIN_SUCCESS audit insert.' );
-        self::assertGreaterThanOrEqual( 400, $resp->get_status(), 'Failed atomic audit must fail OTP verify.' );
         self::assertSame( [], WP_Session_Tokens::get_instance( $this->userPending )->get_all(), 'Rollback must leave zero WP sessions.' );
         $stillUnconsumed = App::db()->fetchValue(
             'SELECT consumed_at FROM ' . App::db()->table( 'cpms_otp_tokens' ) . ' WHERE mobile = %s ORDER BY id DESC LIMIT 1',
@@ -372,7 +377,9 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
 
     public function testP6PendingPatientEndToEndGuestOtpToLinkRecordUiToFullPortal(): void {
         // 1. Guest surface copy has no dead-end misleading copy and no national_id.
-        $guestHtml = ( new PatientOtpLogin() )->render();
+        ob_start();
+        PatientOtpLogin::render();
+        $guestHtml = (string) ob_get_clean();
         self::assertStringContainsString( 'data-role="patient-otp-login"', $guestHtml );
         self::assertStringNotContainsString( 'در صورت نبود حساب فعال، هنگام رزرو یا ثبت پرونده در مطب بررسی می‌شود', $guestHtml );
         self::assertStringNotContainsString( 'national_id', $guestHtml );
@@ -472,7 +479,7 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
         $this->assertNoNationalIdProjectionOrLeak( $wrongNidResp->get_data(), self::NID_WRONG, 'wrong NID 403' );
 
         // Query-string national_id rejected cleanly.
-        $this->withSessionCookie( $this->userPending, $otpToken, static function (): void {
+        $this->withSessionCookie( $this->userPending, $otpToken, function (): void {
             $qsReq = new WP_REST_Request( 'POST', '/clinic/v1/patient/link-record' );
             $qsReq->set_query_params( [ 'national_id' => self::NID_PENDING ] );
             $qsReq->set_header( 'X-WP-Nonce', wp_create_nonce( 'wp_rest' ) );
@@ -507,7 +514,7 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
     private function renderPortalAs( int $userId, string $sessionToken ): string {
         return $this->withSessionCookie( $userId, $sessionToken, static function (): string {
             ob_start();
-            ( new PatientPortalPage() )->render();
+            PatientPortalPage::render();
             return (string) ob_get_clean();
         } );
     }

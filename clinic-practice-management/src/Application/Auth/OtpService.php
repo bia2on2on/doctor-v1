@@ -444,11 +444,12 @@ final class OtpService
         // LOGIN_SUCCESS); the WP auth cookie below is therefore unreachable
         // this slice and stays as inert defense in depth.
         // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy local naming preserved.
-        $clinic_id = $clinicId;
+        $clinic_id      = $clinicId;
         $outer_tx_depth = $this->db->tx_depth();
 
         try {
             $verify_outcome = $this->db->transactional(
+                // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy local naming preserved.
                 function () use ( $row, $rowClinicId, $mobile, $code, $purpose, $ip, $clinic_id, $policy, $outer_tx_depth ): array {
                     // One current read serializes failures and successful consumes
                     // on this challenge. Recheck expiry/lock AFTER any lock wait:

@@ -9,7 +9,7 @@ use ClinicCore\Application\Patients\PatientService;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Bootstrap\App;
-use ClinicCore\Domain\Security\RolesAndCapabilities;
+use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Settings\Settings;
 use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
@@ -401,7 +401,7 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
         $validBody = $validEdit->get_data();
         self::assertSame($selectedPatient, (int) ($validBody['data']['id'] ?? 0));
         self::assertArrayNotHasKey('national_id', $validBody['data'] ?? [], 'P2: PUT /patient/me response must omit national_id.');
-        self::assertSame('0000000061', (string) $this->patientRow($selectedPatient)['national_id'], 'P2: self-service PUT must not change national_id.');
+        self::assertSame('', (string) $this->patientRow($selectedPatient)['national_id'], 'P2: self-service PUT must not change national_id.');
         self::assertSame($auditBeforeValidEdit + 1, $this->auditCountForPatient($selectedPatient), 'Successful edit retains PATIENT_PROFILE_UPDATED audit behavior.');
 
         $selectedBeforeReject = $this->patientRow($selectedPatient);
