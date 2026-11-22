@@ -16,6 +16,7 @@ use ClinicCore\Infrastructure\Licensing\VendorGateway;
 use ClinicCore\Infrastructure\Repository\AppointmentRepository;
 use ClinicCore\Infrastructure\Repository\LicenseRepository;
 use ClinicCore\Infrastructure\Repository\VisitRepository;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 /** Real signed-document/service regressions for the Owner post-expiration policy. */
@@ -90,6 +91,7 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
     {
         remove_all_filters('cpms_license_public_key');
         remove_all_filters('cpms_license_dev_mode');
+        PatientTwoProofTestHelper::reset();
         parent::tearDown();
     }
 
@@ -152,6 +154,12 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
                 $mobile,
                 $now
             )
+        );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $this->clinicId,
+            $patientId,
+            ['mobile' => $mobile, 'seed_session_scope' => true]
         );
     }
 
@@ -292,7 +300,6 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
         // owner decision A (2026-11-09): shared mobile is never an ownership basis —
         // the booking actor must carry an active Patient link in the booking Clinic.
         $this->linkBridgePatient($user, '09127770888', 'MR-EXP-LOCK');
-        cpms_test_seed_patient_session($user, $this->clinicId);
         // First demonstrate a hold capacity lock returning after T0.
         $cross = function (string $sql) use (&$now): string {
             if (str_contains($sql, 'cpms_schedule_slots') && (str_contains($sql, 'FOR UPDATE') || str_contains($sql, 'UPDATE '))) {
@@ -364,7 +371,6 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
         // owner decision A (2026-11-09): shared mobile is never an ownership basis —
         // the booking actor must carry an active Patient link in the booking Clinic.
         $this->linkBridgePatient($user, '09127770999', 'MR-EXP-PUB');
-        cpms_test_seed_patient_session($user, $this->clinicId);
         $hold = App::bookingService()->hold($user, $this->clinicianId, $slot['date'], '11:20');
         $this->assertNotEmpty($hold['hold_token']);
         $this->expiresAt = time() - 1; // Grace and skew must NOT postpone shutdown.

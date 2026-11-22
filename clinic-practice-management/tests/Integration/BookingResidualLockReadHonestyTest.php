@@ -7,6 +7,7 @@ namespace ClinicCore\Tests\Integration;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 /**
@@ -112,6 +113,12 @@ final class BookingResidualLockReadHonestyTest extends WP_UnitTestCase
             $now
         ));
         self::assertGreaterThan(0, (int) $wpdb->insert_id, 'precondition: link');
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserId,
+            1,
+            $this->patientId,
+            ['mobile' => '09121110001', 'seed_session_scope' => true]
+        );
 
         $this->locationId = (int) App::db()->fetchValue(
             'SELECT id FROM ' . App::db()->table('cpms_locations')
@@ -129,6 +136,7 @@ final class BookingResidualLockReadHonestyTest extends WP_UnitTestCase
     protected function tearDown(): void
     {
         $this->removeFault();
+        PatientTwoProofTestHelper::reset();
         App::resetScope();
         parent::tearDown();
     }

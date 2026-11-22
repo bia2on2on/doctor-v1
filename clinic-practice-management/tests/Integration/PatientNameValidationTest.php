@@ -6,6 +6,7 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -48,7 +49,7 @@ final class PatientNameValidationTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
-        wp_set_current_user( 0 );
+        PatientTwoProofTestHelper::reset();
         parent::tearDown();
     }
 
@@ -185,6 +186,12 @@ final class PatientNameValidationTest extends WP_UnitTestCase
             )
         );
         $this->assertGreaterThan(0, $edge, 'the patient identity must be bound to the self user');
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $clinicId,
+            $patientId,
+            ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => true]
+        );
 
         return [
             'patient_id' => $patientId,
@@ -204,6 +211,7 @@ final class PatientNameValidationTest extends WP_UnitTestCase
      */
     private function seedLinkedAddress( array $fixture, string $address = 'اصلی' ): void
     {
+        PatientTwoProofTestHelper::acting_as( (int) $fixture['user_id'] );
         $this->service()->updateMe( (int) $fixture['user_id'], [ 'address' => $address ], (int) $fixture['link_id'] );
     }
 
@@ -706,7 +714,7 @@ final class PatientNameValidationTest extends WP_UnitTestCase
         // نمی‌شود. نتیجه: active_linked_patients_for_user(user1) دو کاندیدای
         // واقعاً مجاز را برمی‌گرداند.
         $secondClinicId = $this->createClinicInOrganization( (int) $first['clinic_id'], 'second' );
-        wp_set_current_user( (int) $first['user_id'] );
+        PatientTwoProofTestHelper::acting_as( (int) $first['user_id'] );
         try {
             $enrolled = $this->service()->enroll_current_patient( $secondClinicId, [
                 'first_name' => 'خودی',
@@ -722,6 +730,13 @@ final class PatientNameValidationTest extends WP_UnitTestCase
         ];
         $this->assertGreaterThan( 0, $second['patient_id'], 'the authorized second enrollment must mint the second record' );
         $this->assertNotSame( (int) $first['patient_id'], $second['patient_id'], 'the second record must be a different patient row' );
+
+        PatientTwoProofTestHelper::seed_patient_proof(
+            (int) $first['user_id'],
+            $secondClinicId,
+            (int) $second['patient_id'],
+            [ 'mobile' => '09120001010', 'seed_session_scope' => true ]
+        );
 
         try {
             $this->service()->updateMe($first['user_id'], [ 'birth_date' => '1990-01-01' ], null);
@@ -958,7 +973,7 @@ final class PatientNameValidationTest extends WP_UnitTestCase
     {
         $fixture = $this->makeRestLinkedSelfFixture('09120100021');
         $this->seedLinkedAddress( $fixture ); // seed a pre-existing address so the assertion covers the whole stored row
-        wp_set_current_user((int) $fixture['user_id']);
+        PatientTwoProofTestHelper::acting_as((int) $fixture['user_id']);
 
         $response = $this->dispatch('PUT', self::NS . '/patient/me', [
             'first_name' => '',
@@ -976,7 +991,7 @@ final class PatientNameValidationTest extends WP_UnitTestCase
     {
         $fixture = $this->makeRestLinkedSelfFixture('09120100022');
         $this->seedLinkedAddress( $fixture ); // seed a pre-existing address so the assertion covers the whole stored row
-        wp_set_current_user((int) $fixture['user_id']);
+        PatientTwoProofTestHelper::acting_as((int) $fixture['user_id']);
 
         $response = $this->dispatch('PUT', self::NS . '/patient/me', [
             'first_name' => null,
@@ -995,7 +1010,7 @@ final class PatientNameValidationTest extends WP_UnitTestCase
     public function testSelfRestUpdateInvalidNameRejectsWholeRequest(): void
     {
         $fixture = $this->makeRestLinkedSelfFixture('09120100023');
-        wp_set_current_user((int) $fixture['user_id']);
+        PatientTwoProofTestHelper::acting_as((int) $fixture['user_id']);
 
         $response = $this->dispatch('PUT', self::NS . '/patient/me', [
             'first_name' => "عل\u{061C}ی", // ARABIC LETTER MARK — bidi control
@@ -1013,7 +1028,7 @@ final class PatientNameValidationTest extends WP_UnitTestCase
     public function testSelfRestUpdateOmitsNamePreservesStoredName(): void
     {
         $fixture = $this->makeRestLinkedSelfFixture('09120100024');
-        wp_set_current_user((int) $fixture['user_id']);
+        PatientTwoProofTestHelper::acting_as((int) $fixture['user_id']);
 
         $response = $this->dispatch('PUT', self::NS . '/patient/me', [
             'address' => 'خانه‌ی جدید',
@@ -1028,7 +1043,7 @@ final class PatientNameValidationTest extends WP_UnitTestCase
     public function testSelfRestUpdateZwnjNameRoundTrips(): void
     {
         $fixture = $this->makeRestLinkedSelfFixture('09120100025');
-        wp_set_current_user((int) $fixture['user_id']);
+        PatientTwoProofTestHelper::acting_as((int) $fixture['user_id']);
 
         $response = $this->dispatch('PUT', self::NS . '/patient/me', [
             'first_name' => "علی\u{200C}رضا",
@@ -1042,14 +1057,14 @@ final class PatientNameValidationTest extends WP_UnitTestCase
     public function testSelfRestUpdateWithoutPortalRoleIsDenied(): void
     {
         $fixture = $this->linkedSelfWithoutPortalRole('09120100026');
-        wp_set_current_user((int) $fixture['user_id']);
+        PatientTwoProofTestHelper::acting_as((int) $fixture['user_id']);
 
         $response = $this->dispatch('PUT', self::NS . '/patient/me', [
             'first_name' => 'تغییر',
         ]);
 
         $this->assertSame(403, $response->get_status());
-        $this->assertClinicError($response, 'CLINIC_PERMISSION_DENIED');
+        $this->assertClinicError($response, \ClinicCore\Application\Auth\PatientAccess::PROOF_FAILED_CODE);
         $row = $this->patientRow((int) $fixture['patient_id']);
         $this->assertSame('خودی', $row['first_name']);
     }

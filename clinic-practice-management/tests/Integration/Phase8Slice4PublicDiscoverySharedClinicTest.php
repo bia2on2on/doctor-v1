@@ -42,6 +42,7 @@ use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Frontend\PublicBookingShortcode;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -99,7 +100,7 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
         Settings::flushCache();
         ScopeContext::clear();
         App::resetScope();
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
 
         parent::tearDown();
     }
@@ -581,7 +582,7 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
         $this->assert_booking_reads_visible( $this->clinicB, $this->sharedSlotB, $this->locationB );
 
         App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
-        wp_set_current_user( $this->patientUserId );
+        PatientTwoProofTestHelper::acting_as( $this->patientUserId );
         $this->assert_booking_reads_denied( $this->clinicB, $this->sharedSlotB );
         $this->assert_booking_reads_visible( $this->clinicB, $this->sharedSlotB, $this->locationB, true );
         App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
@@ -606,7 +607,7 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
         App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', false );
         App::settingsFactory()->forClinic( $this->clinicB )->set( 'public.listing_opt_in', false );
         $unknown = $this->without_surface_id( $this->render( (string) PHP_INT_MAX ) );
-        wp_set_current_user( $this->patientUserId );
+        PatientTwoProofTestHelper::acting_as( $this->patientUserId );
         self::assertSame( $unknown, $this->without_surface_id( $this->render( (string) $this->clinicB ) ) );
         self::assertSame( $unknown, $this->without_surface_id( PublicBookingShortcode::render_for_patient_portal( $this->clinicA ) ) );
 
@@ -824,13 +825,25 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
             'is_primary' => 1,
             'linked_at' => $now,
         ], ['%d', '%d', '%d', '%s', '%d', '%s']);
-        cpms_test_seed_patient_session($this->patientUserId, $this->clinicB);
+        PatientTwoProofTestHelper::seed_patient_proof($this->patientUserId, $this->clinicB, $sharedPatientId, [
+            'mobile' => '09121234999',
+            'seed_session_scope' => true,
+            'full_identity' => false,
+            'set_current_user' => false,
+        ]);
 
-        // Shared clinician: home Clinic A, ACTIVE membership in Clinic B.
+        // Shared clinician: home Clinic A, ACTIVE membership in Clinic B (separate staff account).
+        $sharedClinicianUserId = (int) wp_insert_user([
+            'user_login' => 'p8s4-clinician-' . $this->uid,
+            'user_email' => 'p8s4-clinician-' . $this->uid . '@cpms.local',
+            'user_pass' => wp_generate_password(20, true),
+            'role' => RolesAndCapabilities::ROLE_DOCTOR,
+        ]);
+        self::assertGreaterThan(0, $sharedClinicianUserId, 'Fixture clinician user must be created.');
 
         $this->sharedClinician = $this->insertRow('cpms_clinicians', [
             'clinic_id' => $this->clinicA,
-            'wp_user_id' => $wpUserId,
+            'wp_user_id' => $sharedClinicianUserId,
             'full_name' => 'دكتر علي رضايي', // deliberately Arabic yeh/kaf
             'specialty' => 'قلب',
             'is_active' => 1,
@@ -840,7 +853,7 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
 
         $this->insertRow('cpms_clinic_memberships', [
             'clinic_id' => $this->clinicB,
-            'wp_user_id' => $wpUserId,
+            'wp_user_id' => $sharedClinicianUserId,
             'role_key' => 'doctor',
             'status' => 'active',
             'is_primary' => 0,
@@ -949,7 +962,7 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
 
     private function post(string $route, array $body, ?int $asUserId = null, bool $withNonce = false): WP_REST_Response
     {
-        wp_set_current_user($asUserId ?? 0);
+        PatientTwoProofTestHelper::acting_as($asUserId ?? 0);
         $request = new WP_REST_Request('POST', $route);
         foreach ($body as $key => $value) {
             $request->set_param($key, $value);

@@ -220,6 +220,7 @@ use ClinicCore\Domain\Notifications\NotificationEvents;
 use ClinicCore\Domain\Time\Jalali;
 use ClinicCore\Infrastructure\Repository\NotificationRepository;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -285,7 +286,7 @@ final class Phase9Slice2PatientPortalNotificationsRedTest extends WP_UnitTestCas
 
 	protected function tearDown(): void
 	{
-		wp_set_current_user( 0 );
+		PatientTwoProofTestHelper::reset();
 		ScopeContext::clear();
 		App::resetScope();
 		SystemClinicResolver::flush();
@@ -786,6 +787,16 @@ final class Phase9Slice2PatientPortalNotificationsRedTest extends WP_UnitTestCas
 			[ '%d', '%d', '%d', '%s', '%d', '%s' ],
 			'patient_user_link'
 		);
+		PatientTwoProofTestHelper::seed_patient_proof(
+			$user_id,
+			$clinic_id,
+			$patient_id,
+			[
+				'mobile'             => $mobile,
+				'seed_session_scope' => true,
+				'set_current_user'   => false,
+			]
+		);
 
 		// Foreign recipient control: another Patient in the same install owns one
 		// internal notification that must never surface here nor be mutable by this actor.
@@ -916,6 +927,7 @@ final class Phase9Slice2PatientPortalNotificationsRedTest extends WP_UnitTestCas
 		self::assertNull( $this->readAtOf( (int) $fx['foreign_id'] ), 'positive control: the foreign notification starts unread.' );
 
 		// (4) The backend inbox really returns those notifications with the exact unread_count.
+		PatientTwoProofTestHelper::acting_as( (int) $fx['user_id'] );
 		$inbox = App::notificationService()->inbox( (int) $fx['user_id'], false, 50 );
 		self::assertArrayHasKey( 'notifications', $inbox, 'positive control: NotificationService::inbox() shape (notifications).' );
 		self::assertArrayHasKey( 'unread_count', $inbox, 'positive control: NotificationService::inbox() shape (unread_count).' );
@@ -947,7 +959,7 @@ final class Phase9Slice2PatientPortalNotificationsRedTest extends WP_UnitTestCas
 
 	private function renderPortalAs( int $user_id ): string
 	{
-		wp_set_current_user( $user_id );
+		PatientTwoProofTestHelper::acting_as( $user_id );
 		ob_start();
 		try {
 			PatientPortalPage::render();
@@ -1354,7 +1366,7 @@ final class Phase9Slice2PatientPortalNotificationsRedTest extends WP_UnitTestCas
 	 */
 	private function restAs( int $user_id, string $method, string $route, array $params = [], ?string $nonce = 'auto' ): WP_REST_Response
 	{
-		wp_set_current_user( $user_id );
+		PatientTwoProofTestHelper::acting_as( $user_id );
 		$request = new WP_REST_Request( $method, $route );
 		foreach ( $params as $key => $value ) {
 			$request->set_param( $key, $value );

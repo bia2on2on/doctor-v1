@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Patients\PatientService;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -64,7 +66,7 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         ScopeContext::clear();
         App::resetScope();
         SystemClinicResolver::flush();
@@ -304,10 +306,12 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
         $this->assertClinicError($withoutNonce, 'CLINIC_INVALID_NONCE', 403, 'wp_rest nonce remains mandatory.');
 
         $wrongRole = $this->dispatch('GET', self::ME_PATH, [], $nonPatientUserId);
-        $this->assertClinicError($wrongRole, 'CLINIC_PERMISSION_DENIED', 403, 'Only the cpms_patient role can use patient self-service.');
+        $this->assertClinicError($wrongRole, PatientAccess::PROOF_FAILED_CODE, 403, 'Only the cpms_patient role can use patient self-service.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($wrongRole->get_data()['message'] ?? ''), 'Wrong-role caller must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
 
         $noLink = $this->dispatch('GET', self::ME_PATH, [], $noLinkUserId);
-        $this->assertClinicError($noLink, 'CLINIC_NOT_FOUND', 404, 'A patient-role user without a durable link remains not-found.');
+        $this->assertClinicError($noLink, PatientAccess::PROOF_FAILED_CODE, 403, 'A patient-role user without a durable link remains denied.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($noLink->get_data()['message'] ?? ''), 'No-link caller must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
 
         $patientCountBefore = $this->countRows('cpms_patients');
         $linkCountBefore = $this->countRows('cpms_patient_user_links');
@@ -315,13 +319,16 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
         $allowedBefore = $this->patientRow($allowedPatient);
 
         $foreign = $this->dispatch('GET', self::ME_PATH, ['link_id' => $foreignLink], $callerUserId);
-        $this->assertClinicError($foreign, 'CLINIC_NOT_FOUND', 404, 'A foreign user\'s link_id must fail closed without revealing it exists.');
+        $this->assertClinicError($foreign, PatientAccess::PROOF_FAILED_CODE, 403, 'A foreign user\'s link_id must fail closed without revealing it exists.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($foreign->get_data()['message'] ?? ''), 'Foreign link_id must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
 
         $inactive = $this->dispatch('GET', self::ME_PATH, ['link_id' => $inactiveLink], $callerUserId);
-        $this->assertClinicError($inactive, 'CLINIC_NOT_FOUND', 404, 'A link to an archived Patient must fail closed without revealing it exists.');
+        $this->assertClinicError($inactive, PatientAccess::PROOF_FAILED_CODE, 403, 'A link to an archived Patient must fail closed without revealing it exists.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($inactive->get_data()['message'] ?? ''), 'Inactive link_id must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
 
         $nonexistent = $this->dispatch('GET', self::ME_PATH, ['link_id' => $foreignLink + 999999], $callerUserId);
-        $this->assertClinicError($nonexistent, 'CLINIC_NOT_FOUND', 404, 'A nonexistent link_id must receive the same canonical not-found response.');
+        $this->assertClinicError($nonexistent, PatientAccess::PROOF_FAILED_CODE, 403, 'A nonexistent link_id must receive the same canonical denied response.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($nonexistent->get_data()['message'] ?? ''), 'Nonexistent link_id must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
 
         self::assertSame($foreign->get_data(), $inactive->get_data(), 'Foreign and inactive selectors must have the exact same non-enumerating envelope.');
         self::assertSame($foreign->get_data(), $nonexistent->get_data(), 'Foreign and nonexistent selectors must have the exact same non-enumerating envelope.');
@@ -393,6 +400,16 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
         self::assertSame('0000000140', (string) ($validBody['data']['national_id'] ?? ''));
         self::assertSame('0000000140', (string) $this->patientRow($selectedPatient)['national_id']);
         self::assertSame($auditBeforeValidEdit + 1, $this->auditCountForPatient($selectedPatient), 'Successful edit retains PATIENT_PROFILE_UPDATED audit behavior.');
+
+        // Changing national_id closes active bindings and destroys WP sessions (B1 / §7.6);
+        // re-verify the caller session so the duplicate-NID test reaches updateMe() validation.
+        PatientTwoProofTestHelper::acting_as(0);
+        PatientTwoProofTestHelper::seed_patient_proof($callerUserId, $clinics['b_id'], $selectedPatient, [
+            'mobile' => $this->mobileFor('r4-s'),
+            'is_primary' => true,
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
 
         $selectedBeforeReject = $this->patientRow($selectedPatient);
         $patientCountBeforeReject = $this->countRows('cpms_patients');
@@ -675,7 +692,7 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
 
     private function insertLink(int $clinicId, int $patientId, int $userId, string $mobile, int $isPrimary): int
     {
-        return $this->insertRow('cpms_patient_user_links', [
+        $linkId = $this->insertRow('cpms_patient_user_links', [
             'clinic_id' => $clinicId,
             'patient_id' => $patientId,
             'wp_user_id' => $userId,
@@ -683,6 +700,20 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
             'is_primary' => $isPrimary,
             'linked_at' => App::db()->nowUtcSql(),
         ], ['%d', '%d', '%d', '%s', '%d', '%s'], 'patient-user link');
+        $status = (string) App::db()->fetchValue(
+            'SELECT status FROM ' . App::db()->table('cpms_patients') . ' WHERE id = %d LIMIT 1',
+            [$patientId]
+        );
+        if ('active' === $status) {
+            PatientTwoProofTestHelper::seed_patient_proof($userId, $clinicId, $patientId, [
+                'mobile' => $mobile,
+                'is_primary' => 1 === $isPrimary,
+                'seed_session_scope' => true,
+                'set_current_user' => false,
+            ]);
+        }
+
+        return $linkId;
     }
 
     private function assertMaterializedLink(
@@ -762,7 +793,7 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
      */
     private function dispatch(string $method, string $route, array $params, int $userId, bool $withNonce = true): WP_REST_Response
     {
-        wp_set_current_user($userId);
+        PatientTwoProofTestHelper::acting_as($userId);
         $request = new WP_REST_Request($method, $route);
         foreach ($params as $key => $value) {
             $request->set_param($key, $value);

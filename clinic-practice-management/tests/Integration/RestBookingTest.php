@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Application\Auth\PatientAccess;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -116,12 +118,25 @@ final class RestBookingTest extends WP_UnitTestCase
             )
         );
 
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserId,
+            1,
+            $this->patientId,
+            ['mobile' => '09121110001', 'seed_session_scope' => true, 'set_current_user' => false]
+        );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->otherPatientUserId,
+            1,
+            $this->otherPatientId,
+            ['mobile' => '09121110002', 'seed_session_scope' => true, 'set_current_user' => false]
+        );
+
+        PatientTwoProofTestHelper::acting_as(0);
     }
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         parent::tearDown();
     }
 
@@ -145,7 +160,7 @@ final class RestBookingTest extends WP_UnitTestCase
 
     public function testHoldWithoutNonceRejected(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot(3, '10:00');
 
         $response = $this->dispatch('POST', self::NS . '/booking/hold', [
@@ -160,7 +175,7 @@ final class RestBookingTest extends WP_UnitTestCase
 
     public function testHoldWithInvalidNonceRejected(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot(3, '10:00');
 
         $request = $this->request('POST', self::NS . '/booking/hold', [
@@ -179,7 +194,7 @@ final class RestBookingTest extends WP_UnitTestCase
 
     public function testHoldUnauthenticatedRejected(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::acting_as(0);
         $slot = $this->makeSlot(3, '10:00');
 
         $response = $this->dispatch('POST', self::NS . '/booking/hold', [
@@ -188,8 +203,8 @@ final class RestBookingTest extends WP_UnitTestCase
             'slot_time' => $slot['time'],
         ]);
 
-        $this->assertSame(401, $response->get_status());
-        $this->assertClinicError($response, 'CLINIC_UNAUTHORIZED');
+        $this->assertSame(403, $response->get_status());
+        $this->assertClinicError($response, PatientAccess::PROOF_FAILED_CODE);
     }
 
     public function testHoldByNonPatientRoleRejectedAndAudited(): void
@@ -205,7 +220,7 @@ final class RestBookingTest extends WP_UnitTestCase
         ]);
 
         $this->assertSame(403, $response->get_status());
-        $this->assertClinicError($response, 'CLINIC_PERMISSION_DENIED');
+        $this->assertClinicError($response, PatientAccess::PROOF_FAILED_CODE);
 
         // Audit تلاش غیرمجاز ثبت شده است (TP-07/TP-09)
         $count = (int) App::db()->fetchValue(
@@ -218,7 +233,7 @@ final class RestBookingTest extends WP_UnitTestCase
 
     public function testStaffListByPatientRejected(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
 
         $response = $this->dispatch('GET', self::NS . '/appointments', [
             'clinician_id' => $this->clinicianId,
@@ -258,7 +273,7 @@ final class RestBookingTest extends WP_UnitTestCase
         $this->assertSame(404, $quote->get_status());
         $this->assertClinicError($quote, 'CLINIC_NOT_FOUND');
 
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $hold = $this->dispatch('POST', self::NS . '/booking/hold', [
             'clinician_id' => $this->clinicianId,
             'slot_date' => $slot['date'],
@@ -279,7 +294,7 @@ final class RestBookingTest extends WP_UnitTestCase
 
     public function testHoldConfirmEnvelopeAndCorrelationHeader(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot(3, '10:00');
 
         $holdResponse = $this->dispatch('POST', self::NS . '/booking/hold', [
@@ -322,7 +337,7 @@ final class RestBookingTest extends WP_UnitTestCase
 
     public function testConfirmWithoutIdempotencyKeyRejected(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot(3, '10:00');
         $hold = $this->holdViaService($slot);
 
@@ -336,7 +351,7 @@ final class RestBookingTest extends WP_UnitTestCase
 
     public function testRescheduleWithoutIdempotencyKeyRejected(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $appt = $this->confirmedAppointmentViaService();
         $newSlot = $this->makeSlot(5, '12:00');
 
@@ -353,12 +368,12 @@ final class RestBookingTest extends WP_UnitTestCase
 
     public function testPatientCannotConfirmOthersHold(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot(3, '10:00');
         $hold = $this->holdViaService($slot);
 
         // بیمار B با Hold بیمار A
-        wp_set_current_user($this->otherPatientUserId);
+        PatientTwoProofTestHelper::acting_as($this->otherPatientUserId);
         $response = $this->dispatch('POST', self::NS . '/booking/confirm', [
             'hold_token' => $hold['hold_token'],
         ], idempotencyKey: $this->uuid());
@@ -371,7 +386,7 @@ final class RestBookingTest extends WP_UnitTestCase
     {
         $appt = $this->confirmedAppointmentViaService(); // مالک: بیمار A
 
-        wp_set_current_user($this->otherPatientUserId);
+        PatientTwoProofTestHelper::acting_as($this->otherPatientUserId);
         $response = $this->dispatch('POST', self::NS . '/appointments/' . $appt['id'] . '/cancel', [
             'reason' => 'test',
         ]);
@@ -392,7 +407,7 @@ final class RestBookingTest extends WP_UnitTestCase
         $appt = $this->confirmedAppointmentViaService();
         $newSlot = $this->makeSlot(5, '12:00');
 
-        wp_set_current_user($this->otherPatientUserId);
+        PatientTwoProofTestHelper::acting_as($this->otherPatientUserId);
         $response = $this->dispatch('POST', self::NS . '/appointments/' . $appt['id'] . '/reschedule', [
             'slot_date' => $newSlot['date'],
             'slot_time' => $newSlot['time'],
@@ -446,7 +461,7 @@ final class RestBookingTest extends WP_UnitTestCase
 
     public function testHoldRateLimitedAfterTenPerHour(): void
     {
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
 
         $times = ['08:00', '08:30', '09:00', '09:30', '10:00', '10:30', '11:00', '11:30', '12:00', '12:30', '13:00'];
         $last = null;
@@ -560,6 +575,7 @@ final class RestBookingTest extends WP_UnitTestCase
      */
     private function confirmedAppointmentViaService(): array
     {
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $slot = $this->makeSlot(4, '11:00');
         $hold = $this->holdViaService($slot);
         $view = App::bookingService()->confirm($hold['hold_token'], $this->patientUserId, null, $this->uuid());

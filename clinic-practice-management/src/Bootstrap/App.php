@@ -28,6 +28,10 @@ use ClinicCore\Admin\SecretaryFinancePage;
 use ClinicCore\Admin\SecretaryQueuePage;
 use ClinicCore\Admin\SmsSettingsPage;
 use ClinicCore\Application\Auth\OtpService;
+use ClinicCore\Application\Auth\PatientAccess;
+use ClinicCore\Application\Auth\PatientBindingPromoter;
+use ClinicCore\Application\Auth\PatientNidHmac;
+use ClinicCore\Application\Auth\PatientSessionProofStore;
 use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Application\Backup\BackupService;
 use ClinicCore\Application\Booking\BookingService;
@@ -107,6 +111,7 @@ use ClinicCore\Infrastructure\Repository\LocationRepository;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use ClinicCore\Infrastructure\Repository\PatientEnrollmentRepository;
 use ClinicCore\Infrastructure\Repository\PatientIdentityRepository;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Infrastructure\Repository\FollowUpRepository;
 use ClinicCore\Infrastructure\Repository\HandwritingRepository;
 use ClinicCore\Infrastructure\Repository\InvoiceRepository;
@@ -380,7 +385,7 @@ final class App
 				( new OtpController( self::otpService() ) )->register_routes();
 				( new SmsController( self::smsService() ) )->register_routes();
 				( new BookingController( self::bookingService(), self::patient_session_scope() ) )->register_routes();
-				( new PatientController( self::patientService() ) )->register_routes();
+				( new PatientController( self::patientService(), self::patient_access(), self::patient_binding_promoter() ) )->register_routes();
 				( new QueueController( self::visitService() ) )->register_routes();
 				( new ScheduleController( self::scheduleService() ) )->register_routes();
 				( new ClinicalController( self::clinicalService() ) )->register_routes();
@@ -1936,6 +1941,67 @@ final class App
     }
 
     /**
+     * Resolves the central fail-closed patient access gate.
+     */
+    public static function patient_access(): PatientAccess {
+        static $gate  = null;
+        static $deps  = null;
+        $current_deps = [ self::db(), self::authorization_service() ];
+        if ( null === $gate || $deps !== $current_deps ) {
+            $deps        = $current_deps;
+            $memberships = new MembershipRepository( $current_deps[0] );
+            $gate        = new PatientAccess(
+                $current_deps[0],
+                new PatientRepository( $current_deps[0] ),
+                memberships: $memberships,
+                authorization: $current_deps[1],
+                logins: new PatientLoginRepository( $current_deps[0] ),
+                proofs: new PatientSessionProofStore()
+            );
+        }
+
+        return $gate;
+    }
+
+    /**
+     * Resolves the atomic two-factor binding promoter (`cpms_patient_logins`).
+     */
+    public static function patient_binding_promoter(): PatientBindingPromoter {
+        return new PatientBindingPromoter(
+            self::db(),
+            self::patient_access(),
+            new PatientLoginRepository( self::db() ),
+            new PatientSessionProofStore(),
+            self::otpService(),
+            self::rate(),
+            new PatientNidHmac(),
+            new PatientIdentityRepository( self::db() ),
+            self::patient_identity_service(),
+            self::patient_identity_activator(),
+            self::audit(),
+            self::op(),
+            static function ( int $clinic_id, string $mobile, int $patient_id ): void {
+                $clinic_name = (string) ( self::db()->fetchValue(
+                    'SELECT name FROM ' . self::db()->table( 'cpms_clinics' ) . ' WHERE id = %d LIMIT 1',
+                    [ $clinic_id ]
+                ) ?? '' );
+                if ( '' === trim( $clinic_name ) ) {
+                    $clinic_name = 'مرکز درمانی';
+                }
+                self::smsService()->sendEvent(
+                    $clinic_id,
+                    \ClinicCore\Domain\Sms\SmsEvents::PATIENT_BINDING_VERIFIED,
+                    $mobile,
+                    [ 'clinic_name' => $clinic_name ],
+                    'patient_binding',
+                    $patient_id,
+                    false
+                );
+            }
+        );
+    }
+
+    /**
      * Registry Providerهای SMS + Adapterهای داخلی + Hook افزونه‌پذیری (ADR-0025).
      */
     public static function providers(): SmsProviderRegistry
@@ -2281,6 +2347,7 @@ final class App
         if ( null !== self::$patient_session_scope ) {
             self::$patient_session_scope->reset_in_process_state();
         }
+        \ClinicCore\Application\Auth\PatientAccess::clear_rest_request_verifications();
     }
 
     /**

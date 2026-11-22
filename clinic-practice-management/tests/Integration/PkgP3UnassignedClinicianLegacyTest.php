@@ -32,10 +32,12 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 final class PkgP3UnassignedClinicianLegacyTest extends WP_UnitTestCase
@@ -72,7 +74,7 @@ final class PkgP3UnassignedClinicianLegacyTest extends WP_UnitTestCase
         Settings::flushCache();
         ScopeContext::clear();
         App::resetScope();
-        wp_set_current_user( 0 );
+        PatientTwoProofTestHelper::reset();
 
         parent::tearDown();
     }
@@ -211,8 +213,8 @@ final class PkgP3UnassignedClinicianLegacyTest extends WP_UnitTestCase
             self::assertNull( $unlinked['session_clinic_id'] );
             self::assertArrayHasKey( 'otp_request_path', $unlinked );
             $denied = $this->booking_post( $unlinked['hold_path'], $selection, $unlinked['nonce'] );
-            self::assertSame( 400, $denied->get_status() );
-            self::assertSame( 'CLINIC_SCOPE_REQUIRED', $denied->get_data()['code'] );
+            self::assertSame( 403, $denied->get_status() );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $denied->get_data()['code'] );
 
             $mobile     = '09121234037';
             $patient_id = $this->insert_row(
@@ -242,6 +244,16 @@ final class PkgP3UnassignedClinicianLegacyTest extends WP_UnitTestCase
                 [ '%d', '%d', '%d', '%s', '%d', '%s' ]
             );
             cpms_test_seed_patient_session( $user_id, $this->clinic_id );
+            PatientTwoProofTestHelper::seed_patient_proof(
+                $user_id,
+                $this->clinic_id,
+                $patient_id,
+                [
+                    'mobile'             => $mobile,
+                    'seed_session_scope' => false,
+                    'set_current_user'   => true,
+                ]
+            );
 
             $html   = $this->render( (string) $this->clinic_id );
             $config = $this->config( $html );

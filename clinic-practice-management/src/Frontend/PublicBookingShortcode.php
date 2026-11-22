@@ -66,6 +66,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Frontend;
 
+use ClinicCore\Admin\PatientPortalPage;
 use ClinicCore\Application\Clinic\PublicClinicDirectory;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Domain\Clinical\DoctorDisplayName;
@@ -1197,7 +1198,7 @@ final class PublicBookingShortcode
         }
 
         $user = wp_get_current_user();
-        if (in_array(RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true)) {
+        if ( PatientPortalPage::isPatientOnly( $user ) ) {
             return self::CONTINUATION_PATIENT;
         }
 
@@ -1355,6 +1356,14 @@ final class PublicBookingShortcode
                     if ( ! is_array( $linked_patients ) ) {
                         continue;
                     }
+                    $proved_ids      = \ClinicCore\Bootstrap\App::patient_access()->proved_patient_ids( $uid, $choice_clinic_id );
+                    $proved_map      = array_flip( $proved_ids );
+                    $linked_patients = array_values(
+                        array_filter(
+                            $linked_patients,
+                            static fn ( $lp ): bool => is_array( $lp ) && isset( $proved_map[ (int) ( $lp['id'] ?? 0 ) ] )
+                        )
+                    );
                     if ( count( $linked_patients ) === 0 ) {
                         if ( $choice_clinic_id === $primary_clinic_id ) {
                             $is_first_patient = true;

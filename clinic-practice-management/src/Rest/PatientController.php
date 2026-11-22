@@ -4,10 +4,13 @@ declare(strict_types=1);
 
 namespace ClinicCore\Rest;
 
+use ClinicCore\Application\Auth\PatientAccess;
+use ClinicCore\Application\Auth\PatientBindingPromoter;
+use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Application\Patients\PatientService;
-use ClinicCore\Bootstrap\App;
 use ClinicCore\Auth\RolesAndCapabilities;
+use ClinicCore\Infrastructure\Security\ClientIp;
 use WP_Error;
 use WP_REST_Request;
 use WP_REST_Response;
@@ -29,18 +32,37 @@ use WP_REST_Server;
  */
 final class PatientController extends RestBase
 {
-    public function __construct(private readonly PatientService $patients)
-    {
+    public function __construct(
+        private readonly PatientService $patients,
+        private readonly ?PatientAccess $patient_access = null,
+        private readonly ?PatientBindingPromoter $promoter = null
+    ) {
     }
 
     public function register_routes(): void
     {
         register_rest_route(
             self::NS,
+            '/patient/link-record',
+            [
+                'methods'             => WP_REST_Server::CREATABLE,
+                'permission_callback' => fn ( WP_REST_Request $request ) => $this->require_patient_link_record_access( $request ),
+                'callback'            => fn ( WP_REST_Request $request ) => $this->link_record( $request ),
+                'args'                => [
+                    'clinic_id'   => [ 'required' => false, 'type' => 'integer' ],
+                    'mobile'      => [ 'required' => false, 'type' => 'string' ],
+                    'code'        => [ 'required' => false, 'type' => 'string' ],
+                    'national_id' => [ 'required' => false, 'type' => 'string' ],
+                ],
+            ]
+        );
+
+        register_rest_route(
+            self::NS,
             '/patient/enroll',
             [
                 'methods'             => WP_REST_Server::CREATABLE,
-                'permission_callback' => fn ( WP_REST_Request $request ) => $this->requirePatient( $request ),
+                'permission_callback' => fn ( WP_REST_Request $request ) => $this->requirePatient( $request, PatientAccess::MODE_ENROLL ),
                 'callback'            => fn ( WP_REST_Request $request ) => $this->wrap(
                     fn () => $this->patients->enroll_current_patient( (int) $request->get_param( 'clinic_id' ), $this->body( $request ) )
                 ),
@@ -56,7 +78,7 @@ final class PatientController extends RestBase
                 [
                     'methods'             => WP_REST_Server::READABLE,
                     'callback'            => fn ( WP_REST_Request $request ) => $this->my_records( $request ),
-                    'permission_callback' => fn ( WP_REST_Request $request ) => $this->requirePatient( $request ),
+                    'permission_callback' => fn ( WP_REST_Request $request ) => $this->requirePatient( $request, PatientAccess::MODE_RECORDS_LIST ),
                 ],
             ]
         );
@@ -159,10 +181,10 @@ final class PatientController extends RestBase
 
     private function updateMe(WP_REST_Request $request): WP_REST_Response|WP_Error
     {
-        $user = wp_get_current_user();
+        $user    = wp_get_current_user();
         $link_id = $this->link_id( $request );
         $fields  = $this->body( $request );
-        unset( $fields['link_id'] );
+        unset( $fields['link_id'], $fields['clinic_id'] );
 
         return $this->wrap( fn () => $this->patients->updateMe( (int) $user->ID, $fields, $link_id ) );
     }
@@ -219,6 +241,49 @@ final class PatientController extends RestBase
         ));
     }
 
+    /**
+     * Two-factor promotion of a target Clinic patient record into an active
+     * durable binding + live session proof (§6.2).
+     */
+    private function link_record( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+        $query = $request->get_query_params();
+        if (
+            is_array( $query )
+            && (
+                array_key_exists( 'national_id', $query )
+                || array_key_exists( 'code', $query )
+                || array_key_exists( 'mobile', $query )
+            )
+        ) {
+            return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );
+        }
+
+        $body       = $this->body_only( $request );
+        $clinic_raw = $body['clinic_id'] ?? $request->get_header( 'X-CPMS-Clinic-Id' );
+        $clinic_id  = is_numeric( $clinic_raw ) ? (int) $clinic_raw : 0;
+        $raw_mobile = is_string( $body['mobile'] ?? null ) ? (string) $body['mobile'] : '';
+        $raw_nid    = is_string( $body['national_id'] ?? null ) ? (string) $body['national_id'] : '';
+        $raw_code   = is_string( $body['code'] ?? null ) ? (string) $body['code'] : null;
+        $user_id    = (int) get_current_user_id();
+        $ip         = ClientIp::resolve() ?? '0.0.0.0';
+        $promoter   = $this->promoter ?? App::patient_binding_promoter();
+
+        if ( $clinic_id <= 0 ) {
+            return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );
+        }
+
+        return $this->wrap(
+            static fn (): array => $promoter->promote(
+                $user_id,
+                $clinic_id,
+                $raw_mobile,
+                $raw_nid,
+                $raw_code,
+                $ip
+            )
+        );
+    }
+
     private function create(WP_REST_Request $request): WP_REST_Response|WP_Error
     {
         // Phase 3 Slice 6B — D4 مسیر کارکنی: مجوز Clinic-scoped cpms_patient_create.
@@ -234,32 +299,13 @@ final class PatientController extends RestBase
 
     // ---------- Helpers ----------
 
-    private function requirePatient(WP_REST_Request $request): bool|WP_Error
-    {
-        $nonceError = $this->requireNonce($request);
-        if ($nonceError instanceof WP_Error) {
-            return $nonceError;
-        }
-        $user = wp_get_current_user();
-        if (!$user->exists()) {
-            return $this->error('CLINIC_UNAUTHORIZED', 401, 'وارد نشده‌اید');
-        }
-        if (!in_array(RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true)) {
-            App::audit()->log(
-                'FORBIDDEN_ACCESS_ATTEMPT',
-                ['wp_user_id' => (int) $user->ID, 'role' => $user->roles[0] ?? 'unknown'],
-                'patient',
-                null,
-                null,
-                null,
-                null,
-                ['reason' => 'patient_role_required']
-            );
+    protected function patient_access(): PatientAccess {
+        return $this->patient_access ?? parent::patient_access();
+    }
 
-            return $this->error('CLINIC_PERMISSION_DENIED', 403, 'دسترسی ندارید');
-        }
-
-        return true;
+    // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- Established private helper name.
+    private function requirePatient( WP_REST_Request $request, string $mode = PatientAccess::MODE_CLINICAL ): bool|WP_Error {
+        return $this->require_patient_access( $request, [ 'mode' => $mode ] );
     }
 
     private function link_id( WP_REST_Request $request ): ?int {

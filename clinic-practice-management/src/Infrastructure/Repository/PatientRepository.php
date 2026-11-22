@@ -121,6 +121,7 @@ final class PatientRepository
             . ' INNER JOIN ' . $this->db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
             . " WHERE l.wp_user_id = %d AND p.status = 'active'"
             . " AND c.status = 'active' AND o.status = 'active'"
+            . $this->booking_access_binding_predicate()
             . ' ORDER BY c.name ASC, c.id ASC',
             [ $wp_user_id ]
         );
@@ -158,6 +159,156 @@ final class PatientRepository
     }
 
     /**
+     * Checks whether the user holds clinical ownership access to `$patient_id`
+     * in any active Clinic (used for path-scoped patient file routes when no
+     * explicit clinic selector is provided).
+     */
+    public function user_has_clinical_access_to_patient_any_clinic( int $wp_user_id, int $patient_id ): bool {
+        if ( $wp_user_id <= 0 || $patient_id <= 0 ) {
+            return false;
+        }
+
+        $value = $this->db->fetchValue(
+            'SELECT 1 FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patients' ) . ' p'
+            . ' ON p.id = l.patient_id AND p.clinic_id = l.clinic_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_clinics' ) . ' c ON c.id = l.clinic_id'
+            . " WHERE l.wp_user_id = %d AND l.patient_id = %d AND p.status = 'active'"
+            . $this->clinical_access_identity_predicate()
+            . ' LIMIT 1',
+            [ $wp_user_id, $patient_id ]
+        );
+
+        return null !== $value;
+    }
+
+    /**
+     * Checks whether the user holds at least one active booking-subject link
+     * inside the given active Clinic/Organization.
+     */
+    public function user_has_booking_access_to_clinic( int $wp_user_id, int $clinic_id ): bool {
+        if ( $wp_user_id <= 0 || $clinic_id <= 0 ) {
+            return false;
+        }
+
+        $value = $this->db->fetchValue(
+            'SELECT 1 FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patients' ) . ' p'
+            . ' ON p.id = l.patient_id AND p.clinic_id = l.clinic_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_clinics' ) . ' c ON c.id = l.clinic_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
+            . " WHERE l.wp_user_id = %d AND l.clinic_id = %d AND p.status = 'active'"
+            . " AND c.status = 'active' AND o.status = 'active'"
+            . $this->booking_access_binding_predicate()
+            . ' LIMIT 1',
+            [ $wp_user_id, $clinic_id ]
+        );
+
+        return null !== $value;
+    }
+
+    /**
+     * Checks whether the user holds at least one active booking-subject link
+     * in any active Clinic/Organization.
+     */
+    public function user_has_any_booking_access( int $wp_user_id ): bool {
+        return [] !== $this->active_booking_clinics_for_user( $wp_user_id );
+    }
+
+    /**
+     * Resolves an active booking-subject link owned by `$wp_user_id`.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function find_active_booking_linked_patient_by_link( int $wp_user_id, int $link_id ): ?array {
+        if ( $wp_user_id <= 0 || $link_id <= 0 ) {
+            return null;
+        }
+
+        return $this->db->fetchRow(
+            'SELECT p.*'
+            . ' FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patients' ) . ' p'
+            . ' ON p.id = l.patient_id AND p.clinic_id = l.clinic_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_clinics' ) . ' c ON c.id = l.clinic_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
+            . " WHERE l.id = %d AND l.wp_user_id = %d AND p.status = 'active'"
+            . " AND c.status = 'active' AND o.status = 'active'"
+            . $this->booking_access_binding_predicate()
+            . ' LIMIT 1',
+            [ $link_id, $wp_user_id ]
+        );
+    }
+
+    /**
+     * Checks whether the user holds at least one active clinical patient link
+     * inside the given Clinic.
+     */
+    public function user_has_clinical_access_to_clinic( int $wp_user_id, int $clinic_id ): bool {
+        if ( $wp_user_id <= 0 || $clinic_id <= 0 ) {
+            return false;
+        }
+
+        $value = $this->db->fetchValue(
+            'SELECT 1 FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patients' ) . ' p'
+            . ' ON p.id = l.patient_id AND p.clinic_id = l.clinic_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_clinics' ) . ' c ON c.id = l.clinic_id'
+            . " WHERE l.wp_user_id = %d AND l.clinic_id = %d AND p.status = 'active'"
+            . $this->clinical_access_identity_predicate()
+            . ' LIMIT 1',
+            [ $wp_user_id, $clinic_id ]
+        );
+
+        return null !== $value;
+    }
+
+    /**
+     * Checks whether the user holds at least one active clinical patient link
+     * in any Clinic.
+     */
+    public function user_has_any_clinical_access( int $wp_user_id ): bool {
+        if ( $wp_user_id <= 0 ) {
+            return false;
+        }
+
+        $value = $this->db->fetchValue(
+            'SELECT 1 FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patients' ) . ' p'
+            . ' ON p.id = l.patient_id AND p.clinic_id = l.clinic_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_clinics' ) . ' c ON c.id = l.clinic_id'
+            . " WHERE l.wp_user_id = %d AND p.status = 'active'"
+            . $this->clinical_access_identity_predicate()
+            . ' LIMIT 1',
+            [ $wp_user_id ]
+        );
+
+        return null !== $value;
+    }
+
+    /**
+     * Checks whether the user holds an unambiguous verified Organization
+     * identity eligible to self-enroll in the given active Clinic.
+     */
+    public function user_has_enrollment_eligibility_in_clinic( int $wp_user_id, int $clinic_id ): bool {
+        if ( $wp_user_id <= 0 || $clinic_id <= 0 ) {
+            return false;
+        }
+
+        $count = $this->db->fetchValue(
+            'SELECT COUNT(*)'
+            . ' FROM ' . $this->db->table( 'cpms_clinics' ) . ' c'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patient_identity_links' ) . ' pil ON pil.organization_id = c.organization_id'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_patient_identities' ) . ' pi ON pi.id = pil.identity_id AND pi.organization_id = pil.organization_id'
+            . " WHERE c.id = %d AND c.status = 'active' AND o.status = 'active' AND pil.wp_user_id = %d",
+            [ $clinic_id, $wp_user_id ]
+        );
+
+        return null !== $count && 1 === (int) $count;
+    }
+
+    /**
      * Active Patient candidates backed by a matching durable link and Clinic.
      *
      * @return list<array<string, mixed>>
@@ -181,6 +332,10 @@ final class PatientRepository
      * @return array<string, mixed>|null
      */
     public function find_active_linked_patient_by_link( int $wp_user_id, int $link_id ): ?array {
+        if ( $wp_user_id <= 0 || $link_id <= 0 ) {
+            return null;
+        }
+
         return $this->db->fetchRow(
             'SELECT p.*' .
             ' FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' l' .
@@ -261,21 +416,44 @@ final class PatientRepository
     }
 
     /**
-     * Identity-bearing records require explicit Organization-level self proof.
-     * This keeps a Clinic booking-subject link useful for a dependent without
-     * silently turning it into profile or clinical-record access. Records that
-     * predate Organization identities (identity_id IS NULL) retain their
-     * explicit legacy clinical link for backwards compatibility.
+     * Every patient binding in Clinic/Booking flows must be backed by an active
+     * `cpms_patient_logins` account and an active `two_factor`-verified binding.
+     */
+    private function booking_access_binding_predicate(): string {
+        $logins = $this->db->table( 'cpms_patient_logins' );
+
+        return ' AND EXISTS ('
+            . ' SELECT 1 FROM ' . $logins . ' plb'
+            . ' INNER JOIN ' . $logins . ' pla'
+            . ' ON pla.wp_user_id = plb.wp_user_id'
+            . " AND pla.kind = 'account'"
+            . " AND pla.state = 'active'"
+            . ' WHERE plb.wp_user_id = l.wp_user_id'
+            . ' AND plb.clinic_id = l.clinic_id'
+            . ' AND plb.patient_id = l.patient_id'
+            . " AND plb.kind = 'binding'"
+            . " AND plb.state = 'active'"
+            . ' AND plb.verified_at IS NOT NULL'
+            . " AND plb.verification_method = 'two_factor'"
+            . ')';
+    }
+
+    /**
+     * Clinical/profile access requires BOTH an active Organization-level
+     * identity edge (no `p.identity_id IS NULL` bypass — P3) AND an active
+     * `two_factor`-verified `cpms_patient_logins` binding.
      */
     private function clinical_access_identity_predicate(): string {
-        return ' AND (p.identity_id IS NULL OR EXISTS ('
+        return ' AND p.identity_id IS NOT NULL'
+            . ' AND EXISTS ('
             . ' SELECT 1 FROM ' . $this->db->table( 'cpms_patient_identity_links' ) . ' pil'
             . ' INNER JOIN ' . $this->db->table( 'cpms_patient_identities' ) . ' pi'
             . ' ON pi.id = pil.identity_id AND pi.organization_id = pil.organization_id'
             . ' WHERE pil.identity_id = p.identity_id'
             . ' AND pil.wp_user_id = l.wp_user_id'
             . ' AND pil.organization_id = c.organization_id'
-            . '))';
+            . ')'
+            . $this->booking_access_binding_predicate();
     }
 
     /**

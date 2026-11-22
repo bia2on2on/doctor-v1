@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Rest;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Clinical\ClinicalException;
 use ClinicCore\Application\Clinical\ClinicalService;
 use ClinicCore\Auth\RolesAndCapabilities;
@@ -26,8 +27,14 @@ use WP_REST_Server;
  */
 final class ClinicalController extends RestBase
 {
-    public function __construct(private readonly ClinicalService $clinical)
-    {
+    public function __construct(
+        private readonly ClinicalService $clinical,
+        private readonly ?PatientAccess $patient_access = null
+    ) {
+    }
+
+    protected function patient_access(): PatientAccess {
+        return $this->patient_access ?? parent::patient_access();
     }
 
     public function register_routes(): void
@@ -171,8 +178,14 @@ final class ClinicalController extends RestBase
                     $r,
                     fn () => $this->clinical->patientVisits( $this->userId( $r ), $r['from'] ?? null, $r['to'] ?? null, isset( $r['link_id'] ) ? (int) $r['link_id'] : null )
                 ),
-                'permission_callback' => fn (WP_REST_Request $r)
-                    => $this->permAnyRole($r, [RolesAndCapabilities::ROLE_PATIENT]),
+                'permission_callback' => fn ( WP_REST_Request $r ) => $this->require_patient_access(
+                    $r,
+                    [
+                        'mode'       => PatientAccess::MODE_CLINICAL,
+                        'clinic_id'  => null,
+                        'patient_id' => null,
+                    ]
+                ),
                 'args' => [
                     'link_id' => ['required' => false, 'type' => 'integer'],
                     'from' => ['required' => false, 'type' => 'string'],
@@ -189,8 +202,14 @@ final class ClinicalController extends RestBase
                     $r,
                     fn () => $this->clinical->patientVisitDetail( $this->userId( $r ), (int) $r['id'], isset( $r['link_id'] ) ? (int) $r['link_id'] : null )
                 ),
-                'permission_callback' => fn (WP_REST_Request $r)
-                    => $this->permAnyRole($r, [RolesAndCapabilities::ROLE_PATIENT]),
+                'permission_callback' => fn ( WP_REST_Request $r ) => $this->require_patient_access(
+                    $r,
+                    [
+                        'mode'       => PatientAccess::MODE_CLINICAL,
+                        'clinic_id'  => null,
+                        'patient_id' => null,
+                    ]
+                ),
                 'args'                => ['link_id' => ['required' => false, 'type' => 'integer']],
             ],
         ]);
@@ -203,8 +222,14 @@ final class ClinicalController extends RestBase
                     $r,
                     fn () => $this->clinical->patientPrescriptions( $this->userId( $r ), isset( $r['link_id'] ) ? (int) $r['link_id'] : null )
                 ),
-                'permission_callback' => fn (WP_REST_Request $r)
-                    => $this->permAnyRole($r, [RolesAndCapabilities::ROLE_PATIENT]),
+                'permission_callback' => fn ( WP_REST_Request $r ) => $this->require_patient_access(
+                    $r,
+                    [
+                        'mode'       => PatientAccess::MODE_CLINICAL,
+                        'clinic_id'  => null,
+                        'patient_id' => null,
+                    ]
+                ),
                 'args'                => [
                     'link_id' => ['required' => false, 'type' => 'integer'],
                 ],

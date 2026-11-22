@@ -9,6 +9,7 @@ use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -74,7 +75,7 @@ final class Phase3Slice6BStaffClinicAuthorizationTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         ScopeContext::clear();
         App::resetScope();
         \ClinicCore\Application\Scope\SystemClinicResolver::flush();
@@ -800,6 +801,12 @@ final class Phase3Slice6BStaffClinicAuthorizationTest extends WP_UnitTestCase
             $now
         ));
         self::assertGreaterThan(0, (int) $wpdb->insert_id, 'precondition: patient link row');
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $wpUserId,
+            $clinicId,
+            $patientId,
+            ['seed_session_scope' => true, 'set_current_user' => false]
+        );
     }
 
     private function insertVisit(int $clinicId, int $locationId, int $clinicianId, int $patientId, string $status): int
@@ -981,7 +988,7 @@ final class Phase3Slice6BStaffClinicAuthorizationTest extends WP_UnitTestCase
      */
     private function dispatch(string $method, string $route, array $params, int $clinicId, int $userId): WP_REST_Response
     {
-        wp_set_current_user($userId);
+        PatientTwoProofTestHelper::acting_as($userId);
         $request = new WP_REST_Request($method, $route);
         foreach ($params as $key => $value) {
             $request->set_param($key, $value);
@@ -1012,6 +1019,7 @@ final class Phase3Slice6BStaffClinicAuthorizationTest extends WP_UnitTestCase
             'cpms_schedule_slots',
             'cpms_schedule',
             'cpms_clinicians',
+            'cpms_patient_logins',
             'cpms_patient_user_links',
             'cpms_patients',
             'cpms_clinic_memberships',
@@ -1020,6 +1028,8 @@ final class Phase3Slice6BStaffClinicAuthorizationTest extends WP_UnitTestCase
             $wpdb->query('DELETE t FROM ' . $wpdb->prefix . $table . ' t
                           WHERE t.clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org . ')'); // phpcs:ignore
         }
+        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_patient_identity_links WHERE organization_id = ' . $org); // phpcs:ignore
+        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_patient_identities WHERE organization_id = ' . $org); // phpcs:ignore
         $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org); // phpcs:ignore
         $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_organizations WHERE id = ' . $org); // phpcs:ignore
     }
