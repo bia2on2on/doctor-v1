@@ -49,7 +49,7 @@ final class PatientOtpLogin {
 				</div>
 				<p class="cpms-pp-login__status" data-role="patient-otp-status" role="status" aria-live="polite" hidden></p>
 			</form>
-			<p class="cpms-pp-login__scope-hint">در نصب چند-Clinic، برای تعیین مرکز از مسیر رزرو و انتخاب یک نوبت اقدام کنید؛ این صفحه Clinic را از ورودی مرورگر نمی‌پذیرد.</p>
+			<p class="cpms-pp-login__scope-hint">پس از ورود با کد یک‌بارمصرف، در پورتال مرکز درمانی و کد ملی خود را برای مشاهدهٔ پرونده تأیید کنید.</p>
 			<script type="application/json" class="cpms-patient-portal__auth-config"><?php echo $json; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- JSON encoded with script-safe HEX flags. ?></script>
 		</section>
 		<?php

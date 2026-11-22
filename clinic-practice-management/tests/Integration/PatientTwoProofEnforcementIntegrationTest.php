@@ -738,29 +738,46 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
         // Control 1: non-NID update via updateMe() leaves active binding and session intact.
         $updatedName = App::patientService()->updateMe( $this->patientUserA, [ 'first_name' => 'NoClosure' ] );
         self::assertSame( 'NoClosure', $updatedName['first_name'] ?? null );
+        self::assertArrayNotHasKey( 'national_id', $updatedName, 'P2: national_id must not be projected by updateMe().' );
         self::assertNotNull( $logins->find_binding( $this->patientUserA, $this->clinicA, $this->patientA, true ) );
         self::assertIsArray( WP_Session_Tokens::get_instance( $this->patientUserA )->get( $token ) );
         self::assertSame( PatientAccess::LEVEL_FULL, App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 5, $token ) );
 
-        // Control 2: duplicate-NID rejection in updateMe() leaves active binding and session intact.
+        // Control 2 (P2): national_id is removed from ME_EDITABLE — NID-only updateMe() fails
+        // with generic empty-fields validation (no duplicate-NID oracle), and mixed payload
+        // ignores national_id without mutating DB or closing bindings.
         $this->insertPatient( $this->clinicA, 'MR-DUP-' . uniqid(), '09128880099', '0070000001' );
         try {
             App::patientService()->updateMe( $this->patientUserA, [ 'national_id' => '0070000001' ] );
-            self::fail( 'Duplicate national_id in updateMe() must fail.' );
+            self::fail( 'NID-only updateMe() must fail with no editable fields.' );
         } catch ( BookingException $e ) {
             self::assertSame( 'CLINIC_VALIDATION_FAILED', $e->errorCode );
         }
+        $mixedRes = App::patientService()->updateMe( $this->patientUserA, [
+            'first_name'  => 'NoOracle',
+            'national_id' => '0070000001',
+        ] );
+        self::assertSame( 'NoOracle', $mixedRes['first_name'] ?? null );
+        self::assertArrayNotHasKey( 'national_id', $mixedRes );
+        self::assertSame( self::NID_A, (string) App::db()->fetchValue( 'SELECT national_id FROM ' . App::db()->table( 'cpms_patients' ) . ' WHERE id = %d', [ $this->patientA ] ) );
         self::assertNotNull( $logins->find_binding( $this->patientUserA, $this->clinicA, $this->patientA, true ) );
         self::assertIsArray( WP_Session_Tokens::get_instance( $this->patientUserA )->get( $token ) );
 
-        // Positive closure: changing national_id via updateMe() closes binding and destroys sessions post-commit.
-        App::patientService()->updateMe( $this->patientUserA, [ 'national_id' => '0080000002' ] );
+        // Positive closure: staff changing national_id via PatientService::update() closes binding and destroys sessions post-commit.
+        cpms_test_seed_membership( $this->staffDocUser, $this->clinicA, RolesAndCapabilities::ROLE_DOCTOR );
+        App::replaceExplicitScope( ClinicScope::forClinic( $this->clinicA, $this->locationA ) );
+        try {
+            $staffUpdated = App::patientService()->update( $this->patientA, [ 'national_id' => '0080000002' ], $this->staffDocUser );
+        } finally {
+            App::resetScope();
+        }
+        self::assertArrayNotHasKey( 'national_id', $staffUpdated, 'P2: staffView must not project national_id.' );
         self::assertNull( $logins->find_binding( $this->patientUserA, $this->clinicA, $this->patientA, true ) );
         $closedBinding = $logins->find_binding( $this->patientUserA, $this->clinicA, $this->patientA, false );
         self::assertIsArray( $closedBinding );
         self::assertSame( PatientLoginRepository::STATE_CLOSED, $closedBinding['state'] );
         self::assertNull( $closedBinding['live_key'] );
-        self::assertNull( WP_Session_Tokens::get_instance( $this->patientUserA )->get( $token ), 'Patient sessions must be destroyed after updateMe() NID change.' );
+        self::assertNull( WP_Session_Tokens::get_instance( $this->patientUserA )->get( $token ), 'Patient sessions must be destroyed after staff NID change.' );
         self::assertSame( PatientAccess::LEVEL_NONE, App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 5, $token ) );
     }
 
@@ -1415,8 +1432,8 @@ final class PatientTwoProofEnforcementIntegrationTest extends WP_UnitTestCase {
             $meResp = rest_do_request( $meReq );
             self::assertSame( 200, $meResp->get_status(), (string) wp_json_encode( $meResp->get_data() ) );
             self::assertSame( $this->patientA, (int) ( $meResp->get_data()['data']['id'] ?? 0 ) );
-            // Note: `/patient/me` still returns `national_id` per deferred blocker D2 (A9);
-            // link-record, SMS, audit, and operational logs must never leak NID.
+            self::assertArrayNotHasKey( 'national_id', $meResp->get_data()['data'] ?? [], 'P2: /patient/me must never project national_id.' );
+            self::assertStringNotContainsString( self::NID_A, (string) wp_json_encode( $meResp->get_data() ) );
             $auditLogs = App::db()->fetchAll( 'SELECT action, meta_json FROM ' . App::db()->table( 'cpms_audit_logs' ) );
             self::assertStringNotContainsString( self::NID_A, (string) wp_json_encode( $auditLogs ) );
 

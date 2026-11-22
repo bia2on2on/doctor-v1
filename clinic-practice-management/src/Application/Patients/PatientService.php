@@ -35,7 +35,7 @@ final class PatientService
      */
     public const ME_EDITABLE = [
         'first_name', 'last_name', 'birth_date', 'gender', 'address', 'phone',
-        'national_id', 'emergency_contact_name', 'emergency_contact_phone',
+        'emergency_contact_name', 'emergency_contact_phone',
     ];
 
     /**
@@ -569,6 +569,13 @@ final class PatientService
             throw new BookingException( 'CLINIC_VALIDATION_FAILED', 'فیلدی برای ویرایش ارسال نشده است' );
         }
 
+        if ( isset( $data['national_id'] ) ) {
+            $other = $this->patients->find_by_national_id( (int) $current['clinic_id'], (string) $data['national_id'] );
+            if ( $other !== null && (int) $other['id'] !== $patient_id ) {
+                throw new BookingException( 'CLINIC_VALIDATION_FAILED', 'این کد ملی متعلق به بیمار دیگری است' );
+            }
+        }
+
         $close_bindings         = ( array_key_exists( 'national_id', $data )
                 && (string) ( $data['national_id'] ?? '' ) !== (string) ( $current['national_id'] ?? '' ) )
             || ( isset( $data['status'] ) && 'archived' === (string) $data['status'] );
@@ -578,6 +585,7 @@ final class PatientService
         $this->db->transactional(
             function () use ( $patient_id, $data, $current, $actor_user_id, $close_bindings, &$affected_binding_users ) {
                 $this->patients->update( $patient_id, $data + [ 'updated_at' => $this->db->nowUtcSql() ] );
+                $this->assert_profile_write_succeeded( $current, $data );
                 if ( $close_bindings ) {
                     $login_repo = new PatientLoginRepository( $this->db );
                     if ( $login_repo->table_exists() ) {
@@ -861,7 +869,6 @@ final class PatientService
             'first_name' => (string) $row['first_name'],
             'last_name' => (string) $row['last_name'],
             'mobile' => (string) $row['mobile'],
-            'national_id' => $row['national_id'] !== null ? (string) $row['national_id'] : null,
             'birth_date' => $row['birth_date'] !== null ? (string) $row['birth_date'] : null,
             'gender' => (string) $row['gender'],
             'address' => $row['address'] !== null ? (string) $row['address'] : null,
