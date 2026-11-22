@@ -582,7 +582,10 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
         self::assertIsArray( $failAudit );
         self::assertSame( $this->userPending, (int) ( $failAudit['actor_wp_user_id'] ?? 0 ) );
         $afterDecoded = json_decode( (string) ( $failAudit['after_json'] ?? '' ), true );
-        self::assertSame( [ 'purpose' => 'login', 'reason' => 'session_token_empty' ], $afterDecoded );
+        self::assertIsArray( $afterDecoded );
+        self::assertCount( 2, $afterDecoded );
+        self::assertSame( 'login', $afterDecoded['purpose'] ?? null );
+        self::assertSame( 'session_token_empty', $afterDecoded['reason'] ?? null );
         self::assertNull( $failAudit['meta_json'] );
         $auditDump = (string) wp_json_encode( $failAudit, JSON_UNESCAPED_UNICODE );
         self::assertStringNotContainsString( substr( self::MOBILE_PENDING, -4 ), $auditDump );
@@ -624,11 +627,18 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
         // Seam 2: WP_User_Meta_Session_Tokens subclass lets create() persist a real token,
         // rejects recording `cpms_mobile_proofs` so get_live_session() returns null (record_mobile_proof() === false),
         // and delegates destroy() to parent so we verify OtpService destroys the half-issued session.
+        if ( ! class_exists( \WP_User_Meta_Session_Tokens::class ) ) {
+            require_once ABSPATH . WPINC . '/class-wp-user-meta-session-tokens.php';
+        }
         $failingManager = new class( 0 ) extends \WP_User_Meta_Session_Tokens {
             public static bool $simulatePersistFailure = false;
             public static int $createCount             = 0;
             public static int $proofAttemptCount       = 0;
             public static int $destroyCount            = 0;
+
+            public function __construct( int $user_id ) {
+                parent::__construct( $user_id );
+            }
 
             public static function resetCounters(): void {
                 self::$simulatePersistFailure = false;
@@ -701,7 +711,10 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
         self::assertIsArray( $failAudit );
         self::assertSame( $this->userPending, (int) ( $failAudit['actor_wp_user_id'] ?? 0 ) );
         $afterDecoded = json_decode( (string) ( $failAudit['after_json'] ?? '' ), true );
-        self::assertSame( [ 'purpose' => 'login', 'reason' => 'mobile_proof_persist_failed' ], $afterDecoded );
+        self::assertIsArray( $afterDecoded );
+        self::assertCount( 2, $afterDecoded );
+        self::assertSame( 'login', $afterDecoded['purpose'] ?? null );
+        self::assertSame( 'mobile_proof_persist_failed', $afterDecoded['reason'] ?? null );
         self::assertNull( $failAudit['meta_json'] );
         $auditDump = (string) wp_json_encode( $failAudit, JSON_UNESCAPED_UNICODE );
         self::assertStringNotContainsString( substr( self::MOBILE_PENDING, -4 ), $auditDump );
