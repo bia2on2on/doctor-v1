@@ -68,7 +68,7 @@ final class CorrelationIdTest extends TestCase
 
         $this->assertTrue(CorrelationId::isValid('123456789'));
         $this->assertSame('123456789', CorrelationId::fromHeader('123456789'));
-        $uuid = '550e8400-e29b-41d4-a716-446655440000';
+        $uuid = '550e8400-e29b-41d4-a716-4466554400aa';
         $this->assertTrue(CorrelationId::isValid($uuid));
         $this->assertSame($uuid, CorrelationId::fromHeader($uuid));
     }
