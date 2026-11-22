@@ -933,7 +933,8 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
         $closedBinding = $logins->find_binding( $this->userPending, $this->clinicA, $this->patientPending, false );
         self::assertIsArray( $closedBinding );
         self::assertSame( PatientLoginRepository::STATE_CLOSED, $closedBinding['state'] ?? null );
-        self::assertNull( $closedBinding['live_key'] ?? 'not-null' );
+        self::assertArrayHasKey( 'live_key', $closedBinding );
+        self::assertNull( $closedBinding['live_key'] );
         self::assertNull( WP_Session_Tokens::get_instance( $this->userPending )->get( $tokenTarget ), 'Target WP session token must be destroyed after staff archive.' );
         self::assertSame( [], WP_Session_Tokens::get_instance( $this->userPending )->get_all(), 'Target user must have zero surviving sessions.' );
         self::assertSame( PatientAccess::LEVEL_NONE, App::patient_access()->level( $this->userPending, $this->patientPending, $this->clinicA, time(), $tokenTarget ) );
