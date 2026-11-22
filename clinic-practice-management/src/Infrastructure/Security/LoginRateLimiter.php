@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Infrastructure\Security;
 
+use ClinicCore\Application\Auth\PatientNidHmac;
 use ClinicCore\Application\Backup\RestoreBarrierGate;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 
@@ -20,8 +21,13 @@ use ClinicCore\Infrastructure\Logging\OpLogger;
  *    توزیع‌نشده را می‌گیرد، دومی Credential Stuffing روی یک حساب را از
  *    چند IP کند می‌کند.
  *  - فقط تلاش‌های **ناموفق** شمرده می‌شوند، پس ورود عادی هرگز قفل نمی‌شود.
- *  - وقتی سقف پر شود، `authenticate` یک WP_Error برمی‌گرداند و WordPress
- *    هرگز به مقایسهٔ رمز نمی‌رسد.
+ *  - سقف در **اولویت ۱۰۰** — پس از هندلرهای اصلی هستهٔ WordPress (۲۰)
+ *    و پیش از گیتِ بازیابی (PHP_INT_MAX) — اجرا می‌شود، نه پیش از
+ *    مقایسهٔ رمز. هستهٔ WordPress با اعتبارنامهٔ غیرتهی هر خطای ورودی را
+ *    بازنویسی می‌کند؛ بنابراین تذکر `authenticate` در اولویت ۵ نمی‌توانست
+ *    سقف را تحمیل کند. در اولویت دیرهنگام، نتیجهٔ نهایی (WP_User و
+ *    WP_Error) با `CLINIC_RATE_LIMITED` جایگزین می‌شود تا رمز درست نیز
+ *    به سقف نرسد و پاسخ حساب موجود و ناموجود یکسان بماند.
  *  - پیام خطا عمداً یکسان و بدون افشای وجود/عدم وجود حساب است
  *    (مقاومت در برابر Enumeration).
  *  - IP از ClientIp می‌آید، پس `X-Forwarded-For` فقط با اعلام صریح
@@ -50,13 +56,17 @@ final class LoginRateLimiter
 
     public function register(): void
     {
-        // اولویت 5: پیش از wp_authenticate_username_password (20).
-        add_filter('authenticate', [$this, 'blockWhenThrottled'], 5, 3);
+        // اولویت 100: پس از هندلرهای هسته (20 و 30 و spam-check 99) و پیش از
+        // گیتِ بازیابی (PHP_INT_MAX) — تصمیم نهایی محدودیت است.
+        add_filter('authenticate', [$this, 'blockWhenThrottled'], 100, 3);
         add_action( 'wp_login_failed', [ $this, 'recordFailure' ], 10, 2 );
     }
 
     /**
-     * پیش از هر بررسی رمز، وضعیت محدودیت را کنترل می‌کند.
+     * در پایان زنجیرهٔ `authenticate` (پس از هندلرهای هسته)، وضعیت
+     * محدودیت را کنترل می‌کند؛ اگر سبد در سقف یا بالاتر باشد، نتیجهٔ
+     * نهایی — چه WP_User و چه WP_Error — با `CLINIC_RATE_LIMITED`
+     * جایگزین می‌شود.
      *
      * @param \WP_User|\WP_Error|null $user
      *
@@ -69,8 +79,10 @@ final class LoginRateLimiter
             return $user;
         }
 
-        // Core's password callback checks the canonical recovery account under the barrier.
-        if ( RestoreBarrierGate::blocked() || ! $this->is_login_throttled( $username ) ) {
+        // گیتِ بازیابی (PHP_INT_MAX) پس از این فیلتر دوباره هر نتیجه‌ای را
+        // — شامل خطای محدودیت — دریافت می‌کند و یا آن را حفظ یا همان را
+        // جایگزین می‌کند؛ هیچ‌یک از دو گیت نمی‌تواند دیگری را باز کند.
+        if ( ! $this->is_login_throttled( $username ) ) {
             return $user;
         }
         $this->record( 'LOGIN_THROTTLED', $username, ClientIp::resolve() );
@@ -108,14 +120,18 @@ final class LoginRateLimiter
 
     private function count_failure( string $username ): void {
         $ip = ClientIp::resolve();
-        if ($ip !== null) {
-            $this->rate->hit('login-ip:' . $ip, self::MAX_PER_IP, self::WINDOW_SEC);
+        // تلاش ردشده در سقفی که به آن رسیده یا از آن گذشته است، آن سبد را
+        // بیشتر نمی‌افزاید: شمارندهٔ هر سبد ≤ سقف (IP ≤ ۲۰، نام کاربری ≤ ۱۰)
+        // و با چرخش پنجرهٔ ۹۰۰ ثانیه‌ای باز می‌شود — قفل کاربر قانونی هرگز
+        // نامحدود رشد نمی‌کند.
+        if ( $ip !== null && ! $this->isOver( 'login-ip:' . $ip, self::MAX_PER_IP ) ) {
+            $this->rate->hit( 'login-ip:' . $ip, self::MAX_PER_IP, self::WINDOW_SEC );
         }
-        if ($username !== '') {
-            $this->rate->hit('login-user:' . $this->userKey($username), self::MAX_PER_USERNAME, self::WINDOW_SEC);
+        if ( $username !== '' && ! $this->isOver( 'login-user:' . $this->userKey( $username ), self::MAX_PER_USERNAME ) ) {
+            $this->rate->hit( 'login-user:' . $this->userKey( $username ), self::MAX_PER_USERNAME, self::WINDOW_SEC );
         }
 
-        $this->record('LOGIN_FAILED', $username, $ip);
+        $this->record( 'LOGIN_FAILED', $username, $ip );
     }
 
     /**
@@ -130,12 +146,50 @@ final class LoginRateLimiter
     }
 
     /**
-     * نام کاربری هرگز خام وارد کلید نمی‌شود: طول کلید محدود است و نام
-     * کاربری نباید در جدول Rate Limit ذخیره شود.
+     * نام کاربری هرگز خام وارد کلید نمی‌شود: کلید هش HMAC زده شده با کلید
+     * موجود HMAC (ثابت CPMS_NID_HMAC_KEY یا Option بدون autoload) و با
+     * پیشوند `login-user:` جدا می‌شود، بنابراین هیچ کلید نام کاربری‌ای با
+     * کلید `nid:` یکسان یا برابر نیست.
      */
-    private function userKey(string $username): string
-    {
-        return substr(hash('sha256', strtolower(trim($username))), 0, 32);
+    private function userKey( string $username ): string {
+        return substr(
+            hash_hmac( 'sha256', 'login-user:' . strtolower( trim( $username ) ), $this->hmacKey() ),
+            0,
+            32
+        );
+    }
+
+    /**
+     * کلید HMAC موجود — همان منبع `PatientNidHmac`: ثابت `CPMS_NID_HMAC_KEY`
+     * اگر تعریف شده و غیرتهی باشد، در غیر این صورت Option بدون Autoload با
+     * همان نام (ساخته‌شده یک‌بار با random_bytes). هیچ Option یا Constant جدیدی
+     * اضافه نمی‌کند.
+     */
+    private function hmacKey(): string {
+        if ( defined( PatientNidHmac::CONST_KEY ) ) {
+            $constant = constant( PatientNidHmac::CONST_KEY );
+            if ( is_string( $constant ) && '' !== $constant ) {
+                return $constant;
+            }
+        }
+
+        $existing = get_option( PatientNidHmac::OPTION_KEY, '' );
+        if ( is_string( $existing ) && '' !== $existing ) {
+            return $existing;
+        }
+
+        if ( function_exists( 'add_option' ) ) {
+            $generated = bin2hex( random_bytes( 32 ) );
+            if ( add_option( PatientNidHmac::OPTION_KEY, $generated, '', 'no' ) ) {
+                return $generated;
+            }
+            $reread = get_option( PatientNidHmac::OPTION_KEY, '' );
+            if ( is_string( $reread ) && '' !== $reread ) {
+                return $reread;
+            }
+        }
+
+        throw new \RuntimeException( 'Failed to persist HMAC key' );
     }
 
     /**

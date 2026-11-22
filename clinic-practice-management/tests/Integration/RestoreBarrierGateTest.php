@@ -279,19 +279,28 @@ final class RestoreBarrierGateTest extends WP_UnitTestCase {
             self::assertSame(1, $wpdb->update($wpdb->users, ['user_pass' => $legacy_hash], ['ID' => $user->ID]));
             clean_user_cache($user);
         }
-        $bucket = static fn (\WP_User $user): string => 'login-user:' . substr(hash('sha256', strtolower($user->user_login)), 0, 32);
+        // The throttle key is `login-user:` + the first 32 hex chars of the
+        // HMAC-SHA256 over the normalized login, keyed by the same HMAC key the
+        // plugin uses (CPMS_NID_HMAC_KEY constant else cpms_nid_hmac_key option).
+        $bucket = static function (\WP_User $user): string {
+            $key = (defined(\ClinicCore\Application\Auth\PatientNidHmac::CONST_KEY)
+                && '' !== constant(\ClinicCore\Application\Auth\PatientNidHmac::CONST_KEY))
+                ? constant(\ClinicCore\Application\Auth\PatientNidHmac::CONST_KEY)
+                : get_option(\ClinicCore\Application\Auth\PatientNidHmac::OPTION_KEY, '');
+            return 'login-user:' . substr(hash_hmac('sha256', 'login-user:' . strtolower(trim($user->user_login)), $key), 0, 32);
+        };
         $marks = static fn (): array => [
             $rate->peek($bucket($manager), $limiter::WINDOW_SEC),
             $rate->peek($bucket($patient), $limiter::WINDOW_SEC),
             (int) $db->fetchValue('SELECT COUNT(*) FROM %i WHERE message = %s', [$db->table('operational_logs'), 'LOGIN_FAILED']),
         ];
         $manager_hash = static fn (): string => (string) $db->fetchValue('SELECT user_pass FROM %i WHERE ID = %d', [$wpdb->users, $manager->ID]);
-        $rate_pattern = '/\A' . preg_quote('INSERT INTO ' . $db->table('rate_limits') . ' (window_key, window_id, window_sec, hits)', '/')
+        $rate_pattern = static fn (): string => '/\A' . preg_quote('INSERT INTO ' . $db->table('rate_limits') . ' (window_key, window_id, window_sec, hits)', '/')
             . '\s+VALUES \(\'' . preg_quote($bucket($manager), '/') . '\', [0-9]+, 900, 1\)\s+ON DUPLICATE KEY UPDATE\s+window_sec = VALUES\(window_sec\),\s+hits = hits \+ 1\z/';
         $hash_pattern = '/\AUPDATE `' . preg_quote($wpdb->users, '/') . "` SET `user_pass` = '[^']+', `user_activation_key` = '' WHERE `ID` = " . $manager->ID . '\z/';
         $hits = ['rate' => 0, 'hash' => 0];
         $watch = static function (string $sql) use ($rate_pattern, $hash_pattern, &$hits): string {
-            if (preg_match($rate_pattern, $sql) === 1) {
+            if (preg_match($rate_pattern(), $sql) === 1) {
                 ++$hits['rate'];
             }
             if (preg_match($hash_pattern, $sql) === 1) {
