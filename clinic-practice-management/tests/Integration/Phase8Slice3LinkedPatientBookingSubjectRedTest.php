@@ -1845,6 +1845,8 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
     public function testUiChooserOriginalFiltersExcludeProvedDecoysWithPositiveWitnesses(): void
     {
         $this->buildTwoClinicFixture();
+        App::settingsFactory()->forClinic($this->clinicB)->set('public.listing_opt_in', true);
+        Settings::flushCache();
 
         $patientA1 = $this->insertPatient($this->clinicA, $this->mobileFor('f3w-a1'), 'Witness', 'Alpha');
         $patientA2 = $this->insertPatient($this->clinicA, $this->mobileFor('f3w-a2'), 'Witness', 'Beta');
