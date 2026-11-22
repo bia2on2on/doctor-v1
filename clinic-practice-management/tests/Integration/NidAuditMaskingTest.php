@@ -330,4 +330,37 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
             unlink($temporaryLog);
         }
     }
+
+    public function testOpLogRedactsNidInContextKeysNestedKeysAndCollisions(): void
+    {
+        App::op()->warning(
+            'B0_PR3_KEY_REDACT',
+            [
+                'nid_' . self::NID_ASCII   => 'v1',
+                'nid_' . self::NID_PERSIAN => 'v2',
+                'nested'                   => [
+                    'inner_' . self::NID_ARABIC => 'nested_val',
+                ],
+                'reason'                   => 'ok',
+            ]
+        );
+
+        $row = App::db()->fetchRow(
+            'SELECT context_json FROM ' . App::db()->table('cpms_operational_logs')
+            . ' WHERE message = %s ORDER BY id DESC LIMIT 1',
+            ['B0_PR3_KEY_REDACT']
+        );
+        $this->assertIsArray($row, 'operational log row is persisted');
+        $raw = (string) $row['context_json'];
+        $this->assertStringNotContainsString(self::NID_ASCII, $raw);
+        $this->assertStringNotContainsString(self::NID_PERSIAN, $raw);
+        $this->assertStringNotContainsString(self::NID_ARABIC, $raw);
+
+        $ctx = json_decode($raw, true);
+        $this->assertIsArray($ctx);
+        $this->assertSame('v1', $ctx['nid_[nid-redacted]'] ?? null);
+        $this->assertSame('v2', $ctx['nid_[nid-redacted]~2'] ?? null);
+        $this->assertSame('nested_val', $ctx['nested']['inner_[nid-redacted]'] ?? null);
+        $this->assertSame('ok', $ctx['reason'] ?? null);
+    }
 }
