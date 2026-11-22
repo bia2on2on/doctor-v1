@@ -382,7 +382,7 @@ final class OtpService
      *
      * @throws OtpException
      */
-    public function verify(string $rawMobile, string $code, string $purpose = self::PURPOSE_LOGIN, ?string $ip = null, ?int $expected_clinic_id = null): array
+    public function verify( string $rawMobile, string $code, string $purpose = self::PURPOSE_LOGIN, ?string $ip = null, ?int $expected_clinic_id = null ): array
     {
         $mobile = MobileValidator::normalize($rawMobile);
         if ($mobile === null || !preg_match('/^\d{6}$/', $code)) {

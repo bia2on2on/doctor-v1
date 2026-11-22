@@ -221,9 +221,9 @@ final class PatientRegistrationService {
                             [ $clinic_id, $mobile ]
                         );
 
-                        $now_sql     = $this->db->nowUtcSql();
-                        $is_new_row  = false;
-                        $patient_id  = 0;
+                        $now_sql    = $this->db->nowUtcSql();
+                        $is_new_row = false;
+                        $patient_id = 0;
 
                         if ( [] === $patient_rows ) {
                             // Case A: Create new clinical record in this clinic.

@@ -152,8 +152,9 @@ final class PatientOtpLogin {
 				. " WHERE c.status = 'active' AND o.status = 'active'"
 				. ' ORDER BY c.id ASC LIMIT 50'
 			);
-			$directory   = new PublicClinicDirectory();
-			$opted_in    = array();
+
+			$directory = new PublicClinicDirectory();
+			$opted_in  = array();
 			foreach ( $rows as $row ) {
 				$id   = (int) ( $row['id'] ?? 0 );
 				$name = trim( (string) ( $row['name'] ?? '' ) );

@@ -47,6 +47,7 @@ final class OtpController extends RestBase
                     'slot_id' => ['required' => false, 'type' => 'integer'],
                     'slot_date' => ['required' => false, 'type' => 'string'],
                     'slot_time' => ['required' => false, 'type' => 'string'],
+
                     'clinic_id' => ['required' => false, 'type' => 'integer'],
                 ],
             ],
@@ -291,8 +292,7 @@ final class OtpController extends RestBase
         return $value !== null && $value !== '';
     }
 
-    private function isTrustedPublicRegistrationClinic( int $clinic_id ): bool
-    {
+    private function isTrustedPublicRegistrationClinic( int $clinic_id ): bool {
         if ( $clinic_id <= 0 ) {
             return false;
         }

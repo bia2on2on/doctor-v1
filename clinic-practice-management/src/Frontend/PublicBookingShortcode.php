@@ -150,9 +150,10 @@ final class PublicBookingShortcode
      */
     private const OTP_REQUEST_PATH = '/otp/request';
     private const OTP_VERIFY_PATH = '/otp/verify';
-    private const REGISTER_PATH = '/patient/register';
     private const HOLD_PATH = '/booking/hold';
     private const CONFIRM_PATH = '/booking/confirm';
+
+    private const REGISTER_PATH = '/patient/register';
 
     private const CONTINUATION_ANONYMOUS = 'anonymous';
     private const CONTINUATION_PATIENT = 'patient';

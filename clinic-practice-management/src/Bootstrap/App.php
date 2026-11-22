@@ -210,8 +210,9 @@ final class App
     private static ?LicenseGate $licenseGate = null;
     private static ?VisitService $visitService = null;
     private static ?PatientSessionScope $patient_session_scope = null;
-    private static ?PatientCredentialGuard $patient_credential_guard = null;
     private static bool $booted = false;
+
+    private static ?PatientCredentialGuard $patient_credential_guard = null;
 
     /**
      * N1 — نتیجهٔ پیش‌بررسیِ موتورِ دیتابیس (memoized در هر درخواست؛ موتور
