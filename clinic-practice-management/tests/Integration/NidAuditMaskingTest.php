@@ -108,6 +108,31 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
         $this->assertSame('خیابان 13', $after['address']);
     }
 
+    public function testAuditPhoneKeepsLegacyTailMaskUnlessValueIsNidShaped(): void
+    {
+        App::audit()->log(
+            'B0_PR3_PHONE_AUDIT',
+            ['wp_user_id' => 1, 'role' => 'system'],
+            'test_resource',
+            3,
+            null,
+            ['phone' => '02100000000'],
+            ['phone' => self::NID_ASCII]
+        );
+
+        $row = App::db()->fetchRow(
+            'SELECT before_json, after_json FROM ' . App::db()->table('cpms_audit_logs')
+            . ' WHERE action = %s ORDER BY id DESC LIMIT 1',
+            ['B0_PR3_PHONE_AUDIT']
+        );
+        $this->assertIsArray($row, 'phone audit row is persisted');
+        $before = json_decode((string) $row['before_json'], true);
+        $after = json_decode((string) $row['after_json'], true);
+
+        $this->assertSame('***0000', $before['phone'], 'ordinary eleven-digit phone retains the legacy tail mask');
+        $this->assertSame('[nid-redacted]', $after['phone'], 'ten-digit NID-shaped phone is fully redacted');
+    }
+
     public function testOpLogChokepointRedactsNidInMessageAndContext(): void
     {
         App::op()->error(

@@ -86,6 +86,22 @@ final class NationalIdValidator
     }
 
     /**
+     * Redact exact ten-digit NID-shaped runs in structured phone fields.
+     *
+     * Longer phone-number runs are not NID-shaped and remain eligible for the
+     * legacy four-digit tail mask. All supported digit scripts are matched.
+     *
+     * @param string $value Structured phone value to scan.
+     *
+     * @return string Text with exact ten-digit runs redacted.
+     */
+    public static function redact_nid_candidates( string $value ): string {
+        $redacted = preg_replace( '/(?<![0-9۰-۹٠-٩])[0-9۰-۹٠-٩]{10}(?![0-9۰-۹٠-٩])/u', '[nid-redacted]', $value );
+
+        return $redacted ?? '';
+    }
+
+    /**
      * Redact NID digits inside arbitrary text — B0-PR3 (Audit/Log/اعلان).
      *
      * سیاست مالک: کد ملی هرگز در Audit، Log عملیاتی، متن اعلان یا کلید

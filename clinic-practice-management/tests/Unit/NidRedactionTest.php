@@ -38,6 +38,25 @@ final class NidRedactionTest extends TestCase
         $this->assertSame('A [nid-redacted] B [nid-redacted] C [nid-redacted] D', $out);
     }
 
+    public function testStructuredPhoneRedactionTargetsTenDigitRunsOnly(): void
+    {
+        $in = 'x' . self::NID_ASCII . 'y ' . self::NID_PERSIAN . ' ' . self::NID_ARABIC;
+        $this->assertSame(
+            'x[nid-redacted]y [nid-redacted] [nid-redacted]',
+            NationalIdValidator::redact_nid_candidates($in)
+        );
+        $this->assertSame(
+            '02100000000',
+            NationalIdValidator::redact_nid_candidates('02100000000'),
+            'an eleven-digit phone number is not an exact ten-digit NID candidate'
+        );
+        $this->assertSame(
+            '021[nid-redacted]x',
+            NationalIdValidator::redact_nid_candidates('021' . self::NID_ASCII . 'x'),
+            'a ten-digit run remains redacted when embedded in structured text'
+        );
+    }
+
     public function testRedactDigitsKeepsShortAndNonNidNumbers(): void
     {
         // ۹ رقمی، ۵ رقمی و ۴ رقمی کد ملی نیستند و نباید دست‌بختگان شوند.

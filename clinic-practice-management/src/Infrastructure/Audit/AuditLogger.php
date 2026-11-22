@@ -255,9 +255,12 @@ final class AuditLogger
             }
             $safe_key = NationalIdValidator::redact_digits( $key );
             if ( in_array( $key, self::MASK_KEYS, true ) && is_string( $v ) && strlen( $v ) >= 4 ) {
-                // Phone/mobile values can be misfiled NIDs too. Prefer the
-                // fail-closed digit rule over retaining even a four-digit tail.
-                $safe        = NationalIdValidator::redact_digits( $v );
+                // `phone` is a structured field: redact exact NID-shaped runs,
+                // but preserve the legacy tail mask for longer phone numbers.
+                // Other sensitive fields retain fail-closed long-run redaction.
+                $safe = $key === 'phone'
+                    ? NationalIdValidator::redact_nid_candidates( $v )
+                    : NationalIdValidator::redact_digits( $v );
                 $out[ $safe_key ] = $safe !== $v ? $safe : '***' . substr( $v, -4 );
                 continue;
             }
