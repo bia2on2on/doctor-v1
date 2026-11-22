@@ -901,9 +901,117 @@ jobs:
           fi
           echo 'bin projector tests: OK (output redirected to /tmp).'
           phpunit_status=0
-          php -d memory_limit=1G vendor/bin/phpunit --no-configuration \
+          # Hang containment (approved): the full-suite phpunit run is wrapped in
+          # `timeout --kill-after=30 780`, so a stuck suite is SIGTERMed at 780 s
+          # and SIGKILLed 810 s total — at least 4 minutes before the 20-minute
+          # job cap — and the step fails with timeout's exit codes (124/137)
+          # instead of the job being silently cancelled at the cap. Green-run
+          # exit-code handling and evidence files are byte-identical to the
+          # unwrapped invocation; the watchdog files under /tmp are extra.
+          # --debug is PHPUnit 9.6's bounded per-test trace ("Test '<Class>::<method>'
+          # started"); it adds no stdout/stderr contract changes, changes no exit
+          # code and no JUnit XML — it is what makes the hung-suite diagnostic
+          # able to name the last tests started.
+          # The background watchdog (PYWATCH) is bounded: it polls the redirected
+          # log for started/ended lines, stamps them, and at FIRE (740 s, 40 s
+          # BEFORE the wrapper sends TERM) it writes a 25-line ps snapshot and the
+          # non-Sleep MySQL processlist (literals masked, at most 20 rows) under
+          # /tmp, then exits — it cannot outlive the step: on the normal path it
+          # is killed and reaped right after phpunit returns, and on the wrapper
+          # path it has already fired and exited before TERM. It never prints.
+          python3 - /tmp/phpunit-int.log /tmp/hung-progress.tsv /tmp/hung-ps.txt /tmp/hung-processlist.tsv <<'PYWATCH' &
+          import os
+          import re
+          import subprocess
+          import sys
+          import time
+
+          LOG_PATH, PROGRESS_PATH, PS_PATH, PL_PATH = sys.argv[1:5]
+          WRAPPER_SECONDS = 780
+          LEAD_SECONDS = 40
+          FIRE_IN = WRAPPER_SECONDS - LEAD_SECONDS
+          POLL_SECONDS = 2.0
+          MAX_PROGRESS_ROWS = 4000
+          started_re = re.compile(r"^Test '(.{1,220})' started")
+          ended_re = re.compile(r"^Test '(.{1,220})' ended")
+
+          deadline = time.monotonic() + FIRE_IN
+          offset = 0
+          carry = b""
+          rows = 0
+          with open(PROGRESS_PATH, 'a', buffering=1, encoding='utf-8') as progress:
+              while time.monotonic() < deadline and rows < MAX_PROGRESS_ROWS:
+                  try:
+                      size = os.path.getsize(LOG_PATH)
+                  except OSError:
+                      size = 0
+                  if size > offset:
+                      with open(LOG_PATH, 'rb') as handle:
+                          handle.seek(offset)
+                          chunk = handle.read(min(size - offset, 1 << 20))
+                      data = carry + chunk
+                      parts = data.split(b"\n")
+                      carry = parts.pop()
+                      for raw_line in parts:
+                          line = raw_line.decode('utf-8', errors='replace').rstrip('\r')
+                          match = started_re.match(line)
+                          kind = 'start'
+                          if match is None:
+                              match = ended_re.match(line)
+                              kind = 'end'
+                          if match:
+                              progress.write(f"{time.time():.3f}\t{kind}\t{match.group(1)}\n")
+                              rows += 1
+                              if rows >= MAX_PROGRESS_ROWS:
+                                  break
+                      offset = size - len(carry)
+                  time.sleep(POLL_SECONDS)
+
+          # Fire phase (~740 s mark, 40 s before the wrapper sends TERM).
+          try:
+              result = subprocess.run(
+                  ['ps', '-eo', 'pid,ppid,etimes,stat,wchan:20,args'],
+                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15,
+              )
+              ps_lines = result.stdout.decode('utf-8', errors='replace').splitlines()[:25]
+              with open(PS_PATH, 'w', encoding='utf-8') as ps_out:
+                  for ps_line in ps_lines:
+                      ps_line = re.sub(r'--password[ =]\S*', '--password=[n]', ps_line)
+                      ps_out.write(ps_line[:400] + '\n')
+          except Exception:
+              open(PS_PATH, 'w', encoding='utf-8').close()
+
+          try:
+              mysql = subprocess.run(
+                  ['timeout', '20', 'mysql', '--protocol=TCP', '--host=127.0.0.1',
+                   '--port=3306', '--user=root', '--password=root', '--batch',
+                   '--skip-column-names', '-e', 'SHOW FULL PROCESSLIST'],
+                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=25,
+              )
+              masked = []
+              for raw_row in mysql.stdout.decode('utf-8', errors='replace').splitlines():
+                  fields = raw_row.split('\t')
+                  if len(fields) >= 5 and fields[4].strip().lower() == 'sleep':
+                      continue
+                  row_text = ' | '.join(field[:160] for field in fields)
+                  row_text = re.sub(r"'[^']*'", "'?'", row_text)
+                  row_text = re.sub(r'0x[0-9a-fA-F]+', '[hex]', row_text)
+                  row_text = re.sub(r'\d{10,}', '[n]', row_text)
+                  masked.append(row_text[:300])
+                  if len(masked) >= 20:
+                      break
+              with open(PL_PATH, 'w', encoding='utf-8') as pl_out:
+                  pl_out.write('\n'.join(masked) + ('\n' if masked else ''))
+          except Exception:
+              open(PL_PATH, 'w', encoding='utf-8').close()
+          sys.exit(0)
+          PYWATCH
+          watchdog_pid=$!
+          timeout --kill-after=30 780 php -d memory_limit=1G vendor/bin/phpunit --no-configuration --debug \
             --log-junit /tmp/phpunit-int-junit.xml \
             --bootstrap tests/integration-bootstrap.php tests/Integration > /tmp/phpunit-int.log 2>&1 || phpunit_status=$?
+          kill "$watchdog_pid" 2>/dev/null || true
+          wait "$watchdog_pid" 2>/dev/null || true
           # Narrow sanitized diagnostics for the FULL suite, mirrored onto the PR
           # because raw job logs are publicly reachable. Published facts are
           # bounded and non-sensitive only: PHPUnit exit code, test/assertion
@@ -945,6 +1053,150 @@ jobs:
         continue-on-error: true
         working-directory: ${{ github.workspace }}
         run: python3 clinic-practice-management/bin/phpunit-failure-text.py /tmp/phpunit-int-junit.xml
+
+      # Hang visibility (approved): when step 24's timeout wrapper or the
+      # watchdog fires — i.e. the suite never reaches a terminal summary —
+      # name the last tests that started and attach the bounded process and
+      # processlist snapshots so a hung/red Integration job is actionable
+      # instead of silent. This step reads only the files step 24 wrote
+      # under /tmp, prints a sanitized tail (last 80 lines) and emits at most
+      # three ::error annotations (<= 1380 chars each; '%' escaped to %25;
+      # lines joined with %0A): (1) the last 8 started tests with elapsed
+      # seconds (from the timestamped progress file; 'running' when the test
+      # never ended), (2) the 25-line process snapshot, (3) the non-Sleep
+      # processlist rows (literals masked, <= 20 rows). 10+-digit runs
+      # (ASCII, Persian U+06F0-U+06F9 and Arabic-Indic U+0660-U+0669) become
+      # [n]; URLs become [url]; lines are capped at 300 chars. A completed
+      # suite (any terminal summary, pass or fail) makes this step print and
+      # emit NOTHING, and it always exits 0 — it never fails the job.
+      - name: Diagnose last Integration tests started if the suite did not finish
+        if: always()
+        run: |
+          python3 - /tmp/phpunit-int.log /tmp/hung-progress.tsv /tmp/hung-ps.txt /tmp/hung-processlist.tsv <<'PYEOF'
+          import re
+          import sys
+          import time
+
+          LOG_PATH, PROGRESS_PATH, PS_PATH, PL_PATH = sys.argv[1:5]
+          TERMINAL = re.compile(r'^(OK \(|OK, but|FAILURES!|ERRORS!|WARNINGS!)')
+          DIGIT_RUN = re.compile('[0-9\u0660-\u0669\u06f0-\u06f9]{10,}')
+          URL_RE = re.compile(r'https?://\S+')
+
+          def sanitize(line, limit=300):
+              line = URL_RE.sub('[url]', line)
+              line = DIGIT_RUN.sub('[n]', line)
+              line = re.sub(r'--password[ =]\S*', '--password=[n]', line)
+              line = re.sub(r"'[^']*'", "'?'", line)
+              line = re.sub(r'[^\x20-\x7e]', '.', line)
+              if len(line) > limit:
+                  line = line[:limit] + '...'
+              return line
+
+          def esc(value):
+              return value.replace('%', '%25')
+
+          def annotation(title, lines):
+              budget = 1380
+              kept, total = [], 0
+              for line in lines:
+                  piece = esc(sanitize(line, 200))
+                  add = len(piece) + (4 if kept else 0)
+                  if total + add > budget - 15:
+                      kept.append('...[truncated]')
+                      break
+                  kept.append(piece)
+                  total += add
+              print(f'::error title={title}::{"%0A".join(kept)}')
+
+          try:
+              handle = open(LOG_PATH, 'r', errors='replace')
+          except OSError:
+              print('integration-hung-diagnostic: captured phpunit log not found; no captured output to inspect')
+              sys.exit(0)
+
+          tail, saw_summary = [], False
+          with handle:
+              for raw_line in handle:
+                  line = raw_line.rstrip('\n')
+                  if TERMINAL.match(line):
+                      saw_summary = True
+                  tail.append(line)
+                  if len(tail) > 80:
+                      del tail[0]
+
+          if saw_summary:
+              sys.exit(0)
+
+          now = time.time()
+          print('integration-hung-diagnostic: no terminal PHPUnit summary in the captured log - the suite did not complete; sanitized tail (last 80 lines) follows')
+          for index, line in enumerate(tail, 1):
+              print(f'tail[{index:02d}]: {sanitize(line)}')
+
+          starts, ends = [], {}
+          try:
+              with open(PROGRESS_PATH, 'r', errors='replace') as progress:
+                  for raw in progress:
+                      parts = raw.rstrip('\n').split('\t', 2)
+                      if len(parts) != 3:
+                          continue
+                      stamp, kind, name = parts
+                      try:
+                          epoch = float(stamp)
+                      except ValueError:
+                          continue
+                      if kind == 'start':
+                          starts.append((epoch, name))
+                      elif kind == 'end':
+                          ends.setdefault(name, []).append(epoch)
+          except OSError:
+              starts = []
+
+          consumed = {}
+          test_lines = []
+          for epoch, name in starts[-8:]:
+              name_safe = re.sub(r'[^A-Za-z0-9_.:()\\ -]', '', name)[:180]
+              end_list = ends.get(name, [])
+              end_epoch = None
+              idx = consumed.get(name, 0)
+              while idx < len(end_list):
+                  if end_list[idx] >= epoch:
+                      end_epoch = end_list[idx]
+                      consumed[name] = idx + 1
+                      break
+                  idx += 1
+              if end_epoch is None:
+                  suffix = f'~{int(now - epoch)}s running'
+              else:
+                  suffix = f'{int(end_epoch - epoch)}s'
+              test_lines.append(f'{name_safe}  [{suffix}]')
+          if test_lines:
+              annotation('integration-last-started',
+                         [f'last {len(test_lines)} started tests in the Integration suite (elapsed seconds; ~running = never finished):']
+                         + test_lines)
+
+          try:
+              ps_lines = [l for l in open(PS_PATH, 'r', errors='replace').read().splitlines() if l.strip()][:15]
+          except OSError:
+              ps_lines = []
+          for line in ps_lines:
+              print(f'hung-ps: {sanitize(line)}')
+          if ps_lines:
+              annotation('integration-hung-ps',
+                         ['process snapshot taken 40s before TERM (ps -eo pid,ppid,etimes,stat,wchan:20,args):']
+                         + [sanitize(l, 110) for l in ps_lines])
+
+          try:
+              pl_lines = [l for l in open(PL_PATH, 'r', errors='replace').read().splitlines() if l.strip()][:8]
+          except OSError:
+              pl_lines = []
+          for line in pl_lines:
+              print(f'hung-processlist: {sanitize(line)}')
+          if pl_lines:
+              annotation('integration-hung-processlist',
+                         ['non-Sleep MySQL processlist rows at capture (literals masked, max 20 captured):']
+                         + [sanitize(l, 150) for l in pl_lines])
+          sys.exit(0)
+          PYEOF
 
       # Focused, real-DB proof that the WpSqlFailureLedger publication boundary
       # was exercised against the Integration MySQL service — not skipped and

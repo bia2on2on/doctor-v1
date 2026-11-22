@@ -7309,5 +7309,104 @@ class EnrollmentStep23VisibilityContractTests(unittest.TestCase):
         self.assertIn("[:300]", body)
         compile(body, "<step23-sanitize>", "exec")
 
+class IntegrationHangVisibilityContractTests(unittest.TestCase):
+    """Add-only pins for the Integration hung-suite diagnostic control flow.
+
+    Pins the approved ci.yml edits: step 24 wraps the full-suite PHPUnit
+    invocation in `timeout --kill-after=30 780`, records the exit code, runs a
+    bounded background watchdog (polls the redirected log; at FIRE = 740 s,
+    40 s BEFORE the wrapper sends TERM, writes /tmp/hung-ps.txt and
+    /tmp/hung-processlist.tsv and re-stamps /tmp/hung-progress.tsv, then
+    exits; it is killed and reaped on the normal path), and ONE
+    `if: always()` diagnostic step AFTER the 'Describe PHPUnit failures'
+    step names the last tests started when the suite never reaches a
+    terminal summary. Additive only - nothing here licenses changing the
+    20-minute cap, triggers, permissions, secrets, matrices or any other
+    step, and no existing pin is touched.
+    """
+
+    def _steps(self):
+        doc = _ci_document(workflow("ci.yml"))
+        return doc["jobs"]["integration"]["steps"]
+
+    def _step(self, name):
+        return next(s for s in self._steps() if s.get("name") == name)
+
+    def test_full_suite_step_wraps_phpunit_and_runs_bounded_watchdog(self):
+        step = self._step("Run integration tests")
+        run = step.get("run") or ""
+        self.assertIn("timeout --kill-after=30 780 php -d memory_limit=1G vendor/bin/phpunit", run)
+        self.assertIn("--debug", run)
+        self.assertIn("--log-junit /tmp/phpunit-int-junit.xml", run)
+        # Exit-code handling and evidence semantics unchanged.
+        self.assertIn("|| phpunit_status=$?", run)
+        self.assertIn('exit "$phpunit_status"', run)
+        self.assertIn('--phpunit-exit "$phpunit_status"', run)
+        # The watchdog is bounded, silent and kills nothing by itself.
+        for token in (
+            "PYWATCH",
+            "WRAPPER_SECONDS = 780",
+            "LEAD_SECONDS = 40",
+            "POLL_SECONDS = 2.0",
+            "MAX_PROGRESS_ROWS = 4000",
+            "/tmp/hung-progress.tsv",
+            "/tmp/hung-ps.txt",
+            "/tmp/hung-processlist.tsv",
+            "SHOW FULL PROCESSLIST",
+            "ps', '-eo', 'pid,ppid,etimes,stat,wchan:20,args",
+            'kill "$watchdog_pid"',
+            'wait "$watchdog_pid"',
+            "--password=[n]",
+        ):
+            self.assertIn(token, run, "missing watchdog token: " + token)
+        self.assertNotIn("pkill", run)
+        doc = _ci_document(workflow("ci.yml"))
+        self.assertEqual(20, doc["jobs"]["integration"]["timeout-minutes"])
+
+    def test_describe_step_still_immediately_follows_the_suite_step(self):
+        names = [s.get("name") for s in self._steps()]
+        self.assertEqual(names.index("Run integration tests") + 1,
+                         names.index("Describe PHPUnit failures"))
+
+    def test_diagnostic_step_sits_directly_after_describe_and_is_always(self):
+        names = [s.get("name") for s in self._steps()]
+        describe_index = names.index("Describe PHPUnit failures")
+        self.assertEqual(
+            "Diagnose last Integration tests started if the suite did not finish",
+            names[describe_index + 1],
+        )
+        step = self._steps()[describe_index + 1]
+        self.assertEqual("always()", step.get("if"))
+        run = step.get("run") or ""
+        for token in (
+            "PYEOF",
+            "OK \\(",
+            "FAILURES!",
+            "saw_summary",
+            "sys.exit(0)",
+            "DIGIT_RUN = re.compile",
+            "[0-9\\u0660-\\u0669\\u06f0-\\u06f9]{10,}",
+            "[url]",
+            "[n]",
+            "starts[-8:]",
+            "budget = 1380",
+            "%0A",
+            "%25",
+            "if saw_summary:",
+            "::error title=",
+        ):
+            self.assertIn(token, run, "missing diagnostic token: " + token)
+        # Exactly three annotation call sites, and none below budget.
+        self.assertEqual(3, run.count("annotation('integration-"))
+        # Green runs (terminal summary present) print and emit nothing.
+        self.assertIn("if saw_summary:", run)
+        # The diagnostic never fails the job and never dumps the raw log.
+        self.assertNotIn("exit 1", run)
+        self.assertNotIn("sys.exit(1)", run)
+        self.assertNotIn("readlines", run)
+        self.assertNotIn("cat /tmp/phpunit-int.log", run)
+        self.assertNotIn("tail /tmp/phpunit-int.log", run)
+
+
 if __name__ == "__main__":
     unittest.main()
