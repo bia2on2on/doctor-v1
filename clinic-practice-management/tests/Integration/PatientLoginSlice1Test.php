@@ -436,10 +436,19 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
         self::assertSame( 200, $meOk->get_status() );
         $this->assertNoNationalIdProjectionOrLeak( $meOk->get_data(), self::NID_PENDING, 'GET /patient/me post-link' );
 
-        // 5. Multi-clinic privacy check: unconsented private clinic B must NOT appear in link-record clinic dropdown.
+        // 5. Multi-clinic privacy check: unconsented private clinic B (in another organization)
+        // must NOT appear anywhere in the portal or link-record clinic dropdown.
         $now = App::db()->nowUtcSql();
+        App::db()->insert( 'cpms_organizations', [
+            'name'       => 'Private Org ZZZ',
+            'slug'       => 'private-org-zzz-' . uniqid(),
+            'status'     => 'active',
+            'created_at' => $now,
+            'updated_at' => $now,
+        ] );
+        $orgB = App::db()->wpdb_last_insert_id();
         App::db()->insert( 'cpms_clinics', [
-            'organization_id' => 1,
+            'organization_id' => $orgB,
             'name'            => 'Private Unconsented Clinic ZZZ',
             'slug'            => 'private-zzz-' . uniqid(),
             'timezone'        => 'UTC',
@@ -449,6 +458,7 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
         ] );
         $portalAfterClinicB = $this->renderPortalAs( $this->userPending, $sessionToken );
         self::assertStringNotContainsString( 'Private Unconsented Clinic ZZZ', $portalAfterClinicB );
+        self::assertStringContainsString( 'data-role="link-record-unavailable"', $portalAfterClinicB );
     }
 
     public function testP6LinkRecordDeniedWithoutOtpMobileProofOrWrongNidOrNonPurePatient(): void {
