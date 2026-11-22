@@ -74,7 +74,7 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
         $this->assertSame('[nid-redacted]', $before['numeric_id']);
         $this->assertSame('[nid-redacted]', $before['mobile'], 'NID misplaced under mobile used to leak its last four digits');
         $this->assertSame('key witness', $before['field_[nid-redacted]']);
-        $this->assertSame('[nid-redacted]', $after['free']);
+        $this->assertSame('X [nid-redacted] Y', $after['free']);
         $this->assertSame('Z [nid-redacted] W', $meta['meta']);
 
         // مثبت: رویدادِ بی‌خطر همچنان زنجیره‌پس معتبر است (جمع‌بندی، شواهد را نابود نمی‌کند).
@@ -133,7 +133,7 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
         // منفی: پیام و هر دو مقدارِ متنی مقدار را جمع‌بندی می‌کنند.
         $this->assertStringNotContainsString('001234', (string) $row['context_json']);
         $this->assertStringNotContainsString('1234567890', (string) $row['context_json']);
-        $this->assertSame('[nid-redacted]', $context['note']);
+        $this->assertSame('کد ملی [nid-redacted]', $context['note']);
         $this->assertSame('fail [nid-redacted]', $context['error']);
         $this->assertSame('note [nid-redacted]', $context['arabic']);
         $this->assertSame('[nid-redacted]', $context['numeric_id']);
@@ -260,7 +260,7 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
     {
         global $wpdb;
         $table = App::db()->table('cpms_operational_logs');
-        $pattern = '/\\AINSERT INTO\\s+' . preg_quote($table, '/') . '\\s*\\(/i';
+        $pattern = '/\\AINSERT INTO\\s+`?' . preg_quote($table, '/') . '`?\\s*\\(/i';
         $matchedQueries = 0;
         $contents = '';
         $previousErrorLog = ini_get('error_log');
