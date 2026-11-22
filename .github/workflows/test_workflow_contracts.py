@@ -7048,5 +7048,55 @@ class PHPUnitFailureDescriptionContracts(unittest.TestCase):
         self.assertEqual(closure["restore-apply"]["name"], "Closure — destructive restoreApply (isolated)")
 
 
+
+class EnrollmentStep23VisibilityContractTests(unittest.TestCase):
+    """Add-only pin for the step-23 (patient enrollment) visibility control flow.
+
+    Non-vacuous: each asserted token is required for the step to report a
+    sanitized failure instead of dying silently under `set -e`. The PYENROLL
+    tail and the JUnit assertions are expected to stay untouched.
+    """
+
+    def _step(self):
+        steps = _ci_document(workflow("ci.yml"))["jobs"]["integration"]["steps"]
+        return next(s for s in steps if s.get("name") == "Run patient enrollment options and UI regressions")
+
+    def test_step_captures_phpunit_rc_and_reports_sanitized_failure(self):
+        run = self._step().get("run") or ""
+        for token in (
+            "rc=0",
+            "|| rc=$?",
+            "'^OK \\('",
+            "::group::",
+            "sanitized log tail",
+            "SANITIZE",
+            "::endgroup::",
+            "::error title=",
+            "exit 1",
+            "--phpunit-exit \"$rc\"",
+        ):
+            self.assertIn(token, run, "missing step-23 visibility token: " + token)
+        self.assertLess(run.index("rc=0"), run.index("vendor/bin/phpunit"),
+                        "rc capture must precede the phpunit invocation")
+        self.assertIn("integration_evidence.py", run,
+                      "bounded JUnit projection call must remain in the step")
+        # The enrollment PYENROLL gate must stay byte-identical in intent.
+        self.assertIn("all enrollment tests must execute without skip/failure/error", run)
+
+    def test_sanitizer_masks_urls_and_long_digit_runs(self):
+        run = self._step().get("run") or ""
+        match = re.search(r"<<'SANITIZE'\n(.*?)\n\s*SANITIZE\n", run, re.S)
+        self.assertIsNotNone(match, "SANITIZE heredoc not found in step 23")
+        body = match.group(1)
+        self.assertIn(r"https?://\S+", body)
+        self.assertIn(r"[0-9", body)
+        self.assertIn("06F0", body)
+        self.assertIn("0669", body)
+        self.assertIn("{10,}", body)
+        self.assertIn("[url]", body)
+        self.assertIn("[n]", body)
+        self.assertIn("[:300]", body)
+        compile(body, "<step23-sanitize>", "exec")
+
 if __name__ == "__main__":
     unittest.main()

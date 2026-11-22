@@ -767,13 +767,78 @@ jobs:
         run: |
           set -o pipefail
           for suite in PatientEnrollmentOptionsTest.php PatientEnrollmentUiTest.php; do
+            rc=0
             php -d memory_limit=1G vendor/bin/phpunit --no-configuration \
               --log-junit "/tmp/${suite}-junit.xml" \
               --bootstrap tests/integration-bootstrap.php \
-              "tests/Integration/${suite}" > "/tmp/${suite}.log" 2>&1
-            if ! grep -qE '^OK \(' "/tmp/${suite}.log"; then
-              python3 "$GITHUB_WORKSPACE/bin/integration_evidence.py" junit "/tmp/${suite}-junit.xml" --label patient_enrollment --phpunit-exit 1 --log "/tmp/${suite}.log" || true
-              echo "::error::${suite} did not finish with a passing PHPUnit summary."
+              "tests/Integration/${suite}" > "/tmp/${suite}.log" 2>&1 || rc=$?
+            if [ "$rc" -ne 0 ] || ! grep -qE '^OK \(' "/tmp/${suite}.log"; then
+              python3 "$GITHUB_WORKSPACE/bin/integration_evidence.py" junit "/tmp/${suite}-junit.xml" --label patient_enrollment --phpunit-exit "$rc" --log "/tmp/${suite}.log" || true
+              python3 - "/tmp/${suite}.log" "$suite" <<'SANITIZE'
+          import re
+          import sys
+
+          path = sys.argv[1]
+          suite = sys.argv[2]
+
+          def clean(line):
+              line = re.sub(r'https?://\S+', '[url]', line)
+              line = re.sub(r'www\.\S+', '[url]', line)
+              line = re.sub(r'[0-9\u06F0-\u06F9\u0660-\u0669]{10,}', '[n]', line)
+              line = line.replace('\r', ' ').replace('\n', ' ')
+              return line[:300]
+
+          try:
+              raw = open(path, encoding='utf-8', errors='replace').read().splitlines()
+          except OSError as exc:
+              raw = ['unreadable log ({0})'.format(exc.__class__.__name__)]
+
+          lines = [clean(l) for l in raw]
+
+          print('::group::{0} sanitized log tail'.format(suite))
+          print('--- last 80 lines (sanitized) ---')
+          for l in lines[-80:]:
+              print(l)
+          marker = re.compile(r'^([0-9]+\) |FAILURES!|ERRORS!|Fatal error|PHP Warning)')
+          start = next((i for i, l in enumerate(lines) if marker.match(l)), None)
+          excerpt = lines[start:start + 60] if start is not None else lines[:60]
+          print('--- failure excerpt (from first marker line; <=60 lines; sanitized) ---')
+          for l in excerpt:
+              print(l)
+          print('::endgroup::')
+
+          key_res = [re.compile(p) for p in (
+              r'^[0-9]+\) ',
+              r'::',
+              r'\.php:[0-9]+\s*$',
+              re.escape('Failed'),
+              re.escape('ExpectationFailed'),
+              re.escape('Exception'),
+              r'^(FAILURES!|ERRORS!|Fatal error|PHP Warning)',
+          )]
+          key_lines = []
+          for l in (excerpt if excerpt else lines):
+              if any(rx.search(l) for rx in key_res):
+                  key_lines.append(l)
+              if len(key_lines) >= 12:
+                  break
+          if not key_lines:
+              key_lines = [l for l in lines if l.strip()][:12]
+          body_lines = []
+          total = 0
+          for l in key_lines:
+              esc = l.replace('%', '%25')
+              if total + len(esc) + (3 if body_lines else 0) > 1400:
+                  break
+              if body_lines:
+                  total += 3
+              body_lines.append(esc)
+              total += len(esc)
+          body = '%0A'.join(body_lines)
+          title = re.sub(r'[^A-Za-z0-9._-]+', '_', '{0}-failure'.format(suite))
+          print('::error title={0}::{1}'.format(title, body))
+          sys.exit(0)
+          SANITIZE
               exit 1
             fi
           done
