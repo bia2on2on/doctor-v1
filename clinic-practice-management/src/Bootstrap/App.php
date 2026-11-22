@@ -267,6 +267,7 @@ final class App
         // only); deliberately before the idempotence guard so a repeated boot still
         // restarts the profile exactly like a fresh request would.
         RequestProfiler::mark_boot();
+        \ClinicCore\Application\Backup\RestoreBarrierGate::register();
 
         // ==================================================================
         // Frontend عمومی (خارج از wp-admin) — Phase 8 Slice 1 / FR-3.5 / UC-01
@@ -317,7 +318,16 @@ final class App
         // درخواستِ عادی — از جمله retry حالت بازیابی برای افزونهٔ فعال که
         // نقش‌ها از قبل در Optionها ماندگارند — رفتارِ امروز را نگه می‌دارد.
         if ( ! ( defined( 'WP_SANDBOX_SCRAPING' ) && WP_SANDBOX_SCRAPING ) ) {
-            RolesAndCapabilities::register();
+            $roles  = wp_roles();
+            $use_db = $roles->use_db;
+            if ( \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
+                $roles->use_db = false;
+            }
+            try {
+                RolesAndCapabilities::register();
+            } finally {
+                $roles->use_db = $use_db;
+            }
         }
 
         // Phase 1A — Item 3: محدودسازی نرخ ورود. پیش از این هیچ کنترل
@@ -437,9 +447,7 @@ final class App
         // نمی‌شود تا فعال‌سازیِ ردشده هیچ رویدادِ `cpms_jobs_tick` روی سایت نگذارد؛
         // مسیرِ فعال‌سازیِ مجاز خودش در `activate()` آن را ثبت می‌کند و هر درخواستِ
         // عادیِ دیگر (غیرِ sandbox) مثل قبل اجرا می‌شود.
-        if ( ! ( defined( 'WP_SANDBOX_SCRAPING' ) && WP_SANDBOX_SCRAPING ) ) {
-            CronScheduleRepair::ensure_scheduled();
-        }
+        self::ensure_boot_cron();
 
         // ترمیمِ خودکارِ سمتِ مدیریت (throttle‌شده، حداکثر یک‌بار در ساعت):
         // فقط **شکست** لاگ می‌شود. ثبتِ یک «ترمیمِ موفق» در این مسیرِ خودکار
@@ -450,6 +458,9 @@ final class App
         // موفقیت فقط در مسیرِ صریح و کاربر-آغازشدهٔ `admin_post_cpms_cron_repair`
         // انجام می‌شود.
         $cron_self_heal = static function (): void {
+            if ( \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
+                return;
+            }
             $result = CronScheduleRepair::self_heal_in_admin_result();
 
             if ( CronScheduleRepair::RESULT_FAILED === $result ) {
@@ -536,6 +547,12 @@ final class App
         PatientAdminPage::register(); // Chunk G — Patient Management Entry (operational, capability-driven)
         \ClinicCore\Admin\ClinicReceptionRecoveryPage::register(); // Classic V1 — reception recovery (clinician-location assignment, Persian, Clinic-local)
         PublicShortcodeAdminPage::register(); // Classic shortcode helper (manage_options + authorized Clinic selector)
+    }
+
+    private static function ensure_boot_cron(): void {
+        if ( ! ( defined( 'WP_SANDBOX_SCRAPING' ) && WP_SANDBOX_SCRAPING ) && ! \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
+            CronScheduleRepair::ensure_scheduled();
+        }
     }
 
     public static function activate( bool $network_wide = false ): void
@@ -941,6 +958,9 @@ final class App
 
     private static function ensureMigrated(): void
     {
+        if ( \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
+            return;
+        }
         $lock = 'cpms_migrate_lock';
         if (get_transient($lock)) {
             return;

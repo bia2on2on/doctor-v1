@@ -534,6 +534,191 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("name: Closure Gate (GO-LIVE evidence closure)", workflow("closure-gate.yml"))
         self.assertIn("name: Pilot/Staging Readiness Gate", workflow("pilot-gate.yml"))
 
+    def test_restore_apply_closure_lane_pins_refusal_snapshot_and_success_stage(self):
+        text = workflow("closure-gate.yml")
+        document = _ci_document(text)
+        events = document.get("on", document.get(True))
+        self.assertEqual(events, {
+            "workflow_dispatch": None,
+            "pull_request": {"branches": ["main"]},
+            "push": {"branches": ["main"]},
+        })
+        job = document["jobs"]["restore-apply"]
+        self.assertEqual(job["name"], "Closure — destructive restoreApply (isolated)")
+        self.assertEqual(job["env"]["CPMS_RESTORE_SUCCESS_STAGE"], "false")
+        steps = {step.get("name"): step for step in job["steps"]}
+        snapshot_step = steps["Snapshot comparator self-test"]
+        snapshot_run = snapshot_step["run"]
+        for contract in (
+            "CHECKSUM TABLE", "COUNT(*)", "OPTIONS_EXCLUSIONS = ()",
+            "assert BARRIER_OPTION not in OPTIONS_EXCLUSIONS", "JSON_ARRAY(",
+            "wp-content", "sha256", "SNAPSHOT_SELF_TEST_DIFFERENCE_DETECTED_AND_REVERTED",
+        ):
+            self.assertIn(contract, snapshot_run)
+        active_negative = steps["Negative restore refusals — corrupt SQL and manifest snapshots"]
+        self.assertEqual(active_negative["if"], "env.CPMS_RESTORE_SUCCESS_STAGE == 'false'")
+        self.assertIn("assert_refusal_unchanged", active_negative["run"])
+        refusal = steps["Snapshot and assert populated-target RestoreApply refusal"]
+        self.assertEqual(refusal["if"], "env.CPMS_RESTORE_SUCCESS_STAGE == 'false'")
+        for contract in (
+            "RESTORE_TARGET_NOT_EMPTY", "Restore requires a prepared empty target.",
+            "assert-identical", "RESTORE CREATED A SAFETY BACKUP",
+        ):
+            self.assertIn(contract, refusal["run"])
+        legacy = steps["Mutate to state B + RestoreApply (destructive) + verify state A"]
+        self.assertEqual(legacy["if"], "env.CPMS_RESTORE_SUCCESS_STAGE == 'true'")
+        self.assertIn("grep -q 'Restore applied' /tmp/restore-apply.log", legacy["run"])
+        self.assertIn("[ \"$RC\" -eq 0 ]", legacy["run"])
+        self.assertIn("[ \"$LISTN\" -ge 2 ]", legacy["run"])
+        old_negative = steps["Negative — corrupt db.sql / tampered manifest rejection"]
+        self.assertEqual(old_negative["if"], "env.CPMS_RESTORE_SUCCESS_STAGE == 'true'")
+        self.assertIn("[ \"$LISTN\" -eq 4 ]", old_negative["run"])
+
+    def test_restore_snapshot_comparator_pins_modes_schema_probes_and_scope(self):
+        snapshot_run = {
+            step.get("name"): step
+            for step in _ci_document(workflow("closure-gate.yml"))["jobs"]["restore-apply"]["steps"]
+        }["Snapshot comparator self-test"]["run"]
+        for contract in (
+            "INFORMATION_SCHEMA.COLUMNS", "INFORMATION_SCHEMA.STATISTICS",
+            "INFORMATION_SCHEMA.VIEWS", "INFORMATION_SCHEMA.TRIGGERS",
+            "INFORMATION_SCHEMA.ROUTINES", "INFORMATION_SCHEMA.PARAMETERS",
+            "STATISTICS.CARDINALITY", "TRIGGERS.CREATED", "ROUTINES.CREATED/LAST_ALTERED",
+            "COLUMNS.PRIVILEGES", "def octal_mode(path)", "stat.S_IMODE",
+            "modes_snapshot", '"private_storage"', '"uploads"', '"backup_directory"',
+            '"modes" not in differences(before, changed)', "os.chmod(mode_path, changed_mode)",
+            "os.chmod(mode_path, original_mode)", "SNAPSHOT_SELF_TEST_MODE_REVERT_FAILED",
+            '"schema" not in differences(before, changed)', "CREATE VIEW ",
+            "DROP VIEW IF EXISTS ", "SNAPSHOT_SELF_TEST_SCHEMA_REVERT_FAILED",
+            "finally:", "DB_MAIN plus the three watched roots only",
+            "databases, /tmp, or external writers.",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, snapshot_run)
+
+    def test_restore_snapshot_comparator_pins_cleanup_probes_and_table_options(self):
+        document = _ci_document(workflow("closure-gate.yml"))
+        job = document["jobs"]["restore-apply"]
+        self.assertEqual(job["env"]["CPMS_RESTORE_SUCCESS_STAGE"], "false")
+        snapshot_run = {
+            step.get("name"): step for step in job["steps"]
+        }["Snapshot comparator self-test"]["run"]
+
+        for contract in (
+            "SNAPSHOT_SELF_TEST_VIEW_ALREADY_EXISTS",
+            "DROP VIEW IF EXISTS ",
+            "INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = ",
+            "SNAPSHOT_SELF_TEST_VIEW_REMAINS",
+            "remaining_view = mysql(",
+            "SNAPSHOT_SELF_TEST_SCHEMA_REVERT_FAILED",
+            "uuid.uuid4().hex",
+            "SNAPSHOT_SELF_TEST_PRIVATE_STORAGE_ROOT_MISSING",
+            "SNAPSHOT_SELF_TEST_DIRECTORY_MODE_ALREADY_EXISTS",
+            'if "modes" not in differences(directory_before, changed)',
+            "changed_directory_mode = original_directory_mode ^ stat.S_IWUSR",
+            "os.chmod(directory_path, changed_directory_mode)",
+            "os.chmod(directory_path, original_directory_mode)",
+            "os.rmdir(directory_path)",
+            "SNAPSHOT_SELF_TEST_DIRECTORY_MODE_REVERT_FAILED",
+            "SNAPSHOT_SELF_TEST_TABLE_ALREADY_EXISTS",
+            "remaining_table = mysql(",
+            "SNAPSHOT_SELF_TEST_TABLE_REMAINS",
+            "SNAPSHOT_SELF_TEST_TABLE_OPTIONS_REVERT_FAILED",
+            "SNAPSHOT_SELF_TEST_TABLE_OPTIONS_DIFFERENCE_DETECTED_AND_REVERTED",
+            "ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+            "ROW_FORMAT=COMPACT",
+            'if "schema" not in differences(dynamic_snapshot, compact_snapshot)',
+            "DROP TABLE IF EXISTS ",
+            "INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ",
+            "DDL causes implicit commits; do not wrap this probe in a transaction.",
+            "AUTO_INCREMENT-only changes are deliberately not detected; guarantee = DB_MAIN schema/rows + three roots.",
+            "AUTO_INCREMENT, UPDATE_TIME, CREATE_TIME, CHECK_TIME",
+            "TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH, DATA_FREE, AVG_ROW_LENGTH",
+            "for label, (catalog, schema_column, fields, ordering) in catalogs.items():",
+            '" = " + sql_literal(DB) + " ORDER BY " + ", ".join(ordering)',
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, snapshot_run)
+
+        self.assertNotIn("if view_created", snapshot_run)
+        self.assertNotIn("if table_created", snapshot_run)
+        self.assertIn(
+            '''    finally:
+        try:
+            mysql("DROP VIEW IF EXISTS " + qualified(view_name))''',
+            snapshot_run,
+        )
+        self.assertIn(
+            '''    finally:
+        if os.path.lexists(directory_path):
+            try:''',
+            snapshot_run,
+        )
+        directory_cleanup = snapshot_run.split(
+            '''    finally:
+        if os.path.lexists(directory_path):''', 1
+        )[1].split(''',
+    reverted = snapshot()''', 1)[0]
+        self.assertIn("os.chmod(directory_path, original_directory_mode)", directory_cleanup)
+        self.assertIn("os.rmdir(directory_path)", directory_cleanup)
+        self.assertIn(
+            '''    finally:
+        try:
+            mysql("DROP TABLE IF EXISTS " + qualified(table_name))''',
+            snapshot_run,
+        )
+        self.assertLess(
+            snapshot_run.index("SNAPSHOT_SELF_TEST_VIEW_ALREADY_EXISTS"),
+            snapshot_run.index('mysql("CREATE VIEW '),
+        )
+        self.assertLess(
+            snapshot_run.index("SNAPSHOT_SELF_TEST_DIRECTORY_MODE_ALREADY_EXISTS"),
+            snapshot_run.index("os.mkdir(directory_path)"),
+        )
+        self.assertLess(
+            snapshot_run.index("SNAPSHOT_SELF_TEST_TABLE_ALREADY_EXISTS"),
+            snapshot_run.index('mysql("CREATE TABLE '),
+        )
+
+        tree = ast.parse(snapshot_run.split("cat > /tmp/cpms-restore-snapshot.py <<'PYEOF'\n", 1)[1].split("\nPYEOF", 1)[0])
+        schema_snapshot = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "schema_snapshot"
+        )
+        catalog_assignment = next(
+            statement for statement in schema_snapshot.body
+            if isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "catalogs"
+                    for target in statement.targets)
+        )
+        catalogs = ast.literal_eval(catalog_assignment.value)
+        for name, catalog in (
+            ("columns", "COLUMNS"),
+            ("indexes", "STATISTICS"),
+            ("views", "VIEWS"),
+            ("triggers", "TRIGGERS"),
+            ("routines", "ROUTINES"),
+            ("routine_parameters", "PARAMETERS"),
+        ):
+            with self.subTest(catalog=name):
+                self.assertEqual(catalogs[name][0], catalog)
+                self.assertEqual(catalogs[name][1], {
+                    "columns": "TABLE_SCHEMA",
+                    "indexes": "TABLE_SCHEMA",
+                    "views": "TABLE_SCHEMA",
+                    "triggers": "TRIGGER_SCHEMA",
+                    "routines": "ROUTINE_SCHEMA",
+                    "routine_parameters": "SPECIFIC_SCHEMA",
+                }[name])
+        self.assertEqual(
+            catalogs["table_options"],
+            (
+                "TABLES", "TABLE_SCHEMA",
+                ("TABLE_NAME", "TABLE_TYPE", "ENGINE", "ROW_FORMAT", "TABLE_COLLATION"),
+                ("TABLE_NAME",),
+            ),
+        )
+
     def test_disposable_demo_lane_is_path_scoped_to_its_own_files(self):
         """The lane must not act as a global gate: it runs only for changes to
         its own files, and its isolation decision is made by an executable,
