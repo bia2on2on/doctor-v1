@@ -29,6 +29,7 @@ use ClinicCore\Infrastructure\Sms\CredentialVault;
 use ClinicCore\Infrastructure\Sms\SmsProviderRegistry;
 use ClinicCore\Settings\Settings;
 use ClinicCore\Settings\SettingsFactory;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use DateTimeImmutable;
 use DateTimeZone;
 use WP_REST_Request;
@@ -125,7 +126,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
         if ($this->originalPhpTz !== null) {
             date_default_timezone_set($this->originalPhpTz);
         }
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         $this->purgeJobs();
         $this->purgeFixture();
         ScopeContext::clear();
@@ -1922,6 +1923,12 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
                 $now
             )
         );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $this->clinicId,
+            $patientId,
+            ['mobile' => $mobile, 'seed_session_scope' => true, 'full_identity' => false]
+        );
 
         return $userId;
     }
@@ -2046,6 +2053,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
                 'cpms_schedule_slots',
                 'cpms_schedule_exceptions',
                 'cpms_schedule',
+                'cpms_patient_logins',
                 'cpms_patient_user_links',
                 'cpms_patients',
                 'cpms_clinicians',

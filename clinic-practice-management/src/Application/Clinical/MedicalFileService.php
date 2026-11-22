@@ -231,13 +231,14 @@ final class MedicalFileService
 
     // phpcs:enable
         if ($isPatient) {
-            // P-8 + Phase 9 Slice 7 — مجوز بر پایهٔ **عضویت پایدار**: فایل باید
+            // P-8 + Phase 9 Slice 7 — مجوز بر پایهٔ **عضویت پایدار + دو اثبات**: فایل باید
             // patient_visible و بدون حذف باشد و patient_id آن به رکوردِ بیمارِ
-            // فعالی تعلق داشته باشد که با لینک بالینی identity-aware به کاربرِ
-            // جاری متصل است (Clinicِ فایل = Clinicِ بیمار/لینک). هیچ selector
-            // نمی‌سازد و هیچ fallback اصلی/اولی وجود ندارد. رد = همان 404 امن،
-            // همیشه پیش از خواندنِ دیسک.
-            $membership = $this->patient_record_linked_to_user( $actorUserId, (int) $row['patient_id'], (int) $row['clinic_id'] ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- پارامتر قدیمیِ متدِ میزبان.
+            // فعالی تعلق داشته باشد که با لینک بالینی identity-aware و اثبات جلسهٔ
+            // دو-فاکتوره به کاربرِ جاری متصل است.
+            $patient_id = (int) $row['patient_id'];
+            $clinic_id  = (int) $row['clinic_id'];
+            $membership = $this->patient_record_linked_to_user( $actorUserId, $patient_id, $clinic_id ) // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- پارامتر قدیمیِ متدِ میزبان.
+                && \ClinicCore\Application\Auth\PatientAccess::LEVEL_FULL === App::patient_access()->level( $actorUserId, $patient_id, $clinic_id ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- پارامتر قدیمیِ متدِ میزبان.
             if ( (string) $row['visibility'] !== 'patient_visible' || ! $membership ) {
                 $this->auditAndThrow($actorUserId, 'file', $fileId, 'دسترسی به این فایل مجاز نیست', 'فایل یافت نشد');
             }

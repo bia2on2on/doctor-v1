@@ -9,6 +9,7 @@ use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Rest\RestClinicContext;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -44,6 +45,7 @@ final class RestTrustedClinicContextTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
+        PatientTwoProofTestHelper::reset();
         App::resetScope();
         parent::tearDown();
     }
@@ -285,8 +287,35 @@ final class RestTrustedClinicContextTest extends WP_UnitTestCase
 
     public function testPatientNotificationsDoNotRequireClinicHeader(): void
     {
+        global $wpdb;
         $userId = $this->makeUser('ctx_pat', 'cpms_patient');
-        wp_set_current_user($userId);
+        $mobile = '0912' . str_pad((string) random_int(1000000, 9999999), 7, '0', STR_PAD_LEFT);
+        $now    = App::db()->nowUtcSql();
+        $wpdb->insert($wpdb->prefix . 'cpms_patients', [
+            'clinic_id'  => $this->clinicA,
+            'mrn'        => 'CTX-NOTIF-' . $userId,
+            'first_name' => 'Ctx',
+            'last_name'  => 'Pat',
+            'mobile'     => $mobile,
+            'status'     => 'active',
+            'created_at' => $now,
+            'updated_at' => $now,
+        ]);
+        $patientId = (int) $wpdb->insert_id;
+        self::assertGreaterThan(0, $patientId);
+        $wpdb->insert($wpdb->prefix . 'cpms_patient_user_links', [
+            'clinic_id'      => $this->clinicA,
+            'patient_id'     => $patientId,
+            'wp_user_id'     => $userId,
+            'mobile_at_link' => $mobile,
+            'is_primary'     => 1,
+            'linked_at'      => $now,
+        ]);
+        PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicA, $patientId, [
+            'mobile'             => $mobile,
+            'seed_session_scope' => true,
+            'set_current_user'   => true,
+        ]);
         $res = $this->dispatch('GET', self::NS . '/notifications');
         $this->assertSame(200, $res->get_status());
     }

@@ -163,6 +163,7 @@ use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -210,7 +211,7 @@ final class Phase9Slice1PatientPortalSelfCancelRedTest extends WP_UnitTestCase
             $this->set_permalink_structure($this->permalinkStructureToRestore);
             $this->permalinkStructureToRestore = null;
         }
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         ScopeContext::clear();
         App::resetScope();
         SystemClinicResolver::flush();
@@ -682,6 +683,11 @@ final class Phase9Slice1PatientPortalSelfCancelRedTest extends WP_UnitTestCase
             'is_primary' => 1,
             'linked_at' => $now,
         ], ['%d', '%d', '%d', '%s', '%d', '%s'], 'patient_user_link');
+        PatientTwoProofTestHelper::seed_patient_proof($userId, $clinicId, $patientId, [
+            'mobile' => $mobile,
+            'seed_session_scope' => true,
+            'set_current_user' => false,
+        ]);
 
         // Owned, CONFIRMED, UPCOMING appointment (+5 days: outside any cancel-deadline window).
         $slotDate = $this->ymdDaysOffset(5);
@@ -749,6 +755,7 @@ final class Phase9Slice1PatientPortalSelfCancelRedTest extends WP_UnitTestCase
         self::assertSame((string) $fx['reference_code'], (string) $appt['reference_code'], 'positive control: reference_code persisted.');
 
         // The portal's own data path (BookingService::listMine) includes it as confirmed/upcoming.
+        PatientTwoProofTestHelper::acting_as((int) $fx['user_id']);
         $rows = App::bookingService()->listMine(
             (int) $fx['user_id'],
             gmdate('Y-m-d', strtotime('-365 days')),
@@ -789,7 +796,7 @@ final class Phase9Slice1PatientPortalSelfCancelRedTest extends WP_UnitTestCase
 
     private function renderPortalAs(int $userId): string
     {
-        wp_set_current_user($userId);
+        PatientTwoProofTestHelper::acting_as($userId);
         ob_start();
         try {
             PatientPortalPage::render();
@@ -954,7 +961,7 @@ final class Phase9Slice1PatientPortalSelfCancelRedTest extends WP_UnitTestCase
 
     private function restPostAs(int $userId, string $route, ?string $nonce): WP_REST_Response
     {
-        wp_set_current_user($userId);
+        PatientTwoProofTestHelper::acting_as($userId);
         $request = new WP_REST_Request('POST', $route);
         if ($nonce !== null) {
             $request->set_header('X-WP-Nonce', $nonce);

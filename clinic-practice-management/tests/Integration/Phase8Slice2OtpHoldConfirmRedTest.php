@@ -241,6 +241,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Scope\SystemClinicResolver;
@@ -248,6 +249,7 @@ use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Domain\Otp\OtpPolicy;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -348,7 +350,7 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         ScopeContext::clear();
         App::resetScope();
         SystemClinicResolver::flush();
@@ -467,7 +469,8 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'slot_id' => $slot['slot_id'],
         ], withNonce: true);
 
-        $this->assertClinicError($hold, 'CLINIC_UNAUTHORIZED', 401, 'Anonymous B1 must stay unauthorized.');
+        $this->assertClinicError($hold, PatientAccess::PROOF_FAILED_CODE, 403, 'Anonymous B1 must stay unauthorized.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($hold->get_data()['message'] ?? ''), 'Anonymous B1 must return canonical patient proof failure message.');
         self::assertSame(0, $this->countRows('cpms_slot_holds'), 'A rejected anonymous B1 must not create a Hold.');
         self::assertSame(0, $this->heldCountOf($slot['slot_id']), 'A rejected anonymous B1 must not consume capacity.');
     }
@@ -1265,8 +1268,9 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'slot_time' => $slot['time'],
             'slot_id' => $slot['slot_id'],
         ], asUserId: $userId, withNonce: true);
-        self::assertSame(400, $hold->get_status(), 'owner decision A: fail closed before any Hold is created. Body: ' . wp_json_encode($hold->get_data()));
-        $this->assertClinicError($hold, 'CLINIC_SCOPE_REQUIRED', 400, 'a caller whose session clinic does not resolve gets the uniform fail-closed envelope.');
+        self::assertSame(403, $hold->get_status(), 'owner decision A: fail closed before any Hold is created. Body: ' . wp_json_encode($hold->get_data()));
+        $this->assertClinicError($hold, PatientAccess::PROOF_FAILED_CODE, 403, 'a caller whose session clinic does not resolve gets the uniform fail-closed envelope.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($hold->get_data()['message'] ?? ''), 'Zero-link caller must receive canonical patient proof failure message.');
         self::assertSame(0, $this->heldCountOf($slot['slot_id']), 'no slot capacity is consumed.');
         self::assertSame(0, $this->countRows('cpms_slot_holds'), 'no Hold row is created.');
         self::assertSame(0, $this->countPatientsForMobile($this->clinicA, self::MOBILE_T14), 'no Patient is created in any Clinic.');
@@ -1299,6 +1303,11 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'mobile_at_link' => self::MOBILE_T15,
             'is_primary' => 1,
             'linked_at' => App::db()->nowUtcSql(),
+        ]);
+        PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicA, $patient, [
+            'mobile' => self::MOBILE_T15,
+            'seed_session_scope' => true,
+            'full_identity' => false,
         ]);
 
         $hold = $this->restPost(self::NS . self::HOLD_PATH, [
@@ -1353,8 +1362,9 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'slot_time' => $slot['time'],
             'slot_id' => $slot['slot_id'],
         ], asUserId: $userId, withNonce: true);
-        self::assertSame(400, $hold->get_status(), 'owner decision A: fail closed. Body: ' . wp_json_encode($hold->get_data()));
-        $this->assertClinicError($hold, 'CLINIC_SCOPE_REQUIRED', 400, 'a same-mobile Patient in another Clinic confers no scope.');
+        self::assertSame(403, $hold->get_status(), 'owner decision A: fail closed. Body: ' . wp_json_encode($hold->get_data()));
+        $this->assertClinicError($hold, PatientAccess::PROOF_FAILED_CODE, 403, 'a same-mobile Patient in another Clinic confers no scope.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($hold->get_data()['message'] ?? ''), 'Other-clinic same-mobile caller must receive canonical patient proof failure message.');
         self::assertSame(0, $this->heldCountOf($slot['slot_id']), 'no slot capacity is consumed.');
         self::assertSame(0, $this->countRows('cpms_slot_holds'), 'no Hold row is created.');
         self::assertSame(0, $this->countPatientsForMobile($this->clinicA, self::MOBILE_T16), 'no Patient is created in the booking Clinic.');
@@ -1509,6 +1519,12 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'is_primary' => 1,
             'linked_at' => App::db()->nowUtcSql(),
         ]);
+        PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicA, $patient, [
+            'mobile' => self::MOBILE_T19A,
+            'seed_session_scope' => true,
+            'full_identity' => false,
+            'set_current_user' => false,
+        ]);
         $otherUserId = (int) self::factory()->user->create(['role' => 'cpms_patient']);
         App::db()->insert('cpms_patient_user_links', [
             'clinic_id' => $this->clinicA,
@@ -1517,6 +1533,12 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'mobile_at_link' => self::MOBILE_T19B,
             'is_primary' => 1,
             'linked_at' => App::db()->nowUtcSql(),
+        ]);
+        PatientTwoProofTestHelper::seed_patient_proof($otherUserId, $this->clinicA, $patientOther, [
+            'mobile' => self::MOBILE_T19B,
+            'seed_session_scope' => true,
+            'full_identity' => false,
+            'set_current_user' => false,
         ]);
 
         // --- same-key replay = same reference_code, no duplicates ---
@@ -2138,6 +2160,11 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
                 'is_primary' => 1,
                 'linked_at' => App::db()->nowUtcSql(),
             ]);
+            PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicA, $patient, [
+                'mobile' => $mobile,
+                'seed_session_scope' => true,
+                'full_identity' => false,
+            ]);
 
             return $userId;
         }
@@ -2170,7 +2197,7 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
      */
     private function restPost(string $route, array $body, ?int $asUserId = null, bool $withNonce = false, ?string $idempotencyKey = null): WP_REST_Response
     {
-        wp_set_current_user($asUserId !== null ? $asUserId : 0);
+        PatientTwoProofTestHelper::acting_as($asUserId !== null ? $asUserId : 0);
 
         $request = new WP_REST_Request('POST', $route);
         foreach ($body as $key => $value) {
@@ -2427,7 +2454,8 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'slot_time' => $slot['time'],
             'slot_id' => $slot['slot_id'],
         ], asUserId: $userId, withNonce: true);
-        $this->assertClinicError($hold, 'CLINIC_VALIDATION_FAILED', 400, 'no mobile-derived identity: fail closed before any Hold is created.');
+        $this->assertClinicError($hold, PatientAccess::PROOF_FAILED_CODE, 403, 'no mobile-derived identity: fail closed before any Hold is created.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($hold->get_data()['message'] ?? ''), 'Legacy marker with zero links must return canonical patient proof failure message.');
         self::assertSame(0, $this->countRows('cpms_slot_holds'), 'no Hold row is created.');
         self::assertSame(0, $this->heldCountOf($slot['slot_id']), 'no slot capacity is consumed.');
         self::assertSame(0, $this->countPatientsForMobile($this->clinicA, self::MOBILE_R1), 'no Patient is created in the booking Clinic.');
@@ -2474,7 +2502,8 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'slot_time' => $slot['time'],
             'slot_id' => $slot['slot_id'],
         ], asUserId: $userId, withNonce: true);
-        $this->assertClinicError($hold, 'CLINIC_VALIDATION_FAILED', 400, 'no mobile-derived identity in the booking Clinic: fail closed before any Hold is created.');
+        $this->assertClinicError($hold, PatientAccess::PROOF_FAILED_CODE, 403, 'no mobile-derived identity in the booking Clinic: fail closed before any Hold is created.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($hold->get_data()['message'] ?? ''), 'Legacy marker linked only in Clinic B must return canonical patient proof failure message.');
         self::assertSame(0, $this->countRows('cpms_slot_holds'), 'no Hold row is created.');
         self::assertSame(0, $this->heldCountOf($slot['slot_id']), 'no slot capacity is consumed.');
         self::assertSame(0, $this->countPatientsForMobile($this->clinicA, self::MOBILE_R2), 'no Patient is created in the booking Clinic.');
@@ -2511,6 +2540,11 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'linked_at' => App::db()->nowUtcSql(),
         ]);
         $this->seedStampedMarkerSession($userId, $this->clinicA, [$this->clinicA]);
+        PatientTwoProofTestHelper::seed_patient_proof($userId, $this->clinicA, $patient, [
+            'mobile' => self::MOBILE_R3,
+            'seed_session_scope' => true,
+            'full_identity' => false,
+        ]);
 
         $hold = $this->restPost(self::NS . self::HOLD_PATH, [
             'clinician_id' => $this->clinicianA,
@@ -2559,7 +2593,8 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'slot_time' => $slot['time'],
             'slot_id' => $slot['slot_id'],
         ], asUserId: $userId, withNonce: true);
-        $this->assertClinicError($hold, 'CLINIC_SCOPE_REQUIRED', 400, 'a stale marker grants no scope.');
+        $this->assertClinicError($hold, PatientAccess::PROOF_FAILED_CODE, 403, 'a stale marker grants no scope.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($hold->get_data()['message'] ?? ''), 'Stale marker after link deletion must return canonical patient proof failure message.');
         self::assertSame(0, $this->countRows('cpms_slot_holds'));
         self::assertSame(0, $this->heldCountOf($slot['slot_id']));
     }
@@ -2618,7 +2653,9 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'hold_token' => $holdToken,
             'last_name' => 'احمدی',
         ] + $hostile, asUserId: $userId, withNonce: true, idempotencyKey: $this->uuid());
-        $this->assertConfirmFailClosed($attempt1, $expectedMessage, 'A Historical-NULL confirm with missing first_name must fail closed.');
+        $this->assertClinicError($attempt1, PatientAccess::PROOF_FAILED_CODE, 403, 'A Historical-NULL confirm with missing first_name must fail closed.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($attempt1->get_data()['message'] ?? ''), 'R5 missing first_name must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
+        self::assertNotSame($expectedMessage, (string) ($attempt1->get_data()['message'] ?? ''), 'REST proof gate precedes service-boundary incomplete-profile message.');
         $this->assertSeededHoldUntouchedAndNothingCreated($slot['slot_id'], $holdToken, self::MOBILE_R5, $userId, 1);
         $this->assertWpUserUnchanged($wpUserBefore, $capsBefore, $userId);
 
@@ -2628,7 +2665,8 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'first_name' => '   ',
             'last_name' => 'احمدی',
         ] + $hostile, asUserId: $userId, withNonce: true, idempotencyKey: $this->uuid());
-        $this->assertConfirmFailClosed($attempt2, $expectedMessage, 'A Historical-NULL confirm with a whitespace-only first_name must fail closed.');
+        $this->assertClinicError($attempt2, PatientAccess::PROOF_FAILED_CODE, 403, 'A Historical-NULL confirm with a whitespace-only first_name must fail closed.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($attempt2->get_data()['message'] ?? ''), 'R5 whitespace first_name must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
         self::assertSame($attempt1->get_status(), $attempt2->get_status(), 'name variants produce equal HTTP status');
         self::assertSame($attempt1->get_data(), $attempt2->get_data(), 'name variants produce equal decoded response data');
         $this->assertSeededHoldUntouchedAndNothingCreated($slot['slot_id'], $holdToken, self::MOBILE_R5, $userId, 1);
@@ -2640,7 +2678,8 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'first_name' => 'سارا',
             'last_name' => 'احمدی',
         ] + $hostile, asUserId: $userId, withNonce: true, idempotencyKey: $this->uuid());
-        $this->assertConfirmFailClosed($attempt3, $expectedMessage, 'A Historical-NULL confirm with valid names must still fail closed.');
+        $this->assertClinicError($attempt3, PatientAccess::PROOF_FAILED_CODE, 403, 'A Historical-NULL confirm with valid names must still fail closed.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($attempt3->get_data()['message'] ?? ''), 'R5 valid names must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
         self::assertSame($attempt1->get_data(), $attempt3->get_data(), 'Valid names do not change the fail-closed envelope');
         $this->assertSeededHoldUntouchedAndNothingCreated($slot['slot_id'], $holdToken, self::MOBILE_R5, $userId, 1);
         $this->assertWpUserUnchanged($wpUserBefore, $capsBefore, $userId);
@@ -2714,7 +2753,9 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
         $attempt1 = $this->restPost(self::NS . self::CONFIRM_PATH, [
             'hold_token' => $holdToken,
         ] + $hostile, asUserId: $userId, withNonce: true, idempotencyKey: $this->uuid());
-        $this->assertConfirmFailClosed($attempt1, $expectedMessage, 'An other-Clinic-only same-mobile Patient opens no gate here.');
+        $this->assertClinicError($attempt1, PatientAccess::PROOF_FAILED_CODE, 403, 'An other-Clinic-only same-mobile Patient opens no gate here.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($attempt1->get_data()['message'] ?? ''), 'R6 missing names must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
+        self::assertNotSame($expectedMessage, (string) ($attempt1->get_data()['message'] ?? ''), 'REST proof gate precedes service-boundary incomplete-profile message.');
         $this->assertSeededHoldUntouchedAndNothingCreated($slot['slot_id'], $holdToken, self::MOBILE_R6, $userId, 0, 1);
         $this->assertWpUserUnchanged($wpUserBefore, $capsBefore, $userId);
 
@@ -2725,7 +2766,8 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'first_name' => 'نرگس',
             'last_name' => 'کریمی',
         ] + $hostile, asUserId: $userId, withNonce: true, idempotencyKey: $this->uuid());
-        $this->assertConfirmFailClosed($attempt2, $expectedMessage, 'Valid names must not open the gate in the booking Clinic.');
+        $this->assertClinicError($attempt2, PatientAccess::PROOF_FAILED_CODE, 403, 'Valid names must not open the gate in the booking Clinic.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($attempt2->get_data()['message'] ?? ''), 'R6 valid names must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
         self::assertSame($attempt1->get_status(), $attempt2->get_status(), 'name variants produce equal HTTP status');
         self::assertSame($attempt1->get_data(), $attempt2->get_data(), 'name variants produce equal decoded response data');
         $this->assertSeededHoldUntouchedAndNothingCreated($slot['slot_id'], $holdToken, self::MOBILE_R6, $userId, 0, 1);
@@ -2773,7 +2815,8 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'slot_time' => $slot['time'],
             'slot_id' => $slot['slot_id'],
         ], asUserId: $userId, withNonce: true);
-        $this->assertClinicError($hold, 'CLINIC_SCOPE_REQUIRED', 400, 'a caller linked only in another Clinic gets the uniform fail-closed scope envelope.');
+        $this->assertClinicError($hold, PatientAccess::PROOF_FAILED_CODE, 403, 'a caller linked only in another Clinic gets the uniform fail-closed scope envelope.');
+        self::assertSame(PatientAccess::PROOF_FAILED_MESSAGE, (string) ($hold->get_data()['message'] ?? ''), 'R7 other-clinic-only caller must return exact PatientAccess::PROOF_FAILED_MESSAGE.');
         self::assertSame(0, $this->countRows('cpms_slot_holds'), 'no Hold row is created.');
         self::assertSame(0, $this->heldCountOf($slot['slot_id']), 'no slot capacity is consumed.');
         self::assertSame(0, $this->countPatientsForMobile($this->clinicA, self::MOBILE_R7), 'no Patient is created in the booking Clinic.');

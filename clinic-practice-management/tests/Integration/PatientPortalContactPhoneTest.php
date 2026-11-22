@@ -10,6 +10,7 @@ use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 /**
@@ -106,6 +107,12 @@ final class PatientPortalContactPhoneTest extends WP_UnitTestCase
             'DELETE FROM ' . $wpdb->prefix . 'cpms_patient_user_links WHERE clinic_id >= 61000' // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
         );
         $wpdb->query(
+            'DELETE pl FROM ' . $wpdb->prefix . 'cpms_patient_logins pl INNER JOIN ' . $wpdb->prefix . 'cpms_patients p ON p.id = pl.patient_id WHERE p.clinic_id >= 61000' // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+        );
+        $wpdb->query(
+            'DELETE pil FROM ' . $wpdb->prefix . 'cpms_patient_identity_links pil INNER JOIN ' . $wpdb->prefix . 'cpms_patients p ON p.id = pil.patient_id WHERE p.clinic_id >= 61000' // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+        );
+        $wpdb->query(
             'DELETE FROM ' . $wpdb->prefix . 'cpms_patients WHERE clinic_id >= 61000' // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
         );
         $wpdb->query(
@@ -133,7 +140,7 @@ final class PatientPortalContactPhoneTest extends WP_UnitTestCase
             );
         }
 
-        wp_set_current_user( 0 );
+        PatientTwoProofTestHelper::reset();
         ScopeContext::clear();
         App::resetScope();
         SystemClinicResolver::flush();
@@ -316,7 +323,7 @@ final class PatientPortalContactPhoneTest extends WP_UnitTestCase
         global $wpdb;
 
         $now    = App::db()->nowUtcSql();
-        $mobile = '09' . substr( bin2hex( random_bytes( 5 ) ), 0, 9 );
+        $mobile = '0912' . sprintf( '%07d', random_int( 1000000, 9999999 ) );
         $mrn    = 'MR-CPC' . strtoupper( (string) ( preg_replace( '/[^a-z0-9]/i', '', $tag ) ?? '' ) ) . bin2hex( random_bytes( 4 ) );
 
         $ok = $wpdb->insert(
@@ -371,6 +378,17 @@ final class PatientPortalContactPhoneTest extends WP_UnitTestCase
             [ '%d', '%d', '%d', '%s', '%d', '%s' ]
         );
         self::assertTrue( (bool) $ok, 'fixture: patient_user_link insert failed: ' . $wpdb->last_error );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $clinicId,
+            $patientId,
+            [
+                'mobile'             => $mobile,
+                'is_primary'         => $primary,
+                'seed_session_scope' => true,
+                'set_current_user'   => false,
+            ]
+        );
     }
 
     private function makePurePatientLinkedTo( int $clinicId, string $tag ): int
@@ -384,7 +402,7 @@ final class PatientPortalContactPhoneTest extends WP_UnitTestCase
 
     private function renderPortalAs( int $userId ): string
     {
-        wp_set_current_user( $userId );
+        PatientTwoProofTestHelper::acting_as( $userId );
         ob_start();
         try {
             PatientPortalPage::render();

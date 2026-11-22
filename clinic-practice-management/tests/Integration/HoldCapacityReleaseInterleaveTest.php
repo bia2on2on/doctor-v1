@@ -7,6 +7,7 @@ namespace ClinicCore\Tests\Integration;
 use ClinicCore\Application\Jobs\HoldsExpireHandler;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 /**
@@ -192,6 +193,12 @@ final class HoldCapacityReleaseInterleaveTest extends WP_UnitTestCase
         // runs inside one PHPUnit process on the parent's connection, so the
         // cookie + in-process binding resolve without any seeded tokens elsewhere.
         cpms_test_seed_patient_session( $this->userAId, $this->clinicId );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->userAId,
+            $this->clinicId,
+            $patientA,
+            [ 'mobile' => '09120000011', 'seed_session_scope' => true, 'full_identity' => false ]
+        );
 
         // Slot with capacity 2; two active holds (A and B) => held_count = 2.
         $date = gmdate( 'Y-m-d', time() + 3 * 86400 );
@@ -245,6 +252,13 @@ final class HoldCapacityReleaseInterleaveTest extends WP_UnitTestCase
         foreach ( $this->createdPatientIds as $patientId ) {
             $wpdb->query(
                 $wpdb->prepare(
+                    'DELETE FROM ' . $wpdb->prefix . 'cpms_patient_logins WHERE patient_id = %d AND clinic_id = %d',
+                    $patientId,
+                    $this->clinicId
+                )
+            );
+            $wpdb->query(
+                $wpdb->prepare(
                     'DELETE FROM ' . $wpdb->prefix . 'cpms_patient_user_links WHERE patient_id = %d AND clinic_id = %d',
                     $patientId,
                     $this->clinicId
@@ -257,6 +271,15 @@ final class HoldCapacityReleaseInterleaveTest extends WP_UnitTestCase
                 )
             );
         }
+        foreach ( $this->createdUserIds as $userId ) {
+            $wpdb->query(
+                $wpdb->prepare(
+                    'DELETE FROM ' . $wpdb->prefix . 'cpms_patient_logins WHERE wp_user_id = %d',
+                    $userId
+                )
+            );
+        }
+        PatientTwoProofTestHelper::reset();
         if ( $this->clinicianId > 0 ) {
             $wpdb->query(
                 $wpdb->prepare(

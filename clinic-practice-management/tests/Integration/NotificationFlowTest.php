@@ -13,6 +13,7 @@ use ClinicCore\Domain\Time\Jalali;
 use ClinicCore\Infrastructure\Queue\JobQueue;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use ClinicCore\Infrastructure\Repository\NotificationRepository;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -105,6 +106,18 @@ final class NotificationFlowTest extends WP_UnitTestCase
                 $now
             )
         );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserId,
+            1,
+            $this->patientId,
+            ['mobile' => '09140000001', 'seed_session_scope' => true]
+        );
+    }
+
+    protected function tearDown(): void
+    {
+        PatientTwoProofTestHelper::reset();
+        parent::tearDown();
     }
 
     // ================= QUEUE.called (N-1/N-2) =================
@@ -240,7 +253,7 @@ final class NotificationFlowTest extends WP_UnitTestCase
         $this->assertSame(1, $this->countRows('cpms_notifications', "recipient_patient_id = {$this->patientId} AND template = 'appt_confirmed'"));
         $this->assertSame(1, $this->countRows('cpms_sms_messages', "event = 'appointment_confirmed' AND context_type = 'appointment' AND context_id = {$apptId}"));
 
-        wp_set_current_user($this->patientUserId);
+        PatientTwoProofTestHelper::acting_as($this->patientUserId);
         $res = $this->dispatch('GET', self::NS . '/notifications');
         $data = $this->payload($res);
         $this->assertCount(1, $data['notifications']);

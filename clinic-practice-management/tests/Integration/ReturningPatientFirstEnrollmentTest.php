@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Patients\PatientService;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
@@ -18,6 +19,7 @@ use ClinicCore\Infrastructure\Repository\PatientIdentityRepository;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Infrastructure\Repository\ReturningPatientRepository;
 use ClinicCore\Infrastructure\Repository\VisitRepository;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use WP_REST_Request;
 use WP_REST_Response;
@@ -67,13 +69,18 @@ final class ReturningPatientFirstEnrollmentTest extends WP_UnitTestCase
         $this->assertGreaterThan(0, $this->encounter);
         remove_all_filters('cpms_license_dev_mode');
         $this->installSignedExpiration($this->t0);
-        wp_set_current_user($this->user);
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->user,
+            1,
+            $this->source,
+            ['mobile' => '09127770001', 'seed_session_scope' => true]
+        );
     }
 
     protected function tearDown(): void
     {
         remove_all_filters('cpms_license_public_key');
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         App::resetScope();
         parent::tearDown();
     }
@@ -329,7 +336,7 @@ final class ReturningPatientFirstEnrollmentTest extends WP_UnitTestCase
         $staff = (int) self::factory()->user->create(['role' => 'cpms_secretary']);
         $wrongRole = $this->dispatch($staff, true);
         $this->assertSame(403, $wrongRole->get_status());
-        $this->assertSame('CLINIC_PERMISSION_DENIED', $wrongRole->get_data()['code']);
+        $this->assertSame(PatientAccess::PROOF_FAILED_CODE, $wrongRole->get_data()['code']);
         $this->assertSame($before['cpms_patients'], $this->counts()['cpms_patients']);
         $response = $this->dispatch($this->user, true);
         $this->assertSame(200, $response->get_status(), wp_json_encode($response->get_data()));
@@ -344,7 +351,7 @@ final class ReturningPatientFirstEnrollmentTest extends WP_UnitTestCase
 
     private function dispatch(int $user, bool $nonce): WP_REST_Response
     {
-        wp_set_current_user($user);
+        PatientTwoProofTestHelper::acting_as($user);
         $request = new WP_REST_Request('POST', '/clinic/v1/patient/enroll');
         foreach ($this->fields() + ['clinic_id' => $this->clinic, 'identity_id' => 999999, 'wp_user_id' => 999999] as $key => $value) {
             $request->set_param($key, $value);

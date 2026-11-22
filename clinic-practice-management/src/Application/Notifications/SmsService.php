@@ -131,8 +131,8 @@ final class SmsService
     }
 
     private function allows_licensed_event( string $event, ?string $context_type = null, ?int $context_id = null, int $clinic_id = 0 ): bool {
-        // OTP is the registry's authentication/security event, not a commercial reminder.
-        if ( SmsEvents::OTP === $event ) {
+        // OTP and patient binding verification notice are authentication/security events, not commercial reminders.
+        if ( in_array( $event, [ SmsEvents::OTP, SmsEvents::PATIENT_BINDING_VERIFIED ], true ) ) {
             return true;
         }
         $gate    = $this->license_gate ?? \ClinicCore\Bootstrap\App::licenseGate();
