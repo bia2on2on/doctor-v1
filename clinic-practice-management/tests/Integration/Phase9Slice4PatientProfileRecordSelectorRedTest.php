@@ -9,6 +9,7 @@ use ClinicCore\Application\Patients\PatientService;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Security\RolesAndCapabilities;
 use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Settings\Settings;
 use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
@@ -204,8 +205,8 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
         $this->assertMaterializedLink($linkB, $patientB, $callerUserId, $clinics['b_id'], 'active', 0);
         self::assertSame([
             'first_name', 'last_name', 'birth_date', 'gender', 'address', 'phone',
-            'national_id', 'emergency_contact_name', 'emergency_contact_phone',
-        ], PatientService::ME_EDITABLE, 'Record selection must not widen the established self-service whitelist.');
+            'emergency_contact_name', 'emergency_contact_phone',
+        ], PatientService::ME_EDITABLE, 'P2: Record selection must keep national_id excluded from self-service ME_EDITABLE.');
 
         $selectedRead = $this->dispatch('GET', self::ME_PATH, ['link_id' => $linkB], $callerUserId);
         self::assertSame(200, $selectedRead->get_status());
@@ -381,43 +382,33 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
         self::assertSame(1, $this->countPatientsByClinicAndNationalId($clinics['b_id'], '0000000061'), 'Duplicate fixture exists in the selected Clinic.');
         self::assertSame(1, $this->countPatientsByClinicAndNationalId($clinics['a_id'], '0000000061'), 'The same national ID in another Clinic is not a cross-Clinic merge signal.');
 
-        // Positive controls: the existing one-link /patient/me read remains
-        // automatic, and national ID remains self-service editable when valid
-        // and unique in the selected Clinic.
+        // Positive controls (P2): the existing one-link /patient/me read remains
+        // automatic, never projects national_id, and PUT /patient/me rejects
+        // NID-only edits (both unique and duplicate) with zero oracle.
         $singleLinkRead = $this->dispatch('GET', self::ME_PATH, [], $callerUserId);
         self::assertSame(200, $singleLinkRead->get_status(), 'One active durable link keeps existing /patient/me behavior.');
         $singleLinkBody = $singleLinkRead->get_data();
         self::assertSame($selectedPatient, (int) ($singleLinkBody['data']['id'] ?? 0));
+        self::assertArrayNotHasKey('national_id', $singleLinkBody['data'] ?? [], 'P2: /patient/me must omit national_id.');
 
         $auditBeforeValidEdit = $this->auditCountForPatient($selectedPatient);
         $validEdit = $this->dispatch('PUT', self::ME_PATH, [
             'link_id' => $selectedLink,
+            'first_name' => 'SelfEdited',
             'national_id' => '0000000140',
         ], $callerUserId);
-        self::assertSame(200, $validEdit->get_status(), 'A valid unique national ID edit remains supported.');
+        self::assertSame(200, $validEdit->get_status(), 'A valid non-NID self-service edit succeeds and strips national_id.');
         $validBody = $validEdit->get_data();
         self::assertSame($selectedPatient, (int) ($validBody['data']['id'] ?? 0));
-        self::assertSame('0000000140', (string) ($validBody['data']['national_id'] ?? ''));
-        self::assertSame('0000000140', (string) $this->patientRow($selectedPatient)['national_id']);
+        self::assertArrayNotHasKey('national_id', $validBody['data'] ?? [], 'P2: PUT /patient/me response must omit national_id.');
+        self::assertSame('0000000061', (string) $this->patientRow($selectedPatient)['national_id'], 'P2: self-service PUT must not change national_id.');
         self::assertSame($auditBeforeValidEdit + 1, $this->auditCountForPatient($selectedPatient), 'Successful edit retains PATIENT_PROFILE_UPDATED audit behavior.');
-
-        // Changing national_id closes active bindings and destroys WP sessions (B1 / §7.6);
-        // re-verify the caller session so the duplicate-NID test reaches updateMe() validation.
-        PatientTwoProofTestHelper::acting_as(0);
-        PatientTwoProofTestHelper::seed_patient_proof($callerUserId, $clinics['b_id'], $selectedPatient, [
-            'mobile' => $this->mobileFor('r4-s'),
-            'is_primary' => true,
-            'seed_session_scope' => true,
-            'set_current_user' => false,
-        ]);
 
         $selectedBeforeReject = $this->patientRow($selectedPatient);
         $patientCountBeforeReject = $this->countRows('cpms_patients');
         $linkCountBeforeReject = $this->countRows('cpms_patient_user_links');
         $auditBeforeReject = $this->auditCountForPatient($selectedPatient);
 
-        // No raw SQL is used for the attempted duplicate: this is the actual
-        // selected-record self-service API path under the future link_id contract.
         $duplicateEdit = $this->dispatch('PUT', self::ME_PATH, [
             'link_id' => $selectedLink,
             'national_id' => '0000000061',
@@ -426,13 +417,19 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
             $duplicateEdit,
             'CLINIC_VALIDATION_FAILED',
             400,
-            'Duplicate valid national ID within the selected Clinic must be canonical validation failure, never false success.'
+            'P2: NID-only PUT /patient/me fails with generic CLINIC_VALIDATION_FAILED.'
         );
+        $uniqueNidOnly = $this->dispatch('PUT', self::ME_PATH, [
+            'link_id' => $selectedLink,
+            'national_id' => '0000000140',
+        ], $callerUserId);
+        $this->assertClinicError($uniqueNidOnly, 'CLINIC_VALIDATION_FAILED', 400, 'P2: unique NID-only PUT fails identically (no oracle).');
+        self::assertSame((string) ($duplicateEdit->get_data()['message'] ?? ''), (string) ($uniqueNidOnly->get_data()['message'] ?? ''));
 
-        self::assertSame($selectedBeforeReject, $this->patientRow($selectedPatient), 'A rejected duplicate may not mutate the selected record.');
-        self::assertSame($patientCountBeforeReject, $this->countRows('cpms_patients'), 'A rejected duplicate may not create Patient records.');
-        self::assertSame($linkCountBeforeReject, $this->countRows('cpms_patient_user_links'), 'A rejected duplicate may not create links or associations.');
-        self::assertSame($auditBeforeReject, $this->auditCountForPatient($selectedPatient), 'A rejected duplicate may not write a successful PATIENT_PROFILE_UPDATED audit.');
+        self::assertSame($selectedBeforeReject, $this->patientRow($selectedPatient), 'A rejected NID-only PUT may not mutate the selected record.');
+        self::assertSame($patientCountBeforeReject, $this->countRows('cpms_patients'), 'A rejected NID-only PUT may not create Patient records.');
+        self::assertSame($linkCountBeforeReject, $this->countRows('cpms_patient_user_links'), 'A rejected NID-only PUT may not create links or associations.');
+        self::assertSame($auditBeforeReject, $this->auditCountForPatient($selectedPatient), 'A rejected NID-only PUT may not write a successful PATIENT_PROFILE_UPDATED audit.');
         self::assertSame('0000000061', (string) $this->patientRow($sameClinicDuplicate)['national_id']);
         self::assertSame('0000000061', (string) $this->patientRow($crossClinicSameNationalId)['national_id']);
     }
@@ -556,12 +553,13 @@ final class Phase9Slice4PatientProfileRecordSelectorRedTest extends WP_UnitTestC
             return $sql;
         };
 
+        $staffUserId = $this->createUser('write-failure-staff', RolesAndCapabilities::ROLE_SECRETARY);
+        cpms_test_seed_membership($staffUserId, $clinics['b_id'], RolesAndCapabilities::ROLE_SECRETARY);
         add_filter('query', $injector);
         try {
-            $rejected = $this->dispatch('PUT', self::ME_PATH, [
-                'link_id' => $selectedLink,
+            $rejected = $this->dispatch('PUT', '/clinic/v1/patients/' . $selectedPatient, [
                 'national_id' => $targetNationalId,
-            ], $callerUserId);
+            ], $staffUserId);
         } finally {
             remove_filter('query', $injector);
         }

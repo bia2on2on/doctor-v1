@@ -19,6 +19,7 @@ use ClinicCore\Infrastructure\UserCacheRollback;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 use ClinicCore\Infrastructure\Queue\JobQueue;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Infrastructure\Security\RateLimiter;
 use ClinicCore\Settings\Settings;
 use ClinicCore\Settings\SettingsFactory;
@@ -444,10 +445,11 @@ final class OtpService
         // this slice and stays as inert defense in depth.
         // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy local naming preserved.
         $clinic_id = $clinicId;
+        $outer_tx_depth = $this->db->tx_depth();
 
         try {
             $verify_outcome = $this->db->transactional(
-                function () use ( $row, $rowClinicId, $mobile, $code, $purpose, $ip, $clinic_id, $policy ): array {
+                function () use ( $row, $rowClinicId, $mobile, $code, $purpose, $ip, $clinic_id, $policy, $outer_tx_depth ): array {
                     // One current read serializes failures and successful consumes
                     // on this challenge. Recheck expiry/lock AFTER any lock wait:
                     // stale pre-transaction state cannot lose failed attempts or
@@ -558,11 +560,43 @@ final class OtpService
                     $session_issued = false;
                     $patient_links  = [];
 
+                    // P4: issue an account-only non-persistent session (8h, mobile proof only)
+                    // ONLY when a live pure-patient `cpms_patient_logins` account row exists
+                    // for this mobile on PURPOSE_LOGIN. Pending stays pending; no binding
+                    // proof is written and patient_links stays empty.
+                    if ( self::PURPOSE_LOGIN === $purpose ) {
+                        $login_repo = new PatientLoginRepository( $this->db );
+                        if ( $login_repo->table_exists() ) {
+                            $account = $login_repo->find_account_by_mobile( $mobile, true );
+                            if (
+                                is_array( $account )
+                                && in_array(
+                                    (string) ( $account['state'] ?? '' ),
+                                    [ PatientLoginRepository::STATE_PENDING, PatientLoginRepository::STATE_ACTIVE ],
+                                    true
+                                )
+                            ) {
+                                $candidate_user_id = (int) ( $account['wp_user_id'] ?? 0 );
+                                if (
+                                    $candidate_user_id > 0
+                                    && App::patient_access()->is_pure_patient_actor( $candidate_user_id )
+                                ) {
+                                    if ( $outer_tx_depth > 0 ) {
+                                        throw new OtpException( 'CLINIC_OTP_INVALID', 'خطای نشست؛ لطفاً دوباره تلاش کنید' );
+                                    }
+                                    $user_id        = $candidate_user_id;
+                                    $session_issued = true;
+                                }
+                            }
+                        }
+                    }
+
                     // phpcs:ignore PEAR.Functions.FunctionCallSignature.SpaceAfterOpenBracket,PEAR.Functions.FunctionCallSignature.SpaceBeforeCloseBracket -- compact audit helper.
                     $this->audit( 'OTP_VERIFY_OK', $user_id, $mobile, $ip, [ 'purpose' => $purpose ], $clinic_id );
-                    // LOGIN_SUCCESS عمداً نوشته نمی‌شود: هیچ Sessionی صادر نمی‌شود
-                    // (تصمیم مالک — Option A). در صورت بازگشتِ Session در Slice 2،
-                    // این Audit باید هم‌زمان با صدور کوکی بازگردانده شود.
+                    if ( $session_issued ) {
+                        // phpcs:ignore PEAR.Functions.FunctionCallSignature.SpaceAfterOpenBracket,PEAR.Functions.FunctionCallSignature.SpaceBeforeCloseBracket -- compact audit helper.
+                        $this->audit( 'LOGIN_SUCCESS', $user_id, $mobile, $ip, [ 'purpose' => $purpose ], $clinic_id );
+                    }
 
                     return [
                         'user_id'        => $user_id,
@@ -586,15 +620,19 @@ final class OtpService
             throw $verify_outcome['error'];
         }
 
-        // کوکی احراز هویت وردپرس پس از Commitِ پایدار صادر می‌شود (اثر جانبی
-        // غیرتراکنشی) — هر شکست در مرز بالا پیش از این نقطه کامل roll back شده.
-        if ( $verify_outcome['session_issued'] && function_exists( 'wp_set_auth_cookie' ) ) {
-            $scope = $this->session_scope();
-            $scope->begin_otp_cookie_issue( (int) $verify_outcome['user_id'], (int) $verify_outcome['clinic_id'] );
-            try {
-                wp_set_auth_cookie( (int) $verify_outcome['user_id'], true );
-            } finally {
-                $scope->end_otp_cookie_issue();
+        // کوکی احراز هویت غیرپایدار (۸ ساعت، remember=false) و اثبات موبایلِ نشست
+        // پس از Commitِ پایدار صادر می‌شوند — هر شکست در مرز بالا کامل roll back شده.
+        if ( $verify_outcome['session_issued'] ) {
+            $proof_store   = new PatientSessionProofStore();
+            $session_token = $proof_store->issue_non_persistent_auth_cookie( (int) $verify_outcome['user_id'] );
+            if ( '' !== $session_token ) {
+                $proof_store->record_mobile_proof(
+                    (int) $verify_outcome['user_id'],
+                    $mobile,
+                    null,
+                    $session_token
+                );
+                $this->session_scope()->set_in_process_session_token( (int) $verify_outcome['user_id'], $session_token );
             }
         }
 

@@ -10,6 +10,7 @@ use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Application\Patients\PatientService;
 use ClinicCore\Auth\RolesAndCapabilities;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Infrastructure\Security\ClientIp;
 use WP_Error;
 use WP_REST_Request;
@@ -107,7 +108,6 @@ final class PatientController extends RestBase
                     'gender' => ['required' => false, 'type' => 'string'],
                     'address' => ['required' => false, 'type' => 'string'],
                     'phone' => ['required' => false, 'type' => 'string'],
-                    'national_id' => ['required' => false, 'type' => 'string'],
                     'emergency_contact_name' => ['required' => false, 'type' => 'string'],
                     'emergency_contact_phone' => ['required' => false, 'type' => 'string'],
                 ],
@@ -265,6 +265,22 @@ final class PatientController extends RestBase
         $raw_nid    = is_string( $body['national_id'] ?? null ) ? (string) $body['national_id'] : '';
         $raw_code   = is_string( $body['code'] ?? null ) ? (string) $body['code'] : null;
         $user_id    = (int) get_current_user_id();
+        if ( '' === trim( $raw_mobile ) && ( null === $raw_code || '' === trim( $raw_code ) ) && $user_id > 0 ) {
+            try {
+                $login_repo = new PatientLoginRepository( App::db() );
+                if ( $login_repo->table_exists() ) {
+                    $account = $login_repo->find_account_by_user_id( $user_id );
+                    if (
+                        is_array( $account )
+                        && PatientLoginRepository::STATE_CLOSED !== (string) ( $account['state'] ?? '' )
+                    ) {
+                        $raw_mobile = (string) ( $account['mobile'] ?? '' );
+                    }
+                }
+            } catch ( \Throwable ) {
+                $raw_mobile = '';
+            }
+        }
         $ip         = ClientIp::resolve() ?? '0.0.0.0';
         $promoter   = $this->promoter ?? App::patient_binding_promoter();
 

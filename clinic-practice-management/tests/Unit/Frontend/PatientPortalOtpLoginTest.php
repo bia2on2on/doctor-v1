@@ -37,4 +37,28 @@ final class PatientPortalOtpLoginTest extends TestCase {
 		self::assertStringContainsString( 'result.body.data.sms_sent !== true', $this->source );
 		self::assertStringContainsString( 'codeRequested = true;', $this->source );
 	}
+
+	public function testProfileOmitsNationalIdAndDeadEndOtpErrorCopyIsReplaced(): void {
+		self::assertStringNotContainsString( 'کد معتبر نیست یا ورود برای این حساب مجاز نیست', $this->source );
+		self::assertStringContainsString( 'function bindLinkRecord(config)', $this->source );
+		self::assertStringContainsString( 'config.link_record_path', $this->source );
+
+		$otpFrontendPath = dirname( __DIR__, 3 ) . '/src/Frontend/PatientOtpLogin.php';
+		self::assertFileExists( $otpFrontendPath );
+		$otpFrontend = (string) file_get_contents( $otpFrontendPath );
+		self::assertStringNotContainsString( 'در صورت نبود حساب فعال، هنگام رزرو یا ثبت پرونده در مطب بررسی می‌شود', $otpFrontend );
+	}
+
+	public function testPatientLoginSlice1JsSpecPassesWithNode(): void {
+		$node = trim( (string) shell_exec( 'command -v node 2>/dev/null' ) );
+		self::assertNotSame( '', $node, 'node binary must be available.' );
+
+		$spec = dirname( __DIR__, 2 ) . '/js/patient-login-slice1.spec.js';
+		self::assertFileExists( $spec );
+
+		$output = [];
+		$code   = 1;
+		exec( escapeshellarg( $node ) . ' ' . escapeshellarg( $spec ) . ' 2>&1', $output, $code );
+		self::assertSame( 0, $code, implode( "\n", $output ) );
+	}
 }

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ClinicCore\Admin;
 
+use ClinicCore\Application\Auth\PatientSessionProofStore;
+use ClinicCore\Application\Clinic\PublicClinicDirectory;
 use ClinicCore\Application\Patients\PatientService;
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Auth\RolesAndCapabilities;
@@ -12,6 +14,7 @@ use ClinicCore\Domain\Time\Jalali;
 use ClinicCore\Domain\Time\PersianDigits;
 use ClinicCore\Frontend\PatientPortalShell;
 use ClinicCore\Frontend\PublicBookingShortcode;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 
 /**
  * «نوبت‌های من» — محتوای پورتال بیمار (ADR-0030 / Part 1 + Phase 9 Slices 1–3).
@@ -361,6 +364,8 @@ final class PatientPortalPage
 
         $enrollment_options = self::enrollment_options( $user_id );
         $booking_clinics    = self::booking_clinics( $user_id, $enrollment_options );
+        $has_mobile_proof   = self::has_account_mobile_proof( $user_id );
+        $link_clinics       = $has_mobile_proof ? self::link_record_clinics() : [];
 
         // اصلاح بین‌فازی: «تماس با مطب» از Clinic Profileِ رسمی (cpms_clinics.phone)
         //ِ Clinicِ resolve‌شده از زمینهٔ قابل‌اعتمادِ پورتال (linked_recordsِ کاربر
@@ -388,6 +393,7 @@ final class PatientPortalPage
         $html = '<div class="wrap cpms-patient-portal" dir="rtl" style="max-width:860px">';
 
         $html .= self::dashboard_section( $upcoming, $past, $inbox, $booking_clinics );
+        $html .= self::link_record_section( $has_mobile_proof, $link_clinics, $profile_records );
         $html .= self::booking_section( $booking_clinics );
         $html .= '<section class="cpms-pp-section" data-role="appointments-section" id="appointments" aria-labelledby="cpms-pp-appointments-heading">';
         $html .= '<h2 id="cpms-pp-appointments-heading">نوبت‌های من</h2>';
@@ -733,6 +739,7 @@ final class PatientPortalPage
                 // Existing C0a route only; the Clinic selector is re-authorized
                 // server-side and no clinic/patient authority is published.
                 'enroll_path'             => '/patient/enroll',
+                'link_record_path'        => '/patient/link-record',
                 'login_url'               => wp_login_url(),
                 'profile_records'         => $profile_records_payload,
                 'profile_initial'         => $profile_initial_payload,
@@ -890,13 +897,6 @@ final class PatientPortalPage
                 'label'        => 'نام خانوادگی',
                 'type'         => 'text',
                 'autocomplete' => 'family-name',
-            ],
-            'national_id'             => [
-                'label'        => 'کد ملی',
-                'type'         => 'text',
-                'inputmode'    => 'numeric',
-                'autocomplete' => 'off',
-                'dir'          => 'ltr',
             ],
             'birth_date'              => [
                 'label' => 'تاریخ تولد',
@@ -1150,6 +1150,159 @@ final class PatientPortalPage
         }
 
         return $html . '</dl>';
+    }
+
+    /**
+     * Whether the current pure-patient session carries a valid OTP mobile proof
+     * for an active/pending `cpms_patient_logins` account row.
+     */
+    private static function has_account_mobile_proof( int $user_id ): bool {
+        if ( $user_id <= 0 ) {
+            return false;
+        }
+        try {
+            $login_repo = new PatientLoginRepository( App::db() );
+            if ( ! $login_repo->table_exists() ) {
+                return false;
+            }
+            $account = $login_repo->find_account_by_user_id( $user_id );
+            if ( ! is_array( $account ) || PatientLoginRepository::STATE_CLOSED === (string) ( $account['state'] ?? '' ) ) {
+                return false;
+            }
+            $mobile = (string) ( $account['mobile'] ?? '' );
+            if ( '' === $mobile ) {
+                return false;
+            }
+
+            return ( new PatientSessionProofStore() )->has_valid_mobile_proof( $user_id, $mobile );
+        } catch ( \Throwable ) {
+            return false;
+        }
+    }
+
+    /**
+     * Clinics selectable for browser-side `POST /patient/link-record`:
+     * publicly consented clinics from `PublicClinicDirectory` first; when none are
+     * publicly opted-in and the installation has exactly one active clinic under
+     * an active organization, offer that sole clinic (no private multi-clinic
+     * disclosure, no `cpms_patient_user_links` leak).
+     *
+     * @return list<array{id:int, name:string}>
+     */
+    private static function link_record_clinics(): array {
+        $clinics = [];
+        try {
+            $listed = ( new PublicClinicDirectory() )->listed_clinics();
+            foreach ( (array) ( $listed['clinics'] ?? [] ) as $row ) {
+                if ( ! is_array( $row ) ) {
+                    continue;
+                }
+                $id = (int) ( $row['id'] ?? 0 );
+                if ( $id > 0 ) {
+                    $clinics[] = [
+                        'id'   => $id,
+                        'name' => trim( (string) ( $row['name'] ?? '' ) ),
+                    ];
+                }
+            }
+        } catch ( \Throwable ) {
+            $clinics = [];
+        }
+
+        if ( [] !== $clinics ) {
+            return $clinics;
+        }
+
+        try {
+            $db   = App::db();
+            $rows = $db->fetch_all_strict(
+                'SELECT c.id, c.name FROM ' . $db->table( 'cpms_clinics' ) . ' c'
+                . ' INNER JOIN ' . $db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
+                . " WHERE c.status = 'active' AND o.status = 'active'"
+                . ' ORDER BY c.id ASC LIMIT 2'
+            );
+            if ( 1 === count( $rows ) ) {
+                $id = (int) ( $rows[0]['id'] ?? 0 );
+                if ( $id > 0 ) {
+                    return [
+                        [
+                            'id'   => $id,
+                            'name' => trim( (string) ( $rows[0]['name'] ?? '' ) ),
+                        ],
+                    ];
+                }
+            }
+        } catch ( \Throwable ) {
+            return [];
+        }
+
+        return [];
+    }
+
+    /**
+     * Browser path to `POST /patient/link-record` after OTP account login (P6).
+     *
+     * Never exposes `national_id`, never accepts NID in query strings, and never
+     * pre-selects across multiple clinics.
+     *
+     * @param list<array{id:int, name:string}> $clinics
+     * @param list<array<string, mixed>>       $profile_records
+     */
+    private static function link_record_section( bool $has_mobile_proof, array $clinics, array $profile_records ): string {
+        if ( ! $has_mobile_proof ) {
+            return '';
+        }
+
+        $has_records = [] !== $profile_records;
+        $heading     = $has_records ? 'اتصال پرونده در مرکز دیگر' : 'تأیید هویت و مشاهدهٔ پرونده';
+        $intro       = $has_records
+            ? 'اگر در مرکز درمانی دیگری هم پرونده دارید، مرکز و کد ملی خود را برای تأیید در این نشست وارد کنید.'
+            : 'ورود پیامکی شما انجام شد. برای دسترسی به پرونده، نوبت‌ها و مدارک پزشکی، مرکز درمانی و کد ملی ۱۰ رقمی خود را در این فرم وارد کنید.';
+
+        $html  = '<section class="cpms-pp-section cpms-pp-link-record" id="link-record" data-role="link-record-section" aria-labelledby="cpms-pp-link-record-heading">';
+        $html .= '<h2 id="cpms-pp-link-record-heading">' . esc_html( $heading ) . '</h2>';
+        $html .= '<p class="description">' . esc_html( $intro ) . '</p>';
+
+        if ( [] === $clinics ) {
+            $html .= '<div class="cpms-empty" data-role="link-record-unavailable">';
+            $html .= '<p>برای اتصال پرونده، مرکز درمانی فعالی در این صفحه نمایش داده نشده است؛ لطفاً با پذیرش مرکز تماس بگیرید.</p>';
+            $html .= '</div>';
+            $html .= '</section>';
+
+            return $html;
+        }
+
+        $html .= '<form class="cpms-pp-link-record__form" data-role="link-record-form" method="post" novalidate>';
+        $html .= '<div class="cpms-pp-link-record__field">';
+        $html .= '<label for="cpms-pp-link-record-clinic">مرکز درمانی</label>';
+        $html .= '<select id="cpms-pp-link-record-clinic" data-role="link-record-clinic" required>';
+        if ( count( $clinics ) === 1 ) {
+            $sole  = $clinics[0];
+            $html .= '<option value="' . esc_attr( (string) $sole['id'] ) . '" selected>' . esc_html( $sole['name'] ) . '</option>';
+        } else {
+            $html .= '<option value="">انتخاب مرکز درمانی…</option>';
+            foreach ( $clinics as $clinic ) {
+                $html .= '<option value="' . esc_attr( (string) $clinic['id'] ) . '">' . esc_html( $clinic['name'] ) . '</option>';
+            }
+        }
+        $html .= '</select>';
+        $html .= '</div>';
+
+        $html .= '<div class="cpms-pp-link-record__field">';
+        $html .= '<label for="cpms-pp-link-record-nid">کد ملی</label>';
+        $html .= '<input id="cpms-pp-link-record-nid" type="text" inputmode="numeric" autocomplete="off" maxlength="10" dir="ltr" data-role="link-record-national-id" required>';
+        $html .= '</div>';
+
+        $html .= '<div class="cpms-pp-link-record__actions">';
+        $html .= '<button type="submit" class="cpms-pp-btn cpms-pp-btn--primary" data-role="link-record-submit">تأیید و ورود به پرونده</button>';
+        $html .= '</div>';
+
+        $html .= '<div class="notice inline cpms-pp-link-record__notice cpms-pp-link-record__notice--error" role="alert" data-role="link-record-error" hidden><p></p></div>';
+        $html .= '<div class="notice inline cpms-pp-link-record__notice cpms-pp-link-record__notice--success" role="status" aria-live="polite" data-role="link-record-success" hidden><p></p></div>';
+        $html .= '</form>';
+        $html .= '</section>';
+
+        return $html;
     }
 
     /**
