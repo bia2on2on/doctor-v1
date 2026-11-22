@@ -136,19 +136,28 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
 
         $auditBefore = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_audit_logs' ) );
 
-        $resp = $this->dispatchRest(
-            'POST',
-            '/clinic/v1/patient/register',
-            [
-                'clinic_id'   => $this->clinicListed,
-                'mobile'      => '۰۹۱۲۵۵۵۰۱۰۱',
-                'code'        => '۱۲۳۴۵۶',
-                'given_name'  => 'سارا',
-                'family_name' => 'محمدی',
-                'national_id' => '۰۴۹۹۳۷۰۸۹۹',
-                'birth_date'  => '۱۹۹۳-۰۷-۲۱',
-            ]
-        );
+        $capturedToken = '';
+        $tokenHook     = static function ( string $cookie, int $expire, int $expiration, int $userId, string $scheme, string $token ) use ( &$capturedToken ): void {
+            $capturedToken = $token;
+        };
+        add_action( 'set_logged_in_cookie', $tokenHook, 10, 6 );
+        try {
+            $resp = $this->dispatchRest(
+                'POST',
+                '/clinic/v1/patient/register',
+                [
+                    'clinic_id'   => $this->clinicListed,
+                    'mobile'      => '۰۹۱۲۵۵۵۰۱۰۱',
+                    'code'        => '۱۲۳۴۵۶',
+                    'given_name'  => 'سارا',
+                    'family_name' => 'محمدی',
+                    'national_id' => '۰۴۹۹۳۷۰۸۹۹',
+                    'birth_date'  => '۱۹۹۳-۰۷-۲۱',
+                ]
+            );
+        } finally {
+            remove_action( 'set_logged_in_cookie', $tokenHook, 10 );
+        }
 
         self::assertSame( 200, $resp->get_status() );
         $body = $resp->get_data();
@@ -196,12 +205,11 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertTrue( App::patient_access()->is_pure_patient_actor( $userId ) );
         $tokens = WP_Session_Tokens::get_instance( $userId )->get_all();
         self::assertCount( 1, $tokens );
-        $sessionToken = array_key_first( $tokens );
-        self::assertIsString( $sessionToken );
+        self::assertNotSame( '', $capturedToken );
         $proofStore = new PatientSessionProofStore();
-        self::assertTrue( $proofStore->has_valid_mobile_proof( $userId, self::MOBILE_NEW, time(), $sessionToken ) );
-        self::assertSame( PatientAccess::LEVEL_FULL, App::patient_access()->level( $userId, $patientId, $this->clinicListed, time(), $sessionToken ) );
-        self::assertSame( $this->clinicListed, App::patient_session_scope()->resolve_session_clinic_id( $userId ) );
+        self::assertTrue( $proofStore->has_valid_mobile_proof( $userId, self::MOBILE_NEW, time(), $capturedToken ) );
+        self::assertSame( PatientAccess::LEVEL_FULL, App::patient_access()->level( $userId, $patientId, $this->clinicListed, time(), $capturedToken ) );
+        self::assertSame( $this->clinicListed, App::patient_session_scope()->resolve_clinic_id( $userId ) );
 
         // Audit wrote PATIENT_REGISTERED without raw or masked NID, and rate limits hashed NID.
         $audits = App::db()->fetchAll(
@@ -386,24 +394,39 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
 
     public function testAccountPendingAppointmentCapTwoBlocksThirdHoldAllowsRescheduleAndRejectsUnprovedCrossClinicBinding(): void {
         $this->seedOtp( $this->clinicListed, self::MOBILE_CAP, '888999', OtpService::PURPOSE_VERIFY_MOBILE );
-        $reg = App::patient_registration_service()->register(
-            $this->clinicListed,
-            self::MOBILE_CAP,
-            '888999',
-            'مریم',
-            'رضایی',
-            self::NID_CAP,
-            '1991-03-14',
-            '198.51.100.77',
-            time(),
-            true
-        );
+        $token     = '';
+        $tokenHook = static function ( string $cookie, int $expire, int $expiration, int $userId, string $scheme, string $issuedToken ) use ( &$token ): void {
+            $token = $issuedToken;
+        };
+        add_action( 'set_logged_in_cookie', $tokenHook, 10, 6 );
+        try {
+            $reg = App::patient_registration_service()->register(
+                $this->clinicListed,
+                self::MOBILE_CAP,
+                '888999',
+                'مریم',
+                'رضایی',
+                self::NID_CAP,
+                '1991-03-14',
+                '198.51.100.77',
+                time(),
+                true
+            );
+        } finally {
+            remove_action( 'set_logged_in_cookie', $tokenHook, 10 );
+        }
 
         $userId    = (int) $reg['user_id'];
         $patientId = (int) $reg['patient_id'];
-        $tokens    = WP_Session_Tokens::get_instance( $userId )->get_all();
-        $token     = (string) array_key_first( $tokens );
+        self::assertNotSame( '', $token );
         PatientTwoProofTestHelper::acting_as( $userId );
+        $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie(
+            $userId,
+            time() + PatientSessionProofStore::SESSION_TTL_SECONDS,
+            'logged_in',
+            $token
+        );
+        App::patient_session_scope()->set_in_process_session_token( $userId, $token );
 
         $date1 = gmdate( 'Y-m-d', time() + 3 * 86400 );
         $date2 = gmdate( 'Y-m-d', time() + 4 * 86400 );
