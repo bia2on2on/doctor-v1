@@ -297,7 +297,7 @@ final class LoginRateLimiter
         $this->log?->warning(
             'LOGIN_THROTTLE_UNAVAILABLE',
             [
-                'ip' => $ip,
+                'ip'     => $ip,
                 'reason' => 'hmac_key_unavailable',
             ]
         );
@@ -314,11 +314,14 @@ final class LoginRateLimiter
      */
     private function record( string $action, string $username, ?string $ip, ?string $key = null ): void
     {
-        $this->log?->warning( $action, [
-            // نام کاربری خام لاگ نمی‌شود (Enumeration/PII); بدون کلید نیز
-            // نباید هیش خام را در لاگ گذاشت
-            'username_hash' => ( null !== $key && '' !== $username ) ? $this->user_key( $username, $key ) : null,
-            'ip' => $ip,
-        ] );
+        $this->log?->warning(
+            $action,
+            [
+                // نام کاربری خام لاگ نمی‌شود (Enumeration/PII); بدون کلید نیز
+                // نباید هیش خام را در لاگ گذاشت
+                'username_hash' => ( null !== $key && '' !== $username ) ? $this->user_key( $username, $key ) : null,
+                'ip'            => $ip,
+            ]
+        );
     }
 }
