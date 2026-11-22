@@ -8456,3 +8456,7 @@ Docs only: no code, schema, migration or policy changed; one approved new table;
 - OBSERVED: All 5 Unit Test matrices (PHP 8.1..8.5) failed identically at `CorrelationIdTest.php:72` because the sample UUID `550e8400-e29b-41d4-a716-4466554400aa` contained a 10-digit run `4466554400`, which `CorrelationId::isValid()` rightly rejected.
 - FIX: Updated the positive-witness UUID in `CorrelationIdTest.php:71` to `550e8400-e29b-41d4-a716-44665544abcd` (max 8 consecutive digits).
 - LIMITATION: PHP is unavailable in the sandbox; GitHub CI is the only PHP gate.
+### [2026-11-22 UTC] — PR17-INTEGRATION-RED-FIX — Fix AuditLogger::log() arity in NidAuditMaskingTest and pin UUID limitation
+- OBSERVED: Integration failed at `AuditLogger.php:44` because `NidAuditMaskingTest::testCorrelationIdRejectsNidRunsInBothSinksAndKeepsAuditChainValid()` passed 4 arguments to `AuditLogger::log()`, which requires 7 (`$patientId, $before, $after` have no defaults).
+- FIX: Passed `null, null, null` for `$patientId, $before, $after` in `NidAuditMaskingTest.php:378`. Added `CorrelationIdTest::testUuidWithTenPlusDigitRunIsRejectedWhileEightDigitUuidIsValid()` pinning the accepted 10+-digit UUID limitation.
+- LIMITATION: PHP is unavailable in the sandbox; GitHub CI is the only PHP gate.

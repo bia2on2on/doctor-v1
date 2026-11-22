@@ -72,4 +72,17 @@ final class CorrelationIdTest extends TestCase
         $this->assertTrue(CorrelationId::isValid($uuid));
         $this->assertSame($uuid, CorrelationId::fromHeader($uuid));
     }
+
+    public function testUuidWithTenPlusDigitRunIsRejectedWhileEightDigitUuidIsValid(): void
+    {
+        $tenDigitUuid = '550e8400-e29b-41d4-a716-4466554400aa';
+        $this->assertFalse(CorrelationId::isValid($tenDigitUuid));
+        $replaced = CorrelationId::fromHeader($tenDigitUuid);
+        $this->assertNotSame($tenDigitUuid, $replaced);
+        $this->assertSame(1, preg_match('/^cpms-[0-9a-f]{16}$/', $replaced));
+
+        $eightDigitUuid = '550e8400-e29b-41d4-a716-44665544abcd';
+        $this->assertTrue(CorrelationId::isValid($eightDigitUuid));
+        $this->assertSame($eightDigitUuid, CorrelationId::fromHeader($eightDigitUuid));
+    }
 }

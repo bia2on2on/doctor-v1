@@ -375,7 +375,7 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
             $this->assertDoesNotMatchRegularExpression('/[0-9۰-۹٠-٩]{10,}/u', $resolved);
 
             App::op()->warning('B0_PR3_CORR_OP', ['ok' => 'yes']);
-            App::audit()->log('B0_PR3_CORR_AUDIT', ['wp_user_id' => 1, 'role' => 'system'], 'test_resource', 4);
+            App::audit()->log('B0_PR3_CORR_AUDIT', ['wp_user_id' => 1, 'role' => 'system'], 'test_resource', 4, null, null, null);
         } finally {
             if ($hadServer) {
                 $_SERVER['HTTP_X_CPMS_CORRELATION_ID'] = $prevServer;
