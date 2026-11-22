@@ -841,6 +841,208 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
     }
 
     // =========================================================================
+    // T2 & T3: Staff archive binding/session closure & duplicate-NID pre-check
+    // =========================================================================
+
+    public function testStaffArchiveViaPatientsPutClosesBindingAndDestroysSessionWithControls(): void {
+        $proofStore  = new PatientSessionProofStore();
+        $logins      = new PatientLoginRepository( App::db() );
+        $tokenTarget = $proofStore->issue_non_persistent_auth_cookie( $this->userPending );
+        $proofStore->record_mobile_proof( $this->userPending, self::MOBILE_PENDING, null, $tokenTarget );
+        App::patient_binding_promoter()->promote(
+            $this->userPending,
+            $this->clinicA,
+            self::MOBILE_PENDING,
+            self::NID_PENDING,
+            null,
+            '198.51.100.1',
+            null,
+            $tokenTarget
+        );
+
+        // Control (i): second patient in the same clinic with active binding and live WP session token.
+        $userOther  = $this->makeUser( 'pls1_arch_ctrl_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $logins->insert_pending_account( $userOther, self::MOBILE_GUEST, 'بیمار', 'شاهد' );
+        $tokenOther = $proofStore->issue_non_persistent_auth_cookie( $userOther );
+        $proofStore->record_mobile_proof( $userOther, self::MOBILE_GUEST, null, $tokenOther );
+        App::patient_binding_promoter()->promote(
+            $userOther,
+            $this->clinicA,
+            self::MOBILE_GUEST,
+            self::NID_OTHER,
+            null,
+            '198.51.100.2',
+            null,
+            $tokenOther
+        );
+
+        // Assert BEFORE: both bindings are active with non-null live_key and real WP session tokens present.
+        $targetBindingBefore = $logins->find_binding( $this->userPending, $this->clinicA, $this->patientPending, true );
+        self::assertIsArray( $targetBindingBefore );
+        self::assertSame( PatientLoginRepository::STATE_ACTIVE, $targetBindingBefore['state'] ?? null );
+        self::assertNotNull( $targetBindingBefore['live_key'] ?? null );
+        self::assertIsArray( WP_Session_Tokens::get_instance( $this->userPending )->get( $tokenTarget ) );
+        self::assertSame( PatientAccess::LEVEL_FULL, App::patient_access()->level( $this->userPending, $this->patientPending, $this->clinicA, time(), $tokenTarget ) );
+
+        $otherBindingBefore = $logins->find_binding( $userOther, $this->clinicA, $this->patientOther, true );
+        self::assertIsArray( $otherBindingBefore );
+        self::assertSame( PatientLoginRepository::STATE_ACTIVE, $otherBindingBefore['state'] ?? null );
+        self::assertNotNull( $otherBindingBefore['live_key'] ?? null );
+        self::assertIsArray( WP_Session_Tokens::get_instance( $userOther )->get( $tokenOther ) );
+        self::assertSame( PatientAccess::LEVEL_FULL, App::patient_access()->level( $userOther, $this->patientOther, $this->clinicA, time(), $tokenOther ) );
+
+        // Control (ii): staff edit of a NON-NID, NON-status field leaves binding active and token alive.
+        $nonStatusResp = $this->dispatchRest(
+            'PUT',
+            '/clinic/v1/patients/' . $this->patientPending,
+            [ 'address' => 'تهران، خیابان ولیعصر' ],
+            $this->userStaff
+        );
+        self::assertSame( 200, $nonStatusResp->get_status() );
+        self::assertSame(
+            'تهران، خیابان ولیعصر',
+            (string) App::db()->fetchValue( 'SELECT address FROM ' . App::db()->table( 'cpms_patients' ) . ' WHERE id = %d', [ $this->patientPending ] )
+        );
+        self::assertSame(
+            'active',
+            (string) App::db()->fetchValue( 'SELECT status FROM ' . App::db()->table( 'cpms_patients' ) . ' WHERE id = %d', [ $this->patientPending ] )
+        );
+        $targetBindingAfterEdit = $logins->find_binding( $this->userPending, $this->clinicA, $this->patientPending, true );
+        self::assertIsArray( $targetBindingAfterEdit );
+        self::assertSame( PatientLoginRepository::STATE_ACTIVE, $targetBindingAfterEdit['state'] ?? null );
+        self::assertNotNull( $targetBindingAfterEdit['live_key'] ?? null );
+        self::assertIsArray( WP_Session_Tokens::get_instance( $this->userPending )->get( $tokenTarget ) );
+        self::assertSame( PatientAccess::LEVEL_FULL, App::patient_access()->level( $this->userPending, $this->patientPending, $this->clinicA, time(), $tokenTarget ) );
+
+        // Act: staff archives target patient via real PUT /clinic/v1/patients/{id}.
+        $archiveResp = $this->dispatchRest(
+            'PUT',
+            '/clinic/v1/patients/' . $this->patientPending,
+            [ 'status' => 'archived' ],
+            $this->userStaff
+        );
+        self::assertSame( 200, $archiveResp->get_status() );
+        self::assertSame( 'archived', (string) ( $archiveResp->get_data()['data']['status'] ?? '' ) );
+        self::assertSame(
+            'archived',
+            (string) App::db()->fetchValue( 'SELECT status FROM ' . App::db()->table( 'cpms_patients' ) . ' WHERE id = %d', [ $this->patientPending ] )
+        );
+
+        // Assert AFTER: target binding is closed, live_key is null, and original WP session token is destroyed.
+        self::assertNull( $logins->find_binding( $this->userPending, $this->clinicA, $this->patientPending, true ) );
+        $closedBinding = $logins->find_binding( $this->userPending, $this->clinicA, $this->patientPending, false );
+        self::assertIsArray( $closedBinding );
+        self::assertSame( PatientLoginRepository::STATE_CLOSED, $closedBinding['state'] ?? null );
+        self::assertNull( $closedBinding['live_key'] ?? 'not-null' );
+        self::assertNull( WP_Session_Tokens::get_instance( $this->userPending )->get( $tokenTarget ), 'Target WP session token must be destroyed after staff archive.' );
+        self::assertSame( [], WP_Session_Tokens::get_instance( $this->userPending )->get_all(), 'Target user must have zero surviving sessions.' );
+        self::assertSame( PatientAccess::LEVEL_NONE, App::patient_access()->level( $this->userPending, $this->patientPending, $this->clinicA, time(), $tokenTarget ) );
+
+        // Control (i) AFTER: second patient in the same clinic stays active and its token survives.
+        $otherBindingAfter = $logins->find_binding( $userOther, $this->clinicA, $this->patientOther, true );
+        self::assertIsArray( $otherBindingAfter );
+        self::assertSame( PatientLoginRepository::STATE_ACTIVE, $otherBindingAfter['state'] ?? null );
+        self::assertNotNull( $otherBindingAfter['live_key'] ?? null );
+        self::assertIsArray( WP_Session_Tokens::get_instance( $userOther )->get( $tokenOther ), 'Control (i): second patient session token in same clinic must survive.' );
+        self::assertSame( PatientAccess::LEVEL_FULL, App::patient_access()->level( $userOther, $this->patientOther, $this->clinicA, time(), $tokenOther ) );
+    }
+
+    public function testStaffDuplicateNationalIdPreCheckRejectsBeforeWriteAndLeavesBindingAlive(): void {
+        $proofStore = new PatientSessionProofStore();
+        $logins     = new PatientLoginRepository( App::db() );
+        $token      = $proofStore->issue_non_persistent_auth_cookie( $this->userPending );
+        $proofStore->record_mobile_proof( $this->userPending, self::MOBILE_PENDING, null, $token );
+        App::patient_binding_promoter()->promote(
+            $this->userPending,
+            $this->clinicA,
+            self::MOBILE_PENDING,
+            self::NID_PENDING,
+            null,
+            '198.51.100.3',
+            null,
+            $token
+        );
+
+        $patientTable = App::db()->table( 'cpms_patients' );
+        $auditTable   = App::db()->table( 'cpms_audit_logs' );
+        $targetBefore = App::db()->fetchRow( 'SELECT * FROM ' . $patientTable . ' WHERE id = %d', [ $this->patientPending ] );
+        $otherBefore  = App::db()->fetchRow( 'SELECT * FROM ' . $patientTable . ' WHERE id = %d', [ $this->patientOther ] );
+        $auditBefore  = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . $auditTable );
+        self::assertIsArray( $targetBefore );
+        self::assertIsArray( $otherBefore );
+        self::assertSame( self::NID_OTHER, (string) ( $otherBefore['national_id'] ?? '' ) );
+
+        $precheckSqlPattern  = '/^\s*SELECT\s+id\s+FROM\s+`?' . preg_quote( $patientTable, '/' ) . '`?\s+WHERE\s+clinic_id\s*=\s*\d+\s+AND\s+national_id\s*=/i';
+        $updateSqlPattern    = '/^\s*UPDATE\s+`?' . preg_quote( $patientTable, '/' ) . '`?\s+SET\b/i';
+        $precheckSelectHits  = 0;
+        $patientUpdateHits   = 0;
+        $sqlSpy              = static function ( $query ) use ( $precheckSqlPattern, $updateSqlPattern, &$precheckSelectHits, &$patientUpdateHits ) {
+            $sql = (string) $query;
+            if ( 1 === preg_match( $precheckSqlPattern, $sql ) ) {
+                ++$precheckSelectHits;
+            }
+            if ( 1 === preg_match( $updateSqlPattern, $sql ) ) {
+                ++$patientUpdateHits;
+            }
+
+            return $query;
+        };
+
+        add_filter( 'query', $sqlSpy, 5 );
+        try {
+            $dupResp = $this->dispatchRest(
+                'PUT',
+                '/clinic/v1/patients/' . $this->patientPending,
+                [ 'national_id' => self::NID_OTHER ],
+                $this->userStaff
+            );
+        } finally {
+            remove_filter( 'query', $sqlSpy, 5 );
+        }
+
+        // Exact bounded error shape from PatientService.php:575, distinct from raw SQL / DB unique collision.
+        self::assertSame( 400, $dupResp->get_status() );
+        $dupData = $dupResp->get_data();
+        self::assertSame( 'CLINIC_VALIDATION_FAILED', $dupData['code'] ?? null );
+        self::assertSame( 'این کد ملی متعلق به بیمار دیگری است', $dupData['message'] ?? null );
+        self::assertSame( 400, $dupData['data']['status'] ?? null );
+        $encodedErr = (string) wp_json_encode( $dupData, JSON_UNESCAPED_UNICODE );
+        self::assertStringNotContainsString( 'Duplicate entry', $encodedErr );
+        self::assertStringNotContainsString( 'u_pat_nid', $encodedErr );
+
+        // Pre-check ran find_by_national_id() and threw BEFORE transactional() / UPDATE cpms_patients.
+        self::assertSame( 1, $precheckSelectHits, 'Staff duplicate-NID pre-check query must run once.' );
+        self::assertSame( 0, $patientUpdateHits, 'Pre-check must reject before any UPDATE cpms_patients reaches the DB boundary.' );
+
+        // Zero mutation on target row, competing patient row, or audit log; binding active and token alive.
+        self::assertSame( $targetBefore, App::db()->fetchRow( 'SELECT * FROM ' . $patientTable . ' WHERE id = %d', [ $this->patientPending ] ) );
+        self::assertSame( $otherBefore, App::db()->fetchRow( 'SELECT * FROM ' . $patientTable . ' WHERE id = %d', [ $this->patientOther ] ) );
+        self::assertSame( $auditBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . $auditTable ) );
+
+        $bindingAfter = $logins->find_binding( $this->userPending, $this->clinicA, $this->patientPending, true );
+        self::assertIsArray( $bindingAfter );
+        self::assertSame( PatientLoginRepository::STATE_ACTIVE, $bindingAfter['state'] ?? null );
+        self::assertNotNull( $bindingAfter['live_key'] ?? null );
+        self::assertIsArray( WP_Session_Tokens::get_instance( $this->userPending )->get( $token ) );
+        self::assertSame( PatientAccess::LEVEL_FULL, App::patient_access()->level( $this->userPending, $this->patientPending, $this->clinicA, time(), $token ) );
+
+        // Positive witness: submitting the target patient's own NID passes the pre-check ($other['id'] !== $patient_id).
+        $samePatientResp = $this->dispatchRest(
+            'PUT',
+            '/clinic/v1/patients/' . $this->patientPending,
+            [
+                'national_id' => self::NID_PENDING,
+                'first_name'  => 'PrecheckWitness',
+            ],
+            $this->userStaff
+        );
+        self::assertSame( 200, $samePatientResp->get_status() );
+        self::assertSame( 'PrecheckWitness', (string) ( $samePatientResp->get_data()['data']['first_name'] ?? '' ) );
+        self::assertIsArray( $logins->find_binding( $this->userPending, $this->clinicA, $this->patientPending, true ) );
+        self::assertIsArray( WP_Session_Tokens::get_instance( $this->userPending )->get( $token ) );
+    }
+
+    // =========================================================================
     // Helpers
     // =========================================================================
 
