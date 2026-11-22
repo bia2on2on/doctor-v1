@@ -2127,7 +2127,7 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
 
         $repo = new PatientRepository(App::db());
         $repoRecords = $repo->active_linked_records_for_user($userId);
-        $repoRecordPatientIds = array_column($repoRecords, 'patient_id');
+        $repoRecordPatientIds = array_map('intval', array_column($repoRecords, 'patient_id'));
         // Direct repository assertions (independent of PatientAccess proof filter):
         self::assertContains($patientA1, $repoRecordPatientIds, 'Repository positive witness A1 must be returned.');
         self::assertContains($patientUnprovedB, $repoRecordPatientIds, 'Repository positive witness active UnprovedB must be returned regardless of session proof.');
