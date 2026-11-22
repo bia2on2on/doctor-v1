@@ -209,6 +209,10 @@ final class StaffPortalShell {
 	 * Ensure a published CPMS-owned Page exists and is recorded. Idempotent.
 	 */
 	public static function ensure_portal_page(): int {
+		if ( \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
+			return 0;
+		}
+
 		$existing = (int) get_option( self::PAGE_OPTION, 0 );
 		if ( $existing > 0 ) {
 			$post = get_post( $existing );
