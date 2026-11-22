@@ -58,7 +58,8 @@ final class OpLogger
             }
         } catch (\Throwable) {
             // Log هرگز نباید Request را شکست بدهد
-            error_log('[cpms] op-log write failed: ' . $message);
+            // B0-PR3: مسیرِ جایگزین نباید پیامِ خام را به error_log بنویسد.
+            error_log('[cpms] op-log write failed');
         }
     }
 
@@ -82,6 +83,12 @@ final class OpLogger
                 // `reason` کاربر) می‌تواند ارقامِ کد ملی داشته باشد.
                 $safe = NationalIdValidator::redact_digits($v);
                 $out[$key] = mb_strlen($safe) > 200 ? mb_substr($safe, 0, 200) . '…' : $safe;
+                continue;
+            }
+            if (is_int($v) || is_float($v)) {
+                $numeric = (string) $v;
+                $safe = NationalIdValidator::redact_digits($numeric);
+                $out[$key] = $safe === $numeric ? $v : $safe;
                 continue;
             }
             $out[$key] = is_scalar($v) || $v === null ? $v : gettype($v);

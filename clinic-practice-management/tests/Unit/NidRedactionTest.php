@@ -45,17 +45,28 @@ final class NidRedactionTest extends TestCase
         $this->assertSame($in, NationalIdValidator::redact_digits($in), 'رشتهٔ عددیِ کوتاه باید حفظ شود');
 
         // منفیِ همان متد: ۱۰ رقمیِ کناری باید جمع‌بندی شود.
-        $mixed = 'کد 987654321 و ' . self::NID_ASCII;
+        $mixed = 'کد 987654321 و ' . self::NID_ASCII . ' ' . self::NID_PERSIAN . ' ' . self::NID_ARABIC;
         $out = NationalIdValidator::redact_digits($mixed);
         $this->assertStringContainsString('987654321', $out, '۹ رقمی باید دست‌نخورده بماند');
         $this->assertStringNotContainsString(self::NID_ASCII, $out, '۱۰ رقمی باید جمع‌بندی شود');
+        $this->assertStringNotContainsString(self::NID_PERSIAN, $out);
+        $this->assertStringNotContainsString(self::NID_ARABIC, $out);
     }
 
     public function testRedactDigitsHandlesEmbeddedAndBoundaryRuns(): void
     {
         // داخلِ متن، با حروفِ پیچیده، و در مرزِ رشته.
-        $out = NationalIdValidator::redact_digits('x' . self::NID_ASCII . 'y');
-        $this->assertSame('x[nid-redacted]y', $out, 'کد ملی بین حروف هم جمع‌بندی می‌شود');
+        $out = NationalIdValidator::redact_digits(
+            'x' . self::NID_ASCII . 'y ' . self::NID_PERSIAN . ' ' . self::NID_ARABIC
+        );
+        $this->assertSame(
+            'x[nid-redacted]y [nid-redacted] [nid-redacted]',
+            $out,
+            'کد ملی بین حروف هم جمع‌بندی می‌شود'
+        );
+        $this->assertStringNotContainsString(self::NID_ASCII, $out);
+        $this->assertStringNotContainsString(self::NID_PERSIAN, $out);
+        $this->assertStringNotContainsString(self::NID_ARABIC, $out);
 
         // ۱۱ رقمی: fail-closed کامل جایگزین می‌شود (false positiveِ پذیرفته‌شده).
         $this->assertSame('[nid-redacted]', NationalIdValidator::redact_digits('12345678901'));
@@ -69,12 +80,14 @@ final class NidRedactionTest extends TestCase
     {
         $rendered = NotificationEvents::render(NotificationEvents::APPT_CONFIRMED, [
             'doctor_name' => 'دکتر ' . self::NID_ASCII,
-            'appointment_date' => '1405/06/10',
-            'appointment_time' => '09:30',
+            'appointment_date' => '1405/06/10 ' . self::NID_ARABIC,
+            'appointment_time' => '09:30 ' . self::NID_PERSIAN,
         ]);
 
         // منفی: نه در عنوان و نه در متن، حتی یک رقمِ کد ملی نیست.
         $this->assertStringNotContainsString(self::NID_ASCII, (string) $rendered['body']);
+        $this->assertStringNotContainsString(self::NID_PERSIAN, (string) $rendered['body']);
+        $this->assertStringNotContainsString(self::NID_ARABIC, (string) $rendered['body']);
         $this->assertStringNotContainsString('001234', (string) $rendered['body']);
         $this->assertStringContainsString('[nid-redacted]', (string) $rendered['body']);
 
@@ -104,15 +117,17 @@ final class NidRedactionTest extends TestCase
             'سلام {{patient_name}}، نوبت با {{doctor_name}} در {{appointment_date}}.',
             [
                 'patient_name' => 'بیمار ' . self::NID_PERSIAN,
-                'doctor_name' => 'دکتر',
-                'appointment_date' => '1405/06/10',
+                'doctor_name' => 'دکتر ' . self::NID_ASCII,
+                'appointment_date' => '1405/06/10 ' . self::NID_ARABIC,
             ],
             $allowed,
             ['patient_name', 'appointment_date']
         );
 
         // منفی: کد ملیِ فارسی در متنِ SMS نمی‌آید.
+        $this->assertStringNotContainsString(self::NID_ASCII, $out);
         $this->assertStringNotContainsString(self::NID_PERSIAN, $out);
+        $this->assertStringNotContainsString(self::NID_ARABIC, $out);
         $this->assertStringNotContainsString('001234', $out);
         $this->assertStringContainsString('[nid-redacted]', $out);
 
@@ -125,14 +140,22 @@ final class NidRedactionTest extends TestCase
     {
         // کد OTPِ ۶ رقمی و تاریخ/ساعت باید دست‌نخورده بمانند — جمع‌بندی نباید
         // اعتبارِ پیامِ ارسالی را بشکند.
-        $allowed = ['otp_code', 'appointment_date', 'appointment_time'];
+        $allowed = ['otp_code', 'appointment_date', 'appointment_time', 'note'];
         $out = SmsTemplateRenderer::render(
-            'کد: {{otp_code}} — {{appointment_date}} {{appointment_time}}',
-            ['otp_code' => '654321', 'appointment_date' => '1405/06/10', 'appointment_time' => '09:30'],
+            'کد: {{otp_code}} — {{appointment_date}} {{appointment_time}} {{note}}',
+            [
+                'otp_code' => '654321',
+                'appointment_date' => '1405/06/10 ' . self::NID_ASCII,
+                'appointment_time' => '09:30 ' . self::NID_PERSIAN,
+                'note' => self::NID_ARABIC,
+            ],
             $allowed,
             ['otp_code']
         );
 
-        $this->assertSame('کد: 654321 — 1405/06/10 09:30', $out);
+        $this->assertSame('کد: 654321 — 1405/06/10 09:30 [nid-redacted] [nid-redacted] [nid-redacted]', $out);
+        $this->assertStringNotContainsString(self::NID_ASCII, $out);
+        $this->assertStringNotContainsString(self::NID_PERSIAN, $out);
+        $this->assertStringNotContainsString(self::NID_ARABIC, $out);
     }
 }

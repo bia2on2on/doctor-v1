@@ -250,11 +250,14 @@ final class AuditLogger
             // B0-PR3: کد ملی هرگز (حتی Maskشده) در Audit نمی‌آید. برخلاف
             // MASK_KEYS که ۴ رقمِ آخر را نگه می‌دارند، این کلید کامل حذف می‌شود.
             if (mb_strtolower($key) === 'national_id') {
-                $out[$key] = '[redacted:national_id]';
+                // سیاست مالک: خودِ نام فیلد هم نباید وارد payload شود.
                 continue;
             }
             if (in_array($key, self::MASK_KEYS, true) && is_string($v) && strlen($v) >= 4) {
-                $out[$key] = '***' . substr($v, -4);
+                // Phone/mobile values can be misfiled NIDs too. Prefer the
+                // fail-closed digit rule over retaining even a four-digit tail.
+                $safe = NationalIdValidator::redact_digits($v);
+                $out[$key] = $safe !== $v ? $safe : '***' . substr($v, -4);
                 continue;
             }
             if (is_array($v)) {
@@ -266,6 +269,13 @@ final class AuditLogger
                 // (دلیل لغو، یادداشت، ...). قبل از هر ذخیره، ارقام را جمع‌بندی می‌کند.
                 $safe = NationalIdValidator::redact_digits($v);
                 $out[$key] = mb_strlen($safe) > 2000 ? mb_substr($safe, 0, 2000) . '…[truncated]' : $safe;
+                continue;
+            }
+            if (is_int($v) || is_float($v)) {
+                // ورودیِ عددیِ ۱۰ رقمی هم نباید از اسکنِ رشته‌ای عبور کند.
+                $numeric = (string) $v;
+                $safe = NationalIdValidator::redact_digits($numeric);
+                $out[$key] = $safe === $numeric ? $v : $safe;
                 continue;
             }
             $out[$key] = $v;

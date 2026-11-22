@@ -35,7 +35,7 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
             'test_resource',
             1,
             null,
-            ['national_id' => self::NID_ASCII, 'note' => 'کد ملی ' . self::NID_ASCII . ' است'],
+            ['national_id' => self::NID_ASCII, 'note' => 'کد ملی ' . self::NID_ASCII . ' است', 'numeric_id' => 1234567890],
             ['free' => 'X ' . self::NID_PERSIAN . ' Y'],
             ['meta' => 'Z ' . self::NID_ARABIC . ' W']
         );
@@ -51,14 +51,21 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
         $after = json_decode((string) $row['after_json'], true);
         $meta = json_decode((string) $row['meta_json'], true);
 
-        // منفی: کلیدِ `national_id` کامل حذف می‌شود (نه حتی ۴ رقمِ آخر).
-        $this->assertSame('[redacted:national_id]', $before['national_id'] ?? null);
+        // منفی: کلیدِ `national_id` کامل حذف می‌شود (نه حتی مقدارِ Maskشده).
+        $this->assertArrayNotHasKey('national_id', $before);
+        foreach ([self::NID_ASCII, self::NID_PERSIAN, self::NID_ARABIC] as $nid) {
+            $this->assertStringNotContainsString($nid, (string) $row['before_json']);
+            $this->assertStringNotContainsString($nid, (string) $row['after_json']);
+            $this->assertStringNotContainsString($nid, (string) $row['meta_json']);
+        }
         $this->assertStringNotContainsString('001234', (string) $row['before_json']);
+        $this->assertStringNotContainsString('1234567890', (string) $row['before_json']);
 
         // منفی: متنِ آزاد در هر سه شکلِ رقم — در before/after/meta.
         foreach ([$before, $after, $meta] as $decoded) {
             $this->assertStringNotContainsString('001234', (string) json_encode($decoded));
         }
+        $this->assertSame('[nid-redacted]', $before['numeric_id']);
         $this->assertSame('[nid-redacted]', $after['free']);
         $this->assertSame('Z [nid-redacted] W', $meta['meta']);
 
@@ -89,7 +96,7 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
         // مثبت: رشتهٔ عددیِ کوتاه و موبایلِ Maskشده دست‌نخورده‌اند.
         $this->assertSame('خیابان 12', $before['address']);
         $this->assertSame(42, $before['count']);
-        $this->assertSame('***4567', $before['mobile'], 'Maskingِ موبایل دست‌نخورده می‌ماند');
+        $this->assertSame('[nid-redacted]', $before['mobile'], 'موبایلِ ۱۱ رقمی باید fail-closed بماند');
         $this->assertSame('خیابان 13', $after['address']);
     }
 
@@ -97,7 +104,13 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
     {
         App::op()->error(
             'B0_PR3_OP_FAIL',
-            ['note' => 'کد ملی ' . self::NID_ASCII, 'error' => 'fail ' . self::NID_PERSIAN, 'benign' => 'ok']
+            [
+                'note' => 'کد ملی ' . self::NID_ASCII,
+                'error' => 'fail ' . self::NID_PERSIAN,
+                'arabic' => 'note ' . self::NID_ARABIC,
+                'numeric_id' => 1234567890,
+                'benign' => 'ok',
+            ]
         );
 
         $row = App::db()->fetchRow(
@@ -111,8 +124,11 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
 
         // منفی: پیام و هر دو مقدارِ متنی مقدار را جمع‌بندی می‌کنند.
         $this->assertStringNotContainsString('001234', (string) $row['context_json']);
+        $this->assertStringNotContainsString('1234567890', (string) $row['context_json']);
         $this->assertSame('[nid-redacted]', $context['note']);
         $this->assertSame('fail [nid-redacted]', $context['error']);
+        $this->assertSame('note [nid-redacted]', $context['arabic']);
+        $this->assertSame('[nid-redacted]', $context['numeric_id']);
 
         // مثبت: مقدارِ بی‌خطر دست‌نخورده می‌ماند.
         $this->assertSame('ok', $context['benign']);
@@ -120,7 +136,9 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
 
     public function testOpLogChokepointRedactsNidInMessageText(): void
     {
-        App::op()->warning('B0_PR3_OP_MSG ' . self::NID_ASCII);
+        App::op()->warning(
+            'B0_PR3_OP_MSG ' . self::NID_ASCII . ' ' . self::NID_PERSIAN . ' ' . self::NID_ARABIC
+        );
 
         $row = App::db()->fetchRow(
             'SELECT message FROM ' . App::db()->table('cpms_operational_logs')
@@ -128,7 +146,13 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
             ['B0_PR3_OP_MSG%']
         );
         $this->assertIsArray($row);
-        $this->assertSame('B0_PR3_OP_MSG [nid-redacted]', (string) $row['message']);
+        $this->assertSame(
+            'B0_PR3_OP_MSG [nid-redacted] [nid-redacted] [nid-redacted]',
+            (string) $row['message']
+        );
+        $this->assertStringNotContainsString(self::NID_ASCII, (string) $row['message']);
+        $this->assertStringNotContainsString(self::NID_PERSIAN, (string) $row['message']);
+        $this->assertStringNotContainsString(self::NID_ARABIC, (string) $row['message']);
     }
 
     public function testOpLogChokepointKeepsOrdinaryMessage(): void
