@@ -58,7 +58,7 @@ final class LoginRateLimiter
     {
         // اولویت 100: پس از هندلرهای هسته (20 و 30 و spam-check 99) و پیش از
         // گیتِ بازیابی (PHP_INT_MAX) — تصمیم نهایی محدودیت است.
-        add_filter('authenticate', [$this, 'blockWhenThrottled'], 100, 3);
+        add_filter( 'authenticate', [ $this, 'blockWhenThrottled' ], 100, 3 );
         add_action( 'wp_login_failed', [ $this, 'recordFailure' ], 10, 2 );
     }
 
@@ -115,7 +115,7 @@ final class LoginRateLimiter
     public function is_login_throttled( string $username ): bool {
         $ip = ClientIp::resolve();
         return ( null !== $ip && $this->isOver( 'login-ip:' . $ip, self::MAX_PER_IP ) )
-            || ( '' !== $username && $this->isOver( 'login-user:' . $this->userKey( $username ), self::MAX_PER_USERNAME ) );
+            || ( '' !== $username && $this->isOver( 'login-user:' . $this->user_key( $username ), self::MAX_PER_USERNAME ) );
     }
 
     private function count_failure( string $username ): void {
@@ -127,8 +127,8 @@ final class LoginRateLimiter
         if ( $ip !== null && ! $this->isOver( 'login-ip:' . $ip, self::MAX_PER_IP ) ) {
             $this->rate->hit( 'login-ip:' . $ip, self::MAX_PER_IP, self::WINDOW_SEC );
         }
-        if ( $username !== '' && ! $this->isOver( 'login-user:' . $this->userKey( $username ), self::MAX_PER_USERNAME ) ) {
-            $this->rate->hit( 'login-user:' . $this->userKey( $username ), self::MAX_PER_USERNAME, self::WINDOW_SEC );
+        if ( $username !== '' && ! $this->isOver( 'login-user:' . $this->user_key( $username ), self::MAX_PER_USERNAME ) ) {
+            $this->rate->hit( 'login-user:' . $this->user_key( $username ), self::MAX_PER_USERNAME, self::WINDOW_SEC );
         }
 
         $this->record( 'LOGIN_FAILED', $username, $ip );
@@ -151,9 +151,9 @@ final class LoginRateLimiter
      * پیشوند `login-user:` جدا می‌شود، بنابراین هیچ کلید نام کاربری‌ای با
      * کلید `nid:` یکسان یا برابر نیست.
      */
-    private function userKey( string $username ): string {
+    private function user_key( string $username ): string {
         return substr(
-            hash_hmac( 'sha256', 'login-user:' . strtolower( trim( $username ) ), $this->hmacKey() ),
+            hash_hmac( 'sha256', 'login-user:' . strtolower( trim( $username ) ), $this->hmac_key() ),
             0,
             32
         );
@@ -165,7 +165,7 @@ final class LoginRateLimiter
      * همان نام (ساخته‌شده یک‌بار با random_bytes). هیچ Option یا Constant جدیدی
      * اضافه نمی‌کند.
      */
-    private function hmacKey(): string {
+    private function hmac_key(): string {
         if ( defined( PatientNidHmac::CONST_KEY ) ) {
             $constant = constant( PatientNidHmac::CONST_KEY );
             if ( is_string( $constant ) && '' !== $constant ) {
@@ -173,23 +173,27 @@ final class LoginRateLimiter
             }
         }
 
-        $existing = get_option( PatientNidHmac::OPTION_KEY, '' );
-        if ( is_string( $existing ) && '' !== $existing ) {
-            return $existing;
+        if ( function_exists( 'get_option' ) ) {
+            $existing = get_option( PatientNidHmac::OPTION_KEY, '' );
+            if ( is_string( $existing ) && '' !== $existing ) {
+                return $existing;
+            }
+
+            if ( function_exists( 'add_option' ) ) {
+                $generated = bin2hex( random_bytes( 32 ) );
+                if ( add_option( PatientNidHmac::OPTION_KEY, $generated, '', 'no' ) ) {
+                    return $generated;
+                }
+                $reread = get_option( PatientNidHmac::OPTION_KEY, '' );
+                if ( is_string( $reread ) && '' !== $reread ) {
+                    return $reread;
+                }
+            }
+
+            throw new \RuntimeException( 'Failed to persist HMAC key' );
         }
 
-        if ( function_exists( 'add_option' ) ) {
-            $generated = bin2hex( random_bytes( 32 ) );
-            if ( add_option( PatientNidHmac::OPTION_KEY, $generated, '', 'no' ) ) {
-                return $generated;
-            }
-            $reread = get_option( PatientNidHmac::OPTION_KEY, '' );
-            if ( is_string( $reread ) && '' !== $reread ) {
-                return $reread;
-            }
-        }
-
-        throw new \RuntimeException( 'Failed to persist HMAC key' );
+        throw new \RuntimeException( 'No HMAC key source available' );
     }
 
     /**
@@ -205,7 +209,7 @@ final class LoginRateLimiter
     {
         $this->log?->warning($action, [
             // نام کاربری خام لاگ نمی‌شود (Enumeration/PII)
-            'username_hash' => $this->userKey($username),
+            'username_hash' => $this->user_key($username),
             'ip' => $ip,
         ]);
     }
