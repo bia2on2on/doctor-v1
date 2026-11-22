@@ -93,20 +93,22 @@ final class NationalIdValidator
      * یادداشت، متن پیام) می‌تواند ارقامِ کد ملی را در خود داشته باشد، کلِ
      * رشته اسکن می‌شود، نه فقط فیلدِ `national_id`.
      *
-     * ابتدا ارقامِ فارسی (U+06F0..U+06F9) و عربی-هندی (U+0660..U+0669) به
-     * ASCII تبدیل می‌شوند؛ سپس هر رشتهٔ پیوستهٔ ۱۰ رقم یا بیشتر با
-     * `[nid-redacted]` جایگزین می‌شود. بنابراین «۰۰۱۲۳۴۵۶۷۳»، «٠٠١٢٣٤٥٦٧٣»،
-     * «0012345673» و «کد ملی 0012345673 است» همه حتی یک رقم باقی نمی‌گذارند.
+     * Runs of ten or more ASCII, Persian (U+06F0..U+06F9), or Arabic-Indic
+     * (U+0660..U+0669) digits are replaced with `[nid-redacted]`, including
+     * mixed-script runs and runs embedded in free text. Shorter runs retain
+     * their original digit script.
      *
-     * False positiveِ پذیرفته‌شده (fail-closed): هر رشتهٔ عددیِ ۱۰ رقمی یا
-     * بلندتر — مثلاً تلفنِ ۱۱ رقمی، شناسهٔ عددیِ بلند یا Timestamp — هم
-     * جایگزین می‌شود. مقدارِ غیررشتهای (int/bool) دست نمی‌خورد؛ کد ملی همیشه
-     * رشته است و کلیدِ `national_id` جداگانه و کامل حذف می‌شود.
+     * Fail-closed false positives include 11-digit phone numbers, long numeric
+     * identifiers, and timestamps. Callers separately redact numeric scalars.
+     *
+     * @param string $value Arbitrary text to scan.
+     *
+     * @return string Text with long digit runs redacted.
      */
     public static function redact_digits(string $value): string
     {
-        $folded = strtr($value, self::DIGIT_FOLD);
+        $redacted = preg_replace('/[0-9۰-۹٠-٩]{10,}/u', '[nid-redacted]', $value);
 
-        return (string) preg_replace('/\d{10,}/', '[nid-redacted]', $folded);
+        return $redacted ?? '';
     }
 }

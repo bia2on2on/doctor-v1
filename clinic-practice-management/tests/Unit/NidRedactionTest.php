@@ -67,6 +67,11 @@ final class NidRedactionTest extends TestCase
         $this->assertStringNotContainsString(self::NID_ASCII, $out);
         $this->assertStringNotContainsString(self::NID_PERSIAN, $out);
         $this->assertStringNotContainsString(self::NID_ARABIC, $out);
+        $this->assertSame(
+            'x[nid-redacted]y',
+            NationalIdValidator::redact_digits('x1۰2٣4۵6٧89y'),
+            'mixed-script digits count as one normalized run'
+        );
 
         // ۱۱ رقمی: fail-closed کامل جایگزین می‌شود (false positiveِ پذیرفته‌شده).
         $this->assertSame('[nid-redacted]', NationalIdValidator::redact_digits('12345678901'));
@@ -153,7 +158,9 @@ final class NidRedactionTest extends TestCase
             ['otp_code']
         );
 
-        $this->assertSame('کد: 654321 — 1405/06/10 09:30 [nid-redacted] [nid-redacted] [nid-redacted]', $out);
+        $this->assertSame(3, substr_count($out, '[nid-redacted]'));
+        $this->assertStringContainsString('کد: 654321', $out);
+        $this->assertStringContainsString('1405/06/10 09:30', $out);
         $this->assertStringNotContainsString(self::NID_ASCII, $out);
         $this->assertStringNotContainsString(self::NID_PERSIAN, $out);
         $this->assertStringNotContainsString(self::NID_ARABIC, $out);

@@ -130,7 +130,7 @@ final class NotificationEvents
         // در خود داشته باشد؛ قبل از ذخیرهٔ payload جمع‌بندی می‌شود.
         return [
             'title' => NationalIdValidator::redact_digits($sub($info['title'])),
-            'body'  => NationalIdValidator::redact_digits($sub($info['body'])),
+            'body' => NationalIdValidator::redact_digits($sub($info['body'])),
         ];
     }
 }
