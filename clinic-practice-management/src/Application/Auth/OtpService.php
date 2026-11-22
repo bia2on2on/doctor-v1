@@ -621,27 +621,55 @@ final class OtpService
             throw $verify_outcome['error'];
         }
 
+        $returned_user_id = (int) $verify_outcome['user_id'];
+        $session_issued   = false;
+
         // کوکی احراز هویت غیرپایدار (۸ ساعت، remember=false) و اثبات موبایلِ نشست
         // پس از Commitِ پایدار صادر می‌شوند — هر شکست در مرز بالا کامل roll back شده.
-        if ( $verify_outcome['session_issued'] ) {
-            $proof_store   = new PatientSessionProofStore();
-            $session_token = $proof_store->issue_non_persistent_auth_cookie( (int) $verify_outcome['user_id'] );
-            if ( '' !== $session_token ) {
-                $proof_store->record_mobile_proof(
-                    (int) $verify_outcome['user_id'],
-                    $mobile,
+        if ( $verify_outcome['session_issued'] && $returned_user_id > 0 ) {
+            $proof_store    = new PatientSessionProofStore();
+            $session_token  = $proof_store->issue_non_persistent_auth_cookie( $returned_user_id );
+            $proof_recorded = '' !== $session_token
+                && $proof_store->record_mobile_proof( $returned_user_id, $mobile, null, $session_token );
+
+            if ( $proof_recorded ) {
+                $this->session_scope()->set_in_process_session_token( $returned_user_id, $session_token );
+                $session_issued = true;
+            } else {
+                if ( function_exists( 'wp_clear_auth_cookie' ) ) {
+                    wp_clear_auth_cookie();
+                }
+                if ( '' !== $session_token && class_exists( \WP_Session_Tokens::class ) ) {
+                    \WP_Session_Tokens::get_instance( $returned_user_id )->destroy( $session_token );
+                } else {
+                    $proof_store->destroy_all_sessions( $returned_user_id );
+                }
+                $this->audit->log(
+                    'LOGIN_SESSION_ISSUE_FAILED',
+                    [ 'wp_user_id' => $returned_user_id, 'role' => 'patient' ],
+                    'otp',
                     null,
-                    $session_token
+                    null,
+                    null,
+                    [
+                        'purpose' => $purpose,
+                        'reason'  => '' === $session_token ? 'session_token_empty' : 'mobile_proof_persist_failed',
+                    ],
+                    [],
+                    (int) ( $verify_outcome['clinic_id'] ?? 0 ) > 0 ? (int) $verify_outcome['clinic_id'] : null,
+                    true
                 );
-                $this->session_scope()->set_in_process_session_token( (int) $verify_outcome['user_id'], $session_token );
+                $returned_user_id = 0;
             }
+        } else {
+            $returned_user_id = 0;
         }
 
         return [
-            'user_id'        => (int) $verify_outcome['user_id'],
+            'user_id'        => $returned_user_id,
             'patient_links'  => $verify_outcome['patient_links'],
             'is_new_user'    => (bool) $verify_outcome['is_new_user'],
-            'session_issued' => (bool) $verify_outcome['session_issued'],
+            'session_issued' => $session_issued,
         ];
     }
 

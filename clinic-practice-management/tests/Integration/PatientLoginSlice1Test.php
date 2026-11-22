@@ -5,6 +5,7 @@ declare( strict_types=1 );
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Admin\PatientPortalPage;
+use ClinicCore\Application\Auth\OtpException;
 use ClinicCore\Application\Auth\OtpService;
 use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientSessionProofStore;
@@ -317,14 +318,19 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
     public function testP4AuditInsertFailureRollsBackOtpVerifyAndIssuesZeroSessionAndNestedTxFailsClosed(): void {
         // 1. Nested transaction fails closed before consuming OTP or issuing session.
         $this->seedOtp( $this->clinicA, self::MOBILE_PENDING, '778899', OtpService::PURPOSE_LOGIN );
+        $nestedThrew     = false;
+        $nestedException = null;
         try {
             App::db()->transactional( function (): void {
                 App::otpService()->verify( self::MOBILE_PENDING, '778899', OtpService::PURPOSE_LOGIN );
             } );
-            self::fail( 'Nested transaction on PURPOSE_LOGIN must fail closed.' );
         } catch ( \Throwable $e ) {
-            self::assertSame( [], WP_Session_Tokens::get_instance( $this->userPending )->get_all() );
+            $nestedThrew     = true;
+            $nestedException = $e;
         }
+        self::assertTrue( $nestedThrew, 'Nested transaction on PURPOSE_LOGIN must fail closed.' );
+        self::assertInstanceOf( OtpException::class, $nestedException );
+        self::assertSame( [], WP_Session_Tokens::get_instance( $this->userPending )->get_all() );
 
         // Token was rolled back/unconsumed; verify DB row is still unconsumed.
         $consumedAt = App::db()->fetchValue(
@@ -519,6 +525,309 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
     }
 
     // =========================================================================
+    // R1, R2, R4, R5: Post-audit fix & regression witnesses
+    // =========================================================================
+
+    public function testP4EmptyTokenCaptureClearsHalfIssuedSessionAuditsAndReturnsNeutralResponseWithWitness(): void {
+        WP_Session_Tokens::get_instance( $this->userPending )->destroy_all();
+
+        // Baseline neutral response (guest with no cpms_patient_logins account).
+        $this->seedOtp( $this->clinicA, self::MOBILE_GUEST, '112233', OtpService::PURPOSE_LOGIN );
+        $guestResp = $this->dispatchRest( 'POST', '/clinic/v1/otp/verify', [
+            'mobile' => self::MOBILE_GUEST,
+            'code'   => '112233',
+        ], 0, false );
+        self::assertSame( 200, $guestResp->get_status() );
+        $guestData = $guestResp->get_data()['data'] ?? null;
+        self::assertSame( [
+            'user_id'        => 0,
+            'patient_links'  => [],
+            'is_new_user'    => false,
+            'session_issued' => false,
+        ], $guestData );
+
+        // Seam 1: force WP_Session_Tokens::create() -> wp_generate_password(43, false, false) to yield ''.
+        $this->seedOtp( $this->clinicA, self::MOBILE_PENDING, '223311', OtpService::PURPOSE_LOGIN );
+        $clearBefore     = did_action( 'clear_auth_cookie' );
+        $auditMaxIdBefore = (int) App::db()->fetchValue( 'SELECT COALESCE(MAX(id), 0) FROM ' . App::db()->table( 'cpms_audit_logs' ) );
+        $tokenFilterHit  = false;
+        $emptyTokenHook  = static function ( string $password, int $length, bool $specialChars, bool $extraSpecialChars ) use ( &$tokenFilterHit ): string {
+            if ( 43 === $length && ! $specialChars && ! $extraSpecialChars ) {
+                $tokenFilterHit = true;
+                return '';
+            }
+            return $password;
+        };
+
+        add_filter( 'random_password', $emptyTokenHook, 999, 4 );
+        try {
+            $failResp = $this->dispatchRest( 'POST', '/clinic/v1/otp/verify', [
+                'mobile' => self::MOBILE_PENDING,
+                'code'   => '223311',
+            ], 0, false );
+        } finally {
+            remove_filter( 'random_password', $emptyTokenHook, 999 );
+        }
+
+        self::assertTrue( $tokenFilterHit, 'random_password seam must have fired during WP_Session_Tokens::create().' );
+        self::assertSame( 200, $failResp->get_status() );
+        self::assertSame( $guestData, $failResp->get_data()['data'] ?? null, 'Empty token capture must return identical neutral shape.' );
+        self::assertGreaterThan( $clearBefore, did_action( 'clear_auth_cookie' ), 'Empty token failure must call wp_clear_auth_cookie().' );
+        self::assertSame( [], WP_Session_Tokens::get_instance( $this->userPending )->get_all(), 'Half-issued uncaptured session must be destroyed.' );
+
+        $failAudit = App::db()->fetchRow(
+            'SELECT action, actor_wp_user_id, after_json, meta_json FROM ' . App::db()->table( 'cpms_audit_logs' ) . ' WHERE id > %d AND action = %s ORDER BY id DESC LIMIT 1',
+            [ $auditMaxIdBefore, 'LOGIN_SESSION_ISSUE_FAILED' ]
+        );
+        self::assertIsArray( $failAudit );
+        self::assertSame( $this->userPending, (int) ( $failAudit['actor_wp_user_id'] ?? 0 ) );
+        $afterDecoded = json_decode( (string) ( $failAudit['after_json'] ?? '' ), true );
+        self::assertSame( [ 'purpose' => 'login', 'reason' => 'session_token_empty' ], $afterDecoded );
+        self::assertNull( $failAudit['meta_json'] );
+        $auditDump = (string) wp_json_encode( $failAudit, JSON_UNESCAPED_UNICODE );
+        self::assertStringNotContainsString( substr( self::MOBILE_PENDING, -4 ), $auditDump );
+        $this->assertNoNationalIdLiteral( $auditDump, self::NID_PENDING, 'R1 empty-token failure audit' );
+
+        // Positive witness: without the failure filter, the exact same path succeeds and issues a session.
+        $this->seedOtp( $this->clinicA, self::MOBILE_PENDING, '223399', OtpService::PURPOSE_LOGIN );
+        $capturedToken = '';
+        $tokenHook     = static function ( string $cookie, int $expire, int $expiration, int $userId, string $scheme, string $token ) use ( &$capturedToken ): void {
+            $capturedToken = $token;
+        };
+        add_action( 'set_logged_in_cookie', $tokenHook, 10, 6 );
+        try {
+            $okResp = $this->dispatchRest( 'POST', '/clinic/v1/otp/verify', [
+                'mobile' => self::MOBILE_PENDING,
+                'code'   => '223399',
+            ], 0, false );
+        } finally {
+            remove_action( 'set_logged_in_cookie', $tokenHook, 10 );
+        }
+        self::assertSame( 200, $okResp->get_status() );
+        self::assertTrue( $okResp->get_data()['data']['session_issued'] ?? false );
+        self::assertSame( $this->userPending, (int) ( $okResp->get_data()['data']['user_id'] ?? 0 ) );
+        self::assertNotSame( '', $capturedToken );
+        self::assertTrue( ( new PatientSessionProofStore() )->has_valid_mobile_proof( $this->userPending, self::MOBILE_PENDING, time(), $capturedToken ) );
+    }
+
+    public function testP4MobileProofPersistFailureClearsHalfIssuedSessionAuditsAndReturnsNeutralResponseWithWitness(): void {
+        WP_Session_Tokens::get_instance( $this->userPending )->destroy_all();
+
+        $this->seedOtp( $this->clinicA, self::MOBILE_GUEST, '114477', OtpService::PURPOSE_LOGIN );
+        $guestResp = $this->dispatchRest( 'POST', '/clinic/v1/otp/verify', [
+            'mobile' => self::MOBILE_GUEST,
+            'code'   => '114477',
+        ], 0, false );
+        self::assertSame( 200, $guestResp->get_status() );
+        $guestData = $guestResp->get_data()['data'] ?? null;
+
+        // Seam 2: WP_User_Meta_Session_Tokens subclass lets create() persist a real token,
+        // rejects recording `cpms_mobile_proofs` so get_live_session() returns null (record_mobile_proof() === false),
+        // and delegates destroy() to parent so we verify OtpService destroys the half-issued session.
+        $failingManager = new class( 0 ) extends \WP_User_Meta_Session_Tokens {
+            public static bool $simulatePersistFailure = false;
+            public static int $createCount             = 0;
+            public static int $proofAttemptCount       = 0;
+            public static int $destroyCount            = 0;
+
+            public static function resetCounters(): void {
+                self::$simulatePersistFailure = false;
+                self::$createCount            = 0;
+                self::$proofAttemptCount      = 0;
+                self::$destroyCount           = 0;
+            }
+
+            /** @return array<string, mixed>|null */
+            protected function get_session( $verifier ) {
+                if ( self::$simulatePersistFailure ) {
+                    return null;
+                }
+                return parent::get_session( $verifier );
+            }
+
+            /** @param array<string, mixed>|null $session */
+            protected function update_session( $verifier, $session = null ) {
+                if ( null === $session ) {
+                    ++self::$destroyCount;
+                    parent::update_session( $verifier, null );
+                    return;
+                }
+                if ( isset( $session[ PatientSessionProofStore::KEY_MOBILE_PROOFS ] ) ) {
+                    ++self::$proofAttemptCount;
+                    self::$simulatePersistFailure = true;
+                    return;
+                }
+                ++self::$createCount;
+                parent::update_session( $verifier, $session );
+            }
+        };
+        $failingClass = get_class( $failingManager );
+        $failingClass::resetCounters();
+
+        $this->seedOtp( $this->clinicA, self::MOBILE_PENDING, '334411', OtpService::PURPOSE_LOGIN );
+        $clearBefore      = did_action( 'clear_auth_cookie' );
+        $cookieBefore     = did_action( 'set_logged_in_cookie' );
+        $auditMaxIdBefore = (int) App::db()->fetchValue( 'SELECT COALESCE(MAX(id), 0) FROM ' . App::db()->table( 'cpms_audit_logs' ) );
+        $managerFilter    = static fn (): string => $failingClass;
+
+        add_filter( 'session_token_manager', $managerFilter, 999 );
+        try {
+            $failResp = $this->dispatchRest( 'POST', '/clinic/v1/otp/verify', [
+                'mobile' => self::MOBILE_PENDING,
+                'code'   => '334411',
+            ], 0, false );
+        } finally {
+            remove_filter( 'session_token_manager', $managerFilter, 999 );
+        }
+
+        $createCount       = $failingClass::$createCount;
+        $proofAttemptCount = $failingClass::$proofAttemptCount;
+        $destroyCount      = $failingClass::$destroyCount;
+        $failingClass::resetCounters();
+
+        self::assertSame( 1, $createCount, 'Session token creation must have run before proof persistence.' );
+        self::assertSame( 1, $proofAttemptCount, 'record_mobile_proof() must have attempted update_session.' );
+        self::assertGreaterThanOrEqual( 1, $destroyCount, 'Half-issued session must be destroyed after proof persistence failure.' );
+        self::assertGreaterThan( $cookieBefore, did_action( 'set_logged_in_cookie' ) );
+        self::assertGreaterThan( $clearBefore, did_action( 'clear_auth_cookie' ), 'Proof persistence failure must call wp_clear_auth_cookie().' );
+        self::assertSame( 200, $failResp->get_status() );
+        self::assertSame( $guestData, $failResp->get_data()['data'] ?? null, 'Proof persist failure must return identical neutral shape.' );
+        self::assertSame( [], WP_Session_Tokens::get_instance( $this->userPending )->get_all(), 'Real usermeta must hold zero leftover sessions.' );
+
+        $failAudit = App::db()->fetchRow(
+            'SELECT action, actor_wp_user_id, after_json, meta_json FROM ' . App::db()->table( 'cpms_audit_logs' ) . ' WHERE id > %d AND action = %s ORDER BY id DESC LIMIT 1',
+            [ $auditMaxIdBefore, 'LOGIN_SESSION_ISSUE_FAILED' ]
+        );
+        self::assertIsArray( $failAudit );
+        self::assertSame( $this->userPending, (int) ( $failAudit['actor_wp_user_id'] ?? 0 ) );
+        $afterDecoded = json_decode( (string) ( $failAudit['after_json'] ?? '' ), true );
+        self::assertSame( [ 'purpose' => 'login', 'reason' => 'mobile_proof_persist_failed' ], $afterDecoded );
+        self::assertNull( $failAudit['meta_json'] );
+        $auditDump = (string) wp_json_encode( $failAudit, JSON_UNESCAPED_UNICODE );
+        self::assertStringNotContainsString( substr( self::MOBILE_PENDING, -4 ), $auditDump );
+        $this->assertNoNationalIdLiteral( $auditDump, self::NID_PENDING, 'R1 proof-persist failure audit' );
+
+        // Positive witness: clean path still issues session + mobile proof.
+        $this->seedOtp( $this->clinicA, self::MOBILE_PENDING, '334499', OtpService::PURPOSE_LOGIN );
+        $witnessToken = '';
+        $captureHook  = static function ( string $cookie, int $expire, int $expiration, int $userId, string $scheme, string $token ) use ( &$witnessToken ): void {
+            $witnessToken = $token;
+        };
+        add_action( 'set_logged_in_cookie', $captureHook, 10, 6 );
+        try {
+            $okResp = $this->dispatchRest( 'POST', '/clinic/v1/otp/verify', [
+                'mobile' => self::MOBILE_PENDING,
+                'code'   => '334499',
+            ], 0, false );
+        } finally {
+            remove_action( 'set_logged_in_cookie', $captureHook, 10 );
+        }
+        self::assertSame( 200, $okResp->get_status() );
+        self::assertTrue( $okResp->get_data()['data']['session_issued'] ?? false );
+        self::assertSame( $this->userPending, (int) ( $okResp->get_data()['data']['user_id'] ?? 0 ) );
+        self::assertNotSame( '', $witnessToken );
+        self::assertTrue( ( new PatientSessionProofStore() )->has_valid_mobile_proof( $this->userPending, self::MOBILE_PENDING, time(), $witnessToken ) );
+    }
+
+    public function testR2NationalIdDigitMappingProducesExactPersianAndArabicIndicVariants(): void {
+        $variants = $this->toNationalIdVariants( self::NID_PENDING );
+        self::assertSame( '0010000003', $variants['ascii'] );
+        self::assertSame( '۰۰۱۰۰۰۰۰۰۳', $variants['persian'] );
+        self::assertSame( '٠٠١٠٠٠٠٠٠٣', $variants['arabic'] );
+        self::assertSame( '***0003', $variants['masked'] );
+        self::assertNotSame( self::NID_PENDING, $variants['persian'] );
+        self::assertNotSame( self::NID_PENDING, $variants['arabic'] );
+
+        $allDigits = $this->toNationalIdVariants( '0123456789' );
+        self::assertSame( '۰۱۲۳۴۵۶۷۸۹', $allDigits['persian'] );
+        self::assertSame( '٠١٢٣٤٥٦٧٨٩', $allDigits['arabic'] );
+    }
+
+    public function testR4PatientMeRestRouteArgsExposeNoNationalIdAcrossAllMethods(): void {
+        $routes = rest_get_server()->get_routes();
+        self::assertArrayHasKey( '/clinic/v1/patient/me', $routes );
+        $handlers = $routes['/clinic/v1/patient/me'];
+        self::assertGreaterThanOrEqual( 2, count( $handlers ) );
+
+        $sawGet      = false;
+        $sawEditable = false;
+        foreach ( $handlers as $handler ) {
+            $methods = is_array( $handler['methods'] ?? null ) ? $handler['methods'] : [];
+            $args    = is_array( $handler['args'] ?? null ) ? $handler['args'] : [];
+            self::assertArrayNotHasKey( 'national_id', $args, 'REST /patient/me must not expose national_id arg on any method.' );
+
+            if ( ! empty( $methods['GET'] ) ) {
+                $sawGet = true;
+                self::assertArrayHasKey( 'link_id', $args, 'Positive witness: GET /patient/me exposes link_id.' );
+            }
+            if ( ! empty( $methods['POST'] ) || ! empty( $methods['PUT'] ) || ! empty( $methods['PATCH'] ) ) {
+                $sawEditable = true;
+                self::assertArrayHasKey( 'first_name', $args, 'Positive witness: editable /patient/me exposes first_name.' );
+                self::assertArrayHasKey( 'link_id', $args, 'Positive witness: editable /patient/me exposes link_id.' );
+            }
+        }
+
+        self::assertTrue( $sawGet, 'GET /patient/me handler must be registered.' );
+        self::assertTrue( $sawEditable, 'POST/PUT/PATCH /patient/me handler must be registered.' );
+    }
+
+    public function testR5RealOtpVerifyDeniesPureStaffAndDoctorRolesAndMixedActorWithPurePatientWitness(): void {
+        // Baseline neutral guest response through real OtpService::verify().
+        $this->seedOtp( $this->clinicA, self::MOBILE_GUEST, '445511', OtpService::PURPOSE_LOGIN );
+        $guestRes = App::otpService()->verify( self::MOBILE_GUEST, '445511', OtpService::PURPOSE_LOGIN );
+        self::assertSame( [
+            'user_id'        => 0,
+            'patient_links'  => [],
+            'is_new_user'    => false,
+            'session_issued' => false,
+        ], $guestRes );
+
+        $logins     = new PatientLoginRepository( App::db() );
+        $staffRoles = [
+            RolesAndCapabilities::ROLE_SECRETARY  => '09127770101',
+            RolesAndCapabilities::ROLE_DOCTOR     => '09127770102',
+            RolesAndCapabilities::ROLE_MANAGER    => '09127770103',
+            RolesAndCapabilities::ROLE_ACCOUNTANT => '09127770104',
+        ];
+
+        foreach ( $staffRoles as $role => $mobile ) {
+            $uid = $this->makeUser( 'pls1_r5_' . $role . '_' . uniqid(), $role );
+            cpms_test_seed_membership( $uid, $this->clinicA, $role );
+            $logins->insert_pending_account( $uid, $mobile, 'Staff', $role );
+            $this->seedOtp( $this->clinicA, $mobile, '556611', OtpService::PURPOSE_LOGIN );
+
+            $loggedInBefore = did_action( 'set_logged_in_cookie' );
+            $authBefore     = did_action( 'set_auth_cookie' );
+            $res            = App::otpService()->verify( $mobile, '556611', OtpService::PURPOSE_LOGIN );
+
+            self::assertSame( $loggedInBefore, did_action( 'set_logged_in_cookie' ), $role . ' must trigger zero logged-in cookies.' );
+            self::assertSame( $authBefore, did_action( 'set_auth_cookie' ), $role . ' must trigger zero auth cookies.' );
+            self::assertSame( [], WP_Session_Tokens::get_instance( $uid )->get_all(), $role . ' must receive zero session tokens.' );
+            self::assertSame( $guestRes, $res, $role . ' response must match guest neutral shape.' );
+        }
+
+        // Mixed patient+staff actor also denied with zero cookies/sessions.
+        $this->seedOtp( $this->clinicA, self::MOBILE_MIXED, '556622', OtpService::PURPOSE_LOGIN );
+        $loggedInBefore = did_action( 'set_logged_in_cookie' );
+        $authBefore     = did_action( 'set_auth_cookie' );
+        $mixedRes       = App::otpService()->verify( self::MOBILE_MIXED, '556622', OtpService::PURPOSE_LOGIN );
+        self::assertSame( $loggedInBefore, did_action( 'set_logged_in_cookie' ) );
+        self::assertSame( $authBefore, did_action( 'set_auth_cookie' ) );
+        self::assertSame( [], WP_Session_Tokens::get_instance( $this->userMixed )->get_all() );
+        self::assertSame( $guestRes, $mixedRes );
+
+        // Positive witness: pure patient on the same real OtpService::verify() path gets a session.
+        WP_Session_Tokens::get_instance( $this->userPending )->destroy_all();
+        $this->seedOtp( $this->clinicA, self::MOBILE_PENDING, '556633', OtpService::PURPOSE_LOGIN );
+        $loggedInBefore = did_action( 'set_logged_in_cookie' );
+        $patientRes     = App::otpService()->verify( self::MOBILE_PENDING, '556633', OtpService::PURPOSE_LOGIN );
+        self::assertGreaterThan( $loggedInBefore, did_action( 'set_logged_in_cookie' ) );
+        self::assertTrue( $patientRes['session_issued'] );
+        self::assertSame( $this->userPending, $patientRes['user_id'] );
+        self::assertCount( 1, WP_Session_Tokens::get_instance( $this->userPending )->get_all() );
+    }
+
+    // =========================================================================
     // Helpers
     // =========================================================================
 
@@ -594,15 +903,48 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
         $this->assertNoNationalIdLiteral( $encoded, $nid, $context );
     }
 
+    /**
+     * @return array{ascii:string, persian:string, arabic:string, masked:string}
+     */
+    private function toNationalIdVariants( string $nid ): array {
+        $persianMap = [
+            '0' => '۰',
+            '1' => '۱',
+            '2' => '۲',
+            '3' => '۳',
+            '4' => '۴',
+            '5' => '۵',
+            '6' => '۶',
+            '7' => '۷',
+            '8' => '۸',
+            '9' => '۹',
+        ];
+        $arabicMap  = [
+            '0' => '٠',
+            '1' => '١',
+            '2' => '٢',
+            '3' => '٣',
+            '4' => '٤',
+            '5' => '٥',
+            '6' => '٦',
+            '7' => '٧',
+            '8' => '٨',
+            '9' => '٩',
+        ];
+
+        return [
+            'ascii'   => $nid,
+            'persian' => strtr( $nid, $persianMap ),
+            'arabic'  => strtr( $nid, $arabicMap ),
+            'masked'  => '***' . substr( $nid, -4 ),
+        ];
+    }
+
     private function assertNoNationalIdLiteral( string $text, string $nid, string $context ): void {
         if ( '' === $nid ) {
             return;
         }
-        $persian    = strtr( $nid, '0123456789', '۰۱۲۳۴۵۶۷۸۹' );
-        $arabic     = strtr( $nid, '0123456789', '٠١٢٣٤٥٦٧٨٩' );
-        $maskedTail = '***' . substr( $nid, -4 );
-
-        foreach ( [ $nid, $persian, $arabic, $maskedTail ] as $variant ) {
+        foreach ( $this->toNationalIdVariants( $nid ) as $variant ) {
             self::assertStringNotContainsString( $variant, $text, $context . ': must never leak national_id variant.' );
         }
     }
