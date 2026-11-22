@@ -135,7 +135,7 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         'roles',
     ];
 
-    /** Canonical editable fields per existing PatientService::ME_EDITABLE. */
+    /** Canonical editable fields per existing PatientService::ME_EDITABLE (P2: national_id excluded). */
     private const EXPECTED_EDITABLE_FIELDS = [
         'first_name',
         'last_name',
@@ -143,7 +143,6 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         'gender',
         'address',
         'phone',
-        'national_id',
         'emergency_contact_name',
         'emergency_contact_phone',
     ];
@@ -534,23 +533,11 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
             'RED-UI-3: Profile form must not contain any editable mobile input.'
         );
 
-        // National ID must be visible, editable, and clearly part of Profile (data-field=national_id),
-        // but not marked as booking-required.
+        // P2: National ID must NOT appear as an editable field in the Profile form.
         $nidInputs = $this->fieldInputs($formHtml, 'national_id');
-        self::assertTrue(count($nidInputs) >= 1,
-            'RED-UI-3: national_id must be an editable field in the Profile form.'
+        self::assertCount(0, $nidInputs,
+            'P2: national_id must NOT be an editable field in the Profile form.'
         );
-        foreach ($nidInputs as $inp) {
-            self::assertStringNotContainsString('required="required"', strtolower($inp['tag']),
-                'RED-UI-3: National ID must NOT be marked required at a booking-required level.'
-            );
-            self::assertStringNotContainsString('aria-required="true"', strtolower($inp['tag']),
-                'RED-UI-3: National ID must NOT be marked aria-required.'
-            );
-            self::assertStringNotContainsString('data-booking-required', $inp['tag'],
-                'RED-UI-3: National ID must not be tagged as a booking requirement.'
-            );
-        }
 
         // No clinical/private fields may appear in the self-edit form.
         foreach (self::FORBIDDEN_SELF_EDIT_FIELDS as $forbidden) {
@@ -580,7 +567,9 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
         $this->assertShellGuard($fx);
         $this->assertBackendGuardsForSelectedLink($fx, $fx['link_id']);
 
-        // Backend: valid national-id update; duplicate national-id canonical failure.
+        // Backend (P2): national_id is excluded from ME_EDITABLE & publicView() —
+        // NID-only PUT returns 400 CLINIC_VALIDATION_FAILED (no duplicate-NID oracle),
+        // and valid self-edit ignores national_id and omits it from response.
         self::assertTrue(NationalIdValidator::isValid('0000000140'), 'positive control: valid national ID.');
         self::assertTrue(NationalIdValidator::isValid('0000000061'), 'positive control: valid national ID (duplicate).');
         $dupClinicId = (int) $fx['clinic_id'];
@@ -594,33 +583,35 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
             'active',
             '0000000061'
         );
-        // Duplicate National ID must be canonically rejected (selected patient starts with NULL).
-        $dupEdit = $this->dispatchRest('PUT', self::ME_PATH, [
+        $nidOnlyReject = $this->dispatchRest('PUT', self::ME_PATH, [
             'link_id' => $fx['link_id'],
             'national_id' => '0000000061',
         ], (int) $fx['user_id']);
-        $this->assertClinicError($dupEdit, 'CLINIC_VALIDATION_FAILED', 400,
-            'positive control: duplicate National ID returns canonical CLINIC_VALIDATION_FAILED on backend.'
+        $this->assertClinicError($nidOnlyReject, 'CLINIC_VALIDATION_FAILED', 400,
+            'P2: NID-only PUT /patient/me fails with generic CLINIC_VALIDATION_FAILED (no duplicate-NID oracle).'
         );
-        $dupMsg = (string) ($dupEdit->get_data()['message'] ?? '');
+        $dupMsg = (string) ($nidOnlyReject->get_data()['message'] ?? '');
         self::assertNotSame('', $dupMsg, 'positive control: canonical error carries a Persian message.');
 
-        // A valid, unique National ID update succeeds.
-        $validEdit = $this->dispatchRest('PUT', self::ME_PATH, [
+        $uniqueNidOnlyReject = $this->dispatchRest('PUT', self::ME_PATH, [
             'link_id' => $fx['link_id'],
             'national_id' => '0000000140',
         ], (int) $fx['user_id']);
-        self::assertSame(200, $validEdit->get_status(),
-            'positive control: valid unique National ID update succeeds via PUT /patient/me.'
+        $this->assertClinicError($uniqueNidOnlyReject, 'CLINIC_VALIDATION_FAILED', 400,
+            'P2: unique NID-only PUT /patient/me returns identical failure to duplicate NID.'
         );
-        // Changing national_id closes active bindings and destroys WP sessions (B1 / §7.6);
-        // re-verify the user session before rendering the authenticated portal below.
-        PatientTwoProofTestHelper::acting_as(0);
-        PatientTwoProofTestHelper::seed_patient_proof((int) $fx['user_id'], (int) $fx['clinic_id'], (int) $fx['patient_id'], [
-            'mobile' => (string) $fx['mobile'],
-            'seed_session_scope' => true,
-            'set_current_user' => false,
-        ]);
+        self::assertSame($dupMsg, (string) ($uniqueNidOnlyReject->get_data()['message'] ?? ''));
+
+        $validEdit = $this->dispatchRest('PUT', self::ME_PATH, [
+            'link_id' => $fx['link_id'],
+            'first_name' => 'EditedR4',
+            'national_id' => '0000000140',
+        ], (int) $fx['user_id']);
+        self::assertSame(200, $validEdit->get_status(),
+            'P2: valid self-edit ignores extraneous national_id and succeeds.'
+        );
+        self::assertArrayNotHasKey('national_id', $validEdit->get_data()['data'] ?? [], 'P2: response omits national_id.');
+        self::assertSame('', (string) $this->patientRow((int) $fx['patient_id'])['national_id'], 'P2: DB national_id must not change.');
 
         // ---- INTENDED RED (UI-4): save wiring is absent on live main. ----
         $html = $this->renderProductionFrontendPortalAs((int) $fx['user_id']);
@@ -910,7 +901,8 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
 
         self::assertTrue(NationalIdValidator::isValid('0000000140'));
 
-        // Insert another patient holding national_id 0000000061 first, then duplicate must fail.
+        // P2: national_id is removed from ME_EDITABLE — both duplicate and unique NID
+        // payloads are ignored/rejected identically with zero DB mutation and no oracle.
         $dupPatient = $this->insertPatient(
             (int) $fx['clinic_id'],
             'MR-P9S4-G4DUP-' . $this->fixtureTag,
@@ -926,16 +918,17 @@ final class Phase9Slice4PatientProfileUiRedTest extends WP_UnitTestCase
             'national_id' => '0000000061',
         ], (int) $fx['user_id']);
         $this->assertClinicError($dup, 'CLINIC_VALIDATION_FAILED', 400,
-            'Duplicate National ID must be canonical CLINIC_VALIDATION_FAILED.'
+            'P2: NID-only PUT /patient/me fails generically (no oracle).'
         );
 
-        // A unique valid national ID (0000000140) must succeed.
         $ok = $this->dispatchRest('PUT', self::ME_PATH, [
             'link_id' => $fx['link_id'],
+            'last_name' => 'G4Updated',
             'national_id' => '0000000140',
         ], (int) $fx['user_id']);
         self::assertSame(200, $ok->get_status());
-        self::assertSame('0000000140', (string) $this->patientRow((int) $fx['patient_id'])['national_id']);
+        self::assertArrayNotHasKey('national_id', $ok->get_data()['data'] ?? []);
+        self::assertSame('', (string) $this->patientRow((int) $fx['patient_id'])['national_id']);
     }
 
     /**

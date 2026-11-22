@@ -249,7 +249,12 @@
 					window.location.reload();
 					return;
 				}
-				fail(result, 'کد معتبر نیست یا ورود برای این حساب مجاز نیست. دوباره تلاش کنید.');
+				if (result.ok) {
+					setStatus('امکان ورود مستقیم با این شماره وجود ندارد؛ برای فعال‌سازی حساب یا پیگیری پرونده با پذیرش مرکز درمانی تماس بگیرید.', 'error');
+					codeInput.focus();
+					return;
+				}
+				fail(result, 'کد معتبر نیست یا منقضی شده است. دوباره تلاش کنید.');
 				codeInput.focus();
 			}, function () {
 				setOtpBusy(false);
@@ -367,9 +372,9 @@
 	var PROFILE_MOBILE = '[data-role="profile-login-mobile"]';
 
 	var FIELD_ATTR = 'data-field';
-	// ONLY ME_EDITABLE. mobile/role/clinic_id/patient_id/org_id intentionally absent.
+	// ONLY ME_EDITABLE. mobile/role/clinic_id/patient_id/org_id/national_id intentionally absent.
 	var PROFILE_FIELD_KEYS = [
-		'first_name','last_name','national_id','birth_date','gender','address','phone',
+		'first_name','last_name','birth_date','gender','address','phone',
 		'emergency_contact_name','emergency_contact_phone'
 	];
 
@@ -537,7 +542,6 @@
 		var fields = [
 			{key:'first_name', label:'نام', type:'text', attrs:'autocomplete="given-name"'},
 			{key:'last_name', label:'نام خانوادگی', type:'text', attrs:'autocomplete="family-name"'},
-			{key:'national_id', label:'کد ملی', type:'text', attrs:'inputmode="numeric" autocomplete="off" dir="ltr"'},
 			{key:'birth_date', label:'تاریخ تولد', type:'date', attrs:'dir="ltr"'},
 			{key:'gender', label:'جنسیت', type:'select', options:{'':'انتخاب کنید','male':'مرد','female':'زن','other':'سایر','unknown':'نامشخص'}},
 			{key:'address', label:'آدرس', type:'textarea', full:true},
@@ -1250,6 +1254,87 @@
 		});
 	}
 
+	function bindLinkRecord(config) {
+		var section = document.querySelector('[data-role="link-record-section"]');
+		var form = section ? section.querySelector('[data-role="link-record-form"]') : null;
+		if (!section || !form || !isNonEmptyString(config.link_record_path) || typeof window.fetch !== 'function') { return; }
+
+		var clinicSelect = form.querySelector('[data-role="link-record-clinic"]');
+		var nidInput = form.querySelector('[data-role="link-record-national-id"]');
+		var submitBtn = form.querySelector('[data-role="link-record-submit"]');
+		var errorBoxNode = form.querySelector('[data-role="link-record-error"]');
+		var successBoxNode = form.querySelector('[data-role="link-record-success"]');
+		if (!clinicSelect || !nidInput || !submitBtn) { return; }
+
+		var busy = false;
+		var idleLabel = submitBtn.textContent || 'تأیید و ورود به پرونده';
+
+		function hideNotice(node) {
+			if (!node) { return; }
+			var p = node.querySelector('p') || node;
+			p.textContent = '';
+			node.hidden = true;
+		}
+		function showNotice(node, message) {
+			if (!node) { return; }
+			var p = node.querySelector('p') || node;
+			p.textContent = message || '';
+			node.hidden = false;
+		}
+
+		form.addEventListener('submit', function (event) {
+			event.preventDefault();
+			if (busy) { return; }
+			hideNotice(errorBoxNode);
+			hideNotice(successBoxNode);
+
+			var clinicId = parseInt(String(clinicSelect.value || ''), 10);
+			var nationalId = otpDigits(nidInput.value);
+			if (!clinicId || clinicId <= 0 || !/^\d{10}$/.test(nationalId)) {
+				showNotice(errorBoxNode, 'لطفاً مرکز درمانی و کد ملی ۱۰ رقمی معتبر را وارد کنید.');
+				(!clinicId || clinicId <= 0 ? clinicSelect : nidInput).focus();
+				return;
+			}
+
+			busy = true;
+			setBusy(submitBtn, true, idleLabel, 'در حال بررسی…');
+			form.setAttribute('aria-busy', 'true');
+
+			requestJson(apiUrl(config.rest_root, config.link_record_path), {
+				method: 'POST',
+				credentials: 'same-origin',
+				headers: {
+					Accept: 'application/json',
+					'Content-Type': 'application/json',
+					'X-WP-Nonce': config.nonce
+				},
+				body: JSON.stringify({
+					clinic_id: clinicId,
+					national_id: nationalId
+				})
+			}).then(function (result) {
+				busy = false;
+				form.setAttribute('aria-busy', 'false');
+				var payload = result.body && result.body.data ? result.body.data : null;
+				if (result.ok && payload && payload.patient_id) {
+					nidInput.value = '';
+					showNotice(successBoxNode, 'هویت شما تأیید شد. در حال بارگذاری پرونده…');
+					window.location.reload();
+					return;
+				}
+				setBusy(submitBtn, false, idleLabel);
+				showNotice(errorBoxNode, serverMessage(result) || 'تأیید پرونده انجام نشد. اطلاعات را بررسی کنید یا با پذیرش مرکز تماس بگیرید.');
+				nidInput.focus();
+			}, function () {
+				busy = false;
+				form.setAttribute('aria-busy', 'false');
+				setBusy(submitBtn, false, idleLabel);
+				showNotice(errorBoxNode, 'ارتباط با سرور برقرار نشد. دوباره تلاش کنید.');
+				nidInput.focus();
+			});
+		});
+	}
+
 	function bindSectionNav() {
 		var navLinks = document.querySelectorAll('[data-role="patient-nav"] a');
 		function apply() {
@@ -1775,6 +1860,7 @@
 		bindPrescriptions(config);
 		bindFiles(config);
 		bindEnrollment(config);
+		bindLinkRecord(config);
 		bindSectionNav();
 	}
 
