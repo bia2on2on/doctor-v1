@@ -477,10 +477,15 @@ final class NotificationService
             [ $wp_user_id, $clinic_id, 'active' ]
         );
 
+        $proved = array_flip( App::patient_access()->proved_patient_ids( $wp_user_id, $clinic_id ) );
+        if ( [] === $proved ) {
+            return [];
+        }
+
         $ids = [];
         foreach ( $rows as $row ) {
             $pid = (int) ( $row['id'] ?? 0 );
-            if ( $pid > 0 ) {
+            if ( $pid > 0 && isset( $proved[ $pid ] ) ) {
                 $ids[] = $pid;
             }
         }

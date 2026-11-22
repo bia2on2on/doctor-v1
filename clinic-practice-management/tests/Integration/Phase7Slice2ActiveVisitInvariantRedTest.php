@@ -23,6 +23,7 @@ use ClinicCore\Infrastructure\Repository\AppointmentRepository;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Infrastructure\Repository\SlotRepository;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Infrastructure\Repository\VisitRepository;
 use ClinicCore\Infrastructure\Security\Idempotency;
 use ClinicCore\Infrastructure\Sms\CredentialVault;
@@ -242,6 +243,12 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
                 $now
             )
         );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $this->patientUserId,
+            $this->clinicId,
+            $this->patientId,
+            ['mobile' => '09120000000', 'seed_session_scope' => true]
+        );
 
         // Staff relations through the production primitive (durable membership).
         self::assertGreaterThan(
@@ -275,10 +282,10 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
     {
         // Everything above is COMMITTED (tearDown ROLLBACK is a no-op for it):
         // manual, FK-safe cleanup.
+        PatientTwoProofTestHelper::reset();
         $this->purgeFixture();
         ScopeContext::clear();
         App::resetScope();
-        wp_set_current_user(0);
         parent::tearDown();
     }
 
@@ -956,6 +963,7 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
         $wpdb->query($wpdb->prepare('DELETE FROM ' . $wpdb->prefix . 'cpms_audit_logs WHERE clinic_id = %d', $c));
         $wpdb->query($wpdb->prepare('DELETE FROM ' . $wpdb->prefix . 'cpms_appointments WHERE clinic_id = %d', $c));
         $wpdb->query($wpdb->prepare('DELETE FROM ' . $wpdb->prefix . 'cpms_schedule_slots WHERE clinic_id = %d', $c));
+        $wpdb->query($wpdb->prepare('DELETE FROM ' . $wpdb->prefix . 'cpms_patient_logins WHERE clinic_id = %d', $c));
         $wpdb->query($wpdb->prepare('DELETE FROM ' . $wpdb->prefix . 'cpms_patient_user_links WHERE clinic_id = %d', $c));
         $wpdb->query($wpdb->prepare('DELETE FROM ' . $wpdb->prefix . 'cpms_clinic_memberships WHERE clinic_id = %d', $c));
         $wpdb->query($wpdb->prepare('DELETE FROM ' . $wpdb->prefix . 'cpms_patients WHERE clinic_id = %d', $c));
@@ -964,6 +972,8 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
         $wpdb->query($wpdb->prepare('DELETE FROM ' . $wpdb->prefix . 'cpms_settings WHERE clinic_id = %d', $c));
         $wpdb->query($wpdb->prepare('DELETE FROM ' . $wpdb->prefix . 'cpms_clinics WHERE id = %d', $c));
         if ($this->orgId > 0) {
+            $wpdb->query($wpdb->prepare('DELETE FROM ' . $wpdb->prefix . 'cpms_patient_identity_links WHERE organization_id = %d', (int) $this->orgId));
+            $wpdb->query($wpdb->prepare('DELETE FROM ' . $wpdb->prefix . 'cpms_patient_identities WHERE organization_id = %d', (int) $this->orgId));
             $wpdb->query($wpdb->prepare('DELETE FROM ' . $wpdb->prefix . 'cpms_organizations WHERE id = %d', (int) $this->orgId));
         }
         $wpdb->query('COMMIT'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared

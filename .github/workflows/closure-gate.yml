@@ -210,6 +210,22 @@ jobs:
           $wpdb->query($wpdb->prepare('INSERT INTO ' . $db->table('cpms_patients') . ' (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at) VALUES (1, %s, %s, %s, %s, %s, %s, %s)', 'SYN-CLOSURE-RT-001', 'بیمار', 'Closure (Synthetic)', '09120001234', 'active', $now, $now));
           $patientId = (int) $wpdb->insert_id;
           $wpdb->query($wpdb->prepare('INSERT INTO ' . $db->table('cpms_patient_user_links') . ' (clinic_id, patient_id, wp_user_id, mobile_at_link, is_primary, linked_at) VALUES (1, %d, %d, %s, 1, %s)', $patientId, $patientUserId, '09120001234', $now));
+          $loginRepo = new \ClinicCore\Infrastructure\Repository\PatientLoginRepository($db);
+          $acct = $loginRepo->find_account_by_user_id($patientUserId);
+          if ($acct === null) {
+              $acctId = $loginRepo->insert_pending_account($patientUserId, '09120001234', 'بیمار', 'Closure (Synthetic)');
+              $loginRepo->activate_account_from_pending($acctId, $patientUserId);
+          } elseif ((string) ($acct['state'] ?? '') !== 'active') {
+              $loginRepo->activate_account_from_pending((int) $acct['id'], $patientUserId);
+          }
+          $binding = $loginRepo->upsert_active_binding($patientUserId, 1, $patientId, $now);
+          $proofStore = new \ClinicCore\Application\Auth\PatientSessionProofStore();
+          $proofToken = WP_Session_Tokens::get_instance($patientUserId)->create(time() + \ClinicCore\Application\Auth\PatientSessionProofStore::SESSION_TTL_SECONDS);
+          $proofStore->record_mobile_proof($patientUserId, '09120001234', null, $proofToken);
+          $proofStore->record_binding_proof($patientUserId, 1, $patientId, (int) $binding['id'], (string) $binding['verified_at'], null, $proofToken);
+          $_COOKIE[LOGGED_IN_COOKIE] = wp_generate_auth_cookie($patientUserId, time() + \ClinicCore\Application\Auth\PatientSessionProofStore::SESSION_TTL_SECONDS, 'logged_in', $proofToken);
+          App::patient_session_scope()->set_in_process_session_token($patientUserId, $proofToken);
+          wp_set_current_user($patientUserId);
           $slotDate = gmdate('Y-m-d', time() + 86400);
           $wpdb->query($wpdb->prepare('INSERT IGNORE INTO ' . $db->table('cpms_schedule_slots') . ' (clinic_id, location_id, clinician_id, slot_date, slot_time, duration_min, capacity, booked_count, held_count, is_open, created_at, updated_at) VALUES (1, (SELECT id FROM ' . $db->table('cpms_locations') . ' WHERE clinic_id = 1 AND is_primary = 1 LIMIT 1), %d, %s, %s, 20, 1, 0, 0, 1, %s, %s)', $clinicianId, $slotDate, '10:00', $now, $now));
           $otp = App::otpService()->request('09120001234');
@@ -218,6 +234,9 @@ jobs:
           ok('booking-hold', !empty($hold['hold_token']));
           $appt = App::bookingService()->confirm((string) $hold['hold_token'], $patientUserId, 'بستن Closure (Synthetic)', uuid4());
           ok('booking-confirm', ($appt['status'] ?? '') === 'confirmed', json_encode(['status' => $appt['status'] ?? null]));
+          unset($_COOKIE[LOGGED_IN_COOKIE]);
+          App::patient_session_scope()->reset_in_process_state();
+          wp_set_current_user(0);
           $visit = App::visitService()->walkIn($secretaryId, $patientId, $clinicianId);
           ok('walk-in', ($visit['status'] ?? '') === 'waiting');
           $visitId = (int) $visit['id'];

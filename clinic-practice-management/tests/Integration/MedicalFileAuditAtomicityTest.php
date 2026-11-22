@@ -7,6 +7,7 @@ namespace ClinicCore\Tests\Integration;
 use ClinicCore\Application\Clinical\ClinicalException;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 /**
@@ -91,6 +92,12 @@ final class MedicalFileAuditAtomicityTest extends WP_UnitTestCase
                 $this->patientBId = $patient_id;
                 $this->patientBUser = $user_id;
             }
+            PatientTwoProofTestHelper::seed_patient_proof(
+                $user_id,
+                1,
+                $patient_id,
+                ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => ($tag === 'A')]
+            );
         }
 
         $this->secretaryUserId = (int) wp_create_user('ma_secretary' . bin2hex(random_bytes(3)), 'pass-12345', 'mas@test.local');
@@ -111,6 +118,7 @@ final class MedicalFileAuditAtomicityTest extends WP_UnitTestCase
     protected function tearDown(): void
     {
         $this->restoreAuditInserts();
+        PatientTwoProofTestHelper::reset();
         App::resetScope();
         if (is_dir($this->storagePath)) {
             $it = new \RecursiveIteratorIterator(

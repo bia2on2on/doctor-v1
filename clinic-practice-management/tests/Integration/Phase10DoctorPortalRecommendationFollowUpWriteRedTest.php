@@ -79,6 +79,7 @@ use ClinicCore\Application\Scope\SystemClinicResolver;
 use ClinicCore\Application\Visits\VisitService;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
@@ -126,7 +127,7 @@ final class Phase10DoctorPortalRecommendationFollowUpWriteRedTest extends WP_Uni
 
     protected function tearDown(): void
     {
-        wp_set_current_user(0);
+        PatientTwoProofTestHelper::reset();
         $_GET = [];
         $_POST = [];
         $_REQUEST = [];
@@ -737,7 +738,7 @@ final class Phase10DoctorPortalRecommendationFollowUpWriteRedTest extends WP_Uni
         // B. Patient view: only patient-visible recommendations, no private leak, follow-ups retained.
         $patientUser = $this->makePatientUser('g6_patient_user');
         $this->insertPatientLink($fx['clinic'], $patient, $patientUser);
-        wp_set_current_user($patientUser);
+        PatientTwoProofTestHelper::acting_as($patientUser);
         $rPatientView = $this->dispatch('GET', '/' . sprintf(self::PATIENT_VISIT_DETAIL, $visit));
         $this->gate(200, $rPatientView,
             'G6.B: patient Visit detail route still reachable, got ' . $rPatientView->get_status() . '/' . $this->errCode($rPatientView));
@@ -762,7 +763,7 @@ final class Phase10DoctorPortalRecommendationFollowUpWriteRedTest extends WP_Uni
         $otherPatient = $this->insertPatient($fx['clinic'], 'g6_other_patient');
         $otherUser = $this->makePatientUser('g6_other_user');
         $this->insertPatientLink($fx['clinic'], $otherPatient, $otherUser);
-        wp_set_current_user($otherUser);
+        PatientTwoProofTestHelper::acting_as($otherUser);
         $rForeign = $this->dispatch('GET', '/' . sprintf(self::PATIENT_VISIT_DETAIL, $visit));
         $this->gate(404, $rForeign, 'G6.C: foreign patient Visit detail denied non-enumerating');
         self::assertSame('CLINIC_NOT_FOUND', $this->errCode($rForeign), 'G6.C: established non-enumerating 404');
@@ -1279,10 +1280,22 @@ final class Phase10DoctorPortalRecommendationFollowUpWriteRedTest extends WP_Uni
     {
         global $wpdb;
         $now = App::db()->nowUtcSql();
-        $mobile = '0912' . sprintf('%07d', random_int(1000000, 9999999));
+        $mobile = (string) $wpdb->get_var($wpdb->prepare(
+            'SELECT mobile FROM ' . $wpdb->prefix . 'cpms_patients WHERE id = %d',
+            $patientId
+        ));
+        if ('' === $mobile) {
+            $mobile = '0912' . sprintf('%07d', random_int(1000000, 9999999));
+        }
         $wpdb->query($wpdb->prepare('INSERT INTO ' . $wpdb->prefix . 'cpms_patient_user_links (clinic_id, patient_id, wp_user_id, mobile_at_link, is_primary, linked_at) VALUES (%d, %d, %d, %s, 1, %s)', $clinicId, $patientId, $wpUserId, $mobile, $now));
         $id = (int) $wpdb->insert_id;
         self::assertGreaterThan(0, $id, 'patient user link fixture row must persist (unique patient/user pair)');
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $wpUserId,
+            $clinicId,
+            $patientId,
+            ['mobile' => $mobile, 'seed_session_scope' => true, 'set_current_user' => false]
+        );
         return $id;
     }
 
