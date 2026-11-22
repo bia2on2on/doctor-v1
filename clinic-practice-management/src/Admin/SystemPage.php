@@ -66,10 +66,26 @@ final class SystemPage
         );
     }
 
+    /** Avoid self-initializing health and license probes during recovery. */
+    private static function render_restore_status(): void {
+        echo '<div class="wrap"><h1>وضعیت بازیابی</h1><p>دسترسی به سامانه در زمان بازیابی محدود است.</p>';
+        try {
+            $backup_count = count( App::backupService()->listBackups() );
+            echo '<p>تعداد پشتیبان‌ها: ' . esc_html( (string) $backup_count ) . '</p>';
+        } catch ( \Throwable ) {
+            echo '<p>خواندن فهرست پشتیبان‌ها ممکن نیست.</p>';
+        }
+        echo '</div>';
+    }
+
     public static function render( $health_override = null ): void
     {
         if (!current_user_can('cpms_config')) {
             wp_die('دسترسی ندارید');
+        }
+        if ( \ClinicCore\Application\Backup\RestoreBarrierGate::blocked() ) {
+            self::render_restore_status();
+            return;
         }
         // فیکس گزارش نصب واقعی (D1): صفحهٔ وضعیت باید آخرین نقطهٔ قابل‌رؤیت
         // باشد — شکست هر سرویس وابسته (مثل ساخت پوشهٔ بکاپ روی میزبانِ

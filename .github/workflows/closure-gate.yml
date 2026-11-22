@@ -363,6 +363,7 @@ jobs:
       STORAGE_OUT: /home/runner/closure-storage
       BACKUP_OUT: /home/runner/closure-backups
       DB_MAIN: cpms_restore_test
+      CPMS_RESTORE_SUCCESS_STAGE: 'false'
     steps:
       - uses: actions/checkout@v4
 
@@ -444,7 +445,589 @@ jobs:
           echo "backup list (expect 1): $(WP_HOME="$WP_DIR" php "$WP_DIR/wp-content/plugins/clinic-practice-management/bin/cpms" backup list | wc -l)"
           [ -s /tmp/backup-a.id ] || { echo 'NO BACKUP ID'; exit 1; }
 
+      - name: Snapshot comparator self-test
+        run: |
+          set -euo pipefail
+          cat > /tmp/cpms-restore-snapshot.py <<'PYEOF'
+          #!/usr/bin/env python3
+          import hashlib
+          import json
+          import os
+          import re
+          import stat
+          import subprocess
+          import sys
+          import uuid
+          from pathlib import Path
+
+          # Guarantee: DB_MAIN plus the three watched roots only. It does not cover other
+          # databases, /tmp, or external writers.
+          # AUTO_INCREMENT-only changes are deliberately not detected; guarantee = DB_MAIN schema/rows + three roots.
+          DB = os.environ["DB_MAIN"]
+          BARRIER_OPTION = "cpms_restore_barrier"
+          # Empty by design: no option is excluded from the before/after comparison.
+          OPTIONS_EXCLUSIONS = ()
+          IDENTIFIER = re.compile(r"\A[A-Za-z0-9_$]+\Z")
+          MYSQL = [
+              "mysql", "-h127.0.0.1", "-P3306", "-uroot", "-proot",
+              "--batch", "--skip-column-names", "--raw",
+              "--default-character-set=utf8mb4",
+          ]
+
+          def quote_identifier(value):
+              if IDENTIFIER.fullmatch(value) is None:
+                  raise SystemExit("SNAPSHOT_UNSAFE_IDENTIFIER")
+              return "`" + value + "`"
+
+          def qualified(table):
+              return quote_identifier(DB) + "." + quote_identifier(table)
+
+          def mysql(sql):
+              result = subprocess.run(MYSQL + ["-e", sql], check=False, text=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              if result.returncode != 0:
+                  sys.stderr.write(result.stderr)
+                  raise SystemExit("SNAPSHOT_MYSQL_FAILED")
+              return result.stdout
+
+          def file_sha256(path):
+              digest = hashlib.sha256()
+              with open(path, "rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def octal_mode(path):
+              return format(stat.S_IMODE(os.lstat(path).st_mode), "04o")
+
+          def directory_snapshot(root):
+              if not os.path.lexists(root):
+                  return ({"exists": False, "directories": [], "files": []},
+                          {".": "MISSING"})
+              root_mode = os.lstat(root).st_mode
+              if not stat.S_ISDIR(root_mode):
+                  raise SystemExit("SNAPSHOT_ROOT_NOT_DIRECTORY")
+              directories = []
+              files = []
+              modes = {".": format(stat.S_IMODE(root_mode), "04o")}
+
+              def walk_error(error):
+                  raise error
+
+              for current, names, filenames in os.walk(root, topdown=True, followlinks=False,
+                                                        onerror=walk_error):
+                  names.sort()
+                  filenames.sort()
+                  relative_dir = os.path.relpath(current, root)
+                  if relative_dir != ".":
+                      directories.append(relative_dir.replace(os.sep, "/"))
+                  for name in names:
+                      path = os.path.join(current, name)
+                      mode = os.lstat(path).st_mode
+                      if not stat.S_ISDIR(mode):
+                          raise SystemExit("SNAPSHOT_NON_DIRECTORY_ENTRY")
+                      relative = os.path.relpath(path, root).replace(os.sep, "/")
+                      modes[relative] = octal_mode(path)
+                  for name in filenames:
+                      path = os.path.join(current, name)
+                      mode = os.lstat(path).st_mode
+                      if not stat.S_ISREG(mode):
+                          raise SystemExit("SNAPSHOT_NON_REGULAR_FILE")
+                      relative = os.path.relpath(path, root).replace(os.sep, "/")
+                      modes[relative] = octal_mode(path)
+                      files.append({
+                          "name": relative,
+                          "size": os.path.getsize(path),
+                          "sha256": file_sha256(path),
+                      })
+              return ({"exists": True, "directories": sorted(directories),
+                       "files": sorted(files, key=lambda item: item["name"])}, modes)
+
+          def exact_row_hash(table):
+              columns = mysql("SHOW COLUMNS FROM " + qualified(table)).splitlines()
+              names = []
+              primary = []
+              for line in columns:
+                  fields = line.split("\t")
+                  if len(fields) < 4:
+                      raise SystemExit("SNAPSHOT_COLUMNS_UNAVAILABLE")
+                  names.append(fields[0])
+                  if fields[3] == "PRI":
+                      primary.append(fields[0])
+              if not names or not primary:
+                  raise SystemExit("SNAPSHOT_PRIMARY_KEY_UNAVAILABLE")
+              expression = "JSON_ARRAY(" + ", ".join(quote_identifier(name) for name in names) + ")"
+              sql = (
+                  "SELECT REPLACE(REPLACE(TO_BASE64(CAST(" + expression
+                  + " AS CHAR CHARACTER SET utf8mb4)), CHAR(10), ''), CHAR(13), '') FROM "
+                  + qualified(table) + " ORDER BY "
+                  + ", ".join(quote_identifier(name) for name in primary)
+              )
+              rows = mysql(sql).splitlines()
+              digest = hashlib.sha256()
+              for row in rows:
+                  digest.update(row.encode("ascii") + b"\n")
+              return {"row_count": len(rows), "rows_sha256": digest.hexdigest()}
+
+          def sql_literal(value):
+              return "'" + value.replace("'", "''") + "'"
+
+          def schema_snapshot():
+              if IDENTIFIER.fullmatch(DB) is None:
+                  raise SystemExit("SNAPSHOT_UNSAFE_DATABASE_NAME")
+
+              # Sources: INFORMATION_SCHEMA.COLUMNS, INFORMATION_SCHEMA.STATISTICS (indexes),
+              # INFORMATION_SCHEMA.VIEWS, INFORMATION_SCHEMA.TRIGGERS,
+              # INFORMATION_SCHEMA.ROUTINES, INFORMATION_SCHEMA.PARAMETERS (routine signatures).
+              # These catalog rows describe persistent DDL, not runtime contents.
+              # Exclude STATISTICS.CARDINALITY (a cached estimate), COLUMNS.PRIVILEGES
+              # (login-dependent), TRIGGERS.CREATED and ROUTINES.CREATED/LAST_ALTERED
+              # (timestamps); catalog/schema identity columns are fixed by DB_MAIN.
+              catalogs = {
+                  "columns": (
+                      "COLUMNS", "TABLE_SCHEMA",
+                      ("TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT",
+                       "IS_NULLABLE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH",
+                       "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE",
+                       "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME",
+                       "COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "COLUMN_COMMENT",
+                       "GENERATION_EXPRESSION", "SRS_ID"),
+                      ("TABLE_NAME", "ORDINAL_POSITION", "COLUMN_NAME"),
+                  ),
+                  "indexes": (
+                      "STATISTICS", "TABLE_SCHEMA",
+                      ("TABLE_NAME", "INDEX_NAME", "NON_UNIQUE", "SEQ_IN_INDEX",
+                       "COLUMN_NAME", "EXPRESSION", "COLLATION", "SUB_PART", "NULLABLE",
+                       "INDEX_TYPE", "COMMENT", "INDEX_COMMENT", "IS_VISIBLE"),
+                      ("TABLE_NAME", "INDEX_NAME", "SEQ_IN_INDEX"),
+                  ),
+                  # AUTO_INCREMENT, UPDATE_TIME, CREATE_TIME, CHECK_TIME,
+                  # TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH, DATA_FREE, AVG_ROW_LENGTH are deliberately excluded
+                  # as volatile or estimates.
+                  "table_options": (
+                      "TABLES", "TABLE_SCHEMA",
+                      ("TABLE_NAME", "TABLE_TYPE", "ENGINE", "ROW_FORMAT", "TABLE_COLLATION"),
+                      ("TABLE_NAME",),
+                  ),
+                  "views": (
+                      "VIEWS", "TABLE_SCHEMA",
+                      ("TABLE_NAME", "VIEW_DEFINITION", "CHECK_OPTION", "IS_UPDATABLE",
+                       "DEFINER", "SECURITY_TYPE", "CHARACTER_SET_CLIENT",
+                       "COLLATION_CONNECTION"),
+                      ("TABLE_NAME",),
+                  ),
+                  "triggers": (
+                      "TRIGGERS", "TRIGGER_SCHEMA",
+                      ("TRIGGER_NAME", "EVENT_MANIPULATION", "EVENT_OBJECT_TABLE",
+                       "ACTION_ORDER", "ACTION_STATEMENT", "ACTION_ORIENTATION",
+                       "ACTION_TIMING", "SQL_MODE", "DEFINER", "CHARACTER_SET_CLIENT",
+                       "COLLATION_CONNECTION", "DATABASE_COLLATION"),
+                      ("TRIGGER_NAME",),
+                  ),
+                  "routines": (
+                      "ROUTINES", "ROUTINE_SCHEMA",
+                      ("SPECIFIC_NAME", "ROUTINE_NAME", "ROUTINE_TYPE", "DATA_TYPE",
+                       "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH",
+                       "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION",
+                       "CHARACTER_SET_NAME", "COLLATION_NAME", "DTD_IDENTIFIER",
+                       "ROUTINE_BODY", "ROUTINE_DEFINITION", "EXTERNAL_LANGUAGE",
+                       "PARAMETER_STYLE", "IS_DETERMINISTIC", "SQL_DATA_ACCESS", "SQL_PATH",
+                       "SECURITY_TYPE", "SQL_MODE", "ROUTINE_COMMENT", "DEFINER",
+                       "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION", "DATABASE_COLLATION"),
+                      ("SPECIFIC_NAME", "ROUTINE_TYPE"),
+                  ),
+                  "routine_parameters": (
+                      "PARAMETERS", "SPECIFIC_SCHEMA",
+                      ("SPECIFIC_NAME", "ROUTINE_TYPE", "ORDINAL_POSITION", "PARAMETER_MODE",
+                       "PARAMETER_NAME", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH",
+                       "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE",
+                       "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME",
+                       "DTD_IDENTIFIER"),
+                      ("SPECIFIC_NAME", "ORDINAL_POSITION"),
+                  ),
+              }
+              digest = hashlib.sha256()
+              row_counts = {}
+              for label, (catalog, schema_column, fields, ordering) in catalogs.items():
+                  expression = (
+                      "REPLACE(REPLACE(TO_BASE64(CAST(JSON_ARRAY("
+                      + ", ".join(fields)
+                      + ") AS CHAR CHARACTER SET utf8mb4)), CHAR(10), ''), CHAR(13), '')"
+                  )
+                  sql = (
+                      "SELECT " + expression + " FROM INFORMATION_SCHEMA."
+                      + quote_identifier(catalog) + " WHERE " + quote_identifier(schema_column)
+                      + " = " + sql_literal(DB) + " ORDER BY " + ", ".join(ordering)
+                  )
+                  rows = mysql(sql).splitlines()
+                  if label == "columns" and not rows:
+                      raise SystemExit("SNAPSHOT_SCHEMA_COLUMNS_EMPTY")
+                  digest.update(label.encode("ascii") + b"\\0")
+                  digest.update(len(rows).to_bytes(8, "big"))
+                  for row in rows:
+                      encoded = row.encode("ascii")
+                      digest.update(len(encoded).to_bytes(8, "big"))
+                      digest.update(encoded)
+                  row_counts[label] = len(rows)
+              return {"sha256": digest.hexdigest(), "row_counts": row_counts}
+
+          def snapshot():
+              assert BARRIER_OPTION not in OPTIONS_EXCLUSIONS
+              shown = mysql("SHOW FULL TABLES IN " + quote_identifier(DB)
+                            + " WHERE Table_type = 'BASE TABLE'")
+              tables = sorted(line.split("\t", 1)[0] for line in shown.splitlines() if line)
+              if not tables:
+                  raise SystemExit("SNAPSHOT_NO_DATABASE_TABLES")
+              checksum_sql = "CHECKSUM TABLE " + ", ".join(qualified(table) for table in tables)
+              checksum_rows = mysql(checksum_sql).splitlines()
+              checksums = {}
+              for line in checksum_rows:
+                  fields = line.split("\t", 1)
+                  if len(fields) != 2:
+                      raise SystemExit("SNAPSHOT_CHECKSUM_SHAPE")
+                  checksums[fields[0].rsplit(".", 1)[-1].strip("`")] = fields[1]
+              if set(checksums) != set(tables):
+                  raise SystemExit("SNAPSHOT_CHECKSUM_TABLE_SET_MISMATCH")
+              count_sql = " UNION ALL ".join(
+                  "SELECT '" + table + "', COUNT(*) FROM " + qualified(table)
+                  for table in tables
+              )
+              row_counts = {}
+              for line in mysql(count_sql).splitlines():
+                  fields = line.split("\t", 1)
+                  if len(fields) != 2:
+                      raise SystemExit("SNAPSHOT_ROW_COUNT_SHAPE")
+                  row_counts[fields[0]] = int(fields[1])
+              if set(row_counts) != set(tables):
+                  raise SystemExit("SNAPSHOT_ROW_COUNT_TABLE_SET_MISMATCH")
+              table_snapshot = {
+                  table: {"checksum": checksums[table], "row_count": row_counts[table]}
+                  for table in tables
+              }
+              options_candidates = [
+                  table for table in tables
+                  if table.endswith("_options")
+                  and table[:-len("options")] + "users" in tables
+                  and table[:-len("options")] + "usermeta" in tables
+              ]
+              if len(options_candidates) != 1:
+                  raise SystemExit("SNAPSHOT_WORDPRESS_TABLE_SET_MISMATCH")
+              options_table = options_candidates[0]
+              prefix = options_table[:-len("options")]
+              options_rows = []
+              options_sql = (
+                  "SELECT HEX(option_name), IF(option_value IS NULL, 'NULL', "
+                  "CONCAT('HEX:', HEX(option_value))) FROM " + qualified(options_table)
+                  + " ORDER BY HEX(option_name)"
+              )
+              for line in mysql(options_sql).splitlines():
+                  fields = line.split("\t", 1)
+                  if len(fields) != 2:
+                      raise SystemExit("SNAPSHOT_OPTIONS_ROW_SHAPE")
+                  options_rows.append((fields[0], fields[1]))
+              options_rows.sort(key=lambda item: item[0])
+              options_digest = hashlib.sha256()
+              for name_hex, value_hex in options_rows:
+                  options_digest.update(name_hex.encode("ascii") + b"\0"
+                                        + value_hex.encode("ascii") + b"\n")
+              account_tables = {"users": prefix + "users", "usermeta": prefix + "usermeta"}
+              account_snapshot = {}
+              for label, table in account_tables.items():
+                  if table not in table_snapshot:
+                      raise SystemExit("SNAPSHOT_ACCOUNT_TABLE_MISSING")
+                  account = exact_row_hash(table)
+                  if account["row_count"] != row_counts[table]:
+                      raise SystemExit("SNAPSHOT_ACCOUNT_ROW_COUNT_MISMATCH")
+                  account_snapshot[label] = {"table": table, **account}
+              roots = {
+                  "private_storage": os.environ["STORAGE_OUT"],
+                  "uploads": os.path.join(os.environ["WP_DIR"], "wp-content", "uploads"),
+                  "backup_directory": os.environ["BACKUP_OUT"],
+              }
+              files_snapshot = {}
+              modes_snapshot = {}
+              for label, path in roots.items():
+                  files_snapshot[label], modes_snapshot[label] = directory_snapshot(path)
+              return {
+                  "database": {"table_count": len(tables), "tables": table_snapshot},
+                  "schema": schema_snapshot(),
+                  "wp_options": {
+                      "table": options_table, "row_count": len(options_rows),
+                      "option_name_value_sha256": options_digest.hexdigest(),
+                      "excluded_names": list(OPTIONS_EXCLUSIONS),
+                  },
+                  "users_usermeta": account_snapshot,
+                  "files": files_snapshot,
+                  "modes": modes_snapshot,
+              }
+
+          def differences(before, after):
+              return [key for key in sorted(set(before) | set(after))
+                      if before.get(key) != after.get(key)]
+
+          def write_snapshot(path):
+              Path(path).write_text(json.dumps(snapshot(), sort_keys=True, separators=(",", ":")) + "\n",
+                                    encoding="utf-8")
+
+          def self_test():
+              before = snapshot()
+              private_storage_root = Path(os.environ["STORAGE_OUT"])
+              if not before["files"]["private_storage"]["exists"]:
+                  raise SystemExit("SNAPSHOT_SELF_TEST_PRIVATE_STORAGE_ROOT_MISSING")
+              marker = private_storage_root / ".cpms-restore-snapshot-self-test"
+              if os.path.lexists(marker):
+                  raise SystemExit("SNAPSHOT_SELF_TEST_MARKER_ALREADY_EXISTS")
+              try:
+                  with marker.open("xb") as stream:
+                      stream.write(b"temporary comparator witness\n")
+                  changed = snapshot()
+                  changed_sections = differences(before, changed)
+                  if "files" not in changed_sections:
+                      raise SystemExit("SNAPSHOT_SELF_TEST_DID_NOT_DETECT_FILE_CHANGE")
+              finally:
+                  if os.path.lexists(marker):
+                      marker.unlink()
+              reverted = snapshot()
+              if differences(before, reverted):
+                  raise SystemExit("SNAPSHOT_SELF_TEST_REVERT_FAILED")
+              print("SNAPSHOT_SELF_TEST_DIFFERENCE_DETECTED_AND_REVERTED")
+
+              mode_entries = before["files"]["private_storage"]["files"]
+              if not mode_entries:
+                  raise SystemExit("SNAPSHOT_SELF_TEST_NO_WATCHED_FILE_FOR_MODE")
+              mode_path = Path(os.environ["STORAGE_OUT"]) / mode_entries[0]["name"]
+              original_mode = stat.S_IMODE(os.lstat(mode_path).st_mode)
+              changed_mode = original_mode ^ stat.S_IXUSR
+              mode_failure = None
+              try:
+                  os.chmod(mode_path, changed_mode)
+                  changed = snapshot()
+                  if "modes" not in differences(before, changed):
+                      mode_failure = "SNAPSHOT_SELF_TEST_DID_NOT_DETECT_MODE_CHANGE"
+              except (SystemExit, Exception) as error:
+                  mode_failure = str(error) or "SNAPSHOT_SELF_TEST_MODE_PROBE_FAILED"
+              finally:
+                  try:
+                      if os.path.lexists(mode_path):
+                          os.chmod(mode_path, original_mode)
+                      else:
+                          mode_failure = mode_failure or "SNAPSHOT_SELF_TEST_MODE_FILE_MISSING"
+                  except (SystemExit, Exception) as error:
+                      mode_failure = mode_failure or str(error) or "SNAPSHOT_SELF_TEST_MODE_RESTORE_FAILED"
+              reverted = snapshot()
+              reverted_sections = differences(before, reverted)
+              if reverted_sections:
+                  raise SystemExit("SNAPSHOT_SELF_TEST_MODE_REVERT_FAILED: "
+                                   + ",".join(reverted_sections))
+              if mode_failure:
+                  raise SystemExit(mode_failure)
+              print("SNAPSHOT_SELF_TEST_MODE_DIFFERENCE_DETECTED_AND_REVERTED")
+
+              directory_name = ".cpms-restore-snapshot-directory-mode-" + uuid.uuid4().hex
+              directory_path = private_storage_root / directory_name
+              if os.path.lexists(directory_path):
+                  raise SystemExit("SNAPSHOT_SELF_TEST_DIRECTORY_MODE_ALREADY_EXISTS")
+              original_directory_mode = None
+              directory_failure = None
+              directory_cleanup_failure = None
+              try:
+                  os.mkdir(directory_path)
+                  original_directory_mode = stat.S_IMODE(os.lstat(directory_path).st_mode)
+                  directory_before = snapshot()
+                  changed_directory_mode = original_directory_mode ^ stat.S_IWUSR
+                  os.chmod(directory_path, changed_directory_mode)
+                  changed = snapshot()
+                  if "modes" not in differences(directory_before, changed):
+                      directory_failure = "SNAPSHOT_SELF_TEST_DID_NOT_DETECT_DIRECTORY_MODE_CHANGE"
+              except (SystemExit, Exception) as error:
+                  directory_failure = str(error) or "SNAPSHOT_SELF_TEST_DIRECTORY_MODE_PROBE_FAILED"
+              finally:
+                  if os.path.lexists(directory_path):
+                      try:
+                          directory_stat = os.lstat(directory_path).st_mode
+                          if not stat.S_ISDIR(directory_stat):
+                              directory_cleanup_failure = "SNAPSHOT_SELF_TEST_DIRECTORY_PROBE_NOT_DIRECTORY"
+                          elif original_directory_mode is not None:
+                              os.chmod(directory_path, original_directory_mode)
+                      except (SystemExit, Exception) as error:
+                          directory_cleanup_failure = (
+                              str(error) or "SNAPSHOT_SELF_TEST_DIRECTORY_MODE_RESTORE_FAILED"
+                          )
+                      try:
+                          if os.path.lexists(directory_path):
+                              directory_stat = os.lstat(directory_path).st_mode
+                              if stat.S_ISDIR(directory_stat):
+                                  os.rmdir(directory_path)
+                              else:
+                                  directory_cleanup_failure = (
+                                      directory_cleanup_failure
+                                      or "SNAPSHOT_SELF_TEST_DIRECTORY_PROBE_NOT_DIRECTORY"
+                                  )
+                      except (SystemExit, Exception) as error:
+                          directory_cleanup_failure = directory_cleanup_failure or (
+                              str(error) or "SNAPSHOT_SELF_TEST_DIRECTORY_REMOVE_FAILED"
+                          )
+              reverted = snapshot()
+              reverted_sections = differences(before, reverted)
+              directory_failures = [failure for failure in
+                                    (directory_failure, directory_cleanup_failure) if failure]
+              if reverted_sections:
+                  directory_failures.append(
+                      "SNAPSHOT_SELF_TEST_DIRECTORY_MODE_REVERT_FAILED: "
+                      + ",".join(reverted_sections)
+                  )
+              if directory_failures:
+                  raise SystemExit("; ".join(directory_failures))
+              print("SNAPSHOT_SELF_TEST_DIRECTORY_MODE_DIFFERENCE_DETECTED_AND_REVERTED")
+
+              view_name = "cpms_restore_snapshot_self_test_view"
+              existing_view = mysql(
+                  "SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = "
+                  + sql_literal(DB) + " AND TABLE_NAME = " + sql_literal(view_name)
+              ).strip()
+              if existing_view != "0":
+                  raise SystemExit("SNAPSHOT_SELF_TEST_VIEW_ALREADY_EXISTS")
+              schema_failure = None
+              view_cleanup_failure = None
+              try:
+                  mysql("CREATE VIEW " + qualified(view_name)
+                        + " AS SELECT 1 AS self_test_probe")
+                  changed = snapshot()
+                  if "schema" not in differences(before, changed):
+                      schema_failure = "SNAPSHOT_SELF_TEST_DID_NOT_DETECT_SCHEMA_CHANGE"
+              except (SystemExit, Exception) as error:
+                  schema_failure = str(error) or "SNAPSHOT_SELF_TEST_SCHEMA_PROBE_FAILED"
+              finally:
+                  try:
+                      mysql("DROP VIEW IF EXISTS " + qualified(view_name))
+                  except (SystemExit, Exception) as error:
+                      view_cleanup_failure = (
+                          str(error) or "SNAPSHOT_SELF_TEST_VIEW_DROP_FAILED"
+                      )
+                  try:
+                      remaining_view = mysql(
+                          "SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = "
+                          + sql_literal(DB) + " AND TABLE_NAME = " + sql_literal(view_name)
+                      ).strip()
+                      if remaining_view != "0":
+                          view_cleanup_failure = "SNAPSHOT_SELF_TEST_VIEW_REMAINS"
+                  except (SystemExit, Exception) as error:
+                      view_cleanup_failure = (
+                          str(error) or "SNAPSHOT_SELF_TEST_VIEW_ABSENCE_CHECK_FAILED"
+                      )
+              reverted = snapshot()
+              reverted_sections = differences(before, reverted)
+              schema_failures = [failure for failure in (schema_failure, view_cleanup_failure)
+                                 if failure]
+              if reverted_sections:
+                  schema_failures.append(
+                      "SNAPSHOT_SELF_TEST_SCHEMA_REVERT_FAILED: "
+                      + ",".join(reverted_sections)
+                  )
+              if schema_failures:
+                  raise SystemExit("; ".join(schema_failures))
+              print("SNAPSHOT_SELF_TEST_SCHEMA_DIFFERENCE_DETECTED_AND_REVERTED")
+
+              table_name = "cpms_restore_snapshot_self_test_table"
+              existing_table = mysql(
+                  "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = "
+                  + sql_literal(DB) + " AND TABLE_NAME = " + sql_literal(table_name)
+              ).strip()
+              if existing_table != "0":
+                  raise SystemExit("SNAPSHOT_SELF_TEST_TABLE_ALREADY_EXISTS")
+              table_failure = None
+              table_cleanup_failure = None
+              # DDL causes implicit commits; do not wrap this probe in a transaction.
+              try:
+                  mysql("CREATE TABLE " + qualified(table_name)
+                        + " (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB ROW_FORMAT=DYNAMIC")
+                  dynamic_snapshot = snapshot()
+                  mysql("ALTER TABLE " + qualified(table_name) + " ROW_FORMAT=COMPACT")
+                  compact_snapshot = snapshot()
+                  if "schema" not in differences(dynamic_snapshot, compact_snapshot):
+                      table_failure = "SNAPSHOT_SELF_TEST_DID_NOT_DETECT_TABLE_OPTIONS_CHANGE"
+              except (SystemExit, Exception) as error:
+                  table_failure = str(error) or "SNAPSHOT_SELF_TEST_TABLE_OPTIONS_PROBE_FAILED"
+              finally:
+                  try:
+                      mysql("DROP TABLE IF EXISTS " + qualified(table_name))
+                  except (SystemExit, Exception) as error:
+                      table_cleanup_failure = (
+                          str(error) or "SNAPSHOT_SELF_TEST_TABLE_DROP_FAILED"
+                      )
+                  try:
+                      remaining_table = mysql(
+                          "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = "
+                          + sql_literal(DB) + " AND TABLE_NAME = " + sql_literal(table_name)
+                      ).strip()
+                      if remaining_table != "0":
+                          table_cleanup_failure = "SNAPSHOT_SELF_TEST_TABLE_REMAINS"
+                  except (SystemExit, Exception) as error:
+                      table_cleanup_failure = (
+                          str(error) or "SNAPSHOT_SELF_TEST_TABLE_ABSENCE_CHECK_FAILED"
+                      )
+              reverted = snapshot()
+              reverted_sections = differences(before, reverted)
+              table_failures = [failure for failure in (table_failure, table_cleanup_failure)
+                                if failure]
+              if reverted_sections:
+                  table_failures.append(
+                      "SNAPSHOT_SELF_TEST_TABLE_OPTIONS_REVERT_FAILED: "
+                      + ",".join(reverted_sections)
+                  )
+              if table_failures:
+                  raise SystemExit("; ".join(table_failures))
+              print("SNAPSHOT_SELF_TEST_TABLE_OPTIONS_DIFFERENCE_DETECTED_AND_REVERTED")
+
+          if __name__ == "__main__":
+              if len(sys.argv) == 2 and sys.argv[1] == "self-test":
+                  self_test()
+              elif len(sys.argv) == 3 and sys.argv[1] == "write":
+                  write_snapshot(sys.argv[2])
+                  print("SNAPSHOT_WRITTEN")
+              elif len(sys.argv) == 4 and sys.argv[1] == "assert-identical":
+                  before = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+                  after = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+                  changed_sections = differences(before, after)
+                  if changed_sections:
+                      raise SystemExit("SNAPSHOT_CHANGED: " + ",".join(changed_sections))
+                  print("SNAPSHOT_IDENTICAL")
+              else:
+                  raise SystemExit("SNAPSHOT_USAGE")
+          PYEOF
+          python3 /tmp/cpms-restore-snapshot.py self-test
+
+      - name: Populate state B for fail-closed restore test
+        if: env.CPMS_RESTORE_SUCCESS_STAGE == 'false'
+        run: |
+          set -euo pipefail
+          cat > /tmp/mutate-b-only.php <<'PHPEOF'
+          <?php
+          require getenv('WP_HOME') . '/wp-load.php';
+          use ClinicCore\Bootstrap\App;
+          global $wpdb;
+          $db = App::db();
+          $wpdb->query($wpdb->prepare('UPDATE ' . $db->table('cpms_patients') . ' SET last_name = %s WHERE mrn = %s', 'MUTATED-LastName', 'SYN-CLOSURE-R1'));
+          $now = $db->nowUtcSql();
+          $wpdb->query($wpdb->prepare('INSERT INTO ' . $db->table('cpms_patients') . ' (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at) VALUES (1, %s, %s, %s, %s, %s, %s, %s)', 'SYN-INTRUDER-9', 'Intruder', 'Patient', '09120005555', 'active', $now, $now));
+          $wpdb->query('DELETE FROM ' . $db->table('cpms_audit_logs') . ' ORDER BY id ASC LIMIT 1');
+          $sto = (string) getenv('STORAGE_OUT');
+          $rel = @file_get_contents('/tmp/sentinel-rel.txt');
+          $rel = is_string($rel) ? trim($rel) : '';
+          if ($rel !== '') {
+              @unlink($sto . '/' . $rel);
+          }
+          file_put_contents($sto . '/garbage-intruder.bin', 'GARBAGE');
+          PHPEOF
+          WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php /tmp/mutate-b-only.php
+          mysql -h127.0.0.1 -P3306 -uroot -proot -N -e "SELECT COUNT(*) FROM \`$DB_MAIN\`.cpmswp_cpms_patients WHERE mrn='SYN-INTRUDER-9';" | grep -qx '1'
+          mysql -h127.0.0.1 -P3306 -uroot -proot -N -e "SELECT last_name FROM \`$DB_MAIN\`.cpmswp_cpms_patients WHERE mrn='SYN-CLOSURE-R1';" | grep -qx 'MUTATED-LastName'
+          REL=$(cat /tmp/sentinel-rel.txt)
+          [ ! -f "$STORAGE_OUT/$REL" ]
+          [ -f "$STORAGE_OUT/garbage-intruder.bin" ]
+
       - name: Mutate to state B + RestoreApply (destructive) + verify state A
+        if: env.CPMS_RESTORE_SUCCESS_STAGE == 'true'
         run: |
           set -e
           B0=$(cat /tmp/backup-a.id)
@@ -515,7 +1098,44 @@ jobs:
           grep -q 'license: activation_pending' /tmp/status-a.log || { echo 'LICENSE NOT FRESH AFTER RESTORE'; exit 1; }
           echo 'RESTORE APPLY: state A fully restored ✓'
 
+      - name: Snapshot and assert populated-target RestoreApply refusal
+        if: env.CPMS_RESTORE_SUCCESS_STAGE == 'false'
+        run: |
+          set -euo pipefail
+          B0=$(cat /tmp/backup-a.id)
+          LIST_BEFORE=$(WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php "$WP_DIR/wp-content/plugins/clinic-practice-management/bin/cpms" backup list | wc -l | tr -d '[:space:]')
+          [ "$LIST_BEFORE" -eq 1 ] || { echo 'EXPECTED ONLY THE ORIGINAL BACKUP BEFORE REFUSAL'; exit 1; }
+          python3 /tmp/cpms-restore-snapshot.py write /tmp/restore-populated-before.json
+          set +e
+          WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php "$WP_DIR/wp-content/plugins/clinic-practice-management/bin/cpms" backup restore "$B0" --yes > /tmp/restore-apply.log 2>&1
+          RC=$?
+          set -e
+          [ "$RC" -ne 0 ] || { echo 'POPULATED TARGET RESTORE UNEXPECTEDLY SUCCEEDED'; exit 1; }
+          grep -Fqx 'CPMS backup failed [RESTORE_TARGET_NOT_EMPTY]. Details are omitted.' /tmp/restore-apply.log || { echo 'WRONG POPULATED-TARGET REFUSAL CODE'; exit 1; }
+          cat > /tmp/cpms-restore-refusal.php <<'PHPEOF'
+          <?php
+          require getenv('WP_HOME') . '/wp-load.php';
+          use ClinicCore\Bootstrap\App;
+          use ClinicCore\Infrastructure\Backup\BackupException;
+          try {
+              App::backupService()->restoreApply((string) ($argv[1] ?? ''), true);
+              fwrite(STDOUT, "RESTORE_UNEXPECTEDLY_APPLIED\n");
+              exit(42);
+          } catch (BackupException $error) {
+              fwrite(STDOUT, $error->getErrorCode() . "\n" . $error->getMessage() . "\n");
+          }
+          PHPEOF
+          WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php /tmp/cpms-restore-refusal.php "$B0" > /tmp/restore-exception.txt
+          printf '%s\n' 'RESTORE_TARGET_NOT_EMPTY' 'Restore requires a prepared empty target.' > /tmp/restore-exception-expected.txt
+          cmp -s /tmp/restore-exception-expected.txt /tmp/restore-exception.txt || { echo 'BACKUPSERVICE REFUSAL CODE OR MESSAGE CHANGED'; exit 1; }
+          LIST_AFTER=$(WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php "$WP_DIR/wp-content/plugins/clinic-practice-management/bin/cpms" backup list | wc -l | tr -d '[:space:]')
+          [ "$LIST_AFTER" -eq "$LIST_BEFORE" ] || { echo 'RESTORE CREATED A SAFETY BACKUP'; exit 1; }
+          python3 /tmp/cpms-restore-snapshot.py write /tmp/restore-populated-after.json
+          python3 /tmp/cpms-restore-snapshot.py assert-identical /tmp/restore-populated-before.json /tmp/restore-populated-after.json
+          echo 'POPULATED RESTORE REFUSED WITH EXACT SOURCE ERROR; ZERO SAFETY BACKUPS; SNAPSHOT IDENTICAL'
+
       - name: Negative — corrupt db.sql / tampered manifest rejection
+        if: env.CPMS_RESTORE_SUCCESS_STAGE == 'true'
         run: |
           set -e
           # دو بکاپ سالم تازه
@@ -558,6 +1178,55 @@ jobs:
           mysql -h127.0.0.1 -P3306 -uroot -proot -N -e "SELECT COUNT(*) FROM \`$DB_MAIN\`.cpmswp_cpms_patients WHERE mrn='SYN-INTRUDER-9';" | grep -qx '0' || { echo 'DATA CHANGED BY REJECTED RESTORE'; exit 1; }
           echo 'NEGATIVES: corrupt db.sql + tampered manifest both rejected, data untouched ✓'
           echo 'RESTORE-APPLY GATE OK'
+
+      - name: Negative restore refusals — corrupt SQL and manifest snapshots
+        if: env.CPMS_RESTORE_SUCCESS_STAGE == 'false'
+        run: |
+          set -euo pipefail
+          WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php "$WP_DIR/wp-content/plugins/clinic-practice-management/bin/cpms" backup run > /tmp/b1.log
+          B1=$(grep -oE 'Backup created: [0-9a-z._-]+' /tmp/b1.log | awk '{print $3}')
+          WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php "$WP_DIR/wp-content/plugins/clinic-practice-management/bin/cpms" backup run > /tmp/b2.log
+          B2=$(grep -oE 'Backup created: [0-9a-z._-]+' /tmp/b2.log | awk '{print $3}')
+          [ -n "$B1" ] && [ -n "$B2" ]
+          echo '-- GARBAGE-APPENDED-BY-CLOSURE-NEGATIVE-TEST' >> "$BACKUP_OUT/$B1/db.sql"
+          set +e
+          WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php "$WP_DIR/wp-content/plugins/clinic-practice-management/bin/cpms" backup verify "$B1" > /tmp/verify-b1.log 2>&1
+          RC1=$?
+          set -e
+          [ "$RC1" -eq 2 ] || { echo 'VERIFY DID NOT REJECT CORRUPT SQL'; exit 1; }
+          echo '   ' >> "$BACKUP_OUT/$B2/manifest.json"
+          set +e
+          WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php "$WP_DIR/wp-content/plugins/clinic-practice-management/bin/cpms" backup verify "$B2" > /tmp/verify-b2.log 2>&1
+          RC2=$?
+          set -e
+          [ "$RC2" -eq 2 ] || { echo 'VERIFY DID NOT REJECT TAMPERED MANIFEST'; exit 1; }
+          assert_refusal_unchanged() {
+            local backup_id="$1" expected_code="$2" expected_message="$3" label="$4"
+            local before="/tmp/${label}-before.json" after="/tmp/${label}-after.json"
+            local log="/tmp/${label}-restore.log" expected="/tmp/${label}-expected.txt" observed="/tmp/${label}-exception.txt"
+            local count_before count_after rc
+            count_before=$(WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php "$WP_DIR/wp-content/plugins/clinic-practice-management/bin/cpms" backup list | wc -l | tr -d '[:space:]')
+            [ "$count_before" -eq 3 ] || { echo 'EXPECTED A + B1 + B2; NO SAFETY BACKUPS'; return 1; }
+            python3 /tmp/cpms-restore-snapshot.py write "$before"
+            set +e
+            WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php "$WP_DIR/wp-content/plugins/clinic-practice-management/bin/cpms" backup restore "$backup_id" --yes > "$log" 2>&1
+            rc=$?
+            set -e
+            [ "$rc" -ne 0 ] || { echo 'CORRUPT RESTORE UNEXPECTEDLY SUCCEEDED'; return 1; }
+            grep -Fqx "CPMS backup failed [$expected_code]. Details are omitted." "$log" || { echo 'WRONG CORRUPT-RESTORE REFUSAL CODE'; return 1; }
+            WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php /tmp/cpms-restore-refusal.php "$backup_id" > "$observed"
+            printf '%s\n' "$expected_code" "$expected_message" > "$expected"
+            cmp -s "$expected" "$observed" || { echo 'WRONG CORRUPT-RESTORE SOURCE ERROR'; return 1; }
+            count_after=$(WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php "$WP_DIR/wp-content/plugins/clinic-practice-management/bin/cpms" backup list | wc -l | tr -d '[:space:]')
+            [ "$count_after" -eq "$count_before" ] || { echo 'CORRUPT RESTORE CREATED A SAFETY BACKUP'; return 1; }
+            python3 /tmp/cpms-restore-snapshot.py write "$after"
+            python3 /tmp/cpms-restore-snapshot.py assert-identical "$before" "$after"
+          }
+          assert_refusal_unchanged "$B1" CLINIC_BACKUP_PREFLIGHT_FAILED 'restore preflight failed' corrupt-sql
+          assert_refusal_unchanged "$B2" CLINIC_BACKUP_PREFLIGHT_FAILED 'restore preflight failed' tampered-manifest
+          LISTN=$(WP_HOME="$WP_DIR" STORAGE_OUT="$STORAGE_OUT" BACKUP_OUT="$BACKUP_OUT" php "$WP_DIR/wp-content/plugins/clinic-practice-management/bin/cpms" backup list | wc -l | tr -d '[:space:]')
+          [ "$LISTN" -eq 3 ] || { echo 'EXPECTED THREE SOURCE BACKUPS AND ZERO NEW SAFETY BACKUPS'; exit 1; }
+          echo 'CORRUPT SQL AND MANIFEST REFUSED BEFORE WRITE; EACH SNAPSHOT IDENTICAL; ZERO SAFETY BACKUPS'
 
       - name: Post closure evidence to PR
         if: always()
