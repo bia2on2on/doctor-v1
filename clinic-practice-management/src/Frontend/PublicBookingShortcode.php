@@ -220,7 +220,7 @@ final class PublicBookingShortcode
     public static function register(): void
     {
         add_shortcode(self::TAG, [self::class, 'render']);
-        add_action('template_redirect', [self::class, 'redirect_incomplete_registration'], 10);
+        add_action( 'template_redirect', [ self::class, 'redirect_incomplete_registration' ], 10 );
 
         // assets این سطح — ثبت/انکیو شرطی، کاملاً جدا از assets مدیریتی.
         PublicBookingAssets::register();

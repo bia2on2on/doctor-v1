@@ -637,23 +637,6 @@ final class PatientAccess {
     }
 
     /**
-     * Checks whether `$wp_user_id` exists, holds the pure `patient` WP role
-     * (no other roles), and holds no clinic/organization-scoped staff authority.
-     */
-    public function is_pure_patient_actor( int $wp_user_id ): bool {
-        if ( $wp_user_id <= 0 ) {
-            return false;
-        }
-
-        $user = $this->read_user( $wp_user_id );
-        if ( null === $user || ! $user['exists'] ) {
-            return false;
-        }
-
-        return $this->is_pure_patient_user( $user ) && ! $this->has_scoped_staff_authority( $wp_user_id );
-    }
-
-    /**
      * Evaluates whether a logged-in patient holds an incomplete Step-1
      * self-registration (`STATE_PENDING`, zero active bindings, and either a
      * live `cpms_reg_proofs` registration proof or profile-less Step-1 state).

@@ -139,7 +139,7 @@ final class OtpController extends RestBase
     private function verifyCode(WP_REST_Request $request): \WP_REST_Response|\WP_Error
     {
         try {
-            $purpose            = (string) $request->get_param('purpose');
+            $purpose            = (string) $request->get_param( 'purpose' );
             $expected_clinic_id = null;
 
             if ( OtpService::PURPOSE_VERIFY_MOBILE === $purpose ) {
@@ -157,7 +157,7 @@ final class OtpController extends RestBase
                 (string) $request->get_param('mobile'),
                 (string) $request->get_param('code'),
                 $purpose,
-                $this->clientIp($request),
+                $this->clientIp( $request ),
                 $expected_clinic_id
             );
 
