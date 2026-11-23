@@ -104,7 +104,7 @@ final class PatientRegistrationLicenseGateTest extends WP_UnitTestCase {
         $step1   = $this->seedStep1( self::MOBILE_NEW );
         $nid     = PatientTwoProofTestHelper::next_valid_national_id();
 
-        $result = $service->register( $step1['user_id'], $this->clinicId, self::MOBILE_NEW, 'تست', 'یک ثانیه', $nid, '1990-01-01', '198.51.100.9', $t0 - 1, $step1['token'] );
+        $result = $service->register( $step1['user_id'], $this->clinicId, self::MOBILE_NEW, 'تست', 'یک ثانیه', $nid, '1990-01-01', '198.51.100.9', time(), $step1['token'] );
 
         self::assertTrue( $result['registered'] );
         self::assertGreaterThan( 0, (int) $result['patient_id'] );
@@ -195,7 +195,7 @@ final class PatientRegistrationLicenseGateTest extends WP_UnitTestCase {
         self::assertNotNull( $seedNid );
         $seededId  = $this->insertPatient( self::MOBILE_EXISTING, $seedNid );
         $linkStep1 = $this->seedStep1( self::MOBILE_EXISTING );
-        $result    = $service->register( $linkStep1['user_id'], $this->clinicId, self::MOBILE_EXISTING, 'مریم', 'قدیمی', $seedNid, '1990-01-01', '198.51.100.10', $t0 + 1, $linkStep1['token'] );
+        $result    = $service->register( $linkStep1['user_id'], $this->clinicId, self::MOBILE_EXISTING, 'مریم', 'قدیمی', $seedNid, '1990-01-01', '198.51.100.10', time(), $linkStep1['token'] );
 
         self::assertTrue( $result['registered'] );
         self::assertSame( $seededId, (int) $result['patient_id'] );
@@ -241,8 +241,12 @@ final class PatientRegistrationLicenseGateTest extends WP_UnitTestCase {
      * @param array{user_id: int, token: string} $step1
      */
     private function attemptRegister( PatientRegistrationService $service, array $step1, string $mobile, string $nid, int $nowTs ): ?BookingException {
+        // $nowTs is the fixture clock for the LICENSE GATE (baked into the SignedLicenseGate closure);
+        // the proof-check clock passed to register() must be the real current time so the
+        // freshly-created Step-1 registration proof (3600s TTL) is still valid.
+        unset( $nowTs );
         try {
-            $service->register( $step1['user_id'], $this->clinicId, $mobile, 'تست', 'لایسنس', $nid, '1990-01-01', '198.51.100.11', $nowTs, $step1['token'] );
+            $service->register( $step1['user_id'], $this->clinicId, $mobile, 'تست', 'لایسنس', $nid, '1990-01-01', '198.51.100.11', time(), $step1['token'] );
         } catch ( BookingException $e ) {
             return $e;
         }

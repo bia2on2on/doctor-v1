@@ -464,7 +464,7 @@ final class PatientRegistrationService {
                 }
             );
         } catch ( BookingException $e ) {
-            if ( 'CLINIC_LICENSE_BLOCKED' === $e->errorCode ) {
+            if ( 'CLINIC_LICENSE_BLOCKED' === $e->errorCode ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- Established BookingException property.
                 $this->log_failure( 'license_blocked', $clinic_id );
                 throw $e;
             }
