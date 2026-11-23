@@ -87,6 +87,13 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
 
     private int $orgId = 0;
     private int $clinicId = 0;
+    // True once this test COMMITted the harness transaction (race-visibility
+    // fixtures). The purge in tearDown() must then commit its DELETEs too, or
+    // the harness ROLLBACK at parent::tearDown() resurrects the committed Clinic
+    // rows for every later suite in the shared database (same failure class as
+    // the documented CustomRoleLifecycleTest cascade; fork-children no longer
+    // drop the parent session, so the outer ROLLBACK really rolls back now).
+    private bool $fixtureCommitted = false;
     private int $locTehran = 0;
     private int $locKiritimati = 0;
     private int $locNiue = 0;
@@ -715,6 +722,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
 
         // Make fixture writes visible to all independent sessions before fork.
         $wpdb->query('COMMIT'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+        $this->fixtureCommitted = true;
         $prefix = $wpdb->prefix;
         $writerPipes = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         $bookingPipes = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
@@ -2072,6 +2080,14 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
             $wpdb->query($wpdb->prepare('DELETE FROM ' . $db->table('cpms_organizations') . ' WHERE id = %d', $this->orgId)); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         }
         $wpdb->query('SET FOREIGN_KEY_CHECKS = 1'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+        if ($this->fixtureCommitted) {
+            // The fixture was COMMITted for the forked sessions, so this
+            // cleanup's DELETEs sit in a fresh transaction that tearDown's
+            // ROLLBACK would undo — resurrecting the Clinic rows. Commit them.
+            if ($wpdb->query('COMMIT') === false) { // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                self::fail('cleanup must commit its fixture removal durably (tearDown rolls back the harness transaction)');
+            }
+        }
     }
 
     private function purgeJobs(): void
