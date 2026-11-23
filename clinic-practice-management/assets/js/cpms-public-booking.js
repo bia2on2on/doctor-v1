@@ -1545,10 +1545,15 @@
 			});
 		}
 
+		var regRestNonce = '';
+		var regOtpVerified = false;
+		var regVerifiedClinicId = 0;
+		var regVerifiedMobile = '';
+
 		function regOtpRequest() {
 			var input = root.querySelector('[data-role="reg-mobile"]');
 			var status = root.querySelector('[data-role="auth-status"]');
-			if (!input || busy || !isNonEmptyString(config.otp_request_path)) {
+			if (!input || busy || regOtpVerified || !isNonEmptyString(config.otp_request_path)) {
 				return;
 			}
 			var mobile = digitsOnly(input.value);
@@ -1579,9 +1584,13 @@
 				setBusy(false);
 				if (result.ok && result.body && result.body.data && result.body.data.sms_sent === true) {
 					setNodeMessage(status, '');
+					var codeStep = root.querySelector('[data-role="reg-code-step"]');
+					if (codeStep) {
+						codeStep.hidden = false;
+					}
 					var details = root.querySelector('[data-role="reg-details"]');
 					if (details) {
-						details.hidden = false;
+						details.hidden = true;
 					}
 					var codeInput = root.querySelector('[data-role="reg-code"]');
 					if (codeInput) {
@@ -1598,30 +1607,15 @@
 			});
 		}
 
-		function regSubmit() {
+		function regOtpVerify() {
 			var mobileInput = root.querySelector('[data-role="reg-mobile"]');
 			var codeInput = root.querySelector('[data-role="reg-code"]');
-			var givenInput = root.querySelector('[data-role="reg-given-name"]');
-			var familyInput = root.querySelector('[data-role="reg-family-name"]');
-			var nidInput = root.querySelector('[data-role="reg-national-id"]');
-			var birthInput = root.querySelector('[data-role="reg-birth-date"]');
 			var status = root.querySelector('[data-role="auth-status"]');
-			var regStep = root.querySelector('[data-auth-step="otp-register"]');
-			var registerPath = (regStep && isNonEmptyString(regStep.getAttribute('data-register-path')))
-				? regStep.getAttribute('data-register-path')
-				: config.register_path;
-			if (!mobileInput || !codeInput || !givenInput || !familyInput || !nidInput || !birthInput || busy || !isNonEmptyString(registerPath)) {
+			if (!mobileInput || !codeInput || busy || regOtpVerified || !isNonEmptyString(config.otp_verify_path)) {
 				return;
 			}
-
 			var mobile = digitsOnly(mobileInput.value);
 			var code = digitsOnly(codeInput.value);
-			var givenName = String(givenInput.value || '').trim();
-			var familyName = String(familyInput.value || '').trim();
-			var nationalId = digitsOnly(nidInput.value);
-			var birthDate = String(birthInput.value || '').trim()
-				.replace(/[\u06F0-\u06F9]/g, function (d) { return String(d.charCodeAt(0) - 0x06F0); })
-				.replace(/[\u0660-\u0669]/g, function (d) { return String(d.charCodeAt(0) - 0x0660); });
 			var regSelection = validSelection(lastSelection) || readStoredSelection();
 			var clinicId = (regSelection && toInt(regSelection.clinic_id) > 0)
 				? toInt(regSelection.clinic_id)
@@ -1633,8 +1627,103 @@
 				return;
 			}
 			if (!/^\d{6}$/.test(code)) {
+				codeInput.setAttribute('aria-invalid', 'true');
 				setNodeMessage(status, 'کد تأیید ۶ رقمی را وارد کنید.');
 				codeInput.focus();
+				return;
+			}
+			codeInput.removeAttribute('aria-invalid');
+
+			setBusy(true);
+			requestJson(config.rest_root + config.otp_verify_path, {
+				method: 'POST',
+				credentials: 'same-origin',
+				headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+				body: JSON.stringify({ mobile: mobile, code: code, purpose: 'verify_mobile', clinic_id: clinicId })
+			}).then(function (result) {
+				setBusy(false);
+				var payload = result.body && result.body.data ? result.body.data : null;
+				if (!result.ok || !payload || payload.session_issued !== true) {
+					codeInput.setAttribute('aria-invalid', 'true');
+					setNodeMessage(status, serverMessage(result) || 'کد تأیید معتبر نیست یا منقضی شده است.');
+					codeInput.focus();
+					return;
+				}
+				if (payload.pending_registration === false) {
+					if (lastSelection) {
+						storeSelection(lastSelection);
+					}
+					window.location.reload();
+					return;
+				}
+				var nonce = typeof payload.rest_nonce === 'string' ? payload.rest_nonce : '';
+				if (!nonce) {
+					if (isNonEmptyString(config.complete_registration_url)) {
+						window.location.assign(config.complete_registration_url);
+					} else {
+						window.location.reload();
+					}
+					return;
+				}
+				regRestNonce = nonce;
+				regOtpVerified = true;
+				regVerifiedClinicId = clinicId;
+				regVerifiedMobile = mobile;
+				codeInput.value = '';
+				mobileInput.readOnly = true;
+				var codeStep = root.querySelector('[data-role="reg-code-step"]');
+				if (codeStep) {
+					codeStep.hidden = true;
+				}
+				var details = root.querySelector('[data-role="reg-details"]');
+				if (details) {
+					details.hidden = false;
+				}
+				setNodeMessage(status, '');
+				var givenInput = root.querySelector('[data-role="reg-given-name"]');
+				if (givenInput) {
+					givenInput.focus();
+				}
+			}, function () {
+				setBusy(false);
+				setNodeMessage(status, 'ارتباط با سرور برقرار نشد. لطفاً دوباره تلاش کنید.');
+			});
+		}
+
+		function regSubmit() {
+			var mobileInput = root.querySelector('[data-role="reg-mobile"]');
+			var givenInput = root.querySelector('[data-role="reg-given-name"]');
+			var familyInput = root.querySelector('[data-role="reg-family-name"]');
+			var nidInput = root.querySelector('[data-role="reg-national-id"]');
+			var birthInput = root.querySelector('[data-role="reg-birth-date"]');
+			var status = root.querySelector('[data-role="auth-status"]');
+			var regStep = root.querySelector('[data-auth-step="otp-register"]');
+			var registerPath = (regStep && isNonEmptyString(regStep.getAttribute('data-register-path')))
+				? regStep.getAttribute('data-register-path')
+				: config.register_path;
+			if (!mobileInput || !givenInput || !familyInput || !nidInput || !birthInput || busy || !isNonEmptyString(registerPath)) {
+				return;
+			}
+			if (!regOtpVerified || !regRestNonce) {
+				setNodeMessage(status, 'ابتدا شماره موبایل خود را با کد پیامکی تأیید کنید.');
+				return;
+			}
+
+			var mobile = regVerifiedMobile || digitsOnly(mobileInput.value);
+			var givenName = String(givenInput.value || '').trim();
+			var familyName = String(familyInput.value || '').trim();
+			var nationalId = digitsOnly(nidInput.value);
+			var birthDate = String(birthInput.value || '').trim()
+				.replace(/[\u06F0-\u06F9]/g, function (d) { return String(d.charCodeAt(0) - 0x06F0); })
+				.replace(/[\u0660-\u0669]/g, function (d) { return String(d.charCodeAt(0) - 0x0660); });
+			var regSelection = validSelection(lastSelection) || readStoredSelection();
+			var clinicId = regVerifiedClinicId || ((regSelection && toInt(regSelection.clinic_id) > 0)
+				? toInt(regSelection.clinic_id)
+				: currentClinicId());
+
+			if (clinicId <= 0 || !/^09\d{9}$/.test(mobile)) {
+				setNodeMessage(status, 'شماره موبایل معتبر وارد کنید.');
+				mobileInput.focus();
 				return;
 			}
 			if (!givenName || !familyName) {
@@ -1657,11 +1746,14 @@
 			requestJson(config.rest_root + registerPath, {
 				method: 'POST',
 				credentials: 'same-origin',
-				headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+				headers: {
+					Accept: 'application/json',
+					'Content-Type': 'application/json',
+					'X-WP-Nonce': regRestNonce
+				},
 				body: JSON.stringify({
 					clinic_id: clinicId,
 					mobile: mobile,
-					code: code,
 					given_name: givenName,
 					family_name: familyName,
 					national_id: nationalId,
@@ -1671,7 +1763,6 @@
 				setBusy(false);
 				var payload = result.body && result.body.data ? result.body.data : null;
 				if (result.ok && payload && payload.registered === true && payload.session_issued === true) {
-					codeInput.value = '';
 					nidInput.value = '';
 					if (lastSelection) {
 						storeSelection(lastSelection);
@@ -1680,7 +1771,7 @@
 					return;
 				}
 				setNodeMessage(status, serverMessage(result) || 'ثبت‌نام انجام نشد. اطلاعات را بررسی کنید.');
-				codeInput.focus();
+				nidInput.focus();
 			}, function () {
 				setBusy(false);
 				setNodeMessage(status, 'ارتباط با سرور برقرار نشد. لطفاً دوباره تلاش کنید.');
@@ -2257,6 +2348,8 @@
 					}
 				} else if (action === 'reg-otp-request') {
 					regOtpRequest();
+				} else if (action === 'reg-otp-verify') {
+					regOtpVerify();
 				} else if (action === 'reg-submit') {
 					regSubmit();
 				}

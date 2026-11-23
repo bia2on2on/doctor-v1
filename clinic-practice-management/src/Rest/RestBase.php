@@ -369,9 +369,15 @@ abstract class RestBase
     }
 
     /**
-     * Enforces guest-only + clinic-selector gate for `POST /clinic/v1/patient/register`.
+     * Enforces nonce + Step-1 pending pure-patient + clinic-bound registration
+     * mobile proof gate for Step 2 `POST /clinic/v1/patient/register`.
      */
     protected function require_patient_register_access( WP_REST_Request $request ): bool|WP_Error {
+        $nonce_error = $this->requireNonce( $request );
+        if ( $nonce_error instanceof WP_Error ) {
+            return $nonce_error;
+        }
+
         $clinic_selector = $this->extract_patient_clinic_selector( $request );
         $user_id         = (int) get_current_user_id();
         $decision        = $this->patient_access()->authorize_register_request(

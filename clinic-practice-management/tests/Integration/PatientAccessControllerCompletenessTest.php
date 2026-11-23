@@ -4,6 +4,7 @@ declare( strict_types=1 );
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\OtpService;
 use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
@@ -351,14 +352,35 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
                             ]
                         );
                         self::assertTrue( (bool) $otpInserted );
+                        $step1Cookie = '';
+                        $cookieHook  = static function ( string $cookie ) use ( &$step1Cookie ): void {
+                            $step1Cookie = $cookie;
+                        };
+                        add_action( 'set_logged_in_cookie', $cookieHook, 10, 1 );
+                        try {
+                            $step1Res = App::otpService()->verify(
+                                '09120038888',
+                                '445566',
+                                OtpService::PURPOSE_VERIFY_MOBILE,
+                                '127.0.0.1',
+                                $this->clinicA
+                            );
+                        } finally {
+                            remove_action( 'set_logged_in_cookie', $cookieHook, 10 );
+                        }
+                        self::assertTrue( (bool) ( $step1Res['session_issued'] ?? false ) );
+                        self::assertNotSame( '', $step1Cookie );
+                        $_COOKIE[ LOGGED_IN_COOKIE ] = $step1Cookie;
+                        wp_set_current_user( (int) $step1Res['user_id'] );
+
                         $allowReq = new WP_REST_Request( $method, $route );
                         $allowReq->set_header( 'Content-Type', 'application/json' );
+                        $allowReq->set_header( 'X-WP-Nonce', (string) ( $step1Res['rest_nonce'] ?? '' ) );
                         $allowReq->set_body(
                             (string) wp_json_encode(
                                 [
                                     'clinic_id'   => $this->clinicA,
                                     'mobile'      => '09120038888',
-                                    'code'        => '445566',
                                     'given_name'  => 'Comp',
                                     'family_name' => 'Registered',
                                     'national_id' => '0499370899',

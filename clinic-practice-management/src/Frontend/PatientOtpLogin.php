@@ -86,11 +86,16 @@ final class PatientOtpLogin {
 				<div class="cpms-pp-login__actions">
 					<button type="button" class="cpms-pp-btn cpms-pp-btn--secondary" data-role="register-otp-request">دریافت کد تأیید ثبت‌نام</button>
 				</div>
-				<div data-role="register-details-step" hidden>
+				<div data-role="register-code-step" hidden>
 					<div class="cpms-pp-login__field">
 						<label for="<?php echo esc_attr( $reg_id ); ?>-code">کد ۶ رقمی پیامک‌شده</label>
 						<input id="<?php echo esc_attr( $reg_id ); ?>-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" dir="ltr" data-role="register-code" required>
 					</div>
+					<div class="cpms-pp-login__actions">
+						<button type="button" class="cpms-pp-btn cpms-pp-btn--primary" data-role="register-otp-verify">تأیید کد پیامکی</button>
+					</div>
+				</div>
+				<div data-role="register-details-step" hidden>
 					<div class="cpms-pp-login__field">
 						<label for="<?php echo esc_attr( $reg_id ); ?>-given-name">نام</label>
 						<input id="<?php echo esc_attr( $reg_id ); ?>-given-name" type="text" maxlength="120" autocomplete="given-name" data-role="register-given-name" required>
@@ -116,6 +121,15 @@ final class PatientOtpLogin {
 		</section>
 		<?php endif; ?>
 		<?php
+	}
+
+	/**
+	 * Server-trusted clinics eligible for public guest registration.
+	 *
+	 * @return list<array{id: int, name: string}>
+	 */
+	public static function eligible_register_clinics(): array {
+		return self::register_clinics();
 	}
 
 	/**

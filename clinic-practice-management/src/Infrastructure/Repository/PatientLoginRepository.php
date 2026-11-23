@@ -264,24 +264,50 @@ final class PatientLoginRepository {
 
     /**
      * Promotes a `pending` account row to `active` (`closed` accounts remain closed).
+     * When `$given_name` / `$family_name` are supplied (Step 2 registration completion),
+     * they are persisted atomically alongside the state transition.
      */
-    public function activate_account_from_pending( int $account_id, int $wp_user_id ): void {
+    public function activate_account_from_pending(
+        int $account_id,
+        int $wp_user_id,
+        ?string $given_name = null,
+        ?string $family_name = null
+    ): void {
         $was_strict = $this->db->is_strict();
         $this->db->setStrict( true );
         try {
-            $this->db->execute(
-                'UPDATE ' . $this->db->table( 'cpms_patient_logins' )
-                . ' SET state = %s, updated_at = %s'
-                . ' WHERE id = %d AND kind = %s AND wp_user_id = %d AND state = %s',
-                [
-                    self::STATE_ACTIVE,
-                    $this->db->nowUtcSql(),
-                    $account_id,
-                    self::KIND_ACCOUNT,
-                    $wp_user_id,
-                    self::STATE_PENDING,
-                ]
-            );
+            $now = $this->db->nowUtcSql();
+            if ( null !== $given_name || null !== $family_name ) {
+                $this->db->execute(
+                    'UPDATE ' . $this->db->table( 'cpms_patient_logins' )
+                    . ' SET state = %s, given_name = %s, family_name = %s, updated_at = %s'
+                    . ' WHERE id = %d AND kind = %s AND wp_user_id = %d AND state = %s',
+                    [
+                        self::STATE_ACTIVE,
+                        $given_name,
+                        $family_name,
+                        $now,
+                        $account_id,
+                        self::KIND_ACCOUNT,
+                        $wp_user_id,
+                        self::STATE_PENDING,
+                    ]
+                );
+            } else {
+                $this->db->execute(
+                    'UPDATE ' . $this->db->table( 'cpms_patient_logins' )
+                    . ' SET state = %s, updated_at = %s'
+                    . ' WHERE id = %d AND kind = %s AND wp_user_id = %d AND state = %s',
+                    [
+                        self::STATE_ACTIVE,
+                        $now,
+                        $account_id,
+                        self::KIND_ACCOUNT,
+                        $wp_user_id,
+                        self::STATE_PENDING,
+                    ]
+                );
+            }
 
             $row = $this->find_account_by_user_id( $wp_user_id );
             if ( null === $row || self::STATE_ACTIVE !== (string) ( $row['state'] ?? '' ) ) {

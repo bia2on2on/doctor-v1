@@ -8,6 +8,7 @@ use ClinicCore\Application\Clinic\PublicClinicDirectory;
 use ClinicCore\Application\Patients\PatientIdentityActivator;
 use ClinicCore\Application\Patients\PatientIdentityService;
 use ClinicCore\Auth\RolesAndCapabilities;
+use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Domain\Validators\MobileValidator;
 use ClinicCore\Domain\Validators\NationalIdValidator;
@@ -18,21 +19,26 @@ use ClinicCore\Infrastructure\Logging\OpLogger;
 use ClinicCore\Infrastructure\Repository\PatientIdentityRepository;
 use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Infrastructure\Security\RateLimiter;
-use ClinicCore\Infrastructure\UserCacheRollback;
 use DateTimeImmutable;
 use DateTimeZone;
 use RuntimeException;
 use Throwable;
 
 /**
- * Public self-registration service for patients (§4, Slice 2).
+ * Public self-registration service for patients (§4, Slice 2 — two-step split).
  *
- * All registration requests flow through the single public entry method
- * `register()`. Consumes a `verify_mobile` OTP for the body's mobile and
- * executes one depth-0 atomic transaction across:
+ * Step 1 (`OtpService::verify(..., PURPOSE_VERIFY_MOBILE, ..., $clinic_id)` +
+ * `provision_pending_account_in_tx()`) consumes the mobile OTP single-use,
+ * provisions or reuses a `STATE_PENDING` pure-patient WP account with zero
+ * `cpms_patients` row and zero bindings, issues an 8-hour WP session cookie,
+ * and stamps a clinic+mobile-bound `cpms_reg_proofs` session proof.
+ *
+ * Step 2 (`register()`) requires the live Step-1 session, a `STATE_PENDING`
+ * pure-patient account, and a valid `cpms_reg_proofs` for the same
+ * `(clinic_id, mobile)`, and executes one depth-0 atomic transaction across:
  *   1) `cpms_patients` (insert new record or link matching-NID active record);
- *   2) WordPress `wp_users` (pure-patient role, opaque credentials);
- *   3) `cpms_patient_logins` (`kind='account', state='active'` + `kind='binding', state='active'`);
+ *   2) WordPress `wp_users` (update names; preserves pure-patient role & opaque credentials);
+ *   3) `cpms_patient_logins` (promote `pending` -> `active` with names + insert `two_factor` binding);
  *   4) `cpms_patients.identity_id` + `cpms_patient_identity_links` + `cpms_patient_user_links`;
  *   5) Atomic audit log (`PATIENT_REGISTERED` / `PATIENT_REGISTRATION_LINKED`, never raw/masked NID).
  *
@@ -58,7 +64,6 @@ final class PatientRegistrationService {
         private readonly PatientLoginRepository $logins,
         private readonly PatientSessionProofStore $proofs,
         private readonly PatientSessionScope $session_scope,
-        private readonly OtpService $otp,
         private readonly RateLimiter $rate,
         private readonly PatientNidHmac $hmac,
         private readonly PatientIdentityRepository $identity_repo,
@@ -66,14 +71,73 @@ final class PatientRegistrationService {
         private readonly PatientIdentityActivator $identity_activator,
         private readonly AuditLogger $audit,
         private readonly OpLogger $op,
-        ?callable $sms_notifier = null
+        ?callable $sms_notifier = null,
+        private readonly ?PatientAccess $access = null
     ) {
         $this->sms_notifier = $sms_notifier;
     }
 
     /**
-     * Registers a new patient account (creating a new clinic record or linking
-     * an existing matching-NID active clinic record) after OTP verification.
+     * Step 1 helper (invoked strictly inside `OtpService::verify()`'s transaction):
+     * provisions a pure-patient WP user (`ROLE_PATIENT`, un-authenticatable) and a
+     * profile-less `STATE_PENDING` `cpms_patient_logins` account row (`kind='account'`),
+     * with ZERO `cpms_patients` rows and ZERO bindings.
+     *
+     * Kept inside `PatientRegistrationService` so all `wp_insert_user()` writes remain
+     * confined to the inventoried patient-boundary writer allowlist.
+     *
+     * @return array{
+     *     user_id: int,
+     *     descriptor: array{id: int, login: string, email: string}
+     * }
+     */
+    public static function provision_pending_account_in_tx(
+        CpmsDb $db,
+        PatientLoginRepository $logins,
+        string $normalized_mobile
+    ): array {
+        if ( $db->tx_depth() <= 0 ) {
+            throw new RuntimeException( 'pending_account_requires_transaction' );
+        }
+
+        $mobile = MobileValidator::normalize( $normalized_mobile );
+        if ( null === $mobile ) {
+            throw new RuntimeException( 'invalid_mobile_for_pending_account' );
+        }
+
+        $user_login = 'cpms_p_' . bin2hex( random_bytes( 8 ) );
+        $user_email = $user_login . '@patient.cpms.invalid';
+        $wp_user_id = wp_insert_user(
+            [
+                'user_login'   => $user_login,
+                'user_pass'    => bin2hex( random_bytes( 32 ) ),
+                'user_email'   => $user_email,
+                'first_name'   => '',
+                'last_name'    => '',
+                'display_name' => '',
+                'role'         => RolesAndCapabilities::ROLE_PATIENT,
+            ]
+        );
+        if ( is_wp_error( $wp_user_id ) || $wp_user_id <= 0 ) {
+            throw new RuntimeException( 'wp_user_insert_failed' );
+        }
+
+        $logins->insert_pending_account( $wp_user_id, $mobile, null, null );
+
+        return [
+            'user_id'    => $wp_user_id,
+            'descriptor' => [
+                'id'    => $wp_user_id,
+                'login' => $user_login,
+                'email' => $user_email,
+            ],
+        ];
+    }
+
+    /**
+     * Step 2 registration completion: completes profile + National ID for an
+     * already Step-1-verified `STATE_PENDING` patient session without accepting
+     * or re-verifying an OTP code.
      *
      * Single public registration seam (future license-expiry enforcement hooks here).
      *
@@ -89,16 +153,16 @@ final class PatientRegistrationService {
      * @throws BookingException Always `403 CLINIC_PATIENT_PROOF_FAILED` on any rejection.
      */
     public function register(
+        int $wp_user_id,
         int $clinic_id,
         string $raw_mobile,
-        string $otp_code,
         string $raw_given_name,
         string $raw_family_name,
         string $raw_national_id,
         string $raw_birth_date,
         string $ip = '0.0.0.0',
         ?int $now = null,
-        bool $issue_session = true
+        ?string $session_token = null
     ): array {
         $now_ts = $now ?? time();
 
@@ -112,17 +176,17 @@ final class PatientRegistrationService {
         $normalized_nid = PatientNidHmac::normalize( $raw_national_id );
 
         // Enforce anti-enumeration rate limits BEFORE field rejections (§9, §9.1).
-        $this->enforce_pre_limits( $mobile, $normalized_nid, $ip );
+        $this->enforce_pre_limits( $wp_user_id, $mobile, $normalized_nid, $ip );
+
+        // Actor check: must be an authenticated, pure-patient account (anonymous/staff/mixed refused).
+        if ( $wp_user_id <= 0 || ! $this->is_pure_patient_actor( $wp_user_id ) ) {
+            $this->log_failure( 'actor_not_pure_patient', $clinic_id );
+            throw $this->uniform_failure();
+        }
 
         // Normalize and validate all required inputs; every failure yields the uniform envelope.
         if ( $clinic_id <= 0 || null === $mobile ) {
             $this->log_failure( 'invalid_clinic_or_mobile', $clinic_id );
-            throw $this->uniform_failure();
-        }
-
-        $clean_otp = self::fold_ascii_digits( trim( $otp_code ) );
-        if ( 1 !== preg_match( '/^\d{6}$/', $clean_otp ) ) {
-            $this->log_failure( 'invalid_otp_format', $clinic_id );
             throw $this->uniform_failure();
         }
 
@@ -144,41 +208,61 @@ final class PatientRegistrationService {
             throw $this->uniform_failure();
         }
 
-        // Verify clinic is trusted (public opt-in directory or sole active clinic) before consuming OTP.
+        // Verify clinic is trusted (public opt-in directory or sole active clinic).
         if ( ! $this->is_trusted_clinic_unlocked( $clinic_id ) ) {
             $this->log_failure( 'untrusted_clinic', $clinic_id );
             throw $this->uniform_failure();
         }
 
-        // Step 1: Consume a `verify_mobile` OTP for the body's mobile (bound to clinic if stamped).
-        try {
-            $this->otp->verify( $mobile, $clean_otp, OtpService::PURPOSE_VERIFY_MOBILE, $ip, $clinic_id );
-        } catch ( Throwable ) {
-            $this->log_failure( 'otp_verify_failed', $clinic_id );
+        // Verify Step-1 session-bound mobile+clinic registration proof (3600s TTL, non-replay).
+        if ( ! $this->proofs->has_valid_registration_mobile_proof( $wp_user_id, $clinic_id, $mobile, $now_ts, $session_token ) ) {
+            $this->log_failure( 'registration_mobile_proof_missing', $clinic_id );
             throw $this->uniform_failure();
         }
 
-        // Step 2: One depth-0 atomic transaction across account, clinic record, WP user, identity, link, binding, audit.
-        $created_user_descriptor = null;
-
+        // Step 2: One depth-0 atomic transaction across account activation, clinic record, WP user, identity, link, binding, audit.
         try {
             $outcome = $this->db->transactional(
                 function () use (
+                    $wp_user_id,
                     $clinic_id,
                     $mobile,
                     $given_name,
                     $family_name,
                     $normalized_nid,
-                    $birth_date,
-                    &$created_user_descriptor
+                    $birth_date
                 ): array {
                     $was_strict = $this->db->is_strict();
                     $this->db->setStrict( true );
                     try {
-                        // Lock order: Account (mobile) -> Organization -> Clinic -> Patient.
-                        $existing_account = $this->logins->find_account_by_mobile( $mobile, true );
-                        if ( null !== $existing_account ) {
-                            throw new RuntimeException( 'account_already_exists' );
+                        // Lock order: Account (user_id / mobile) -> Organization -> Clinic -> Patient.
+                        $account = $this->logins->find_account_by_user_id( $wp_user_id, true );
+                        if (
+                            null === $account
+                            || PatientLoginRepository::STATE_PENDING !== (string) ( $account['state'] ?? '' )
+                            || $mobile !== MobileValidator::normalize( (string) ( $account['mobile'] ?? '' ) )
+                        ) {
+                            throw new RuntimeException( 'pending_account_required' );
+                        }
+
+                        $account_by_mobile = $this->logins->find_account_by_mobile( $mobile, true );
+                        if (
+                            null === $account_by_mobile
+                            || (int) ( $account_by_mobile['id'] ?? 0 ) !== (int) ( $account['id'] ?? 0 )
+                        ) {
+                            throw new RuntimeException( 'account_mobile_mismatch' );
+                        }
+
+                        if ( [] !== $this->logins->find_active_bindings_for_user( $wp_user_id ) ) {
+                            throw new RuntimeException( 'active_bindings_already_exist' );
+                        }
+
+                        $existing_link_cnt = (int) $this->db->fetchValue(
+                            'SELECT COUNT(*) FROM ' . $this->db->table( 'cpms_patient_user_links' ) . ' WHERE wp_user_id = %d',
+                            [ $wp_user_id ]
+                        );
+                        if ( $existing_link_cnt > 0 ) {
+                            throw new RuntimeException( 'patient_links_already_exist' );
                         }
 
                         $candidate_org_id = (int) $this->db->fetchValue(
@@ -226,7 +310,7 @@ final class PatientRegistrationService {
                         $patient_id = 0;
 
                         if ( [] === $patient_rows ) {
-                            // Case A: Create new clinical record in this clinic.
+                            // Case A: Create new clinical record in this clinic (only at Step 2).
                             $is_new_row = true;
                             $mrn        = $this->generate_mrn( $clinic_id );
                             $wpdb       = $this->db->wpdb();
@@ -292,33 +376,22 @@ final class PatientRegistrationService {
                             }
                         }
 
-                        // Create pure-patient WP user with opaque login, email, and random unused secret.
-                        $user_login = 'cpms_p_' . bin2hex( random_bytes( 8 ) );
-                        $user_email = $user_login . '@patient.cpms.invalid';
-                        $wp_user_id = wp_insert_user(
+                        // Update WP user display/name fields without touching credentials or pure-patient role.
+                        $updated_user = wp_update_user(
                             [
-                                'user_login'   => $user_login,
-                                'user_pass'    => bin2hex( random_bytes( 32 ) ),
-                                'user_email'   => $user_email,
+                                'ID'           => $wp_user_id,
                                 'first_name'   => $given_name,
                                 'last_name'    => $family_name,
                                 'display_name' => trim( $given_name . ' ' . $family_name ),
-                                'role'         => RolesAndCapabilities::ROLE_PATIENT,
                             ]
                         );
-                        if ( is_wp_error( $wp_user_id ) || $wp_user_id <= 0 ) {
-                            throw new RuntimeException( 'wp_user_insert_failed' );
+                        if ( is_wp_error( $updated_user ) || (int) $updated_user !== $wp_user_id ) {
+                            throw new RuntimeException( 'wp_user_update_failed' );
                         }
 
-                        $created_user_descriptor = [
-                            'id'    => $wp_user_id,
-                            'login' => $user_login,
-                            'email' => $user_email,
-                        ];
-
-                        // Artefact 1: `cpms_patient_logins` account row (`kind='account', state='active'`).
-                        $account_id = $this->logins->insert_pending_account( $wp_user_id, $mobile, $given_name, $family_name );
-                        $this->logins->activate_account_from_pending( $account_id, $wp_user_id );
+                        // Artefact 1: Promote `pending` account -> `active` with persisted names.
+                        $account_id = (int) ( $account['id'] ?? 0 );
+                        $this->logins->activate_account_from_pending( $account_id, $wp_user_id, $given_name, $family_name );
 
                         // Artefact 2: clinical organization identity (`cpms_patients.identity_id`).
                         $identity_id = $this->identity_activator->activate_for_new_patient(
@@ -387,50 +460,38 @@ final class PatientRegistrationService {
                 }
             );
         } catch ( Throwable ) {
-            // Invalidate WP user cache AFTER CpmsDb::transactional() has rolled back.
-            UserCacheRollback::invalidate( null !== $created_user_descriptor ? [ $created_user_descriptor ] : [] );
             $this->log_failure( 'registration_failed', $clinic_id );
             throw $this->uniform_failure();
         }
 
-        $wp_user_id     = (int) $outcome['user_id'];
-        $patient_id     = (int) $outcome['patient_id'];
-        $binding_id     = (int) $outcome['binding_id'];
-        $verified_at    = (string) $outcome['verified_at'];
-        $session_issued = false;
+        $patient_id  = (int) $outcome['patient_id'];
+        $binding_id  = (int) $outcome['binding_id'];
+        $verified_at = (string) $outcome['verified_at'];
 
-        if ( $issue_session ) {
-            $this->session_scope->begin_otp_cookie_issue( $wp_user_id, $clinic_id );
-            try {
-                $session_token = $this->proofs->issue_non_persistent_auth_cookie( $wp_user_id );
-            } finally {
-                $this->session_scope->end_otp_cookie_issue();
-            }
+        $mobile_stamped  = $this->proofs->record_mobile_proof( $wp_user_id, $mobile, $now_ts, $session_token );
+        $binding_stamped = $this->proofs->record_binding_proof(
+            $wp_user_id,
+            $clinic_id,
+            $patient_id,
+            $binding_id,
+            $verified_at,
+            $now_ts,
+            $session_token
+        );
 
-            if ( '' === $session_token ) {
-                $this->log_failure( 'session_cookie_issue_failed', $clinic_id );
-                throw $this->uniform_failure();
-            }
+        if ( ! $mobile_stamped || ! $binding_stamped ) {
+            $this->log_failure( 'session_proof_stamp_failed', $clinic_id );
+            throw $this->uniform_failure();
+        }
 
-            $mobile_stamped  = $this->proofs->record_mobile_proof( $wp_user_id, $mobile, $now_ts, $session_token );
-            $binding_stamped = $this->proofs->record_binding_proof(
-                $wp_user_id,
-                $clinic_id,
-                $patient_id,
-                $binding_id,
-                $verified_at,
-                $now_ts,
-                $session_token
-            );
+        // Consume the Step-1 registration proof so Step 2 cannot be replayed.
+        $this->proofs->consume_registration_mobile_proof( $wp_user_id, $clinic_id, $mobile, $now_ts, $session_token );
 
-            if ( ! $mobile_stamped || ! $binding_stamped ) {
-                $this->proofs->destroy_all_sessions( $wp_user_id );
-                $this->log_failure( 'session_proof_stamp_failed', $clinic_id );
-                throw $this->uniform_failure();
-            }
-
-            $this->session_scope->set_in_process_session_token( $wp_user_id, $session_token );
-            $session_issued = true;
+        $resolved_token = null !== $session_token && '' !== $session_token
+            ? $session_token
+            : ( function_exists( 'wp_get_session_token' ) ? (string) wp_get_session_token() : '' );
+        if ( '' !== $resolved_token ) {
+            $this->session_scope->set_in_process_session_token( $wp_user_id, $resolved_token );
         }
 
         // Optional post-commit SMS notice (never includes NID).
@@ -448,16 +509,30 @@ final class PatientRegistrationService {
             'patient_id'     => $patient_id,
             'clinic_id'      => $clinic_id,
             'binding_id'     => $binding_id,
-            'session_issued' => $session_issued,
+            'session_issued' => true,
         ];
     }
 
-    private function enforce_pre_limits( ?string $mobile, ?string $normalized_nid, string $ip ): void {
+    private function is_pure_patient_actor( int $wp_user_id ): bool {
+        $access = $this->access ?? App::patient_access();
+
+        return $access->is_pure_patient_actor( $wp_user_id );
+    }
+
+    private function enforce_pre_limits( int $wp_user_id, ?string $mobile, ?string $normalized_nid, string $ip ): void {
         try {
             $ip_rl = $this->rate->hit( $this->hmac->ip_rate_limit_key_with_domain( 'reg-ip', $ip ), self::RATE_IP_MAX, self::RATE_WINDOW_SEC );
             if ( ! $ip_rl['allowed'] ) {
                 $this->log_failure( 'rate_limited_ip', 0 );
                 throw $this->uniform_failure();
+            }
+
+            if ( $wp_user_id > 0 ) {
+                $acct_rl = $this->rate->hit( 'reg-acct:' . $wp_user_id, self::RATE_MOBILE_MAX, self::RATE_WINDOW_SEC );
+                if ( ! $acct_rl['allowed'] ) {
+                    $this->log_failure( 'rate_limited_account', 0 );
+                    throw $this->uniform_failure();
+                }
             }
 
             if ( null !== $mobile ) {

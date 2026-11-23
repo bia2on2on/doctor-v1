@@ -1854,6 +1854,8 @@
 		var clinicSelect = form.querySelector('[data-role="register-clinic"]');
 		var mobileInput = form.querySelector('[data-role="register-mobile"]');
 		var otpBtn = form.querySelector('[data-role="register-otp-request"]');
+		var codeStep = form.querySelector('[data-role="register-code-step"]');
+		var verifyBtn = form.querySelector('[data-role="register-otp-verify"]');
 		var detailsStep = form.querySelector('[data-role="register-details-step"]');
 		var codeInput = form.querySelector('[data-role="register-code"]');
 		var givenInput = form.querySelector('[data-role="register-given-name"]');
@@ -1862,10 +1864,14 @@
 		var birthInput = form.querySelector('[data-role="register-birth-date"]');
 		var submitBtn = form.querySelector('[data-role="register-submit"]');
 		var status = form.querySelector('[data-role="register-status"]');
-		if (!clinicSelect || !mobileInput || !otpBtn || !detailsStep || !codeInput || !givenInput || !familyInput || !nidInput || !birthInput || !submitBtn || !status) { return; }
+		if (!clinicSelect || !mobileInput || !otpBtn || !codeStep || !verifyBtn || !detailsStep || !codeInput || !givenInput || !familyInput || !nidInput || !birthInput || !submitBtn || !status) { return; }
 
 		var busy = false;
 		var otpRequested = false;
+		var otpVerified = false;
+		var step1Nonce = '';
+		var verifiedClinicId = 0;
+		var verifiedMobile = '';
 		var submitIdle = submitBtn.textContent || 'تکمیل ثبت‌نام';
 
 		function setStatus(message, state) {
@@ -1877,6 +1883,7 @@
 		function setRegBusy(value) {
 			busy = !!value;
 			otpBtn.disabled = busy;
+			verifyBtn.disabled = busy;
 			submitBtn.disabled = busy;
 			form.setAttribute('aria-busy', busy ? 'true' : 'false');
 		}
@@ -1885,7 +1892,7 @@
 			return val > 0 ? val : 0;
 		}
 		function requestRegisterOtp() {
-			if (busy) { return; }
+			if (busy || otpVerified) { return; }
 			var clinicId = selectedClinicId();
 			var mobile = otpDigits(mobileInput.value);
 			if (!clinicId) {
@@ -1912,25 +1919,20 @@
 					return;
 				}
 				otpRequested = true;
-				detailsStep.hidden = false;
-				setStatus('کد تأیید ارسال شد. مشخصات خود را وارد و ثبت‌نام را تکمیل کنید.', 'success');
+				codeStep.hidden = false;
+				detailsStep.hidden = true;
+				setStatus('کد تأیید ارسال شد. کد ۶ رقمی را وارد و تأیید کنید.', 'success');
 				codeInput.focus();
 			}, function () {
 				setRegBusy(false);
 				setStatus('ارتباط برقرار نشد. اتصال خود را بررسی و دوباره تلاش کنید.', 'error');
 			});
 		}
-		function submitRegistration() {
-			if (busy) { return; }
+		function verifyRegisterOtp() {
+			if (busy || otpVerified) { return; }
 			var clinicId = selectedClinicId();
 			var mobile = otpDigits(mobileInput.value);
 			var code = otpDigits(codeInput.value);
-			var givenName = String(givenInput.value || '').trim();
-			var familyName = String(familyInput.value || '').trim();
-			var nationalId = otpDigits(nidInput.value);
-			var birthDate = String(birthInput.value || '').trim()
-				.replace(/[\u06F0-\u06F9]/g, function (d) { return String(d.charCodeAt(0) - 0x06F0); })
-				.replace(/[\u0660-\u0669]/g, function (d) { return String(d.charCodeAt(0) - 0x0660); });
 			if (!clinicId || !/^09\d{9}$/.test(mobile)) {
 				setStatus('مرکز درمانی و شمارهٔ موبایل را بررسی کنید.', 'error');
 				(!clinicId ? clinicSelect : mobileInput).focus();
@@ -1939,6 +1941,65 @@
 			if (!/^\d{6}$/.test(code)) {
 				setStatus('کد تأیید ۶ رقمی را وارد کنید.', 'error');
 				codeInput.focus();
+				return;
+			}
+			setRegBusy(true);
+			setStatus('در حال بررسی کد تأیید…', 'busy');
+			requestJson(apiUrl(config.rest_root, config.otp_verify_path), {
+				method: 'POST',
+				credentials: 'same-origin',
+				headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+				body: JSON.stringify({ mobile: mobile, code: code, purpose: 'verify_mobile', clinic_id: clinicId })
+			}).then(function (result) {
+				setRegBusy(false);
+				var payload = result.body && result.body.data ? result.body.data : null;
+				if (!result.ok || !payload || payload.session_issued !== true) {
+					setStatus(serverMessage(result) || 'کد تأیید معتبر نیست یا منقضی شده است.', 'error');
+					codeInput.focus();
+					return;
+				}
+				if (payload.pending_registration === false) {
+					setStatus('شمارهٔ شما از قبل فعال است. در حال ورود به پورتال…', 'success');
+					window.location.reload();
+					return;
+				}
+				step1Nonce = typeof payload.rest_nonce === 'string' ? payload.rest_nonce : '';
+				if (!step1Nonce) {
+					window.location.reload();
+					return;
+				}
+				otpVerified = true;
+				verifiedClinicId = clinicId;
+				verifiedMobile = mobile;
+				codeInput.value = '';
+				codeStep.hidden = true;
+				detailsStep.hidden = false;
+				clinicSelect.disabled = true;
+				mobileInput.readOnly = true;
+				setStatus('شمارهٔ موبایل تأیید شد. مشخصات خود را برای تکمیل ثبت‌نام وارد کنید.', 'success');
+				givenInput.focus();
+			}, function () {
+				setRegBusy(false);
+				setStatus('ارتباط با سرور برقرار نشد. دوباره تلاش کنید.', 'error');
+				codeInput.focus();
+			});
+		}
+		function submitRegistration() {
+			if (busy) { return; }
+			if (!otpVerified || !step1Nonce) {
+				setStatus('ابتدا شمارهٔ موبایل خود را با کد پیامکی تأیید کنید.', 'error');
+				return;
+			}
+			var clinicId = verifiedClinicId || selectedClinicId();
+			var mobile = verifiedMobile || otpDigits(mobileInput.value);
+			var givenName = String(givenInput.value || '').trim();
+			var familyName = String(familyInput.value || '').trim();
+			var nationalId = otpDigits(nidInput.value);
+			var birthDate = String(birthInput.value || '').trim()
+				.replace(/[\u06F0-\u06F9]/g, function (d) { return String(d.charCodeAt(0) - 0x06F0); })
+				.replace(/[\u0660-\u0669]/g, function (d) { return String(d.charCodeAt(0) - 0x0660); });
+			if (!clinicId || !/^09\d{9}$/.test(mobile)) {
+				setStatus('مرکز درمانی و شمارهٔ موبایل را بررسی کنید.', 'error');
 				return;
 			}
 			if (!givenName || !familyName) {
@@ -1963,11 +2024,14 @@
 			requestJson(apiUrl(config.rest_root, config.register_path), {
 				method: 'POST',
 				credentials: 'same-origin',
-				headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+				headers: {
+					Accept: 'application/json',
+					'Content-Type': 'application/json',
+					'X-WP-Nonce': step1Nonce
+				},
 				body: JSON.stringify({
 					clinic_id: clinicId,
 					mobile: mobile,
-					code: code,
 					given_name: givenName,
 					family_name: familyName,
 					national_id: nationalId,
@@ -1978,27 +2042,233 @@
 				submitBtn.textContent = submitIdle;
 				var payload = result.body && result.body.data ? result.body.data : null;
 				if (result.ok && payload && payload.registered === true && payload.session_issued === true) {
-					codeInput.value = '';
 					nidInput.value = '';
 					setStatus('ثبت‌نام با موفقیت انجام شد. در حال ورود به پورتال…', 'success');
 					window.location.reload();
 					return;
 				}
 				setStatus(serverMessage(result) || 'ثبت‌نام انجام نشد. اطلاعات واردشده را بررسی کنید.', 'error');
-				codeInput.focus();
+				nidInput.focus();
 			}, function () {
 				setRegBusy(false);
 				submitBtn.textContent = submitIdle;
 				setStatus('ارتباط با سرور برقرار نشد. دوباره تلاش کنید.', 'error');
-				codeInput.focus();
+				nidInput.focus();
 			});
 		}
 
 		otpBtn.addEventListener('click', requestRegisterOtp);
+		verifyBtn.addEventListener('click', verifyRegisterOtp);
 		form.addEventListener('submit', function (event) {
 			event.preventDefault();
-			if (otpRequested) { submitRegistration(); }
+			if (otpVerified) { submitRegistration(); }
+			else if (otpRequested) { verifyRegisterOtp(); }
 			else { requestRegisterOtp(); }
+		});
+	}
+
+	function bindCompleteRegistration(config) {
+		var form = document.querySelector('[data-role="complete-registration-form"]');
+		if (!form || !config || config.register_incomplete !== true || !isNonEmptyString(config.register_path) || typeof window.fetch !== 'function') {
+			return;
+		}
+
+		var clinicSelect = form.querySelector('[data-role="complete-reg-clinic"]');
+		var otpBtn = form.querySelector('[data-role="complete-reg-otp-request"]');
+		var codeStep = form.querySelector('[data-role="complete-reg-code-step"]');
+		var codeInput = form.querySelector('[data-role="complete-reg-code"]');
+		var verifyBtn = form.querySelector('[data-role="complete-reg-otp-verify"]');
+		var detailsStep = form.querySelector('[data-role="complete-reg-details-step"]');
+		var givenInput = form.querySelector('[data-role="complete-reg-given-name"]');
+		var familyInput = form.querySelector('[data-role="complete-reg-family-name"]');
+		var nidInput = form.querySelector('[data-role="complete-reg-national-id"]');
+		var birthInput = form.querySelector('[data-role="complete-reg-birth-date"]');
+		var submitBtn = form.querySelector('[data-role="complete-reg-submit"]');
+		var errorBox = form.querySelector('[data-role="complete-reg-error"]');
+		var successBox = form.querySelector('[data-role="complete-reg-success"]');
+		if (!detailsStep || !givenInput || !familyInput || !nidInput || !birthInput || !submitBtn) {
+			return;
+		}
+
+		var busy = false;
+		var hasProof = config.register_has_valid_proof === true;
+		var activeNonce = String(config.nonce || '');
+		var activeClinicId = parseInt(String(config.register_clinic_id || '0'), 10) || 0;
+		var activeMobile = String(config.register_mobile || '');
+		var submitIdle = submitBtn.textContent || 'تکمیل ثبت‌نام و فعال‌سازی حساب';
+
+		function showError(msg) {
+			if (successBox) { successBox.hidden = true; }
+			if (!errorBox) { return; }
+			var p = errorBox.querySelector('p') || errorBox;
+			p.textContent = msg || '';
+			errorBox.hidden = !msg;
+		}
+		function showSuccess(msg) {
+			if (errorBox) { errorBox.hidden = true; }
+			if (!successBox) { return; }
+			var p = successBox.querySelector('p') || successBox;
+			p.textContent = msg || '';
+			successBox.hidden = !msg;
+		}
+		function setBusyState(val) {
+			busy = !!val;
+			submitBtn.disabled = busy;
+			if (otpBtn) { otpBtn.disabled = busy; }
+			if (verifyBtn) { verifyBtn.disabled = busy; }
+			form.setAttribute('aria-busy', busy ? 'true' : 'false');
+		}
+		function currentClinicId() {
+			if (activeClinicId > 0) { return activeClinicId; }
+			if (!clinicSelect) { return 0; }
+			var v = parseInt(String(clinicSelect.value || ''), 10);
+			return v > 0 ? v : 0;
+		}
+
+		if (otpBtn && clinicSelect && isNonEmptyString(config.otp_request_path)) {
+			otpBtn.addEventListener('click', function () {
+				if (busy || hasProof) { return; }
+				var clinicId = currentClinicId();
+				if (!clinicId || !/^09\d{9}$/.test(activeMobile)) {
+					showError('لطفاً مرکز درمانی را انتخاب کنید.');
+					return;
+				}
+				setBusyState(true);
+				showError('');
+				requestJson(apiUrl(config.rest_root, config.otp_request_path), {
+					method: 'POST',
+					credentials: 'same-origin',
+					headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+					body: JSON.stringify({ mobile: activeMobile, purpose: 'verify_mobile', clinic_id: clinicId })
+				}).then(function (result) {
+					setBusyState(false);
+					if (!result.ok || !result.body || !result.body.data || result.body.data.sms_sent !== true) {
+						showError(serverMessage(result) || 'ارسال کد تأیید انجام نشد.');
+						return;
+					}
+					if (codeStep) { codeStep.hidden = false; }
+					showSuccess('کد تأیید ارسال شد.');
+					if (codeInput) { codeInput.focus(); }
+				}, function () {
+					setBusyState(false);
+					showError('ارتباط برقرار نشد. دوباره تلاش کنید.');
+				});
+			});
+		}
+
+		if (verifyBtn && codeInput && clinicSelect && isNonEmptyString(config.otp_verify_path)) {
+			verifyBtn.addEventListener('click', function () {
+				if (busy || hasProof) { return; }
+				var clinicId = currentClinicId();
+				var code = otpDigits(codeInput.value);
+				if (!clinicId || !/^\d{6}$/.test(code)) {
+					showError('مرکز درمانی و کد تأیید ۶ رقمی را وارد کنید.');
+					return;
+				}
+				setBusyState(true);
+				showError('');
+				requestJson(apiUrl(config.rest_root, config.otp_verify_path), {
+					method: 'POST',
+					credentials: 'same-origin',
+					headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+					body: JSON.stringify({ mobile: activeMobile, code: code, purpose: 'verify_mobile', clinic_id: clinicId })
+				}).then(function (result) {
+					setBusyState(false);
+					var payload = result.body && result.body.data ? result.body.data : null;
+					if (!result.ok || !payload || payload.session_issued !== true) {
+						showError(serverMessage(result) || 'کد تأیید معتبر نیست یا منقضی شده است.');
+						return;
+					}
+					if (payload.pending_registration === false) {
+						window.location.reload();
+						return;
+					}
+					hasProof = true;
+					activeClinicId = clinicId;
+					if (typeof payload.rest_nonce === 'string' && payload.rest_nonce) {
+						activeNonce = payload.rest_nonce;
+					}
+					codeInput.value = '';
+					if (codeStep) { codeStep.hidden = true; }
+					detailsStep.hidden = false;
+					clinicSelect.disabled = true;
+					showSuccess('شمارهٔ موبایل تأیید شد. مشخصات خود را ثبت کنید.');
+					givenInput.focus();
+				}, function () {
+					setBusyState(false);
+					showError('ارتباط با سرور برقرار نشد.');
+				});
+			});
+		}
+
+		form.addEventListener('submit', function (event) {
+			event.preventDefault();
+			if (busy || !hasProof) {
+				if (!hasProof) { showError('ابتدا شمارهٔ موبایل خود را تأیید کنید.'); }
+				return;
+			}
+			var clinicId = currentClinicId();
+			var givenName = String(givenInput.value || '').trim();
+			var familyName = String(familyInput.value || '').trim();
+			var nationalId = otpDigits(nidInput.value);
+			var birthDate = String(birthInput.value || '').trim()
+				.replace(/[\u06F0-\u06F9]/g, function (d) { return String(d.charCodeAt(0) - 0x06F0); })
+				.replace(/[\u0660-\u0669]/g, function (d) { return String(d.charCodeAt(0) - 0x0660); });
+			if (!clinicId || !/^09\d{9}$/.test(activeMobile)) {
+				showError('اطلاعات مرکز درمانی یا موبایل ناقص است.');
+				return;
+			}
+			if (!givenName || !familyName) {
+				showError('نام و نام خانوادگی را وارد کنید.');
+				(!givenName ? givenInput : familyInput).focus();
+				return;
+			}
+			if (!/^\d{10}$/.test(nationalId)) {
+				showError('کد ملی ۱۰ رقمی معتبر وارد کنید.');
+				nidInput.focus();
+				return;
+			}
+			if (!/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) {
+				showError('تاریخ تولد را به صورت YYYY-MM-DD وارد کنید.');
+				birthInput.focus();
+				return;
+			}
+
+			setBusyState(true);
+			submitBtn.textContent = 'در حال ثبت اطلاعات…';
+			showError('');
+			requestJson(apiUrl(config.rest_root, config.register_path), {
+				method: 'POST',
+				credentials: 'same-origin',
+				headers: {
+					Accept: 'application/json',
+					'Content-Type': 'application/json',
+					'X-WP-Nonce': activeNonce
+				},
+				body: JSON.stringify({
+					clinic_id: clinicId,
+					mobile: activeMobile,
+					given_name: givenName,
+					family_name: familyName,
+					national_id: nationalId,
+					birth_date: birthDate
+				})
+			}).then(function (result) {
+				setBusyState(false);
+				submitBtn.textContent = submitIdle;
+				var payload = result.body && result.body.data ? result.body.data : null;
+				if (result.ok && payload && payload.registered === true && payload.session_issued === true) {
+					nidInput.value = '';
+					showSuccess('ثبت‌نام با موفقیت تکمیل شد. در حال بارگذاری پورتال…');
+					window.location.reload();
+					return;
+				}
+				showError(serverMessage(result) || 'ثبت‌نام انجام نشد. اطلاعات واردشده را بررسی کنید.');
+			}, function () {
+				setBusyState(false);
+				submitBtn.textContent = submitIdle;
+				showError('ارتباط با سرور برقرار نشد. دوباره تلاش کنید.');
+			});
 		});
 	}
 
@@ -2009,6 +2279,7 @@
 		if (!config) {
 			return;
 		}
+		bindCompleteRegistration(config);
 		bind(config);
 		bindReschedule(config);
 		bindMarkAllRead(config);

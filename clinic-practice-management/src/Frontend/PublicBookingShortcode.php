@@ -220,9 +220,64 @@ final class PublicBookingShortcode
     public static function register(): void
     {
         add_shortcode(self::TAG, [self::class, 'render']);
+        add_action('template_redirect', [self::class, 'redirect_incomplete_registration'], 10);
 
         // assets این سطح — ثبت/انکیو شرطی، کاملاً جدا از assets مدیریتی.
         PublicBookingAssets::register();
+    }
+
+    /**
+     * Canonical destination for patients who completed Step 1 (`verify_mobile`)
+     * but have not yet completed Step 2 profile + National ID registration.
+     */
+    public static function incomplete_registration_redirect_url(): string {
+        try {
+            $url = PatientPortalShell::portal_url();
+        } catch ( Throwable ) {
+            $url = '';
+        }
+
+        if ( '' === $url ) {
+            return '';
+        }
+
+        return $url . '#complete-registration';
+    }
+
+    /**
+     * Redirects logged-in patients with an incomplete Step-1 registration away
+     * from public booking pages to the Patient Portal profile completion step (T5).
+     */
+    public static function redirect_incomplete_registration(): void {
+        if ( is_admin() || wp_doing_ajax() || wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+            return;
+        }
+        if ( ! self::isOnCurrentPage() || ! is_user_logged_in() ) {
+            return;
+        }
+
+        $uid = (int) get_current_user_id();
+        if ( $uid <= 0 || ! PatientPortalPage::isPatientOnly( $uid ) ) {
+            return;
+        }
+
+        try {
+            $state = App::patient_access()->registration_completion_state( $uid );
+        } catch ( Throwable ) {
+            return;
+        }
+
+        if ( ! ( $state['incomplete'] ?? false ) ) {
+            return;
+        }
+
+        $target = self::incomplete_registration_redirect_url();
+        if ( '' === $target ) {
+            return;
+        }
+
+        wp_safe_redirect( $target );
+        exit;
     }
 
     /**
@@ -263,6 +318,16 @@ final class PublicBookingShortcode
         try {
             if ( \ClinicCore\Bootstrap\RuntimeSchemaGate::is_blocked() ) {
                 return \ClinicCore\Bootstrap\RuntimeSchemaGate::shortcode_markup();
+            }
+
+            if ( is_user_logged_in() ) {
+                $uid = (int) get_current_user_id();
+                if ( $uid > 0 && PatientPortalPage::isPatientOnly( $uid ) ) {
+                    $reg_state = App::patient_access()->registration_completion_state( $uid );
+                    if ( $reg_state['incomplete'] ?? false ) {
+                        return self::render_incomplete_registration_notice();
+                    }
+                }
             }
 
             $request = self::parse_request( $atts, $tag );
@@ -528,6 +593,43 @@ final class PublicBookingShortcode
         $lines[] = '</div>';
 
         return implode('', $lines);
+    }
+
+    /**
+     * Fallback notice rendered when an authenticated patient with an
+     * incomplete Step-1 registration reaches the shortcode directly without
+     * `template_redirect` running (e.g., direct shortcode evaluation): refuses
+     * booking continuation and links to `#complete-registration`.
+     */
+    private static function render_incomplete_registration_notice(): string {
+        PublicBookingAssets::enqueue();
+
+        $surface_id = self::surfaceId();
+        $target     = self::incomplete_registration_redirect_url();
+        $lines      = [];
+
+        $lines[] = sprintf(
+            '<div class="%1$s %1$s--closed" dir="rtl" lang="fa" data-state="%2$s" data-role="complete-registration-redirect" id="%3$s">',
+            esc_attr( self::ROOT_CLASS ),
+            esc_attr( self::STATE_ERROR ),
+            esc_attr( $surface_id )
+        );
+        $lines[] = sprintf(
+            '<p class="%1$s" role="status">%2$s</p>',
+            esc_attr( self::ROOT_CLASS . '__notice' ),
+            esc_html( 'برای ادامه رزرو نوبت، ابتدا تکمیل مشخصات ثبت‌نام خود را در پورتال بیمار انجام دهید.' )
+        );
+        if ( '' !== $target ) {
+            $lines[] = sprintf(
+                '<p><a class="%1$s" data-role="complete-registration-link" href="%2$s">%3$s</a></p>',
+                esc_attr( self::ROOT_CLASS . '__portal-link' ),
+                esc_url( $target ),
+                esc_html( 'تکمیل ثبت‌نام در پورتال بیمار' )
+            );
+        }
+        $lines[] = '</div>';
+
+        return implode( '', $lines );
     }
 
     /**
@@ -1341,7 +1443,7 @@ final class PublicBookingShortcode
                 esc_attr( $b . '__link-btn' ),
                 esc_html( 'قبلاً ثبت‌نام کرده‌اید؟ ورود با کد تأیید' )
             );
-            $lines[] = '<div data-role="reg-details" hidden>';
+            $lines[] = '<div data-role="reg-code-step" hidden>';
             $lines[] = sprintf(
                 '<label class="%1$s" for="%2$s">%3$s</label><input type="text" class="%4$s" id="%2$s" data-role="reg-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" dir="ltr">',
                 esc_attr( $b . '__label' ),
@@ -1349,6 +1451,13 @@ final class PublicBookingShortcode
                 esc_html( 'کد ۶ رقمی پیامک‌شده' ),
                 esc_attr( $b . '__input' )
             );
+            $lines[] = sprintf(
+                '<button type="button" class="%1$s" data-auth-action="reg-otp-verify">%2$s</button>',
+                esc_attr( $b . '__btn' ),
+                esc_html( 'تأیید کد پیامکی و ادامه' )
+            );
+            $lines[] = '</div>';
+            $lines[] = '<div data-role="reg-details" hidden>';
             $lines[] = sprintf(
                 '<label class="%1$s" for="%2$s">%3$s</label><input type="text" class="%4$s" id="%2$s" data-role="reg-given-name" maxlength="120" autocomplete="given-name">',
                 esc_attr( $b . '__label' ),
@@ -1926,6 +2035,11 @@ final class PublicBookingShortcode
         if ( self::CONTINUATION_ANONYMOUS === $continuation ) {
             $config['otp_request_path'] = self::OTP_REQUEST_PATH;
             $config['otp_verify_path']  = self::OTP_VERIFY_PATH;
+            $config['register_path']    = self::REGISTER_PATH;
+            $complete_reg_url           = self::incomplete_registration_redirect_url();
+            if ( '' !== $complete_reg_url ) {
+                $config['complete_registration_url'] = $complete_reg_url;
+            }
         } elseif ( self::CONTINUATION_PATIENT === $continuation ) {
             // فقط برای بیمارِ واردشده — CSRF با wp_rest nonce (همان مرزِ B1/B2).
             $config['nonce']        = wp_create_nonce( 'wp_rest' );

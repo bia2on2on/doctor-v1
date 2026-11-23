@@ -2046,7 +2046,6 @@ final class App
             new PatientLoginRepository( self::db() ),
             new PatientSessionProofStore(),
             self::patient_session_scope(),
-            self::otpService(),
             self::rate(),
             new PatientNidHmac(),
             new PatientIdentityRepository( self::db() ),
@@ -2071,7 +2070,8 @@ final class App
                     $patient_id,
                     false
                 );
-            }
+            },
+            self::patient_access()
         );
     }
 

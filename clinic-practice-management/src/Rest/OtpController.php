@@ -59,9 +59,10 @@ final class OtpController extends RestBase
                 'callback' => fn (WP_REST_Request $request) => $this->verifyCode($request),
                 'permission_callback' => fn () => $this->permPublic(),
                 'args' => [
-                    'mobile' => ['required' => true, 'type' => 'string'],
-                    'code' => ['required' => true, 'type' => 'string'],
-                    'purpose' => ['required' => false, 'type' => 'string', 'enum' => OtpService::PURPOSES, 'default' => OtpService::PURPOSE_LOGIN],
+                    'mobile'    => ['required' => true, 'type' => 'string'],
+                    'code'      => ['required' => true, 'type' => 'string'],
+                    'purpose'   => ['required' => false, 'type' => 'string', 'enum' => OtpService::PURPOSES, 'default' => OtpService::PURPOSE_LOGIN],
+                    'clinic_id' => ['required' => false, 'type' => 'integer'],
                 ],
             ],
         ]);
@@ -138,11 +139,26 @@ final class OtpController extends RestBase
     private function verifyCode(WP_REST_Request $request): \WP_REST_Response|\WP_Error
     {
         try {
+            $purpose            = (string) $request->get_param('purpose');
+            $expected_clinic_id = null;
+
+            if ( OtpService::PURPOSE_VERIFY_MOBILE === $purpose ) {
+                $raw_clinic_param = $request->get_param( 'clinic_id' );
+                if ( self::hasValue( $raw_clinic_param ) ) {
+                    $candidate_clinic_id = (int) $raw_clinic_param;
+                    if ( ! $this->isTrustedPublicRegistrationClinic( $candidate_clinic_id ) ) {
+                        return $this->error( 'CLINIC_NOT_FOUND', 404, 'مرکز درمانی یافت نشد' );
+                    }
+                    $expected_clinic_id = $candidate_clinic_id;
+                }
+            }
+
             $result = $this->otp->verify(
                 (string) $request->get_param('mobile'),
                 (string) $request->get_param('code'),
-                (string) $request->get_param('purpose'),
-                $this->clientIp($request)
+                $purpose,
+                $this->clientIp($request),
+                $expected_clinic_id
             );
 
             return $this->success($result, 200);
