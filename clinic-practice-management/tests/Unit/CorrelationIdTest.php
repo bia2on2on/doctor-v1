@@ -47,4 +47,42 @@ final class CorrelationIdTest extends TestCase
         $this->assertMatchesRegularExpression('/^cpms-[0-9a-f]{16}$/', $a);
         $this->assertMatchesRegularExpression('/^cpms-[0-9a-f]{16}$/', $b);
     }
+
+    public function testRejectsTenPlusDigitRunsAndKeepsValidTracingIds(): void
+    {
+        $rejected = [
+            '0012345673',
+            '۰۰۱۲۳۴۵۶۷۳',
+            '٠٠١٢٣٤٥٦٧٣',
+            '00123۴۵۶73',
+            'req-0012345673',
+        ];
+        foreach ($rejected as $candidate) {
+            $this->assertFalse(CorrelationId::isValid($candidate));
+            $resolved = CorrelationId::fromHeader($candidate);
+            $this->assertNotSame($candidate, $resolved);
+            $this->assertStringStartsWith('cpms-', $resolved);
+            $this->assertSame(1, preg_match('/^cpms-[0-9a-f]{16}$/', $resolved));
+            $this->assertDoesNotMatchRegularExpression('/[0-9]{10,}/', $resolved);
+        }
+
+        $this->assertTrue(CorrelationId::isValid('123456789'));
+        $this->assertSame('123456789', CorrelationId::fromHeader('123456789'));
+        $uuid = '550e8400-e29b-41d4-a716-44665544abcd';
+        $this->assertTrue(CorrelationId::isValid($uuid));
+        $this->assertSame($uuid, CorrelationId::fromHeader($uuid));
+    }
+
+    public function testUuidWithTenPlusDigitRunIsRejectedWhileEightDigitUuidIsValid(): void
+    {
+        $tenDigitUuid = '550e8400-e29b-41d4-a716-4466554400aa';
+        $this->assertFalse(CorrelationId::isValid($tenDigitUuid));
+        $replaced = CorrelationId::fromHeader($tenDigitUuid);
+        $this->assertNotSame($tenDigitUuid, $replaced);
+        $this->assertSame(1, preg_match('/^cpms-[0-9a-f]{16}$/', $replaced));
+
+        $eightDigitUuid = '550e8400-e29b-41d4-a716-44665544abcd';
+        $this->assertTrue(CorrelationId::isValid($eightDigitUuid));
+        $this->assertSame($eightDigitUuid, CorrelationId::fromHeader($eightDigitUuid));
+    }
 }

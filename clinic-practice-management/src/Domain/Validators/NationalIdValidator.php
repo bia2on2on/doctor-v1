@@ -84,4 +84,46 @@ final class NationalIdValidator
 
         return strlen($clean) >= 4 ? '***' . substr($clean, -4) : '***';
     }
+
+    /**
+     * Redact exact ten-digit NID-shaped runs in structured phone fields.
+     *
+     * Longer phone-number runs are not NID-shaped and remain eligible for the
+     * legacy four-digit tail mask. All supported digit scripts are matched.
+     *
+     * @param string $value Structured phone value to scan.
+     *
+     * @return string Text with exact ten-digit runs redacted.
+     */
+    public static function redact_nid_candidates( string $value ): string {
+        $redacted = preg_replace( '/(?<![0-9۰-۹٠-٩])[0-9۰-۹٠-٩]{10}(?![0-9۰-۹٠-٩])/u', '[nid-redacted]', $value );
+
+        return $redacted ?? '';
+    }
+
+    /**
+     * Redact NID digits inside arbitrary text — B0-PR3 (Audit/Log/اعلان).
+     *
+     * سیاست مالک: کد ملی هرگز در Audit، Log عملیاتی، متن اعلان یا کلید
+     * Rate-Limit ثبت نمی‌شود — نه خام و نه Maskشده. چون متنِ آزاد (دلیل لغو،
+     * یادداشت، متن پیام) می‌تواند ارقامِ کد ملی را در خود داشته باشد، کلِ
+     * رشته اسکن می‌شود، نه فقط فیلدِ `national_id`.
+     *
+     * Runs of ten or more ASCII, Persian (U+06F0..U+06F9), or Arabic-Indic
+     * (U+0660..U+0669) digits are replaced with `[nid-redacted]`, including
+     * mixed-script runs and runs embedded in free text. Shorter runs retain
+     * their original digit script.
+     *
+     * Fail-closed false positives include 11-digit phone numbers, long numeric
+     * identifiers, and timestamps. Callers separately redact numeric scalars.
+     *
+     * @param string $value Arbitrary text to scan.
+     *
+     * @return string Text with long digit runs redacted.
+     */
+    public static function redact_digits( string $value ): string {
+        $redacted = preg_replace( '/[0-9۰-۹٠-٩]{10,}/u', '[nid-redacted]', $value );
+
+        return $redacted ?? '';
+    }
 }
