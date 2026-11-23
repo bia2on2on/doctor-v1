@@ -31,7 +31,7 @@ final class VisitNoShowM2WiringRedTest extends WP_UnitTestCase
         // Reset class-level private static properties — use project's safe convention
         // Includes visitService which is now class-level (was function-static) to allow test reset
         $refClass = new \ReflectionClass(App::class);
-        foreach (['db','op','audit','jobs','rate','loginRateLimiter','idem','settingsFactory','migrations','dispatcher','providers','vault','smsService','licenseGate','visitService'] as $propName) {
+        foreach (['db','op','audit','jobs','rate','login_rate_limiter','idem','settings_factory','migrations','dispatcher','providers','vault','sms_service','license_gate','visit_service'] as $propName) {
             if ($refClass->hasProperty($propName)) {
                 $prop = $refClass->getProperty($propName);
                 $prop->setAccessible(true);
@@ -52,8 +52,8 @@ final class VisitNoShowM2WiringRedTest extends WP_UnitTestCase
     private function assertVisitServiceCacheIsFresh(): void
     {
         $refClass = new \ReflectionClass(App::class);
-        if ($refClass->hasProperty('visitService')) {
-            $prop = $refClass->getProperty('visitService');
+        if ($refClass->hasProperty('visit_service')) {
+            $prop = $refClass->getProperty('visit_service');
             $prop->setAccessible(true);
             $value = $prop->getValue();
             self::assertNull($value, 'App::$visitService cache must be null/fresh before tick');

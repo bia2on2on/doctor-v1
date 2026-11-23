@@ -45,7 +45,7 @@ final class FollowUpReminderStarvationRedTest extends WP_UnitTestCase
     private function resetAppCaches(): void
     {
         $refClass = new \ReflectionClass(App::class);
-        foreach (['db','op','audit','jobs','rate','loginRateLimiter','idem','settingsFactory','installationSettings','migrations','dispatcher','providers','vault','smsService','licenseGate','visitService'] as $propName) {
+        foreach (['db','op','audit','jobs','rate','login_rate_limiter','idem','settings_factory','installationSettings','migrations','dispatcher','providers','vault','sms_service','license_gate','visit_service'] as $propName) {
             if ($refClass->hasProperty($propName)) {
                 $prop = $refClass->getProperty($propName);
                 $prop->setAccessible(true);

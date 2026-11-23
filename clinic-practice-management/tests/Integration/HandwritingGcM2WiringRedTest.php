@@ -87,9 +87,9 @@ final class HandwritingGcM2WiringRedTest extends WP_UnitTestCase
     {
         $refClass = new \ReflectionClass(App::class);
         foreach ([
-            'db', 'op', 'audit', 'jobs', 'rate', 'loginRateLimiter', 'idem',
-            'settingsFactory', 'installationSettings', 'migrations', 'dispatcher',
-            'providers', 'vault', 'smsService', 'licenseGate', 'visitService',
+            'db', 'op', 'audit', 'jobs', 'rate', 'login_rate_limiter', 'idem',
+            'settings_factory', 'installationSettings', 'migrations', 'dispatcher',
+            'providers', 'vault', 'sms_service', 'license_gate', 'visit_service',
         ] as $propName) {
             if ($refClass->hasProperty($propName)) {
                 $prop = $refClass->getProperty($propName);

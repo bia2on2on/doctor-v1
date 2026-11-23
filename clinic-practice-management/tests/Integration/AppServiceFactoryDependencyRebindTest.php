@@ -38,4 +38,34 @@ final class AppServiceFactoryDependencyRebindTest extends WP_UnitTestCase
         self::assertNotSame($bookingBefore, $bookingAfter, 'bookingService must rebind its cached graph to reset App singletons');
         self::assertNotSame($otpBefore, $otpAfter, 'otpService must rebind its cached graph to reset App singletons');
     }
+
+    // Pin the static property names on App (PR16-ROUND9): the integration
+    // reset loops reflect on these names; a silent rename would void every
+    // reset guard without failing anything.
+    public function testAppDeclaresSnakeCaseSingletonStaticsAndNotCamelCaseAliases(): void
+    {
+        $reflection = new \ReflectionClass(App::class);
+        foreach (['login_rate_limiter', 'settings_factory', 'sms_service', 'license_gate', 'visit_service'] as $name) {
+            self::assertTrue($reflection->hasProperty($name), 'App must declare static $' . $name);
+            self::assertTrue($reflection->getProperty($name)->isStatic(), 'App::$' . $name . ' must be static');
+        }
+        foreach (['loginRateLimiter', 'settingsFactory', 'smsService', 'licenseGate', 'visitService'] as $name) {
+            self::assertFalse($reflection->hasProperty($name), 'App must NOT declare a stale camelCase static $' . $name);
+        }
+        // installationSettings is declared camelCase by design and stays.
+        self::assertTrue($reflection->hasProperty('installationSettings'));
+    }
+
+    public function testResetListNamesUsedByIntegrationSuitesAreDeclaredOnApp(): void
+    {
+        $reflection = new \ReflectionClass(App::class);
+        foreach ([
+            'db', 'op', 'audit', 'jobs', 'rate', 'login_rate_limiter', 'idem',
+            'settings_factory', 'installationSettings', 'migrations', 'dispatcher',
+            'providers', 'vault', 'sms_service', 'license_gate', 'visit_service',
+        ] as $name) {
+            self::assertArrayHasKey($name, $reflection->getStaticProperties(), 'App must declare static $' . $name);
+            self::assertTrue($reflection->getProperty($name)->isStatic(), 'App::$' . $name . ' must be static');
+        }
+    }
 }
