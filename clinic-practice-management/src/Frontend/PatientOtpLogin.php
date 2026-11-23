@@ -120,40 +120,21 @@ final class PatientOtpLogin {
 
 	/**
 	 * Server-trusted clinics eligible for public guest registration:
-	 * opted-in public directory clinics first, falling back to the sole active
-	 * clinic on a single-clinic installation (never enumerates private multi-clinics).
+	 * only active clinics in active organizations that have explicitly opted in
+	 * via `public.listing_opt_in` (fail-closed; no sole-clinic fallback).
 	 *
 	 * @return list<array{id: int, name: string}>
 	 */
 	private static function register_clinics(): array {
 		try {
-			$listed = ( new PublicClinicDirectory() )->listed_clinics();
-			if ( [] !== $listed ) {
-				$out = array();
-				foreach ( $listed as $clinic ) {
-					$id   = (int) ( $clinic['id'] ?? 0 );
-					$name = trim( (string) ( $clinic['name'] ?? '' ) );
-					if ( $id > 0 && '' !== $name ) {
-						$out[] = array(
-							'id'   => $id,
-							'name' => $name,
-						);
-					}
-				}
-				if ( [] !== $out ) {
-					return $out;
-				}
-			}
-
-			$db   = App::db();
-			$rows = $db->fetchAll(
+			$directory = new PublicClinicDirectory();
+			$db        = App::db();
+			$rows      = $db->fetchAll(
 				'SELECT c.id, c.name FROM ' . $db->table( 'cpms_clinics' ) . ' c'
 				. ' INNER JOIN ' . $db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
 				. " WHERE c.status = 'active' AND o.status = 'active'"
 				. ' ORDER BY c.id ASC LIMIT 50'
 			);
-
-			$directory = new PublicClinicDirectory();
 			$opted_in  = array();
 			foreach ( $rows as $row ) {
 				$id   = (int) ( $row['id'] ?? 0 );
@@ -165,25 +146,10 @@ final class PatientOtpLogin {
 					);
 				}
 			}
-			if ( [] !== $opted_in ) {
-				return $opted_in;
-			}
-			if ( 1 === count( $rows ) ) {
-				$id   = (int) ( $rows[0]['id'] ?? 0 );
-				$name = trim( (string) ( $rows[0]['name'] ?? '' ) );
-				if ( $id > 0 && '' !== $name ) {
-					return array(
-						array(
-							'id'   => $id,
-							'name' => $name,
-						),
-					);
-				}
-			}
+
+			return $opted_in;
 		} catch ( Throwable ) {
 			return array();
 		}
-
-		return array();
 	}
 }

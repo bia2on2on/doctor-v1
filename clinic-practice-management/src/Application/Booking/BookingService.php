@@ -27,6 +27,7 @@ use ClinicCore\Domain\Slots\DurationResolver;
 use ClinicCore\Domain\Time\Jalali;
 use ClinicCore\Domain\Time\PersianDigits;
 use ClinicCore\Domain\Validators\MobileValidator;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Domain\Validators\VisibleText;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
@@ -578,7 +579,6 @@ final class BookingService
         if ( null === $mobile ) {
             throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا موبایل خود را تأیید کنید (OTP)' );
         }
-        $this->assert_patient_profile_complete_for_booking( $patient_id_to_persist );
 
         // N-4: Hold Active موجود همان بیمار/اسلات → Idempotent (بازگردانی همان Token)
         $existing = $this->db->fetchRow(
@@ -649,6 +649,7 @@ final class BookingService
                     $settings
                 );
                 $this->assert_patient_session_matches_clinic( $wp_user_id, (int) $locked_slot['clinic_id'] );
+                $this->assert_patient_profile_complete_for_booking( $patient_id_to_persist );
 
                 if ( ! $this->slots->atomicHold( (int) $locked_slot['id'] ) ) {
                     // FR-4.6: پاکت/کد/پیام دست‌نخورده — فقط دادهٔ الحاقیِ nearby_slots
@@ -931,7 +932,6 @@ final class BookingService
                 throw BookingException::of( 'CLINIC_PATIENT_SELECTION_REQUIRED', 'انتخاب بیمار برای تکمیل رزرو الزامی است', 422 );
             }
         }
-        $this->assert_patient_profile_complete_row( $patient );
 
         $check = $this->idem->check($idemKey, self::EP_CONFIRM, $wpUserId, null, $idemClinicId);
         if ($check['is_replay']) {
@@ -1012,6 +1012,7 @@ final class BookingService
                     // existing Patient (frozen subject or single-linked
                     // Historical-NULL auto-bind). No Patient row is created here.
                     $patient_id = (int) $patient['id'];
+                    $this->assert_patient_profile_complete_for_booking( $patient_id );
 
                     $dup = $this->appointments->findActiveForPatientSlot( $patient_id, $slot_id, self::ACTIVE_STATUSES );
                     if ( $dup !== null ) {
@@ -3093,7 +3094,12 @@ final class BookingService
         if ( null === $patient_id || $patient_id <= 0 ) {
             throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
         }
-        $this->assert_patient_profile_complete_row( $this->patients->find( $patient_id ) );
+        $row = $this->db->fetchRowForUpdate(
+            'SELECT id, first_name, last_name, mobile, national_id, birth_date FROM ' . $this->db->table( 'cpms_patients' ) . ' WHERE id = %d LIMIT 1',
+            [ $patient_id ]
+        );
+        $this->assert_read_succeeded( 'patient_profile', [ 'patient_id' => $patient_id ] );
+        $this->assert_patient_profile_complete_row( $row );
     }
 
     /**
@@ -3103,10 +3109,22 @@ final class BookingService
         if ( null === $patient ) {
             throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
         }
-        $first_name = trim( (string) ( $patient['first_name'] ?? '' ) );
-        $last_name  = trim( (string) ( $patient['last_name'] ?? '' ) );
-        $mobile     = trim( (string) ( $patient['mobile'] ?? '' ) );
-        if ( '' === $first_name || '' === $last_name || '' === $mobile ) {
+        $first_name  = trim( (string) ( $patient['first_name'] ?? '' ) );
+        $last_name   = trim( (string) ( $patient['last_name'] ?? '' ) );
+        $mobile      = trim( (string) ( $patient['mobile'] ?? '' ) );
+        $national_id = trim( (string) ( $patient['national_id'] ?? '' ) );
+        $birth_date  = trim( (string) ( $patient['birth_date'] ?? '' ) );
+        $valid_birth = 1 === preg_match( '/^(\d{4})-(\d{2})-(\d{2})$/', $birth_date, $birth_parts )
+            && '0000-00-00' !== $birth_date
+            && checkdate( (int) $birth_parts[2], (int) $birth_parts[3], (int) $birth_parts[1] );
+        if (
+            '' === $first_name
+            || '' === $last_name
+            || '' === $mobile
+            || '' === $national_id
+            || ! NationalIdValidator::isValid( $national_id )
+            || ! $valid_birth
+        ) {
             throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
         }
     }

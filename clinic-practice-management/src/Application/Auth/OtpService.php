@@ -422,7 +422,7 @@ final class OtpService
         // هرگز استثنای فراری، هرگز 500. کلیدهای Cooldown/Lockout هویت‌سطح
         // می‌مانند (AD-15 — بدون بازطراحی).
         $rowClinicId = (isset($row['clinic_id']) && $row['clinic_id'] !== null) ? (int) $row['clinic_id'] : null;
-        if ( null !== $expected_clinic_id && $expected_clinic_id > 0 && null !== $rowClinicId && $rowClinicId !== $expected_clinic_id ) {
+        if ( null !== $expected_clinic_id && $expected_clinic_id > 0 && $rowClinicId !== $expected_clinic_id ) {
             throw new OtpException( 'CLINIC_OTP_INVALID', 'کد واردشده معتبر نیست' );
         }
         try {
@@ -467,7 +467,7 @@ final class OtpService
                     }
                     $locked_clinic = $locked !== null && isset( $locked['clinic_id'] ) ? (int) $locked['clinic_id'] : null;
                     if ( $locked === null || $locked_clinic !== $rowClinicId
-                        || ( null !== $expected_clinic_id && $expected_clinic_id > 0 && null !== $locked_clinic && $locked_clinic !== $expected_clinic_id )
+                        || ( null !== $expected_clinic_id && $expected_clinic_id > 0 && $locked_clinic !== $expected_clinic_id )
                         || (string) $locked['mobile'] !== $mobile || (string) $locked['purpose'] !== $purpose
                         || $locked['consumed_at'] !== null ) {
                         return [ 'error' => new OtpException( 'CLINIC_OTP_INVALID', 'این کد قبلاً استفاده شده است' ) ];

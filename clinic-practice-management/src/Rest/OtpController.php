@@ -194,8 +194,13 @@ final class OtpController extends RestBase
             || self::hasValue( $slot_date ) || self::hasValue( $slot_time );
         if ( ! $has_selection ) {
             if ( OtpService::PURPOSE_VERIFY_MOBILE === (string) $request->get_param( 'purpose' ) ) {
-                $raw_clinic_id = (int) $request->get_param( 'clinic_id' );
-                if ( $raw_clinic_id > 0 && $this->isTrustedPublicRegistrationClinic( $raw_clinic_id ) ) {
+                $raw_clinic_param = $request->get_param( 'clinic_id' );
+                if ( self::hasValue( $raw_clinic_param ) ) {
+                    $raw_clinic_id = (int) $raw_clinic_param;
+                    if ( ! $this->isTrustedPublicRegistrationClinic( $raw_clinic_id ) ) {
+                        throw BookingException::of( 'CLINIC_NOT_FOUND', 'مرکز درمانی یافت نشد', 404 );
+                    }
+
                     return $raw_clinic_id;
                 }
             }
@@ -308,17 +313,7 @@ final class OtpController extends RestBase
             return false;
         }
 
-        if ( ( new PublicClinicDirectory() )->is_listed( $clinic_id ) ) {
-            return true;
-        }
-
-        $active_ids = $db->fetchAll(
-            'SELECT c.id FROM ' . $db->table( 'cpms_clinics' ) . ' c'
-            . ' INNER JOIN ' . $db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
-            . " WHERE c.status = 'active' AND o.status = 'active' ORDER BY c.id ASC LIMIT 2"
-        );
-
-        return 1 === count( $active_ids ) && (int) ( $active_ids[0]['id'] ?? 0 ) === $clinic_id;
+        return ( new PublicClinicDirectory() )->is_listed( $clinic_id );
     }
 
     /**

@@ -100,14 +100,16 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
         $db->insert(
             'cpms_patients',
             [
-                'clinic_id'  => 1,
-                'mrn'        => 'MR-SBC-' . uniqid(),
-                'first_name' => 'SliceB',
-                'last_name'  => 'Complete',
-                'mobile'     => '09123334455',
-                'status'     => 'active',
-                'created_at' => $now,
-                'updated_at' => $now,
+                'clinic_id'   => 1,
+                'mrn'         => 'MR-SBC-' . uniqid(),
+                'first_name'  => 'SliceB',
+                'last_name'   => 'Complete',
+                'mobile'      => '09123334455',
+                'national_id' => PatientTwoProofTestHelper::next_valid_national_id(),
+                'birth_date'  => '1990-01-01',
+                'status'      => 'active',
+                'created_at'  => $now,
+                'updated_at'  => $now,
             ]
         );
         $this->patientA = $db->wpdb_last_insert_id();

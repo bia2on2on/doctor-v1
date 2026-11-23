@@ -1043,21 +1043,10 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
         self::assertIsArray( WP_Session_Tokens::get_instance( $this->userPending )->get( $token ) );
 
         // W1: Valid unique-NID staff edit passes pre-check, executes 1 UPDATE cpms_patients row, and closes binding (§7.6).
-        $uniqueNid            = '0499370899';
-        $uniquePrecheckHits   = 0;
-        $uniqueUpdateHits     = 0;
-        $uniqueSqlSpy         = static function ( $query ) use ( $precheckSqlPattern, $updateSqlPattern, &$uniquePrecheckHits, &$uniqueUpdateHits ) {
-            $sql = (string) $query;
-            if ( 1 === preg_match( $precheckSqlPattern, $sql ) ) {
-                ++$uniquePrecheckHits;
-            }
-            if ( 1 === preg_match( $updateSqlPattern, $sql ) ) {
-                ++$uniqueUpdateHits;
-            }
-
-            return $query;
-        };
-        add_filter( 'query', $uniqueSqlSpy, 5 );
+        $uniqueNid          = '0499370899';
+        $precheckSelectHits = 0;
+        $patientUpdateHits  = 0;
+        add_filter( 'query', $sqlSpy, 5 );
         try {
             $uniqueResp = $this->dispatchRest(
                 'PUT',
@@ -1066,11 +1055,11 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
                 $this->userStaff
             );
         } finally {
-            remove_filter( 'query', $uniqueSqlSpy, 5 );
+            remove_filter( 'query', $sqlSpy, 5 );
         }
         self::assertSame( 200, $uniqueResp->get_status() );
-        self::assertSame( 1, $uniquePrecheckHits, 'Valid unique-NID staff edit must run the pre-check query once.' );
-        self::assertSame( 1, $uniqueUpdateHits, 'Valid unique-NID staff edit must execute exactly 1 UPDATE cpms_patients statement.' );
+        self::assertSame( 1, $precheckSelectHits, 'Valid unique-NID staff edit must run the pre-check query once.' );
+        self::assertSame( 1, $patientUpdateHits, 'Valid unique-NID staff edit must execute exactly 1 UPDATE cpms_patients statement.' );
         $updatedRow = App::db()->fetchRow( 'SELECT national_id FROM ' . $patientTable . ' WHERE id = %d', [ $this->patientPending ] );
         self::assertSame( $uniqueNid, (string) ( $updatedRow['national_id'] ?? '' ) );
         self::assertNull( $logins->find_binding( $this->userPending, $this->clinicA, $this->patientPending, true ), 'NID correction must close active binding (§7.6).' );

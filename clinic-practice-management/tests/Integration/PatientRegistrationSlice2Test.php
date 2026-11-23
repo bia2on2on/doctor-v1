@@ -10,6 +10,8 @@ use ClinicCore\Application\Auth\PatientCredentialGuard;
 use ClinicCore\Application\Auth\PatientRegistrationService;
 use ClinicCore\Application\Auth\PatientSessionProofStore;
 use ClinicCore\Application\Auth\PatientSessionScope;
+use ClinicCore\Application\Scope\ClinicScope;
+use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
@@ -125,6 +127,7 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
     }
 
     protected function tearDown(): void {
+        ScopeContext::clear();
         remove_all_filters( 'cpms_license_public_key' );
         PatientTwoProofTestHelper::reset();
         App::resetScope();
@@ -161,15 +164,21 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
 
         self::assertSame( 200, $resp->get_status() );
         $body = $resp->get_data();
-        self::assertTrue( (bool) ( $body['data']['registered'] ?? false ) );
-        self::assertTrue( (bool) ( $body['data']['session_issued'] ?? false ) );
-        $userId    = (int) ( $body['data']['user_id'] ?? 0 );
-        $patientId = (int) ( $body['data']['patient_id'] ?? 0 );
-        $bindingId = (int) ( $body['data']['binding_id'] ?? 0 );
+        self::assertIsArray( $body );
+        self::assertArrayHasKey( 'data', $body );
+        self::assertIsArray( $body['data'] );
+        foreach ( [ 'registered', 'session_issued', 'user_id', 'patient_id', 'binding_id', 'clinic_id' ] as $expectedKey ) {
+            self::assertArrayHasKey( $expectedKey, $body['data'] );
+        }
+        self::assertTrue( $body['data']['registered'] );
+        self::assertTrue( $body['data']['session_issued'] );
+        $userId    = (int) $body['data']['user_id'];
+        $patientId = (int) $body['data']['patient_id'];
+        $bindingId = (int) $body['data']['binding_id'];
         self::assertGreaterThan( 0, $userId );
         self::assertGreaterThan( 0, $patientId );
         self::assertGreaterThan( 0, $bindingId );
-        self::assertSame( $this->clinicListed, (int) ( $body['data']['clinic_id'] ?? 0 ) );
+        self::assertSame( $this->clinicListed, (int) $body['data']['clinic_id'] );
 
         // Zero PII / NID / MRN in REST response.
         $encoded = (string) wp_json_encode( $body, JSON_UNESCAPED_UNICODE );
@@ -228,9 +237,12 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertTrue( $foundRegAudit );
 
         $rateKeys = App::db()->fetchAll( 'SELECT window_key FROM ' . App::db()->table( 'cpms_rate_limits' ) );
+        self::assertNotEmpty( $rateKeys, 'Registration must record non-empty rate-limit keys to inspect.' );
         foreach ( $rateKeys as $rk ) {
-            self::assertStringNotContainsString( self::NID_NEW, (string) ( $rk['window_key'] ?? '' ) );
-            self::assertStringNotContainsString( self::MOBILE_NEW, (string) ( $rk['window_key'] ?? '' ) );
+            self::assertArrayHasKey( 'window_key', $rk );
+            self::assertNotSame( '', (string) $rk['window_key'] );
+            self::assertStringNotContainsString( self::NID_NEW, (string) $rk['window_key'] );
+            self::assertStringNotContainsString( self::MOBILE_NEW, (string) $rk['window_key'] );
         }
 
         // §4.4 N2 guard: password sign-in, password reset, and app passwords are all blocked.
@@ -265,7 +277,12 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         );
 
         self::assertSame( 200, $resp->get_status() );
-        self::assertSame( $existingId, (int) ( $resp->get_data()['data']['patient_id'] ?? 0 ) );
+        $linkData = $resp->get_data();
+        self::assertIsArray( $linkData );
+        self::assertArrayHasKey( 'data', $linkData );
+        self::assertIsArray( $linkData['data'] );
+        self::assertArrayHasKey( 'patient_id', $linkData['data'] );
+        self::assertSame( $existingId, (int) $linkData['data']['patient_id'] );
 
         $row = App::db()->fetchRow( 'SELECT first_name, last_name, birth_date FROM ' . App::db()->table( 'cpms_patients' ) . ' WHERE id = %d', [ $existingId ] );
         self::assertIsArray( $row );
@@ -283,6 +300,9 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         $usersBefore    = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->wpdb()->users );
         $patientsBefore = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_patients' ) );
         $loginsBefore   = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_patient_logins' ) );
+        $rateBefore     = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_rate_limits' ) );
+        $auditBefore    = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_audit_logs' ) );
+        $otpBefore      = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_otp_tokens' ) );
 
         $responses = [];
 
@@ -351,8 +371,11 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         foreach ( $responses as $idx => $resp ) {
             self::assertSame( 403, $resp->get_status(), 'Branch #' . $idx . ' status mismatch' );
             $data = $resp->get_data();
-            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $data['code'] ?? null, 'Branch #' . $idx );
-            self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $data['message'] ?? null, 'Branch #' . $idx );
+            self::assertIsArray( $data );
+            self::assertArrayHasKey( 'code', $data, 'Branch #' . $idx );
+            self::assertArrayHasKey( 'message', $data, 'Branch #' . $idx );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $data['code'], 'Branch #' . $idx );
+            self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $data['message'], 'Branch #' . $idx );
             if ( null === $baseline ) {
                 $baseline = $data;
             } else {
@@ -360,10 +383,14 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
             }
         }
 
-        // Zero side effects in DB (no ghost WP user, no patient created, no login row).
+        // The 3 checked identity/account tables (wp_users, cpms_patients, cpms_patient_logins) have zero writes;
+        // expected security telemetry (seeded OTP challenges, rate-limit counters, failure audits) persists.
         self::assertSame( $usersBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->wpdb()->users ) );
         self::assertSame( $patientsBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_patients' ) ) );
         self::assertSame( $loginsBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_patient_logins' ) ) );
+        self::assertSame( $otpBefore + 5, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_otp_tokens' ) ) );
+        self::assertGreaterThan( $rateBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_rate_limits' ) ) );
+        self::assertGreaterThan( $auditBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_audit_logs' ) ) );
         self::assertGreaterThan( 0, $existingMismatchId );
     }
 
@@ -455,7 +482,8 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
 
         // Reschedule of appt1 at cap = 2 must succeed (replacement replaces source, total remains 2).
         $rescheduled = $booking->reschedule( $userId, (int) $appt1['id'], $this->clinicianListed, $date3, '11:00:00', 'cap-r1-' . uniqid(), $slot3 );
-        self::assertGreaterThan( 0, (int) ( $rescheduled['id'] ?? 0 ) );
+        self::assertArrayHasKey( 'id', $rescheduled );
+        self::assertGreaterThan( 0, (int) $rescheduled['id'] );
 
         // §2.8 / §8 / §10: if an active binding exists on clinicPrivate without a session proof, cap check fails closed (403).
         $patientB = $this->insertPatient( $this->clinicPrivate, '09125550199', 'مریم', 'ب', '0061234567', '1991-03-14' );
@@ -504,7 +532,458 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertStringContainsString( 'data-register-path="/patient/register"', $bookingHtml );
     }
 
-    private function seedOtp( int $clinicId, string $mobile, string $code, string $purpose ): void {
+    public function testSoleActiveOptedOutClinicMatchesNonexistentAcrossAllThreePathsAndOptedInWitnessPassesUnderSameSpy(): void {
+        $db = App::db();
+        $db->update( 'cpms_clinics', [ 'status' => 'archived' ], [ 'id' => $this->clinicPrivate ] );
+        self::assertSame(
+            1,
+            (int) $db->fetchValue( "SELECT COUNT(*) FROM " . $db->table( 'cpms_clinics' ) . " WHERE status = 'active'" ),
+            'Precondition: exactly one active clinic exists.'
+        );
+        App::settingsFactory()->forClinic( $this->clinicListed )->set( 'public.listing_opt_in', false );
+        \ClinicCore\Settings\Settings::flushCache();
+
+        $optInMobile  = '09125550181';
+        $optOutMobile = '09125550183';
+        $this->seedOtp( $this->clinicListed, $optOutMobile, '334455', OtpService::PURPOSE_VERIFY_MOBILE );
+
+        $settingsTable       = $db->table( 'cpms_settings' );
+        $otpTable            = $db->table( 'cpms_otp_tokens' );
+        $usersTable          = $db->wpdb()->users;
+        $patientsTable       = $db->table( 'cpms_patients' );
+        $loginsTable         = $db->table( 'cpms_patient_logins' );
+        $optInSettingReads   = 0;
+        $otpInserts          = 0;
+        $patientUserInserts  = 0;
+        $optInSpy            = static function ( $query ) use (
+            $settingsTable,
+            $otpTable,
+            $usersTable,
+            $patientsTable,
+            $loginsTable,
+            &$optInSettingReads,
+            &$otpInserts,
+            &$patientUserInserts
+        ) {
+            $sql = (string) $query;
+            if ( false !== stripos( $sql, $settingsTable ) && false !== strpos( $sql, 'public.listing_opt_in' ) ) {
+                ++$optInSettingReads;
+            }
+            if ( 1 === preg_match( '/^\s*INSERT\s+INTO\s+`?' . preg_quote( $otpTable, '/' ) . '`?\b/i', $sql ) ) {
+                ++$otpInserts;
+            }
+            if (
+                1 === preg_match( '/^\s*INSERT\s+INTO\s+`?(?:' . preg_quote( $usersTable, '/' ) . '|' . preg_quote( $patientsTable, '/' ) . '|' . preg_quote( $loginsTable, '/' ) . ')`?\b/i', $sql )
+            ) {
+                ++$patientUserInserts;
+            }
+
+            return $query;
+        };
+
+        $normalizeHtml = static function ( string $html ): string {
+            return (string) preg_replace( '/cpms-pp-login-[a-z0-9]+/i', 'cpms-pp-login-ID', $html );
+        };
+
+        PatientTwoProofTestHelper::acting_as( 0 );
+        add_filter( 'query', $optInSpy, 5 );
+        try {
+            // 1) Sole active opted-out clinic across all 3 paths.
+            ob_start();
+            PatientOtpLogin::render();
+            $optedOutHtml = $normalizeHtml( (string) ob_get_clean() );
+            self::assertStringNotContainsString( 'data-role="patient-register-form"', $optedOutHtml );
+
+            $optedOutOtpResp = $this->dispatchRest(
+                'POST',
+                '/clinic/v1/otp/request',
+                [
+                    'clinic_id' => $this->clinicListed,
+                    'mobile'    => $optOutMobile,
+                    'purpose'   => OtpService::PURPOSE_VERIFY_MOBILE,
+                ]
+            );
+            self::assertSame( 404, $optedOutOtpResp->get_status() );
+            $optedOutOtpData = $optedOutOtpResp->get_data();
+            self::assertIsArray( $optedOutOtpData );
+            self::assertArrayHasKey( 'code', $optedOutOtpData );
+            self::assertSame( 'CLINIC_NOT_FOUND', $optedOutOtpData['code'] );
+
+            $optedOutRegResp = $this->dispatchRest(
+                'POST',
+                '/clinic/v1/patient/register',
+                [
+                    'clinic_id'   => $this->clinicListed,
+                    'mobile'      => $optOutMobile,
+                    'code'        => '334455',
+                    'given_name'  => 'سارا',
+                    'family_name' => 'مخفی',
+                    'national_id' => self::NID_NEW,
+                    'birth_date'  => '1993-07-21',
+                ]
+            );
+            self::assertSame( 403, $optedOutRegResp->get_status() );
+            $optedOutRegData = $optedOutRegResp->get_data();
+            self::assertIsArray( $optedOutRegData );
+            self::assertArrayHasKey( 'code', $optedOutRegData );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $optedOutRegData['code'] );
+            self::assertGreaterThanOrEqual( 3, $optInSettingReads );
+            self::assertSame( 0, $otpInserts );
+            self::assertSame( 0, $patientUserInserts );
+
+            // 2) Nonexistent clinic / zero active clinics: identical across all 3 paths.
+            $optInSettingReads  = 0;
+            $otpInserts         = 0;
+            $patientUserInserts = 0;
+
+            $db->update( 'cpms_clinics', [ 'status' => 'archived' ], [ 'id' => $this->clinicListed ] );
+            ob_start();
+            PatientOtpLogin::render();
+            $noClinicHtml = $normalizeHtml( (string) ob_get_clean() );
+            $db->update( 'cpms_clinics', [ 'status' => 'active' ], [ 'id' => $this->clinicListed ] );
+            self::assertSame( $optedOutHtml, $noClinicHtml );
+
+            $nonexistentOtpResp = $this->dispatchRest(
+                'POST',
+                '/clinic/v1/otp/request',
+                [
+                    'clinic_id' => 999999,
+                    'mobile'    => $optOutMobile,
+                    'purpose'   => OtpService::PURPOSE_VERIFY_MOBILE,
+                ]
+            );
+            self::assertSame( 404, $nonexistentOtpResp->get_status() );
+            self::assertSame( $optedOutOtpData, $nonexistentOtpResp->get_data() );
+
+            $nonexistentRegResp = $this->dispatchRest(
+                'POST',
+                '/clinic/v1/patient/register',
+                [
+                    'clinic_id'   => 999999,
+                    'mobile'      => $optOutMobile,
+                    'code'        => '334455',
+                    'given_name'  => 'سارا',
+                    'family_name' => 'مخفی',
+                    'national_id' => self::NID_NEW,
+                    'birth_date'  => '1993-07-21',
+                ]
+            );
+            self::assertSame( 403, $nonexistentRegResp->get_status() );
+            self::assertSame( $optedOutRegData, $nonexistentRegResp->get_data() );
+            self::assertSame( 0, $otpInserts );
+            self::assertSame( 0, $patientUserInserts );
+
+            // 3) Positive witness: same sole active clinic opted in under the SAME spy.
+            $optInSettingReads  = 0;
+            $otpInserts         = 0;
+            $patientUserInserts = 0;
+            App::settingsFactory()->forClinic( $this->clinicListed )->set( 'public.listing_opt_in', true );
+            \ClinicCore\Settings\Settings::flushCache();
+
+            ob_start();
+            PatientOtpLogin::render();
+            $optedInHtml = (string) ob_get_clean();
+            self::assertStringContainsString( 'data-role="patient-register-form"', $optedInHtml );
+
+            $witnessOtpResp = $this->dispatchRest(
+                'POST',
+                '/clinic/v1/otp/request',
+                [
+                    'clinic_id' => $this->clinicListed,
+                    'mobile'    => $optInMobile,
+                    'purpose'   => OtpService::PURPOSE_VERIFY_MOBILE,
+                ]
+            );
+            self::assertSame( 200, $witnessOtpResp->get_status() );
+            $witnessOtpData = $witnessOtpResp->get_data();
+            self::assertIsArray( $witnessOtpData );
+            self::assertArrayHasKey( 'data', $witnessOtpData );
+            self::assertTrue( $witnessOtpData['data']['sms_sent'] );
+            self::assertSame( 1, $otpInserts );
+
+            $pepper = defined( 'CPMS_PEPPER' ) && '' !== (string) CPMS_PEPPER
+                ? (string) CPMS_PEPPER
+                : (string) get_option( 'cpms_otp_pepper', '' );
+            self::assertNotSame( '', $pepper );
+            $latestOtpId = (int) $db->fetchValue(
+                'SELECT id FROM ' . $otpTable . ' WHERE clinic_id = %d AND mobile = %s ORDER BY id DESC LIMIT 1',
+                [ $this->clinicListed, $optInMobile ]
+            );
+            self::assertGreaterThan( 0, $latestOtpId );
+            $db->update( 'cpms_otp_tokens', [ 'code_hash' => OtpPolicy::hashCode( '556677', $pepper ) ], [ 'id' => $latestOtpId ] );
+
+            $witnessRegResp = $this->dispatchRest(
+                'POST',
+                '/clinic/v1/patient/register',
+                [
+                    'clinic_id'   => $this->clinicListed,
+                    'mobile'      => $optInMobile,
+                    'code'        => '556677',
+                    'given_name'  => 'سارا',
+                    'family_name' => 'ثبت‌شده',
+                    'national_id' => self::NID_NEW,
+                    'birth_date'  => '1993-07-21',
+                ]
+            );
+            self::assertSame( 200, $witnessRegResp->get_status() );
+            $witnessRegData = $witnessRegResp->get_data();
+            self::assertIsArray( $witnessRegData );
+            self::assertArrayHasKey( 'data', $witnessRegData );
+            self::assertTrue( $witnessRegData['data']['registered'] );
+            self::assertGreaterThanOrEqual( 3, $optInSettingReads );
+            self::assertSame( 1, $otpInserts );
+            self::assertGreaterThanOrEqual( 3, $patientUserInserts );
+        } finally {
+            remove_filter( 'query', $optInSpy, 5 );
+        }
+    }
+
+    public function testBookingGateRefusesLegacyProvedPatientMissingBirthDateInsideTransactionAllowsStaffAndPassesCompleteWitness(): void {
+        $db  = App::db();
+        $now = $db->nowUtcSql();
+
+        // Legacy proved patient: valid national_id, MISSING birth_date.
+        $legacyMobile    = '09125550171';
+        $legacyPatientId = $this->insertPatient( $this->clinicListed, $legacyMobile, 'قدیمی', 'ناقص', self::NID_EXISTING, null );
+        $legacyUserId    = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_PATIENT ] );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $legacyUserId,
+            $this->clinicListed,
+            $legacyPatientId,
+            [
+                'mobile'             => $legacyMobile,
+                'seed_session_scope' => true,
+                'set_current_user'   => false,
+            ]
+        );
+
+        // Staff-created incomplete patient: missing BOTH national_id and birth_date.
+        $walkinPatientId = $this->insertPatient( $this->clinicListed, '09125550173', 'حضوری', 'بدون‌کد', null, null );
+
+        // Complete-profile proved patient witness.
+        $completeMobile    = '09125550172';
+        $completePatientId = $this->insertPatient( $this->clinicListed, $completeMobile, 'کامل', 'تست', self::NID_CAP, '1992-05-10' );
+        $completeUserId    = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_PATIENT ] );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $completeUserId,
+            $this->clinicListed,
+            $completePatientId,
+            [
+                'mobile'             => $completeMobile,
+                'seed_session_scope' => true,
+                'set_current_user'   => false,
+            ]
+        );
+
+        $staffUserId = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_SECRETARY ] );
+        App::membership_service()->create_membership( $this->clinicListed, $staffUserId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $date1            = gmdate( 'Y-m-d', time() + 3 * 86400 );
+        $date2            = gmdate( 'Y-m-d', time() + 4 * 86400 );
+        $date3            = gmdate( 'Y-m-d', time() + 5 * 86400 );
+        $date4            = gmdate( 'Y-m-d', time() + 6 * 86400 );
+        $slotStaff        = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $date1, '09:00:00' );
+        $slotHoldFail     = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $date2, '10:00:00' );
+        $slotConfirmFail  = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $date3, '11:00:00' );
+        $slotWitness      = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $date4, '12:00:00' );
+
+        $apptsTable = $db->table( 'cpms_appointments' );
+        $holdsTable = $db->table( 'cpms_slot_holds' );
+        $patsTable  = $db->table( 'cpms_patients' );
+        $booking    = App::bookingService();
+
+        $apptsBefore = (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable );
+
+        // 1) Staff creation MUST succeed for an incomplete patient (no national_id, no birth_date).
+        ScopeContext::set( ClinicScope::forClinic( $this->clinicListed, $this->locationListed )->withOrganization( $this->orgId ) );
+        try {
+            $staffAppt = $booking->createByStaff( $staffUserId, $walkinPatientId, $this->clinicianListed, $date1, '09:00:00', 'پذیرش حضوری', $slotStaff );
+        } finally {
+            ScopeContext::clear();
+        }
+        self::assertArrayHasKey( 'appointment_id', $staffAppt );
+        self::assertGreaterThan( 0, (int) $staffAppt['appointment_id'] );
+        $expectedAppts = $apptsBefore + 1;
+        self::assertSame( $expectedAppts, (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable ) );
+
+        $txStarts             = 0;
+        $txRollbacks          = 0;
+        $txCommits            = 0;
+        $txActive             = false;
+        $patientGateLockReads = 0;
+        $patientGateReadsInTx = 0;
+        $holdInserts          = 0;
+        $appointmentInserts   = 0;
+        $bookingSpy           = static function ( $query ) use (
+            $patsTable,
+            $holdsTable,
+            $apptsTable,
+            &$txStarts,
+            &$txRollbacks,
+            &$txCommits,
+            &$txActive,
+            &$patientGateLockReads,
+            &$patientGateReadsInTx,
+            &$holdInserts,
+            &$appointmentInserts
+        ) {
+            $sql = trim( (string) $query );
+            if ( 1 === preg_match( '/^(?:\/\*cpms\*\/\s*)?(?:START\s+TRANSACTION|BEGIN)\b/i', $sql ) ) {
+                ++$txStarts;
+                $txActive = true;
+            }
+            if ( 1 === preg_match( '/^(?:\/\*cpms\*\/\s*)?ROLLBACK\b/i', $sql ) ) {
+                ++$txRollbacks;
+                $txActive = false;
+            }
+            if ( 1 === preg_match( '/^(?:\/\*cpms\*\/\s*)?COMMIT\b/i', $sql ) ) {
+                ++$txCommits;
+                $txActive = false;
+            }
+            if ( false !== stripos( $sql, $patsTable ) && false !== stripos( $sql, 'FOR UPDATE' ) ) {
+                ++$patientGateLockReads;
+                if ( $txActive ) {
+                    ++$patientGateReadsInTx;
+                }
+            }
+            if ( 1 === preg_match( '/^INSERT\s+INTO\s+`?' . preg_quote( $holdsTable, '/' ) . '`?\b/i', $sql ) ) {
+                ++$holdInserts;
+            }
+            if ( 1 === preg_match( '/^INSERT\s+INTO\s+`?' . preg_quote( $apptsTable, '/' ) . '`?\b/i', $sql ) ) {
+                ++$appointmentInserts;
+            }
+
+            return $query;
+        };
+
+        add_filter( 'query', $bookingSpy, 5 );
+        try {
+            // 2) Self-service hold() refuses legacy proved patient missing birth_date inside transaction.
+            PatientTwoProofTestHelper::acting_as( $legacyUserId );
+            $holdEx = null;
+            try {
+                $booking->hold( $legacyUserId, $this->clinicianListed, $date2, '10:00:00', $slotHoldFail, $legacyPatientId, $this->locationListed );
+            } catch ( BookingException $e ) {
+                $holdEx = $e;
+            }
+            self::assertInstanceOf( BookingException::class, $holdEx );
+            self::assertSame( 'CLINIC_VALIDATION_FAILED', $holdEx->errorCode );
+            self::assertSame( 400, $holdEx->httpStatus );
+            self::assertGreaterThanOrEqual( 1, $txStarts );
+            self::assertSame( 1, $patientGateLockReads );
+            self::assertSame( 1, $patientGateReadsInTx );
+            self::assertGreaterThanOrEqual( 1, $txRollbacks );
+            self::assertSame( 0, $holdInserts );
+            self::assertSame( 0, $appointmentInserts );
+            self::assertSame( $expectedAppts, (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable ) );
+
+            // 3) Self-service confirm() refuses legacy proved patient missing birth_date inside transaction.
+            $seedHoldToken = 'hold-legacy-' . bin2hex( random_bytes( 6 ) );
+            $db->update( 'cpms_schedule_slots', [ 'held_count' => 1 ], [ 'id' => $slotConfirmFail ] );
+            $db->insert(
+                'cpms_slot_holds',
+                [
+                    'clinic_id'         => $this->clinicListed,
+                    'slot_id'           => $slotConfirmFail,
+                    'holder_wp_user_id' => $legacyUserId,
+                    'holder_mobile'     => $legacyMobile,
+                    'patient_id'        => $legacyPatientId,
+                    'token'             => $seedHoldToken,
+                    'expires_at'        => gmdate( 'Y-m-d H:i:s', time() + 600 ) . '.000',
+                    'status'            => 'active',
+                    'created_at'        => $now,
+                ]
+            );
+
+            $txStarts             = 0;
+            $txRollbacks          = 0;
+            $txCommits            = 0;
+            $txActive             = false;
+            $patientGateLockReads = 0;
+            $patientGateReadsInTx = 0;
+            $holdInserts          = 0;
+            $appointmentInserts   = 0;
+
+            $confirmEx = null;
+            try {
+                $booking->confirm( $seedHoldToken, $legacyUserId, null, 'confirm-legacy-' . uniqid() );
+            } catch ( BookingException $e ) {
+                $confirmEx = $e;
+            }
+            self::assertInstanceOf( BookingException::class, $confirmEx );
+            self::assertSame( 'CLINIC_VALIDATION_FAILED', $confirmEx->errorCode );
+            self::assertSame( 400, $confirmEx->httpStatus );
+            self::assertGreaterThanOrEqual( 1, $txStarts );
+            self::assertSame( 1, $patientGateLockReads );
+            self::assertSame( 1, $patientGateReadsInTx );
+            self::assertGreaterThanOrEqual( 1, $txRollbacks );
+            self::assertSame( 0, $appointmentInserts );
+            self::assertSame( $expectedAppts, (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable ) );
+
+            // 4) Positive witness: complete-profile proved patient succeeds under the SAME spy.
+            $txStarts             = 0;
+            $txRollbacks          = 0;
+            $txCommits            = 0;
+            $txActive             = false;
+            $patientGateLockReads = 0;
+            $patientGateReadsInTx = 0;
+            $holdInserts          = 0;
+            $appointmentInserts   = 0;
+
+            PatientTwoProofTestHelper::acting_as( $completeUserId );
+            $witnessHold    = $booking->hold( $completeUserId, $this->clinicianListed, $date4, '12:00:00', $slotWitness, $completePatientId, $this->locationListed );
+            $witnessConfirm = $booking->confirm( (string) $witnessHold['hold_token'], $completeUserId, null, 'confirm-complete-' . uniqid() );
+            self::assertArrayHasKey( 'appointment_id', $witnessConfirm );
+            self::assertGreaterThan( 0, (int) $witnessConfirm['appointment_id'] );
+            self::assertGreaterThanOrEqual( 2, $txCommits );
+            self::assertSame( 2, $patientGateLockReads );
+            self::assertSame( 2, $patientGateReadsInTx );
+            self::assertSame( 1, $holdInserts );
+            self::assertSame( 1, $appointmentInserts );
+            self::assertSame( $expectedAppts + 1, (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable ) );
+        } finally {
+            remove_filter( 'query', $bookingSpy, 5 );
+        }
+    }
+
+    public function testNullClinicOtpTokenIsRejectedForRegistrationInAnyClinic(): void {
+        $mobile = '09125550191';
+        $this->seedOtp( null, $mobile, '445566', OtpService::PURPOSE_VERIFY_MOBILE );
+
+        $usersBefore    = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->wpdb()->users );
+        $patientsBefore = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_patients' ) );
+        $loginsBefore   = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_patient_logins' ) );
+
+        $resp = $this->dispatchRest(
+            'POST',
+            '/clinic/v1/patient/register',
+            [
+                'clinic_id'   => $this->clinicListed,
+                'mobile'      => $mobile,
+                'code'        => '445566',
+                'given_name'  => 'تست',
+                'family_name' => 'بدون‌کلینیک',
+                'national_id' => self::NID_NEW,
+                'birth_date'  => '1993-07-21',
+            ]
+        );
+
+        self::assertSame( 403, $resp->get_status() );
+        $data = $resp->get_data();
+        self::assertIsArray( $data );
+        self::assertArrayHasKey( 'code', $data );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $data['code'] );
+        $consumedAt = App::db()->fetchValue(
+            'SELECT consumed_at FROM ' . App::db()->table( 'cpms_otp_tokens' ) . ' WHERE mobile = %s ORDER BY id DESC LIMIT 1',
+            [ $mobile ]
+        );
+        self::assertNull( $consumedAt );
+        self::assertSame( $usersBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->wpdb()->users ) );
+        self::assertSame( $patientsBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_patients' ) ) );
+        self::assertSame( $loginsBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_patient_logins' ) ) );
+    }
+
+    private function seedOtp( ?int $clinicId, string $mobile, string $code, string $purpose ): void {
         $pepper = defined( 'CPMS_PEPPER' ) && '' !== (string) CPMS_PEPPER
             ? (string) CPMS_PEPPER
             : (string) get_option( 'cpms_otp_pepper', '' );

@@ -65,11 +65,12 @@ final class BookingFlowTest extends WP_UnitTestCase
         $wpdb->query(
             $wpdb->prepare(
                 'INSERT INTO ' . $wpdb->prefix . 'cpms_patients
-                     (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
-                 VALUES (%d, %s, "Test", "Patient", %s, "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                     (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at)
+                 VALUES (%d, %s, "Test", "Patient", %s, %s, "1990-01-01", "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
                 $this->clinicId,
                 'MR-TEST-0001',
                 '09120000001',
+                PatientTwoProofTestHelper::next_valid_national_id(),
                 $now,
                 $now
             )
@@ -362,11 +363,12 @@ final class BookingFlowTest extends WP_UnitTestCase
         $wpdb->query(
             $wpdb->prepare(
                 'INSERT INTO ' . $wpdb->prefix . 'cpms_patients
-                     (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
-                 VALUES (%d, %s, "Double", "Booking", %s, "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                     (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at)
+                 VALUES (%d, %s, "Double", "Booking", %s, %s, "1990-01-01", "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
                 $this->clinicId,
                 'MR-TEST-0002',
                 '09120000002',
+                PatientTwoProofTestHelper::next_valid_national_id(),
                 $now,
                 $now
             )
@@ -786,11 +788,12 @@ final class BookingFlowTest extends WP_UnitTestCase
             $wpdb->query(
                 $wpdb->prepare(
                     'INSERT INTO ' . $wpdb->prefix . 'cpms_patients
-                         (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
-                     VALUES (%d, %s, "Test", "PatientTwo", %s, "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                         (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at)
+                     VALUES (%d, %s, "Test", "PatientTwo", %s, %s, "1990-01-01", "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
                     $this->clinicId,
                     'MR-TEST-0002',
                     $secondMobile,
+                    PatientTwoProofTestHelper::next_valid_national_id(),
                     $secondNow,
                     $secondNow
                 )

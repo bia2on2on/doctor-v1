@@ -513,17 +513,7 @@ final class PatientRegistrationService {
             return false;
         }
 
-        if ( ( new PublicClinicDirectory() )->is_listed( $clinic_id ) ) {
-            return true;
-        }
-
-        $active_ids = $this->db->fetchAll(
-            'SELECT c.id FROM ' . $this->db->table( 'cpms_clinics' ) . ' c'
-            . ' INNER JOIN ' . $this->db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
-            . " WHERE c.status = 'active' AND o.status = 'active' ORDER BY c.id ASC LIMIT 2"
-        );
-
-        return 1 === count( $active_ids ) && (int) ( $active_ids[0]['id'] ?? 0 ) === $clinic_id;
+        return ( new PublicClinicDirectory() )->is_listed( $clinic_id );
     }
 
     private function clean_name( string $raw ): ?string {
