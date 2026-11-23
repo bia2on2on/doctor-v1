@@ -287,10 +287,10 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         $staffRoutes = [
             [ 'POST', '/clinic/v1/patients/search', [ 'q' => 'سارا' ] ],
             [ 'GET', '/clinic/v1/patients/' . $this->patientRecord, [] ],
-            [ 'GET', '/clinic/v1/queue/today', [] ],
-            [ 'GET', '/clinic/v1/reception/overview', [] ],
-            [ 'GET', '/clinic/v1/doctor/context', [] ],
-            [ 'GET', '/clinic/v1/reports/daily-summary', [] ],
+            [ 'GET', '/clinic/v1/queue', [] ],
+            [ 'GET', '/clinic/v1/staff/portal/reception/context', [] ],
+            [ 'GET', '/clinic/v1/doctor/portal/context', [] ],
+            [ 'GET', '/clinic/v1/reports', [] ],
         ];
 
         foreach ( [ $accountOnly, $step1 ] as $session ) {
@@ -527,12 +527,12 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         if ( class_exists( wp_xmlrpc_server::class ) ) {
             $xmlrpc = new wp_xmlrpc_server();
             foreach ( [ $activeUserObj, $pendUserObj, $step1UserObj ] as $patUser ) {
-                $res = $xmlrpc->wp_getUsersBlogs( [ 1, $patUser->user_login, $this->patientKnownPass ] );
+                $res = $xmlrpc->wp_getUsersBlogs( [ $patUser->user_login, $this->patientKnownPass ] );
                 self::assertInstanceOf( IXR_Error::class, $res, 'XML-RPC must fail closed for patient account ' . $patUser->user_login );
                 self::assertSame( 403, $res->code );
             }
 
-            $staffXmlrpc = $xmlrpc->wp_getUsersBlogs( [ 1, $staffUserObj->user_login, $this->staffDoctorPass ] );
+            $staffXmlrpc = $xmlrpc->wp_getUsersBlogs( [ $staffUserObj->user_login, $this->staffDoctorPass ] );
             self::assertIsArray( $staffXmlrpc, 'Positive control: XML-RPC must remain open for non-patient staff accounts.' );
         }
     }
