@@ -672,7 +672,7 @@ final class ManagementPortalService {
 			// retained for callers that rely on the portal-level SAVEPOINT.
 			$this->db()->transactional(
 				function () use ( $actor_wp_user_id, $trusted, $input ) {
-					App::locationService()->createLocation( $actor_wp_user_id, $trusted, $input );
+					App::location_service()->createLocation( $actor_wp_user_id, $trusted, $input );
 				}
 			);
 		} catch ( LocationException $e ) {
@@ -727,7 +727,7 @@ final class ManagementPortalService {
 			// boundary is retained for the nested SAVEPOINT contract.
 			$this->db()->transactional(
 				function () use ( $actor_wp_user_id, $trusted, $location_id, $input ) {
-					App::locationService()->updateLocation( $actor_wp_user_id, $trusted, $location_id, $input );
+					App::location_service()->updateLocation( $actor_wp_user_id, $trusted, $location_id, $input );
 				}
 			);
 		} catch ( \Throwable $e ) {
@@ -763,7 +763,7 @@ final class ManagementPortalService {
 			// D6 audit atomicity: status write + mandatory audit in one boundary.
 			$this->db()->transactional(
 				function () use ( $actor_wp_user_id, $trusted, $location_id, $active, $location ) {
-					App::locationService()->set_active( $actor_wp_user_id, $trusted, $location_id, $active );
+					App::location_service()->set_active( $actor_wp_user_id, $trusted, $location_id, $active );
 
 					$this->audit_change(
 						$active ? 'LOCATION_ACTIVATED' : 'LOCATION_DEACTIVATED',

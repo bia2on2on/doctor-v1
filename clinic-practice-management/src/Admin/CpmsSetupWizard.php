@@ -860,7 +860,7 @@ final class CpmsSetupWizard
 		// phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- ID
 		$active_clinic_id = (int) App::scope()->clinicId;
 		$active_locs      = array_filter(
-			App::locationRepository()->listForClinic( $active_clinic_id ),
+			App::location_repository()->listForClinic( $active_clinic_id ),
 			static fn ( $loc ) => 1 === (int) ( $loc['is_active'] ?? 0 )
 		);
 		$doctors_fa       = PersianDigits::format_int( $doctor_count );
@@ -1217,7 +1217,7 @@ final class CpmsSetupWizard
                     return self::canonical_clinic_name( $settings ) !== '';
                 case 'locations':
                     $clinic_id = (int) App::scope()->clinicId; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- ScopeContext public property
-                    foreach ( App::locationRepository()->listForClinic( $clinic_id ) as $loc ) {
+                    foreach ( App::location_repository()->listForClinic( $clinic_id ) as $loc ) {
                         if ( (int) ( $loc['is_active'] ?? 0 ) === 1 && trim( (string) ( $loc['timezone'] ?? '' ) ) !== '' ) {
                             return true;
                         }

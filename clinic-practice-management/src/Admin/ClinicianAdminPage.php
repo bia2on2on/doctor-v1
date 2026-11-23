@@ -369,7 +369,7 @@ final class ClinicianAdminPage
          * اصلی دارد (Migration 0011)؛ فهرست خالی ⇒ هیچ ردیف قابل ثبت نیست
          * (fail-closed — با قراردادِ جدیدی که Location صریح می‌خواهد سازگار است).
          */
-        $locations = App::locationRepository()->listForClinic($clinicId);
+        $locations = App::location_repository()->listForClinic($clinicId);
         /*
          * Phase 6 Slice 6: نام Locationها برای نمایش در فهرست استثناها (همهٔ
          * Locationهای همین Clinic معتبر — FK ردیف را تضمین می‌کند) و مجموعهٔ

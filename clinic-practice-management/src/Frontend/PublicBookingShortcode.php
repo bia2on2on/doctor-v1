@@ -1580,7 +1580,7 @@ final class PublicBookingShortcode
 
             try {
                 $by_location = $directory->clinicians_by_location( $clinic_id );
-                $rows        = App::locationRepository()->listForClinic( $clinic_id );
+                $rows        = App::location_repository()->listForClinic( $clinic_id );
             } catch ( Throwable $e ) {
                 self::logFailure( $e );
                 $by_location = [];

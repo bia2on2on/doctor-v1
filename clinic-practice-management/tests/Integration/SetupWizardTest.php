@@ -431,7 +431,7 @@ final class SetupWizardTest extends WP_UnitTestCase
         // acknowledgment, so completion readiness changes only when B is acked.
         $suffix      = bin2hex(random_bytes(4));
         $created_at  = App::db()->nowUtcSql();
-        $location_id = App::locationRepository()->create(
+        $location_id = App::location_repository()->create(
             $clinic_b,
             'A-to-B location ' . $suffix,
             'a2b-' . $suffix,

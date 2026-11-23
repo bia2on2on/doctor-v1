@@ -74,8 +74,8 @@ final class FacilitySetupPage {
         return new FacilitySetupService(
             App::db(),
             App::organization_clinic_provisioning_service(),
-            App::locationService(),
-            App::locationRepository(),
+            App::location_service(),
+            App::location_repository(),
             App::authorization_service(),
             App::membership_service(),
             new MembershipRepository( App::db() ),

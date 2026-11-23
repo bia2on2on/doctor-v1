@@ -1032,7 +1032,7 @@ class Platform {
 	 * @return int Location id.
 	 */
 	public function create_location( int $actor_id, int $clinic_id, string $name, string $slug, string $timezone = 'Asia/Tehran' ): int {
-		$result = App::locationService()->createLocation(
+		$result = App::location_service()->createLocation(
 			$actor_id,
 			$clinic_id,
 			array(

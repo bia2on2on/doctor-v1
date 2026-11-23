@@ -72,7 +72,7 @@ final class LocationAdminPage
         }
 
         $clinic_id      = self::formClinicId();
-        $rows           = $clinic_id > 0 ? App::locationRepository()->listForClinic( $clinic_id ) : [];
+        $rows           = $clinic_id > 0 ? App::location_repository()->listForClinic( $clinic_id ) : [];
         $edit           = self::edit_target( $clinic_id );
         $clinic_choices = self::managed_clinic_choices( (int) get_current_user_id() );
         ?>
@@ -262,7 +262,7 @@ final class LocationAdminPage
 
             if ( $active_value === '0' || $active_value === '1' ) {
                 try {
-                    App::locationService()->set_active(
+                    App::location_service()->set_active(
                         $actor_user_id,
                         $authorization['clinic_id'],
                         $location_id,
@@ -345,14 +345,14 @@ final class LocationAdminPage
                 if ( array_key_exists( 'phone', $in ) ) {
                     $update_input['phone'] = self::sanitize_text_input( $in['phone'] );
                 }
-                $result = App::locationService()->updateLocation(
+                $result = App::location_service()->updateLocation(
                     $updated_by,
                     $authorization['clinic_id'],
                     $location_id,
                     $update_input
                 );
             } else {
-                $result = App::locationService()->createLocation(
+                $result = App::location_service()->createLocation(
                     $updated_by,
                     $authorization['clinic_id'],
                     [
@@ -499,7 +499,7 @@ final class LocationAdminPage
             return null;
         }
 
-        $row = App::locationRepository()->find( $location_id );
+        $row = App::location_repository()->find( $location_id );
         if ( $row === null || (int) ( $row['clinic_id'] ?? 0 ) !== $clinic_id || (int) ( $row['is_primary'] ?? 0 ) === 1 ) {
             return null;
         }

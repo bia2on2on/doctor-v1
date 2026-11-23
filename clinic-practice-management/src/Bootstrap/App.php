@@ -213,23 +213,25 @@ final class App
      */
     private static array $singleton_pids = [];
 
-    private static ?OpLogger $op = null;
-    private static ?AuditLogger $audit = null;
-    private static ?JobQueue $jobs = null;
-    private static ?RateLimiter $rate = null;
-    private static ?LoginRateLimiter $login_rate_limiter = null;
-    private static ?Idempotency $idem = null;
-    private static ?SettingsFactory $settings_factory = null;
+    private static ?OpLogger $op                               = null;
+    private static ?AuditLogger $audit                         = null;
+    private static ?JobQueue $jobs                             = null;
+    private static ?RateLimiter $rate                          = null;
+    private static ?LoginRateLimiter $login_rate_limiter       = null;
+    private static ?Idempotency $idem                          = null;
+    private static ?SettingsFactory $settings_factory          = null;
     private static ?InstallationSettings $installationSettings = null;
-    private static ?MigrationRunner $migrations = null;
-    private static ?JobsDispatcher $dispatcher = null;
-    private static ?SmsProviderRegistry $providers = null;
-    private static ?CredentialVault $vault = null;
-    private static ?SmsService $sms_service = null;
-    private static ?LicenseGate $license_gate = null;
-    private static ?VisitService $visit_service = null;
+    private static ?MigrationRunner $migrations                = null;
+    private static ?JobsDispatcher $dispatcher                 = null;
+    private static ?SmsProviderRegistry $providers             = null;
+    private static ?CredentialVault $vault                     = null;
+    private static ?SmsService $sms_service                    = null;
+    private static ?LicenseService $licenses                   = null;
+    private static ?VendorGateway $gateway                     = null;
+    private static ?LicenseGate $license_gate                  = null;
+    private static ?VisitService $visit_service                = null;
     private static ?PatientSessionScope $patient_session_scope = null;
-    private static bool $booted = false;
+    private static bool $booted                                = false;
 
     /**
      * N1 — نتیجهٔ پیش‌بررسیِ موتورِ دیتابیس (memoized در هر درخواست؛ موتور
@@ -1404,14 +1406,14 @@ final class App
     {
         static $schedule = null;
         static $deps     = null;
-        $current_deps    = [ self::db(), self::locationRepository(), self::jobs(), self::audit(), self::op() ];
+        $current_deps    = [ self::db(), self::location_repository(), self::jobs(), self::audit(), self::op() ];
         if ( $schedule === null || $deps !== $current_deps ) {
             $db       = self::db();
             $schedule = new ScheduleService(
                 $db,
                 new ScheduleRepository( $db ),
                 new MembershipRepository( $db ),
-                self::locationRepository(),
+                self::location_repository(),
                 self::jobs(),
                 self::audit(),
                 self::op()
@@ -1451,16 +1453,16 @@ final class App
 
     public static function clinicProfileService(): ClinicProfileService
     {
-        static $service = null;
+        static $service     = null;
         static $service_pid = null;
         if ( $service === null || $service_pid !== (int) getmypid() ) {
             try {
-            $service = new ClinicProfileService(
-                self::db(),
-                self::clinicRepository(),
-                self::authorization_service(),
-                self::audit()
-            );
+                $service = new ClinicProfileService(
+                    self::db(),
+                    self::clinicRepository(),
+                    self::authorization_service(),
+                    self::audit()
+                );
             } catch ( \Throwable $exception ) {
                 if ( null === $service ) {
                     throw $exception;
@@ -1475,8 +1477,7 @@ final class App
     /**
      * ریپوی canonical شعبه‌ها (cpms_locations) — Phase 4 Location master data.
      */
-    public static function locationRepository(): LocationRepository
-    {
+    public static function location_repository(): LocationRepository {
         static $repo   = null;
         static $db_ref = null;
         if ( $repo === null || $db_ref !== self::db() ) {
@@ -1491,18 +1492,17 @@ final class App
      * سرویس Location master data — CREATE + UPDATE name/timezone
      * (trusted Clinic + CONFIG scoped + IANA timezone + parity-safe denial).
      */
-    public static function locationService(): LocationService
-    {
-        static $service = null;
+    public static function location_service(): LocationService {
+        static $service     = null;
         static $service_pid = null;
         if ( $service === null || $service_pid !== (int) getmypid() ) {
             try {
-            $service = new LocationService(
-                self::db(),
-                self::locationRepository(),
-                self::authorization_service(),
-                self::audit()
-            );
+                $service = new LocationService(
+                    self::db(),
+                    self::location_repository(),
+                    self::authorization_service(),
+                    self::audit()
+                );
             } catch ( \Throwable $exception ) {
                 if ( null === $service ) {
                     throw $exception;
@@ -1519,17 +1519,17 @@ final class App
      * authority از TrustedClinicEstablisher + AuthorizationService می‌آید.
      */
     public static function custom_role_management_service(): \ClinicCore\Application\Roles\CustomRoleManagementService {
-        static $service = null;
+        static $service     = null;
         static $service_pid = null;
         if ( $service === null || $service_pid !== (int) getmypid() ) {
             try {
-            $service = new \ClinicCore\Application\Roles\CustomRoleManagementService(
-                new \ClinicCore\Application\Scope\TrustedClinicEstablisher( self::db(), new MembershipRepository( self::db() ) ),
-                self::authorization_service(),
-                new \ClinicCore\Infrastructure\Repository\CustomRoleRepository( self::db() ),
-                self::audit(),
-                self::db()
-            );
+                $service = new \ClinicCore\Application\Roles\CustomRoleManagementService(
+                    new \ClinicCore\Application\Scope\TrustedClinicEstablisher( self::db(), new MembershipRepository( self::db() ) ),
+                    self::authorization_service(),
+                    new \ClinicCore\Infrastructure\Repository\CustomRoleRepository( self::db() ),
+                    self::audit(),
+                    self::db()
+                );
             } catch ( \Throwable $exception ) {
                 if ( null === $service ) {
                     throw $exception;
@@ -1546,18 +1546,18 @@ final class App
      * membership-only، Clinic-local، bounded-delegation، Auditشده.
      */
     public static function custom_role_assignment_service(): \ClinicCore\Application\Roles\CustomRoleAssignmentService {
-        static $service = null;
+        static $service     = null;
         static $service_pid = null;
         if ( $service === null || $service_pid !== (int) getmypid() ) {
             try {
-            $service = new \ClinicCore\Application\Roles\CustomRoleAssignmentService(
-                new \ClinicCore\Application\Scope\TrustedClinicEstablisher( self::db(), new MembershipRepository( self::db() ) ),
-                self::authorization_service(),
-                new MembershipRepository( self::db() ),
-                new \ClinicCore\Infrastructure\Repository\CustomRoleRepository( self::db() ),
-                self::audit(),
-                self::db()
-            );
+                $service = new \ClinicCore\Application\Roles\CustomRoleAssignmentService(
+                    new \ClinicCore\Application\Scope\TrustedClinicEstablisher( self::db(), new MembershipRepository( self::db() ) ),
+                    self::authorization_service(),
+                    new MembershipRepository( self::db() ),
+                    new \ClinicCore\Infrastructure\Repository\CustomRoleRepository( self::db() ),
+                    self::audit(),
+                    self::db()
+                );
             } catch ( \Throwable $exception ) {
                 if ( null === $service ) {
                     throw $exception;
@@ -1574,15 +1574,15 @@ final class App
      * bootstrap؛ مجوز نهایی پس از آن فقط از MembershipService/AuthorizationService.
      */
     public static function first_practice_setup_service(): \ClinicCore\Application\Onboarding\FirstPracticeSetupService {
-        static $service = null;
+        static $service     = null;
         static $service_pid = null;
         if ( $service === null || $service_pid !== (int) getmypid() ) {
             try {
-            $service = new \ClinicCore\Application\Onboarding\FirstPracticeSetupService(
-                self::db(),
-                new MembershipRepository( self::db() ),
-                self::audit()
-            );
+                $service = new \ClinicCore\Application\Onboarding\FirstPracticeSetupService(
+                    self::db(),
+                    new MembershipRepository( self::db() ),
+                    self::audit()
+                );
             } catch ( \Throwable $exception ) {
                 if ( null === $service ) {
                     throw $exception;
@@ -1598,14 +1598,14 @@ final class App
      * سرویس عضویت (Phase 2 — C4 primitives / P2-D1).
      */
     public static function membership_service(): MembershipService {
-        static $service = null;
+        static $service     = null;
         static $service_pid = null;
         if ( $service === null || $service_pid !== (int) getmypid() ) {
             try {
-            $service = new MembershipService(
-                self::db(),
-                new MembershipRepository( self::db() )
-            );
+                $service = new MembershipService(
+                    self::db(),
+                    new MembershipRepository( self::db() )
+                );
             } catch ( \Throwable $exception ) {
                 if ( null === $service ) {
                     throw $exception;
@@ -1984,14 +1984,14 @@ final class App
      * `POST /clinic/v1/patient/enroll` remains the sole authority.
      */
     public static function patient_enrollment_options(): PatientEnrollmentOptions {
-        static $options = null;
+        static $options     = null;
         static $options_pid = null;
         if ( $options === null || $options_pid !== (int) getmypid() ) {
             try {
-            $options = new PatientEnrollmentOptions(
-                new PatientEnrollmentRepository( self::db() ),
-                self::licenseService()
-            );
+                $options = new PatientEnrollmentOptions(
+                    new PatientEnrollmentRepository( self::db() ),
+                    self::licenseService()
+                );
             } catch ( \Throwable $exception ) {
                 if ( null === $options ) {
                     throw $exception;
@@ -2352,16 +2352,16 @@ final class App
      * از همان ذخیره‌سازی Override عضویت و همان موتور مجوز استفاده می‌کند.
      */
     public static function finance_delegation_service(): FinanceDelegationService {
-        static $service = null;
+        static $service     = null;
         static $service_pid = null;
         if ( $service === null || $service_pid !== (int) getmypid() ) {
             try {
-            $service = new FinanceDelegationService(
-                self::db(),
-                new MembershipRepository( self::db() ),
-                self::membership_service(),
-                self::audit()
-            );
+                $service = new FinanceDelegationService(
+                    self::db(),
+                    new MembershipRepository( self::db() ),
+                    self::membership_service(),
+                    self::audit()
+                );
             } catch ( \Throwable $exception ) {
                 if ( null === $service ) {
                     throw $exception;
@@ -2377,19 +2377,19 @@ final class App
      * Dedicated Management Portal orchestration (reads + authorized writes).
      */
     public static function management_portal_service(): ManagementPortalService {
-        static $service = null;
+        static $service     = null;
         static $service_pid = null;
         if ( $service === null || $service_pid !== (int) getmypid() ) {
             try {
-            $service = new ManagementPortalService(
-                self::organization_clinic_provisioning_service(),
-                self::authorization_service(),
-                new \ClinicCore\Application\Scope\TrustedClinicEstablisher( self::db(), new MembershipRepository( self::db() ) ),
-                new MembershipRepository( self::db() ),
-                new LocationRepository( self::db() ),
-                new ClinicianRepository( self::db() ),
-                new ClinicRepository( self::db() )
-            );
+                $service = new ManagementPortalService(
+                    self::organization_clinic_provisioning_service(),
+                    self::authorization_service(),
+                    new \ClinicCore\Application\Scope\TrustedClinicEstablisher( self::db(), new MembershipRepository( self::db() ) ),
+                    new MembershipRepository( self::db() ),
+                    new LocationRepository( self::db() ),
+                    new ClinicianRepository( self::db() ),
+                    new ClinicRepository( self::db() )
+                );
             } catch ( \Throwable $exception ) {
                 if ( null === $service ) {
                     throw $exception;
@@ -2407,23 +2407,23 @@ final class App
      * is transport-agnostic, so the frontend portal can drive it without wp-admin.
      */
     public static function facility_setup_service(): \ClinicCore\Application\Onboarding\FacilitySetupService {
-        static $service = null;
+        static $service     = null;
         static $service_pid = null;
         if ( $service === null || $service_pid !== (int) getmypid() ) {
             try {
-            $service = new \ClinicCore\Application\Onboarding\FacilitySetupService(
-                self::db(),
-                self::organization_clinic_provisioning_service(),
-                self::locationService(),
-                self::locationRepository(),
-                self::authorization_service(),
-                self::membership_service(),
-                new MembershipRepository( self::db() ),
-                self::clinicianRepository(),
-                self::scheduleService(),
-                self::settingsFactory(),
-                self::audit()
-            );
+                $service = new \ClinicCore\Application\Onboarding\FacilitySetupService(
+                    self::db(),
+                    self::organization_clinic_provisioning_service(),
+                    self::location_service(),
+                    self::location_repository(),
+                    self::authorization_service(),
+                    self::membership_service(),
+                    new MembershipRepository( self::db() ),
+                    self::clinicianRepository(),
+                    self::scheduleService(),
+                    self::settingsFactory(),
+                    self::audit()
+                );
             } catch ( \Throwable $exception ) {
                 if ( null === $service ) {
                     throw $exception;
@@ -2760,15 +2760,15 @@ final class App
      */
     public static function wpUpdateBridge(): WpUpdateBridge
     {
-        static $bridge = null;
+        static $bridge     = null;
         static $bridge_pid = null;
         if ( $bridge === null || $bridge_pid !== (int) getmypid() ) {
             try {
-            // Phase 2 (رگرسیون 1f8b36d): سرویس Lazy — App::boot نباید
-            // Scope/Settings را resolve کند (نصبِ پیش از Migration / bootstrap
-            // تست‌ها). Provider فقط داخل هوک‌ها صدا زده می‌شود و آنجا هم
-            // fail-soft است (WpUpdateBridge).
-            $bridge = new WpUpdateBridge(static fn (): UpdateService => self::updateService());
+                // Phase 2 (رگرسیون 1f8b36d): سرویس Lazy — App::boot نباید
+                // Scope/Settings را resolve کند (نصبِ پیش از Migration / bootstrap
+                // تست‌ها). Provider فقط داخل هوک‌ها صدا زده می‌شود و آنجا هم
+                // fail-soft است (WpUpdateBridge).
+                $bridge = new WpUpdateBridge(static fn (): UpdateService => self::updateService());
             } catch ( \Throwable $exception ) {
                 if ( null === $bridge ) {
                     throw $exception;

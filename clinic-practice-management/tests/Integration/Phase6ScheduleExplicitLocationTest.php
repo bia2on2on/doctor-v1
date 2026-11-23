@@ -653,7 +653,7 @@ final class Phase6ScheduleExplicitLocationTest extends WP_UnitTestCase
         );
 
         $this->setClinicHorizon( $this->clinicA, self::HORIZON * 2 );
-        $deactivated = App::locationService()->set_active( $this->managerAId, $this->clinicA, $this->locA2, false );
+        $deactivated = App::location_service()->set_active( $this->managerAId, $this->clinicA, $this->locA2, false );
         self::assertSame( 0, (int) ( $deactivated['is_active'] ?? 1 ), 'LocationService deactivation persisted' );
         self::assertSame( 1, (int) ( $this->scheduleRow( $scheduleId )['is_active'] ?? 0 ), 'deactivation must preserve the existing Schedule row' );
         self::assertSame( $this->locA2, $this->scheduleLocationId( $scheduleId ), 'deactivation must not retarget the Schedule' );
@@ -677,7 +677,7 @@ final class Phase6ScheduleExplicitLocationTest extends WP_UnitTestCase
         $afterIds = array_map( static fn ( array $row ): int => (int) $row['id'], $after );
         self::assertSame( $beforeIds, $afterIds, 'inactive sweep must neither add slots nor remove historical/materialized rows' );
 
-        $reactivated = App::locationService()->set_active( $this->managerAId, $this->clinicA, $this->locA2, true );
+        $reactivated = App::location_service()->set_active( $this->managerAId, $this->clinicA, $this->locA2, true );
         self::assertSame( 1, (int) ( $reactivated['is_active'] ?? 0 ), 'LocationService reactivation persisted' );
         $this->runProductionSlotSweep();
         $afterReactivation = App::db()->fetchAll(
@@ -701,7 +701,7 @@ final class Phase6ScheduleExplicitLocationTest extends WP_UnitTestCase
         $scheduleId = (int) ( $created->get_data()['data']['id'] ?? 0 );
         self::assertGreaterThan( 0, $scheduleId, 'precondition: schedule id persisted' );
 
-        $deactivated = App::locationService()->set_active( $this->managerAId, $this->clinicA, $this->locA2, false );
+        $deactivated = App::location_service()->set_active( $this->managerAId, $this->clinicA, $this->locA2, false );
         self::assertSame( 0, (int) ( $deactivated['is_active'] ?? 1 ), 'precondition: A2 deactivated through lifecycle service' );
 
         $beforeCount = (int) App::db()->fetchValue(

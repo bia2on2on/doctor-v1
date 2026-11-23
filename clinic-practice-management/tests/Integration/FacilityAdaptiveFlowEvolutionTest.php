@@ -287,8 +287,8 @@ final class FacilityAdaptiveFlowEvolutionTest extends WP_UnitTestCase {
   $uid = $this->authorize(); $clinicId = (int) App::scope()->clinicId; global $wpdb;
   self::assertSame('', CpmsSetupWizard::save_facility(App::settings(),['facility_type'=>'doctor_practice','structure'=>'single'],$uid));
   self::assertSame('', CpmsSetupWizard::saveClinic(App::settings(),['clinic_name'=>'مطب کامل'],$uid));
-  $locs = App::locationRepository()->listForClinic($clinicId);
-  if ($locs===[]) { App::locationRepository()->create($clinicId,'مکان اصلی','main-'.wp_generate_password(6,false,false),'Asia/Tehran', gmdate('Y-m-d H:i:s')); $locs = App::locationRepository()->listForClinic($clinicId); }
+  $locs = App::location_repository()->listForClinic($clinicId);
+  if ($locs===[]) { App::location_repository()->create($clinicId,'مکان اصلی','main-'.wp_generate_password(6,false,false),'Asia/Tehran', gmdate('Y-m-d H:i:s')); $locs = App::location_repository()->listForClinic($clinicId); }
   $locationId = (int) $locs[0]['id'];
   $wpdb->query('SET FOREIGN_KEY_CHECKS=0'); $wpdb->query('DELETE FROM '.$wpdb->prefix.'cpms_clinicians WHERE clinic_id='.$clinicId); $wpdb->query('SET FOREIGN_KEY_CHECKS=1');
   App::clinicianRepository()->create($clinicId,['full_name'=>'پزشک کامل']);
@@ -485,8 +485,8 @@ final class FacilityAdaptiveFlowEvolutionTest extends WP_UnitTestCase {
   // Build a genuinely completed doctor-practice setup with real data.
   self::assertSame('', CpmsSetupWizard::save_facility(App::settings(),['facility_type'=>'doctor_practice','structure'=>'single'],$uid));
   self::assertSame('', CpmsSetupWizard::saveClinic(App::settings(),['clinic_name'=>'مطب کامل'],$uid));
-  $locs = App::locationRepository()->listForClinic($clinicId);
-  if ($locs===[]) { App::locationRepository()->create($clinicId,'مکان اصلی','main-'.wp_generate_password(6,false,false),'Asia/Tehran', gmdate('Y-m-d H:i:s')); $locs = App::locationRepository()->listForClinic($clinicId); }
+  $locs = App::location_repository()->listForClinic($clinicId);
+  if ($locs===[]) { App::location_repository()->create($clinicId,'مکان اصلی','main-'.wp_generate_password(6,false,false),'Asia/Tehran', gmdate('Y-m-d H:i:s')); $locs = App::location_repository()->listForClinic($clinicId); }
   $wpdb->query('SET FOREIGN_KEY_CHECKS=0'); $wpdb->query('DELETE FROM '.$wpdb->prefix.'cpms_clinicians WHERE clinic_id='.$clinicId); $wpdb->query('SET FOREIGN_KEY_CHECKS=1');
   App::clinicianRepository()->create($clinicId,['full_name'=>'پزشک کامل']);
   $clinicians = App::clinicianRepository()->listAll($clinicId,false);

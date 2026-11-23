@@ -212,7 +212,7 @@ final class Phase4LocationMasterDataTest extends WP_UnitTestCase
         ];
         wp_set_current_user($this->managerA);
 
-        $disabled = App::locationService()->set_active($this->managerA, $this->clinicA, $locationId, false);
+        $disabled = App::location_service()->set_active($this->managerA, $this->clinicA, $locationId, false);
         self::assertFalse((bool) $disabled['noop'], 'deactivation is a real transition');
         $disabledRow = $this->locationRow($locationId);
         self::assertNotNull($disabledRow, 'deactivation preserves the Location row');
@@ -232,11 +232,11 @@ final class Phase4LocationMasterDataTest extends WP_UnitTestCase
             $this->assertEqualsHistorical($historyBefore[$kind], $this->tableRow($table, $id), $kind . ' history survives Location deactivation');
         }
         self::assertSame(1, $this->auditCount('LOCATION_DEACTIVATED'), 'deactivation is audited');
-        $duplicate = App::locationService()->set_active($this->managerA, $this->clinicA, $locationId, false);
+        $duplicate = App::location_service()->set_active($this->managerA, $this->clinicA, $locationId, false);
         self::assertTrue((bool) $duplicate['noop'], 'duplicate deactivation is idempotent');
         self::assertSame(1, $this->auditCount('LOCATION_DEACTIVATED'), 'duplicate submissions do not duplicate audit entries');
 
-        $enabled = App::locationService()->set_active($this->managerA, $this->clinicA, $locationId, true);
+        $enabled = App::location_service()->set_active($this->managerA, $this->clinicA, $locationId, true);
         self::assertFalse((bool) $enabled['noop'], 'reactivation is a real transition');
         $enabledRow = $this->locationRow($locationId);
         self::assertNotNull($enabledRow, 'reactivation preserves the Location row');
@@ -255,7 +255,7 @@ final class Phase4LocationMasterDataTest extends WP_UnitTestCase
         wp_set_current_user($this->managerB);
 
         try {
-            App::locationService()->set_active($this->managerB, $this->clinicA, $locationId, false);
+            App::location_service()->set_active($this->managerB, $this->clinicA, $locationId, false);
             self::fail('a manager from Clinic B cannot change Clinic A Location state');
         } catch (\ClinicCore\Application\Location\LocationException $exception) {
             self::assertSame('LOCATION_PERMISSION_DENIED', $exception->getErrorCode());
@@ -271,7 +271,7 @@ final class Phase4LocationMasterDataTest extends WP_UnitTestCase
     {
         wp_set_current_user($this->managerA);
         try {
-            App::locationService()->set_active($this->managerA, $this->clinicA, $this->locA, false);
+            App::location_service()->set_active($this->managerA, $this->clinicA, $this->locA, false);
             self::fail('primary Location cannot be deactivated');
         } catch (\ClinicCore\Application\Location\LocationException $exception) {
             self::assertSame('LOCATION_LIFECYCLE_CONFLICT', $exception->getErrorCode());
@@ -948,7 +948,7 @@ final class Phase4LocationMasterDataTest extends WP_UnitTestCase
         try {
             $failed = false;
             try {
-                App::locationService()->set_active($this->managerA, $this->clinicA, $locationId, false);
+                App::location_service()->set_active($this->managerA, $this->clinicA, $locationId, false);
             } catch (\ClinicCore\Application\Location\LocationException) {
                 $failed = true;
             }
