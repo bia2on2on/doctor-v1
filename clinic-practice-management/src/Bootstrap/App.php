@@ -2156,6 +2156,7 @@ final class App
             self::patient_identity_activator(),
             self::audit(),
             self::op(),
+            self::licenseGate(),
             static function ( int $clinic_id, string $mobile, int $patient_id ): void {
                 $clinic_name = (string) ( self::db()->fetchValue(
                     'SELECT name FROM ' . self::db()->table( 'cpms_clinics' ) . ' WHERE id = %d LIMIT 1',

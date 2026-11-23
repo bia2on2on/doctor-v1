@@ -10,6 +10,7 @@ use ClinicCore\Application\Patients\PatientIdentityService;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
+use ClinicCore\Domain\Licensing\LicenseGate;
 use ClinicCore\Domain\Validators\MobileValidator;
 use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Domain\Validators\VisibleText;
@@ -71,6 +72,7 @@ final class PatientRegistrationService {
         private readonly PatientIdentityActivator $identity_activator,
         private readonly AuditLogger $audit,
         private readonly OpLogger $op,
+        private readonly LicenseGate $license_gate,
         ?callable $sms_notifier = null,
         private readonly ?PatientAccess $access = null
     ) {
@@ -310,7 +312,9 @@ final class PatientRegistrationService {
                         $patient_id = 0;
 
                         if ( [] === $patient_rows ) {
-                            // Case A: Create new clinical record in this clinic (only at Step 2).
+                            // Case A: new record — Q1 owner rule: new patients closed from T0 (stages 2 and 3).
+                            // Gate sits inside the transaction, immediately before the row is created; deny rolls back.
+                            $this->assert_registration_license( $clinic_id );
                             $is_new_row = true;
                             $mrn        = $this->generate_mrn( $clinic_id );
                             $wpdb       = $this->db->wpdb();
@@ -459,6 +463,13 @@ final class PatientRegistrationService {
                     }
                 }
             );
+        } catch ( BookingException $e ) {
+            if ( 'CLINIC_LICENSE_BLOCKED' === $e->errorCode ) {
+                $this->log_failure( 'license_blocked', $clinic_id );
+                throw $e;
+            }
+            $this->log_failure( 'registration_failed', $clinic_id );
+            throw $this->uniform_failure();
         } catch ( Throwable ) {
             $this->log_failure( 'registration_failed', $clinic_id );
             throw $this->uniform_failure();
@@ -671,6 +682,22 @@ final class PatientRegistrationService {
                 '٩' => '9',
             ]
         );
+    }
+
+    /**
+     * Q1 (owner rule): creating a NEW patient is closed from T0 in every stage.
+     * Mirrors PatientService::assert_license — same gate, same operation constant,
+     * same BookingException/503/CLINIC_LICENSE_BLOCKED mapping; no extra blanket rules.
+     */
+    private function assert_registration_license( int $clinic_id ): void {
+        try {
+            $decision = $this->license_gate->assert( LicenseGate::OP_PATIENT_CREATE, [ 'clinic_id' => $clinic_id ] );
+        } catch ( Throwable ) {
+            $decision = null;
+        }
+        if ( null === $decision || ! $decision->allowed ) {
+            throw new BookingException( 'CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازه ایجاد بیمار جدید را نمی‌دهد؛ خدمات مجاز برای بیماران موجود ادامه دارد', 503 );
+        }
     }
 
     private function uniform_failure(): BookingException {
