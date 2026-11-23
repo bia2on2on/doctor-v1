@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace ClinicCore\Infrastructure\Logging;
 
+use ClinicCore\Domain\Validators\NationalIdValidator;
+
 /**
  * Correlation ID (Baseline §26, M10) — خالص و قابل تست.
  *
@@ -23,7 +25,7 @@ final class CorrelationId
      */
     public static function fromHeader(?string $header): string
     {
-        if (is_string($header) && $header !== '' && preg_match(self::PATTERN, $header) === 1) {
+        if ( is_string( $header ) && '' !== $header && self::isValid( $header ) ) {
             return $header;
         }
 
@@ -32,11 +34,16 @@ final class CorrelationId
 
     public static function generate(): string
     {
-        return 'cpms-' . bin2hex(random_bytes(8));
+        do {
+            $id = 'cpms-' . bin2hex( random_bytes( 8 ) );
+        } while ( ! self::isValid( $id ) );
+
+        return $id;
     }
 
     public static function isValid(string $value): bool
     {
-        return preg_match(self::PATTERN, $value) === 1;
+        return 1 === preg_match( self::PATTERN, $value )
+            && NationalIdValidator::redact_digits( $value ) === $value;
     }
 }
