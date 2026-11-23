@@ -1419,7 +1419,8 @@ final class PublicBookingShortcode
             $reg_birth_id  = $auth_ns . '-reg-birth';
 
             $complete_reg_url = self::incomplete_registration_redirect_url();
-            $lines[]          = sprintf(
+
+            $lines[] = sprintf(
                 '<div class="%1$s" data-auth-step="otp-register" data-register-path="%2$s"%3$s hidden>',
                 esc_attr( $b . '__auth-step' ),
                 esc_attr( self::REGISTER_PATH ),
