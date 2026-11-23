@@ -1418,10 +1418,12 @@ final class PublicBookingShortcode
             $reg_nid_id    = $auth_ns . '-reg-nid';
             $reg_birth_id  = $auth_ns . '-reg-birth';
 
-            $lines[] = sprintf(
-                '<div class="%1$s" data-auth-step="otp-register" data-register-path="%2$s" hidden>',
+            $complete_reg_url = self::incomplete_registration_redirect_url();
+            $lines[]          = sprintf(
+                '<div class="%1$s" data-auth-step="otp-register" data-register-path="%2$s"%3$s hidden>',
                 esc_attr( $b . '__auth-step' ),
-                esc_attr( self::REGISTER_PATH )
+                esc_attr( self::REGISTER_PATH ),
+                '' !== $complete_reg_url ? ' data-complete-registration-url="' . esc_attr( $complete_reg_url ) . '"' : ''
             );
             $lines[] = sprintf(
                 '<label class="%1$s" for="%2$s">%3$s</label>',
@@ -2035,11 +2037,6 @@ final class PublicBookingShortcode
         if ( self::CONTINUATION_ANONYMOUS === $continuation ) {
             $config['otp_request_path'] = self::OTP_REQUEST_PATH;
             $config['otp_verify_path']  = self::OTP_VERIFY_PATH;
-            $config['register_path']    = self::REGISTER_PATH;
-            $complete_reg_url           = self::incomplete_registration_redirect_url();
-            if ( '' !== $complete_reg_url ) {
-                $config['complete_registration_url'] = $complete_reg_url;
-            }
         } elseif ( self::CONTINUATION_PATIENT === $continuation ) {
             // فقط برای بیمارِ واردشده — CSRF با wp_rest nonce (همان مرزِ B1/B2).
             $config['nonce']        = wp_create_nonce( 'wp_rest' );

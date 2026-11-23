@@ -202,7 +202,16 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertSame( 403, $visitsDenied->get_status() );
         self::assertSame( PatientAccess::PROOF_FAILED_CODE, $visitsDenied->get_data()['code'] ?? null );
 
-        $holdDenied = $this->dispatchRestWithNonce( 'POST', '/clinic/v1/booking/hold', [ 'clinician_id' => $this->clinicianListed ], $step1['rest_nonce'] );
+        $holdDenied = $this->dispatchRestWithNonce(
+            'POST',
+            '/clinic/v1/booking/hold',
+            [
+                'clinician_id' => $this->clinicianListed,
+                'slot_date'    => gmdate( 'Y-m-d', time() + 3 * 86400 ),
+                'slot_time'    => '10:00:00',
+            ],
+            $step1['rest_nonce']
+        );
         self::assertSame( 403, $holdDenied->get_status() );
         self::assertSame( PatientAccess::PROOF_FAILED_CODE, $holdDenied->get_data()['code'] ?? null );
 

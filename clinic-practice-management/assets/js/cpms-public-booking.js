@@ -1658,8 +1658,12 @@
 				}
 				var nonce = typeof payload.rest_nonce === 'string' ? payload.rest_nonce : '';
 				if (!nonce) {
-					if (isNonEmptyString(config.complete_registration_url)) {
-						window.location.assign(config.complete_registration_url);
+					var regStep = root.querySelector('[data-auth-step="otp-register"]');
+					var completeUrl = (regStep && isNonEmptyString(regStep.getAttribute('data-complete-registration-url')))
+						? regStep.getAttribute('data-complete-registration-url')
+						: config.complete_registration_url;
+					if (isNonEmptyString(completeUrl)) {
+						window.location.assign(completeUrl);
 					} else {
 						window.location.reload();
 					}
