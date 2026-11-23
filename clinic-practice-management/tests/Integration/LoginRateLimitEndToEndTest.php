@@ -521,4 +521,104 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
         self::assertCount(1, $ipRowsAfter);
         self::assertSame(LoginRateLimiter::MAX_PER_USERNAME + 1, (int) $ipRowsAfter[0]['hits'], 'the IP bucket grows by exactly one failure.');
     }
+
+    /** (new) Empty-string key row on a correct password: controlled 503 error, no cookie, no bucket growth. */
+    public function testEmptyKeyRowReturnsControlledErrorWithoutCookieOrBuckets(): void
+    {
+        self::assertFalse(defined('CPMS_NID_HMAC_KEY'), 'CPMS_NID_HMAC_KEY must not be defined for this test');
+
+        $username = 'lrl_e2e_key_' . bin2hex(random_bytes(4));
+        $password = 'e2e-password-123';
+        $user_id  = wp_create_user($username, $password, $username . '@e2e.test');
+        self::assertGreaterThan(0, $user_id);
+
+        $db    = App::db();
+        $table = $db->table('cpms_rate_limits');
+        $countUsernameBuckets = static function () use ($db, $table): int {
+            return (int) $db->fetchValue('SELECT COUNT(*) FROM ' . $table . " WHERE window_key LIKE 'login-user:%'", []);
+        };
+
+        // Save the prior state of the key option (absent vs present).
+        wp_cache_delete('cpms_nid_hmac_key', 'options');
+        wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
+        $prior_key = get_option('cpms_nid_hmac_key', null);
+        $count_before = $countUsernameBuckets();
+
+        try {
+            // Empty-string option row: add_option() refuses (the row exists),
+            // the plain re-read returns '', hmac_key() throws.
+            update_option('cpms_nid_hmac_key', '');
+            wp_cache_delete('cpms_nid_hmac_key', 'options');
+            wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
+
+            $authCookieCount   = 0;
+            $loggedInCookieCount = 0;
+            $cookieSpy = static function () use (&$authCookieCount): void {
+                $authCookieCount++;
+            };
+            $loggedInCookieSpy = static function () use (&$loggedInCookieCount): void {
+                $loggedInCookieCount++;
+            };
+            $suppressCookies = static function (): bool {
+                return false;
+            };
+            add_action('set_auth_cookie', $cookieSpy, 10, 6);
+            add_action('set_logged_in_cookie', $loggedInCookieSpy, 10, 6);
+            add_filter('send_auth_cookies', $suppressCookies, 10, 1);
+
+            $result = null;
+            $signon = null;
+            try {
+                $result = wp_authenticate($username, $password);
+                $signon = wp_signon([
+                    'user_login'    => $username,
+                    'user_password' => $password,
+                    'remember'      => false,
+                ], false);
+            } finally {
+                remove_action('set_auth_cookie', $cookieSpy, 10);
+                remove_action('set_logged_in_cookie', $loggedInCookieSpy, 10);
+                remove_filter('send_auth_cookies', $suppressCookies, 10);
+            }
+
+            wp_set_current_user(0);
+
+            // A correct password must NOT get a session on the key-failure path.
+            self::assertInstanceOf(WP_Error::class, $result);
+            self::assertSame('cpms_login_throttle_unavailable', $result->get_error_code());
+            $resultData = $result->get_error_data();
+            self::assertArrayHasKey('status', $resultData);
+            self::assertSame(503, $resultData['status']);
+            self::assertInstanceOf(WP_Error::class, $signon);
+            self::assertSame('cpms_login_throttle_unavailable', $signon->get_error_code());
+            $signonData = $signon->get_error_data();
+            self::assertArrayHasKey('status', $signonData);
+            self::assertSame(503, $signonData['status']);
+            self::assertSame(0, $authCookieCount, 'set_auth_cookie must not fire on the key-failure path.');
+            self::assertSame(0, $loggedInCookieCount, 'set_logged_in_cookie must not fire on the key-failure path.');
+            self::assertSame([], WP_Session_Tokens::get_instance($user_id)->get_all());
+            self::assertSame($count_before, $countUsernameBuckets(), 'the key-failure path must not grow the username buckets.');
+
+            // Positive witness under the SAME count query: a valid key + a
+            // wrong password grows exactly one username bucket row.
+            update_option('cpms_nid_hmac_key', bin2hex(random_bytes(32)));
+            wp_cache_delete('cpms_nid_hmac_key', 'options');
+            wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
+            $count_before_positive = $countUsernameBuckets();
+
+            $positive = wp_authenticate($username, 'wrong-password-1');
+
+            self::assertInstanceOf(WP_Error::class, $positive);
+            self::assertSame('incorrect_password', $positive->get_error_code());
+            self::assertSame($count_before_positive + 1, $countUsernameBuckets(), 'a wrong-password attempt with a valid key grows the username bucket by exactly one row.');
+        } finally {
+            if ($prior_key === null) {
+                delete_option('cpms_nid_hmac_key');
+            } else {
+                update_option('cpms_nid_hmac_key', $prior_key);
+            }
+            wp_cache_delete('cpms_nid_hmac_key', 'options');
+            wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
+        }
+    }
 }
