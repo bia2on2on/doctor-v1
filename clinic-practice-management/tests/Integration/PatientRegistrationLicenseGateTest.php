@@ -5,7 +5,7 @@ declare( strict_types=1 );
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Application\Auth\OtpService;
-use ClinicCore\Application\Auth\PatientLoginRepository;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Application\Auth\PatientNidHmac;
 use ClinicCore\Application\Auth\PatientRegistrationService;
 use ClinicCore\Application\Auth\PatientSessionProofStore;
