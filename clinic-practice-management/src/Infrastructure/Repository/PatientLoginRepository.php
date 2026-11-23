@@ -180,7 +180,11 @@ final class PatientLoginRepository {
      *
      * @param list<int> $patient_ids
      */
-    public function count_active_future_appointments_for_patients( array $patient_ids, string $today_date ): int {
+    public function count_active_future_appointments_for_patients(
+        array $patient_ids,
+        string $today_date,
+        ?int $exclude_appointment_id = null
+    ): int {
         $clean_ids = array_values(
             array_unique(
                 array_filter(
@@ -195,14 +199,18 @@ final class PatientLoginRepository {
 
         $placeholders = implode( ',', array_fill( 0, count( $clean_ids ), '%d' ) );
         $params       = array_merge( $clean_ids, [ $today_date ] );
-        $rows         = $this->db->fetch_all_strict(
-            'SELECT COUNT(*) AS cnt FROM ' . $this->db->table( 'cpms_appointments' )
+        $sql          = 'SELECT COUNT(*) AS cnt FROM ' . $this->db->table( 'cpms_appointments' )
             . " WHERE patient_id IN ({$placeholders})"
             . " AND status IN ('pending','confirmed')"
             . ' AND rescheduled_to IS NULL'
-            . ' AND slot_date >= %s',
-            $params
-        );
+            . ' AND slot_date >= %s';
+
+        if ( null !== $exclude_appointment_id && $exclude_appointment_id > 0 ) {
+            $sql     .= ' AND id <> %d';
+            $params[] = $exclude_appointment_id;
+        }
+
+        $rows = $this->db->fetch_all_strict( $sql, $params );
 
         return (int) ( $rows[0]['cnt'] ?? 0 );
     }
@@ -256,24 +264,50 @@ final class PatientLoginRepository {
 
     /**
      * Promotes a `pending` account row to `active` (`closed` accounts remain closed).
+     * When `$given_name` / `$family_name` are supplied (Step 2 registration completion),
+     * they are persisted atomically alongside the state transition.
      */
-    public function activate_account_from_pending( int $account_id, int $wp_user_id ): void {
+    public function activate_account_from_pending(
+        int $account_id,
+        int $wp_user_id,
+        ?string $given_name = null,
+        ?string $family_name = null
+    ): void {
         $was_strict = $this->db->is_strict();
         $this->db->setStrict( true );
         try {
-            $this->db->execute(
-                'UPDATE ' . $this->db->table( 'cpms_patient_logins' )
-                . ' SET state = %s, updated_at = %s'
-                . ' WHERE id = %d AND kind = %s AND wp_user_id = %d AND state = %s',
-                [
-                    self::STATE_ACTIVE,
-                    $this->db->nowUtcSql(),
-                    $account_id,
-                    self::KIND_ACCOUNT,
-                    $wp_user_id,
-                    self::STATE_PENDING,
-                ]
-            );
+            $now = $this->db->nowUtcSql();
+            if ( null !== $given_name || null !== $family_name ) {
+                $this->db->execute(
+                    'UPDATE ' . $this->db->table( 'cpms_patient_logins' )
+                    . ' SET state = %s, given_name = %s, family_name = %s, updated_at = %s'
+                    . ' WHERE id = %d AND kind = %s AND wp_user_id = %d AND state = %s',
+                    [
+                        self::STATE_ACTIVE,
+                        $given_name,
+                        $family_name,
+                        $now,
+                        $account_id,
+                        self::KIND_ACCOUNT,
+                        $wp_user_id,
+                        self::STATE_PENDING,
+                    ]
+                );
+            } else {
+                $this->db->execute(
+                    'UPDATE ' . $this->db->table( 'cpms_patient_logins' )
+                    . ' SET state = %s, updated_at = %s'
+                    . ' WHERE id = %d AND kind = %s AND wp_user_id = %d AND state = %s',
+                    [
+                        self::STATE_ACTIVE,
+                        $now,
+                        $account_id,
+                        self::KIND_ACCOUNT,
+                        $wp_user_id,
+                        self::STATE_PENDING,
+                    ]
+                );
+            }
 
             $row = $this->find_account_by_user_id( $wp_user_id );
             if ( null === $row || self::STATE_ACTIVE !== (string) ( $row['state'] ?? '' ) ) {

@@ -26,6 +26,21 @@ final class PatientTwoProofTestHelper {
     /** @var array<int, string> */
     private static array $cookies_by_user = [];
 
+    private static int $nid_seq = 1000;
+
+    public static function next_valid_national_id(): string {
+        ++self::$nid_seq;
+        $base = sprintf( '049%06d', self::$nid_seq % 1000000 );
+        $sum  = 0;
+        for ( $i = 0; $i < 9; ++$i ) {
+            $sum += (int) $base[ $i ] * ( 10 - $i );
+        }
+        $rem   = $sum % 11;
+        $check = $rem < 2 ? $rem : 11 - $rem;
+
+        return $base . (string) $check;
+    }
+
     /**
      * Seeds a live two-proof patient session + active binding (+ optional identity edges).
      *

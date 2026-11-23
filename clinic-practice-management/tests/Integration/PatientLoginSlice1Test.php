@@ -1041,6 +1041,31 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
         self::assertSame( 'PrecheckWitness', (string) ( $samePatientResp->get_data()['data']['first_name'] ?? '' ) );
         self::assertIsArray( $logins->find_binding( $this->userPending, $this->clinicA, $this->patientPending, true ) );
         self::assertIsArray( WP_Session_Tokens::get_instance( $this->userPending )->get( $token ) );
+
+        // W1: Valid unique-NID staff edit passes pre-check, executes 1 UPDATE cpms_patients row, and closes binding (§7.6).
+        $uniqueNid          = '0499370899';
+        $precheckSelectHits = 0;
+        $patientUpdateHits  = 0;
+        add_filter( 'query', $sqlSpy, 5 );
+        try {
+            $uniqueResp = $this->dispatchRest(
+                'PUT',
+                '/clinic/v1/patients/' . $this->patientPending,
+                [ 'national_id' => $uniqueNid ],
+                $this->userStaff
+            );
+        } finally {
+            remove_filter( 'query', $sqlSpy, 5 );
+        }
+        self::assertSame( 200, $uniqueResp->get_status() );
+        self::assertSame( 1, $precheckSelectHits, 'Valid unique-NID staff edit must run the pre-check query once.' );
+        self::assertSame( 1, $patientUpdateHits, 'Valid unique-NID staff edit must execute exactly 1 UPDATE cpms_patients statement.' );
+        $updatedRow = App::db()->fetchRow( 'SELECT national_id FROM ' . $patientTable . ' WHERE id = %d', [ $this->patientPending ] );
+        self::assertIsArray( $updatedRow );
+        self::assertArrayHasKey( 'national_id', $updatedRow );
+        self::assertSame( $uniqueNid, (string) $updatedRow['national_id'] );
+        self::assertNull( $logins->find_binding( $this->userPending, $this->clinicA, $this->patientPending, true ), 'NID correction must close active binding (§7.6).' );
+        self::assertNull( WP_Session_Tokens::get_instance( $this->userPending )->get( $token ), 'NID correction must destroy patient sessions (§7.6).' );
     }
 
     // =========================================================================

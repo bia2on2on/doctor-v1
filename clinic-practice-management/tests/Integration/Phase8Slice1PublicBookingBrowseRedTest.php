@@ -1510,10 +1510,12 @@ final class Phase8Slice1PublicBookingBrowseRedTest extends WP_UnitTestCase
             'first_name' => $this->phiFirstName,
             'last_name' => $this->phiLastName,
             'mobile' => $this->phiMobile,
+            'national_id' => '0010000003',
+            'birth_date' => '1990-01-01',
             'status' => 'active',
             'created_at' => $now,
             'updated_at' => $now,
-        ], ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s'], 'patient');
+        ], ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s'], 'patient');
 
         // Settings for the bound Clinic, at the documented defaults. Chosen
         // timings below are unambiguous under every value this repository ever

@@ -220,16 +220,18 @@ final class PkgP3UnassignedClinicianLegacyTest extends WP_UnitTestCase
             $patient_id = $this->insert_row(
                 'cpms_patients',
                 [
-                    'clinic_id'  => $this->clinic_id,
-                    'mrn'        => 'P3UL-' . $this->uid,
-                    'first_name' => 'Legacy',
-                    'last_name'  => 'Fixture',
-                    'mobile'     => $mobile,
-                    'status'     => 'active',
-                    'created_at' => $now,
-                    'updated_at' => $now,
+                    'clinic_id'   => $this->clinic_id,
+                    'mrn'         => 'P3UL-' . $this->uid,
+                    'first_name'  => 'Legacy',
+                    'last_name'   => 'Fixture',
+                    'mobile'      => $mobile,
+                    'national_id' => PatientTwoProofTestHelper::next_valid_national_id(),
+                    'birth_date'  => '1990-01-01',
+                    'status'      => 'active',
+                    'created_at'  => $now,
+                    'updated_at'  => $now,
                 ],
-                [ '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s' ]
+                [ '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' ]
             );
             $this->insert_row(
                 'cpms_patient_user_links',

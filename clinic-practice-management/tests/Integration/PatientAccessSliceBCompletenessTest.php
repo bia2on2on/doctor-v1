@@ -43,7 +43,8 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
 
     /** @var list<string> */
     private const GATED_PATIENT_ENDPOINTS = [
-        // Slice A + D4 (5 definitions -> 7 expanded pairs).
+        // Slice A + D4 + Slice 2 registration (6 definitions -> 8 expanded pairs).
+        'POST /clinic/v1/patient/register',
         'POST /clinic/v1/patient/link-record',
         'POST /clinic/v1/patient/enroll',
         'GET /clinic/v1/patient/my-records',
@@ -99,14 +100,16 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
         $db->insert(
             'cpms_patients',
             [
-                'clinic_id'  => 1,
-                'mrn'        => 'MR-SBC-' . uniqid(),
-                'first_name' => 'SliceB',
-                'last_name'  => 'Complete',
-                'mobile'     => '09123334455',
-                'status'     => 'active',
-                'created_at' => $now,
-                'updated_at' => $now,
+                'clinic_id'   => 1,
+                'mrn'         => 'MR-SBC-' . uniqid(),
+                'first_name'  => 'SliceB',
+                'last_name'   => 'Complete',
+                'mobile'      => '09123334455',
+                'national_id' => PatientTwoProofTestHelper::next_valid_national_id(),
+                'birth_date'  => '1990-01-01',
+                'status'      => 'active',
+                'created_at'  => $now,
+                'updated_at'  => $now,
             ]
         );
         $this->patientA = $db->wpdb_last_insert_id();
@@ -190,7 +193,7 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
                 );
             }
         }
-        self::assertCount( 23, $nonPublic23 );
+        self::assertCount( 24, $nonPublic23 );
     }
 
     /**
@@ -428,7 +431,7 @@ final class PatientAccessSliceBCompletenessTest extends WP_UnitTestCase {
     }
 
     private function populateSampleParams( WP_REST_Request $request, string $pattern ): void {
-        if ( str_contains( $pattern, '/patient/link-record' ) ) {
+        if ( str_contains( $pattern, '/patient/register' ) || str_contains( $pattern, '/patient/link-record' ) ) {
             $request->set_param( 'clinic_id', 1 );
         } elseif ( str_contains( $pattern, '/patient/enroll' ) ) {
             $request->set_param( 'clinic_id', 1 );

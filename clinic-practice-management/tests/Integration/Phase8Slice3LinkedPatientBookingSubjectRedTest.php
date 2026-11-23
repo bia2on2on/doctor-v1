@@ -1502,10 +1502,12 @@ final class Phase8Slice3LinkedPatientBookingSubjectRedTest extends WP_UnitTestCa
             'first_name' => $firstName,
             'last_name' => $lastName,
             'mobile' => $mobile,
+            'national_id' => PatientTwoProofTestHelper::next_valid_national_id(),
+            'birth_date' => '1990-01-01',
             'status' => $status,
             'created_at' => App::db()->nowUtcSql(),
             'updated_at' => App::db()->nowUtcSql(),
-        ], ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s'], 'patient');
+        ], ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s'], 'patient');
     }
 
     private function insertLink(int $clinicId, int $patientId, int $userId, string $mobile, int $isPrimary): int

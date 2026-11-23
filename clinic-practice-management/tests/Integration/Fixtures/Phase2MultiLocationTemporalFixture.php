@@ -120,12 +120,14 @@ trait Phase2MultiLocationTemporalFixture
 
         // Patient
         $wpdb->query($wpdb->prepare(
-            'INSERT INTO ' . $wpdb->prefix . 'cpms_patients (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at) VALUES (%d, %s, %s, %s, %s, "active", %s, %s)',
+            'INSERT INTO ' . $wpdb->prefix . 'cpms_patients (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at) VALUES (%d, %s, %s, %s, %s, %s, %s, "active", %s, %s)',
             self::FX_T_CLINIC_ID,
             'MR-TEMP-' . bin2hex(random_bytes(3)),
             'Temporal',
             'Patient',
             '0912000' . random_int(1000, 9999),
+            \ClinicCore\Tests\Support\PatientTwoProofTestHelper::next_valid_national_id(),
+            '1990-01-01',
             $now,
             $now
         ));
@@ -175,12 +177,14 @@ trait Phase2MultiLocationTemporalFixture
         $now = App::db()->nowUtcSql();
         $clinicId = $clinicId ?? self::FX_T_CLINIC_ID;
         $wpdb->query($wpdb->prepare(
-            'INSERT INTO ' . $wpdb->prefix . 'cpms_patients (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at) VALUES (%d, %s, %s, %s, %s, "active", %s, %s)',
+            'INSERT INTO ' . $wpdb->prefix . 'cpms_patients (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at) VALUES (%d, %s, %s, %s, %s, %s, %s, "active", %s, %s)',
             $clinicId,
             'MR-TEMP-' . bin2hex(random_bytes(3)),
             'Temporal',
             'Patient' . bin2hex(random_bytes(2)),
             '0912000' . random_int(1000, 9999),
+            \ClinicCore\Tests\Support\PatientTwoProofTestHelper::next_valid_national_id(),
+            '1990-01-01',
             $now,
             $now
         ));

@@ -82,12 +82,13 @@ final class NotificationFlowTest extends WP_UnitTestCase
         $wpdb->query(
             $wpdb->prepare(
                 'INSERT INTO ' . $wpdb->prefix . 'cpms_patients
-                     (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
-                 VALUES (1, %s, %s, %s, %s, "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                     (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at)
+                 VALUES (1, %s, %s, %s, %s, %s, "1990-01-01", "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
                 'MR-NF-' . $seq,
                 'Notify',
                 'P' . $seq,
                 '0914' . sprintf('%07d', $seq),
+                PatientTwoProofTestHelper::next_valid_national_id(),
                 $now,
                 $now
             )

@@ -6,6 +6,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Application\Auth;
 
+use ClinicCore\Application\Clinic\PublicClinicDirectory;
 use ClinicCore\Application\Notifications\SmsService;
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Bootstrap\App;
@@ -382,7 +383,7 @@ final class OtpService
      *
      * @throws OtpException
      */
-    public function verify(string $rawMobile, string $code, string $purpose = self::PURPOSE_LOGIN, ?string $ip = null): array
+    public function verify( string $rawMobile, string $code, string $purpose = self::PURPOSE_LOGIN, ?string $ip = null, ?int $expected_clinic_id = null ): array
     {
         $mobile = MobileValidator::normalize($rawMobile);
         if ($mobile === null || !preg_match('/^\d{6}$/', $code)) {
@@ -422,6 +423,9 @@ final class OtpService
         // هرگز استثنای فراری، هرگز 500. کلیدهای Cooldown/Lockout هویت‌سطح
         // می‌مانند (AD-15 — بدون بازطراحی).
         $rowClinicId = (isset($row['clinic_id']) && $row['clinic_id'] !== null) ? (int) $row['clinic_id'] : null;
+        if ( null !== $expected_clinic_id && $expected_clinic_id > 0 && $rowClinicId !== $expected_clinic_id ) {
+            throw new OtpException( 'CLINIC_OTP_INVALID', 'کد واردشده معتبر نیست' );
+        }
         try {
             $settings = $rowClinicId !== null
                 ? $this->settingsFactory->forClinic($rowClinicId)
@@ -446,11 +450,27 @@ final class OtpService
         // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy local naming preserved.
         $clinic_id      = $clinicId;
         $outer_tx_depth = $this->db->tx_depth();
+        $is_step1_reg   = ( self::PURPOSE_VERIFY_MOBILE === $purpose && null !== $expected_clinic_id && $expected_clinic_id > 0 );
+        $current_actor_id = function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+
+        if ( $is_step1_reg ) {
+            if ( $outer_tx_depth > 0 ) {
+                throw new OtpException( 'CLINIC_OTP_INVALID', 'خطای نشست؛ لطفاً دوباره تلاش کنید' );
+            }
+            if ( $current_actor_id > 0 && ! App::patient_access()->is_pure_patient_actor( $current_actor_id ) ) {
+                throw new OtpException( 'CLINIC_OTP_INVALID', 'احراز هویت برای این نشست مجاز نیست' );
+            }
+            if ( ! $this->is_trusted_public_registration_clinic( (int) $expected_clinic_id ) ) {
+                throw new OtpException( 'CLINIC_OTP_INVALID', 'کد واردشده معتبر نیست' );
+            }
+        }
+
+        $created_user_descriptors = [];
 
         try {
             $verify_outcome = $this->db->transactional(
                 // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy local naming preserved.
-                function () use ( $row, $rowClinicId, $mobile, $code, $purpose, $ip, $clinic_id, $policy, $outer_tx_depth ): array {
+                function () use ( $row, $rowClinicId, $mobile, $code, $purpose, $ip, $clinic_id, $policy, $outer_tx_depth, $expected_clinic_id, $is_step1_reg, $current_actor_id, &$created_user_descriptors ): array {
                     // One current read serializes failures and successful consumes
                     // on this challenge. Recheck expiry/lock AFTER any lock wait:
                     // stale pre-transaction state cannot lose failed attempts or
@@ -464,6 +484,7 @@ final class OtpService
                     }
                     $locked_clinic = $locked !== null && isset( $locked['clinic_id'] ) ? (int) $locked['clinic_id'] : null;
                     if ( $locked === null || $locked_clinic !== $rowClinicId
+                        || ( null !== $expected_clinic_id && $expected_clinic_id > 0 && $locked_clinic !== $expected_clinic_id )
                         || (string) $locked['mobile'] !== $mobile || (string) $locked['purpose'] !== $purpose
                         || $locked['consumed_at'] !== null ) {
                         return [ 'error' => new OtpException( 'CLINIC_OTP_INVALID', 'این کد قبلاً استفاده شده است' ) ];
@@ -556,10 +577,11 @@ final class OtpService
                     //
                     // OD-8 هم برقرار است: Purposeِ `verify_mobile` نیز همین مسیر
                     // را می‌گیرد (هیچ حسابی ساخته نمی‌شود).
-                    $user_id        = 0;
-                    $is_new_user    = false;
-                    $session_issued = false;
-                    $patient_links  = [];
+                    $user_id              = 0;
+                    $is_new_user          = false;
+                    $session_issued       = false;
+                    $pending_registration = false;
+                    $patient_links        = [];
 
                     // P4: issue an account-only non-persistent session (8h, mobile proof only)
                     // ONLY when a live pure-patient `cpms_patient_logins` account row exists
@@ -590,6 +612,42 @@ final class OtpService
                                 }
                             }
                         }
+                    } elseif ( $is_step1_reg ) {
+                        // Two-step registration Step 1: only when `PURPOSE_VERIFY_MOBILE` is
+                        // verified against a trusted public `clinic_id` (`$expected_clinic_id`).
+                        // Provisions/reuses a `STATE_PENDING` account with ZERO `cpms_patients`
+                        // rows and ZERO bindings (clinic-less `verify_mobile` keeps `user_id=0`).
+                        $login_repo = new PatientLoginRepository( $this->db );
+                        if ( ! $login_repo->table_exists() ) {
+                            throw new \RuntimeException( 'PatientLoginRepository table missing' );
+                        }
+                        $account = $login_repo->find_account_by_mobile( $mobile, true );
+                        if ( null === $account ) {
+                            $provisioned                = PatientRegistrationService::provision_pending_account_in_tx( $this->db, $login_repo, $mobile );
+                            $created_user_descriptors[] = $provisioned['descriptor'];
+                            $user_id                    = (int) $provisioned['user_id'];
+                            $session_issued             = true;
+                            $pending_registration       = true;
+                        } elseif (
+                            in_array(
+                                (string) ( $account['state'] ?? '' ),
+                                [ PatientLoginRepository::STATE_PENDING, PatientLoginRepository::STATE_ACTIVE ],
+                                true
+                            )
+                        ) {
+                            $candidate_user_id = (int) ( $account['wp_user_id'] ?? 0 );
+                            if (
+                                $candidate_user_id > 0
+                                && App::patient_access()->is_pure_patient_actor( $candidate_user_id )
+                                && ( $current_actor_id <= 0 || $current_actor_id === $candidate_user_id )
+                            ) {
+                                $user_id              = $candidate_user_id;
+                                $session_issued       = true;
+                                $pending_registration = ( PatientLoginRepository::STATE_PENDING === (string) ( $account['state'] ?? '' ) );
+                            } elseif ( $current_actor_id > 0 && $current_actor_id !== $candidate_user_id ) {
+                                throw new OtpException( 'CLINIC_OTP_INVALID', 'احراز هویت برای این نشست مجاز نیست' );
+                            }
+                        }
                     }
 
                     // phpcs:ignore PEAR.Functions.FunctionCallSignature.SpaceAfterOpenBracket,PEAR.Functions.FunctionCallSignature.SpaceBeforeCloseBracket -- compact audit helper.
@@ -600,20 +658,17 @@ final class OtpService
                     }
 
                     return [
-                        'user_id'        => $user_id,
-                        'clinic_id'      => $clinic_id,
-                        'patient_links'  => $patient_links,
-                        'is_new_user'    => $is_new_user,
-                        'session_issued' => $session_issued,
+                        'user_id'              => $user_id,
+                        'clinic_id'            => $clinic_id,
+                        'patient_links'        => $patient_links,
+                        'is_new_user'          => $is_new_user,
+                        'session_issued'       => $session_issued,
+                        'pending_registration' => $pending_registration,
                     ];
                 }
             );
         } catch ( \Throwable $e ) {
-            // CpmsDb has already rolled the boundary back when this catch runs.
-            // Since owner decision A the boundary provisions no identities, so
-            // there are no WP user caches to evict; the call stays as a narrow,
-            // allocation-free no-op (defense in depth, never a global flush).
-            UserCacheRollback::invalidate( [] );
+            UserCacheRollback::invalidate( $created_user_descriptors );
             throw $e;
         }
 
@@ -623,18 +678,42 @@ final class OtpService
 
         $returned_user_id = (int) $verify_outcome['user_id'];
         $session_issued   = false;
+        $rest_nonce       = '';
 
         // کوکی احراز هویت غیرپایدار (۸ ساعت، remember=false) و اثبات موبایلِ نشست
         // پس از Commitِ پایدار صادر می‌شوند — هر شکست در مرز بالا کامل roll back شده.
         if ( $verify_outcome['session_issued'] && $returned_user_id > 0 ) {
-            $proof_store    = new PatientSessionProofStore();
-            $session_token  = $proof_store->issue_non_persistent_auth_cookie( $returned_user_id );
+            $proof_store = new PatientSessionProofStore();
+            if ( $is_step1_reg ) {
+                $this->session_scope()->begin_otp_cookie_issue( $returned_user_id, (int) $expected_clinic_id );
+                try {
+                    $session_token = $proof_store->issue_non_persistent_auth_cookie( $returned_user_id );
+                } finally {
+                    $this->session_scope()->end_otp_cookie_issue();
+                }
+            } else {
+                $session_token = $proof_store->issue_non_persistent_auth_cookie( $returned_user_id );
+            }
+
             $proof_recorded = '' !== $session_token
                 && $proof_store->record_mobile_proof( $returned_user_id, $mobile, null, $session_token );
+
+            if ( $proof_recorded && $is_step1_reg && (bool) ( $verify_outcome['pending_registration'] ?? false ) ) {
+                $proof_recorded = $proof_store->record_registration_mobile_proof(
+                    $returned_user_id,
+                    (int) $expected_clinic_id,
+                    $mobile,
+                    null,
+                    $session_token
+                );
+            }
 
             if ( $proof_recorded ) {
                 $this->session_scope()->set_in_process_session_token( $returned_user_id, $session_token );
                 $session_issued = true;
+                if ( $is_step1_reg ) {
+                    $rest_nonce = $proof_store->create_rest_nonce_for_token( $returned_user_id, $session_token );
+                }
             } else {
                 if ( function_exists( 'wp_clear_auth_cookie' ) ) {
                     wp_clear_auth_cookie();
@@ -665,12 +744,38 @@ final class OtpService
             $returned_user_id = 0;
         }
 
-        return [
+        $response = [
             'user_id'        => $returned_user_id,
             'patient_links'  => $verify_outcome['patient_links'],
             'is_new_user'    => (bool) $verify_outcome['is_new_user'],
             'session_issued' => $session_issued,
         ];
+
+        if ( $is_step1_reg && $session_issued ) {
+            $response['rest_nonce']           = $rest_nonce;
+            $response['clinic_id']            = (int) $expected_clinic_id;
+            $response['pending_registration'] = (bool) ( $verify_outcome['pending_registration'] ?? false );
+        }
+
+        return $response;
+    }
+
+    private function is_trusted_public_registration_clinic( int $clinic_id ): bool {
+        if ( $clinic_id <= 0 ) {
+            return false;
+        }
+
+        $row = $this->db->fetchRow(
+            'SELECT c.id FROM ' . $this->db->table( 'cpms_clinics' ) . ' c'
+            . ' INNER JOIN ' . $this->db->table( 'cpms_organizations' ) . ' o ON o.id = c.organization_id'
+            . " WHERE c.id = %d AND c.status = 'active' AND o.status = 'active' LIMIT 1",
+            [ $clinic_id ]
+        );
+        if ( null === $row ) {
+            return false;
+        }
+
+        return ( new PublicClinicDirectory() )->is_listed( $clinic_id );
     }
 
     /**
