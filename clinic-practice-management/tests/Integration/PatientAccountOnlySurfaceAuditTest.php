@@ -29,6 +29,7 @@ use WP_Error;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_UnitTestCase;
+use WP_User;
 use WPDieException;
 use wp_xmlrpc_server;
 
@@ -269,19 +270,19 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         $step1 = $this->verifyOtpWithSession( self::MOBILE_STEP1_NEW, '232323', OtpService::PURPOSE_VERIFY_MOBILE, $this->clinicPublic );
 
         $patientRoutes = [
-            [ 'GET', '/clinic/v1/patient/me', [] ],
-            [ 'POST', '/clinic/v1/patient/me', [ 'first_name' => 'Hack' ] ],
-            [ 'GET', '/clinic/v1/patient/my-records', [] ],
-            [ 'POST', '/clinic/v1/patient/enroll', [ 'clinic_id' => $this->clinicPublic ] ],
-            [ 'POST', '/clinic/v1/booking/hold', [ 'clinician_id' => $this->clinicianPublic, 'slot_date' => '2026-12-01', 'slot_time' => '10:00:00' ] ],
-            [ 'POST', '/clinic/v1/booking/confirm', [ 'hold_id' => 1 ] ],
-            [ 'GET', '/clinic/v1/booking/resume', [] ],
-            [ 'GET', '/clinic/v1/appointments/mine', [] ],
-            [ 'GET', '/clinic/v1/visits', [] ],
-            [ 'GET', '/clinic/v1/prescriptions', [] ],
-            [ 'GET', '/clinic/v1/patients/' . $this->patientRecord . '/files', [] ],
-            [ 'GET', '/clinic/v1/notifications', [] ],
-            [ 'POST', '/clinic/v1/notifications/read', [ 'all' => true ] ],
+            [ 'GET', '/clinic/v1/patient/me', [], [] ],
+            [ 'POST', '/clinic/v1/patient/me', [ 'first_name' => 'Hack' ], [] ],
+            [ 'GET', '/clinic/v1/patient/my-records', [], [] ],
+            [ 'POST', '/clinic/v1/patient/enroll', [ 'clinic_id' => $this->clinicPublic ], [] ],
+            [ 'POST', '/clinic/v1/booking/hold', [ 'clinician_id' => $this->clinicianPublic, 'slot_date' => '2026-12-01', 'slot_time' => '10:00:00' ], [] ],
+            [ 'POST', '/clinic/v1/booking/confirm', [ 'hold_token' => 'tok-audit' ], [] ],
+            [ 'GET', '/clinic/v1/booking/resume', [], [ 'hold_token' => 'tok-audit' ] ],
+            [ 'GET', '/clinic/v1/appointments/mine', [], [] ],
+            [ 'GET', '/clinic/v1/visits', [], [] ],
+            [ 'GET', '/clinic/v1/prescriptions', [], [] ],
+            [ 'GET', '/clinic/v1/patients/' . $this->patientRecord . '/files', [], [] ],
+            [ 'GET', '/clinic/v1/notifications', [], [] ],
+            [ 'POST', '/clinic/v1/notifications/read', [ 'all' => true ], [] ],
         ];
 
         $staffRoutes = [
@@ -297,8 +298,8 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
             $this->activateSession( $session );
             $nonce = wp_create_nonce( 'wp_rest' );
 
-            foreach ( $patientRoutes as [ $method, $route, $body ] ) {
-                $resp = $this->dispatchRestWithNonce( $method, $route, $body, $nonce );
+            foreach ( $patientRoutes as [ $method, $route, $body, $query ] ) {
+                $resp = $this->dispatchRestWithNonce( $method, $route, $body, $nonce, $query );
                 self::assertSame( 403, $resp->get_status(), $method . ' ' . $route . ' must fail closed for account-only/pending session.' );
                 self::assertSame( PatientAccess::PROOF_FAILED_CODE, $resp->get_data()['code'] ?? null );
             }
@@ -514,26 +515,42 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         self::assertNotFalse( $step1UserObj );
         self::assertNotFalse( $staffUserObj );
 
-        // 1) Password/app-password/reset guards reject patient accounts even with valid WP password.
-        foreach ( [ $activeUserObj, $pendUserObj, $step1UserObj ] as $patUser ) {
-            $auth = wp_authenticate( $patUser->user_login, $this->patientKnownPass );
-            self::assertInstanceOf( WP_Error::class, $auth );
-            self::assertSame( PatientCredentialGuard::ERROR_CODE, $auth->get_error_code() );
-            self::assertFalse( apply_filters( 'allow_password_reset', true, (int) $patUser->ID ) );
-            self::assertFalse( apply_filters( 'wp_is_application_passwords_available_for_user', true, $patUser ) );
-        }
-
-        // 2) Real wp_xmlrpc_server denies patient accounts and allows staff positive control.
-        if ( class_exists( wp_xmlrpc_server::class ) ) {
-            $xmlrpc = new wp_xmlrpc_server();
+        $prevRemoteAddr = $_SERVER['REMOTE_ADDR'] ?? null;
+        unset( $_SERVER['REMOTE_ADDR'] );
+        try {
+            // 1) Password/app-password/reset guards reject patient accounts even with valid WP password.
             foreach ( [ $activeUserObj, $pendUserObj, $step1UserObj ] as $patUser ) {
-                $res = $xmlrpc->wp_getUsersBlogs( [ $patUser->user_login, $this->patientKnownPass ] );
-                self::assertInstanceOf( IXR_Error::class, $res, 'XML-RPC must fail closed for patient account ' . $patUser->user_login );
-                self::assertSame( 403, $res->code );
+                $auth = wp_authenticate( $patUser->user_login, $this->patientKnownPass );
+                self::assertInstanceOf( WP_Error::class, $auth );
+                self::assertSame( PatientCredentialGuard::ERROR_CODE, $auth->get_error_code() );
+                self::assertFalse( apply_filters( 'allow_password_reset', true, (int) $patUser->ID ) );
+                self::assertFalse( apply_filters( 'wp_is_application_passwords_available_for_user', true, $patUser ) );
             }
 
-            $staffXmlrpc = $xmlrpc->wp_getUsersBlogs( [ $staffUserObj->user_login, $this->staffDoctorPass ] );
-            self::assertIsArray( $staffXmlrpc, 'Positive control: XML-RPC must remain open for non-patient staff accounts.' );
+            $staffAuth = wp_authenticate( $staffUserObj->user_login, $this->staffDoctorPass );
+            self::assertInstanceOf( WP_User::class, $staffAuth, 'Positive control: wp_authenticate must allow non-patient staff accounts.' );
+
+            // 2) Real wp_xmlrpc_server denies patient accounts and allows staff positive control.
+            if ( class_exists( wp_xmlrpc_server::class ) ) {
+                foreach ( [ $activeUserObj, $pendUserObj, $step1UserObj ] as $patUser ) {
+                    $patXmlrpc = new wp_xmlrpc_server();
+                    $res       = $patXmlrpc->wp_getUsersBlogs( [ $patUser->user_login, $this->patientKnownPass ] );
+                    self::assertInstanceOf( IXR_Error::class, $res, 'XML-RPC must fail closed for patient account ' . $patUser->user_login );
+                    self::assertSame( 403, $res->code );
+                }
+
+                $staffXmlrpcSrv = new wp_xmlrpc_server();
+                $staffLogin     = $staffXmlrpcSrv->login( $staffUserObj->user_login, $this->staffDoctorPass );
+                self::assertInstanceOf( WP_User::class, $staffLogin, 'Positive control: wp_xmlrpc_server::login must allow non-patient staff.' );
+                $staffXmlrpc = $staffXmlrpcSrv->wp_getUsersBlogs( [ $staffUserObj->user_login, $this->staffDoctorPass ] );
+                self::assertIsArray( $staffXmlrpc, 'Positive control: XML-RPC must remain open for non-patient staff accounts.' );
+            }
+        } finally {
+            if ( null === $prevRemoteAddr ) {
+                unset( $_SERVER['REMOTE_ADDR'] );
+            } else {
+                $_SERVER['REMOTE_ADDR'] = $prevRemoteAddr;
+            }
         }
     }
 
