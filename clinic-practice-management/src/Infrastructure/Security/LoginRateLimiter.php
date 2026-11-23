@@ -92,9 +92,10 @@ final class LoginRateLimiter
             // `authenticate` chain (e.g. the HMAC key could not be read or
             // persisted). No cookie/session is issued and the response is
             // IDENTICAL for known/unknown accounts and for correct or wrong
-            // passwords. Counters are not written on the unavailable path; a
-            // first-use key bootstrap (add_option) may still have written the
-            // key option (accepted limitation).
+            // passwords. Counters are not written on the unavailable path
+            // (see recordFailure); the barrier-active detail is in that
+            // catch block. A first-use key bootstrap (add_option) may still
+            // have written the key option (accepted limitation).
             return new \WP_Error(
                 'cpms_login_throttle_unavailable',
                 'سرویس محدودیت در دسترس نیست — کمی بعد دوباره تلاش کنید',
@@ -134,7 +135,13 @@ final class LoginRateLimiter
             $this->count_failure( $username );
         } catch ( \Throwable ) {
             // Fail-closed silence: wp_login_failed must never escape into core.
-            // Counters are not written on the unavailable path; a first-use key
+            // Counters are not written on the unavailable path: with the
+            // barrier inert the exact-code early return above applies; with
+            // the barrier ACTIVE the 503 is replaced by the barrier error
+            // (RestoreBarrierGate guard_login, PHP_INT_MAX) before recordFailure
+            // sees it, the early return does not match, the recovery-account
+            // path applies, its inner is_login_throttled() throws on the
+            // unavailable key, and this catch swallows it. A first-use key
             // bootstrap (add_option) may still have written the key option
             // (accepted limitation). Nothing is logged — the caller already
             // holds the failure.

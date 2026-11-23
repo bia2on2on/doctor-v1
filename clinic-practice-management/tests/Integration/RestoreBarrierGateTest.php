@@ -382,11 +382,21 @@ final class RestoreBarrierGateTest extends WP_UnitTestCase {
 
     /** PR19-FINAL (fix A): barrier active + recovery manager + empty key — fail-closed, no exception escapes. */
     public function testBarrierRecoveryManagerWithEmptyKeyFailsClosedWithoutException(): void {
+        global $wpdb;
+
         self::assertFalse(defined('CPMS_NID_HMAC_KEY'), 'CPMS_NID_HMAC_KEY must not be defined for this test');
 
+        // RB-17/RB-18 discipline (tests/Integration/RestoreBarrierGateTest.php:218-219, :279-280):
+        // set a known legacy hash so the positive witness reaches core's
+        // password check with the correct password (core otherwise rejects
+        // before wp_check_password, surfacing incorrect_password instead of
+        // the WP_User the positive witness requires).
         $password = 'synthetic-restore-fix-witness';
         $manager = self::factory()->user->create_and_get(['role' => 'administrator']);
         $manager->add_cap('cpms_config');
+        $manager_hash = md5($password);
+        self::assertSame(1, $wpdb->update($wpdb->users, ['user_pass' => $manager_hash], ['ID' => $manager->ID]));
+        clean_user_cache($manager);
 
         // Same restore discipline as the end-to-end key-row witness: save the
         // prior option, clear the cache keys, restore in finally.
