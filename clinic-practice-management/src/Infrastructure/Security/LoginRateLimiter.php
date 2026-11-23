@@ -90,10 +90,11 @@ final class LoginRateLimiter
         } catch ( \Throwable ) {
             // Fail-closed: throttle housekeeping must never escape into the
             // `authenticate` chain (e.g. the HMAC key could not be read or
-            // persisted). No cookie/session is issued, nothing is counted, no
-            // option is written, no OpLogger row is written, no retry — and the
-            // response is IDENTICAL for known/unknown accounts and for correct
-            // or wrong passwords.
+            // persisted). No cookie/session is issued and the response is
+            // IDENTICAL for known/unknown accounts and for correct or wrong
+            // passwords. Counters are not written on the unavailable path; a
+            // first-use key bootstrap (add_option) may still have written the
+            // key option (accepted limitation).
             return new \WP_Error(
                 'cpms_login_throttle_unavailable',
                 'سرویس محدودیت در دسترس نیست — کمی بعد دوباره تلاش کنید',
@@ -114,6 +115,12 @@ final class LoginRateLimiter
     // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- Preserve the existing public callback.
     public function recordFailure( string $username, ?\WP_Error $error = null ): void
     {
+        // The fail-closed 503 is not a failure worth counting: return before
+        // any counting or logging. A first-use key bootstrap (add_option) may
+        // still have written the key option — an accepted limitation.
+        if ( $error instanceof \WP_Error && 'cpms_login_throttle_unavailable' === $error->get_error_code() ) {
+            return;
+        }
         try {
             $accounts = null !== $error && RestoreBarrierGate::blocked() ? RestoreBarrierGate::recovery_failure_accounts( $error ) : null;
             if ( null !== $accounts ) {
@@ -127,8 +134,10 @@ final class LoginRateLimiter
             $this->count_failure( $username );
         } catch ( \Throwable ) {
             // Fail-closed silence: wp_login_failed must never escape into core.
-            // Nothing counted, nothing logged, nothing written — the caller
-            // already holds the failure.
+            // Counters are not written on the unavailable path; a first-use key
+            // bootstrap (add_option) may still have written the key option
+            // (accepted limitation). Nothing is logged — the caller already
+            // holds the failure.
             return;
         }
     }

@@ -537,12 +537,21 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
         $countUsernameBuckets = static function () use ($db, $table): int {
             return (int) $db->fetchValue('SELECT COUNT(*) FROM ' . $table . " WHERE window_key LIKE 'login-user:%'", []);
         };
+        // The username-only query cannot see IP-bucket writes (window_key
+        // LIKE 'login-user:%' filters them out). A second, IP-scoped query
+        // covers the wp_login_failed dispatch, which is the whole point of
+        // the early-return in recordFailure: no IP bucket is written on the
+        // unavailable path.
+        $countIpBuckets = static function () use ($db, $table): int {
+            return (int) $db->fetchValue('SELECT COUNT(*) FROM ' . $table . " WHERE window_key LIKE 'login-ip:%'", []);
+        };
 
         // Save the prior state of the key option (absent vs present).
         wp_cache_delete('cpms_nid_hmac_key', 'options');
         wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
         $prior_key = get_option('cpms_nid_hmac_key', null);
         $count_before = $countUsernameBuckets();
+        $ip_count_before = $countIpBuckets();
 
         try {
             // Empty-string option row: add_option() refuses (the row exists),
@@ -598,6 +607,7 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
             self::assertSame(0, $loggedInCookieCount, 'set_logged_in_cookie must not fire on the key-failure path.');
             self::assertSame([], WP_Session_Tokens::get_instance($user_id)->get_all());
             self::assertSame($count_before, $countUsernameBuckets(), 'the key-failure path must not grow the username buckets.');
+            self::assertSame($ip_count_before, $countIpBuckets(), 'the key-failure path must not grow the IP buckets (the wp_login_failed dispatch must not count).');
 
             // Positive witness under the SAME count query: a valid key + a
             // wrong password grows exactly one username bucket row.
@@ -605,12 +615,14 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
             wp_cache_delete('cpms_nid_hmac_key', 'options');
             wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
             $count_before_positive = $countUsernameBuckets();
+            $ip_count_before_positive = $countIpBuckets();
 
             $positive = wp_authenticate($username, 'wrong-password-1');
 
             self::assertInstanceOf(WP_Error::class, $positive);
             self::assertSame('incorrect_password', $positive->get_error_code());
             self::assertSame($count_before_positive + 1, $countUsernameBuckets(), 'a wrong-password attempt with a valid key grows the username bucket by exactly one row.');
+            self::assertSame($ip_count_before_positive + 1, $countIpBuckets(), 'a wrong-password attempt with a valid key grows the IP bucket by exactly one row.');
         } finally {
             if ($prior_key === null) {
                 delete_option('cpms_nid_hmac_key');

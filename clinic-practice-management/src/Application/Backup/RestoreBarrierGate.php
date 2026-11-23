@@ -50,7 +50,16 @@ final class RestoreBarrierGate {
             return self::error();
         }
 
-        return App::loginRateLimiter()->is_login_throttled( $result->user_login ) ? self::error() : $result;
+        try {
+            return App::loginRateLimiter()->is_login_throttled( $result->user_login ) ? self::error() : $result;
+        } catch ( \Throwable ) {
+            // WP 7.1.3 applies wp_authenticate_user without a catch (user.php:203).
+            // Fail closed with the same error the guard already returns — no new
+            // error code, no session/cookie state, no escape. The error is
+            // identical for known and unknown accounts (self::error() is
+            // parameterless).
+            return self::error();
+        }
     }
 
     public static function guard_login( mixed $result, string $identifier = '' ): mixed {

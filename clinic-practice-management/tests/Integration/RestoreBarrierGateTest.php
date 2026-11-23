@@ -379,4 +379,57 @@ final class RestoreBarrierGateTest extends WP_UnitTestCase {
         }
         return false;
     }
+
+    /** PR19-FINAL (fix A): barrier active + recovery manager + empty key — fail-closed, no exception escapes. */
+    public function testBarrierRecoveryManagerWithEmptyKeyFailsClosedWithoutException(): void {
+        self::assertFalse(defined('CPMS_NID_HMAC_KEY'), 'CPMS_NID_HMAC_KEY must not be defined for this test');
+
+        $password = 'synthetic-restore-fix-witness';
+        $manager = self::factory()->user->create_and_get(['role' => 'administrator']);
+        $manager->add_cap('cpms_config');
+
+        // Same restore discipline as the end-to-end key-row witness: save the
+        // prior option, clear the cache keys, restore in finally.
+        wp_cache_delete('cpms_nid_hmac_key', 'options');
+        wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
+        $prior_key = get_option('cpms_nid_hmac_key', null);
+
+        try {
+            self::assertTrue(add_option(RestoreBarrierStore::OPTION, 'test marker', '', false));
+
+            update_option('cpms_nid_hmac_key', '');
+            wp_cache_delete('cpms_nid_hmac_key', 'options');
+            wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
+
+            $result = wp_authenticate($manager->user_login, $password);
+
+            // An uncaught exception would fail the test at the wp_authenticate
+            // call above. The guard must fail closed with the same error the
+            // barrier already returns — no new error code.
+            self::assertInstanceOf(WP_Error::class, $result);
+            self::assertSame(RestoreBarrierGate::ERROR_CODE, $result->get_error_code());
+            $resultData = $result->get_error_data();
+            self::assertArrayHasKey('status', $resultData);
+            self::assertSame(503, $resultData['status']);
+
+            // Positive witness under the same setup: a valid key lets the
+            // recovery-manager authentication through the guard.
+            update_option('cpms_nid_hmac_key', bin2hex(random_bytes(32)));
+            wp_cache_delete('cpms_nid_hmac_key', 'options');
+            wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
+
+            $allowed = wp_authenticate($manager->user_login, $password);
+            self::assertInstanceOf(\WP_User::class, $allowed);
+            self::assertSame($manager->ID, $allowed->ID);
+        } finally {
+            delete_option(RestoreBarrierStore::OPTION);
+            if ($prior_key === null) {
+                delete_option('cpms_nid_hmac_key');
+            } else {
+                update_option('cpms_nid_hmac_key', $prior_key);
+            }
+            wp_cache_delete('cpms_nid_hmac_key', 'options');
+            wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
+        }
+    }
 }
