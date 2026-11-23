@@ -4,6 +4,7 @@ declare( strict_types=1 );
 
 namespace ClinicCore\Application\Auth;
 
+use ClinicCore\Admin\PatientPortalPage;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
@@ -60,7 +61,7 @@ final class PatientCredentialGuard {
         unset( $password );
 
         if ( $user instanceof WP_User ) {
-            if ( $this->has_patient_login_account( (int) $user->ID ) ) {
+            if ( $this->is_credential_blocked( (int) $user->ID ) ) {
                 return new WP_Error( self::ERROR_CODE, PatientAccess::PROOF_FAILED_MESSAGE );
             }
 
@@ -77,7 +78,7 @@ final class PatientCredentialGuard {
             $candidate = get_user_by( 'email', $clean );
         }
 
-        if ( $candidate instanceof WP_User && $this->has_patient_login_account( (int) $candidate->ID ) ) {
+        if ( $candidate instanceof WP_User && $this->is_credential_blocked( (int) $candidate->ID ) ) {
             return new WP_Error( self::ERROR_CODE, PatientAccess::PROOF_FAILED_MESSAGE );
         }
 
@@ -93,7 +94,7 @@ final class PatientCredentialGuard {
     public function filter_wp_authenticate_user( mixed $user, string $password ): mixed {
         unset( $password );
 
-        if ( $user instanceof WP_User && $this->has_patient_login_account( (int) $user->ID ) ) {
+        if ( $user instanceof WP_User && $this->is_credential_blocked( (int) $user->ID ) ) {
             return new WP_Error( self::ERROR_CODE, PatientAccess::PROOF_FAILED_MESSAGE );
         }
 
@@ -104,7 +105,7 @@ final class PatientCredentialGuard {
      * Blocks WordPress password reset for OTP-only patient accounts.
      */
     public function filter_allow_password_reset( bool $allow, int $user_id ): bool {
-        if ( $user_id > 0 && $this->has_patient_login_account( $user_id ) ) {
+        if ( $user_id > 0 && $this->is_credential_blocked( $user_id ) ) {
             return false;
         }
 
@@ -115,11 +116,19 @@ final class PatientCredentialGuard {
      * Blocks WordPress Application Passwords for OTP-only patient accounts.
      */
     public function filter_app_passwords_available( bool $available, WP_User $user ): bool {
-        if ( $this->has_patient_login_account( (int) $user->ID ) ) {
+        if ( $this->is_credential_blocked( (int) $user->ID ) ) {
             return false;
         }
 
         return $available;
+    }
+
+    private function is_credential_blocked( int $wp_user_id ): bool {
+        if ( $this->has_patient_login_account( $wp_user_id ) ) {
+            return true;
+        }
+
+        return defined( 'XMLRPC_REQUEST' ) && XMLRPC_REQUEST && PatientPortalPage::isPatientOnly( $wp_user_id );
     }
 
     private function has_patient_login_account( int $wp_user_id ): bool {
