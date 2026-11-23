@@ -1818,7 +1818,7 @@ final class CpmsSetupWizard
         // Resolve trusted clinicId — no raw payload clinic_id, no fixed IDs, no first-clinic fallback
         try {
             $scope = ScopeContext::tryGet() ?? App::scope();
-            $trusted_clinic_id = (int) $scope->clinicId;
+            $trusted_clinic_id = (int) $scope->clinicId; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- ScopeContext public property
         } catch (\Throwable $e) {
             // Fail-closed: scope required
             return 'زمینه کلینیک معتبر یافت نشد: ' . $e->getMessage();

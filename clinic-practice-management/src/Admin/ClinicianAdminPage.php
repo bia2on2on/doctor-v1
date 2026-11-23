@@ -132,9 +132,9 @@ final class ClinicianAdminPage
             delete_transient(self::NOTICE_KEY);
         }
 
-        $repo = App::clinicianRepository();
-        $clinic_id = (int) $scope->clinicId;
-        $selected = self::schedule_target( self::requested_clinician_id(), $scope );
+        $repo      = App::clinicianRepository();
+        $clinic_id  = (int) $scope->clinicId; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- ClinicScope::$clinicId is the published scope API.
+        $selected  = self::schedule_target( self::requested_clinician_id(), $scope );
         ?>
 <div class="wrap" dir="rtl">
     <h1>پزشکان و برنامه هفتگی</h1>
@@ -147,7 +147,7 @@ final class ClinicianAdminPage
         <?php endif; ?>
 
     <?php if ($selected === null) : ?>
-        <?php self::renderList( $repo, $clinic_id ); ?>
+            <?php self::renderList( $repo, $clinic_id ); ?>
     <?php else : ?>
         <?php self::render_clinician( $repo, $selected, $clinic_id ); ?>
     <?php endif; ?>
