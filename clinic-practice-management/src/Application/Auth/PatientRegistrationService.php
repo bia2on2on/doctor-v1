@@ -688,8 +688,6 @@ final class PatientRegistrationService {
      * Q1 (owner rule): creating a NEW patient is closed from T0 in every stage.
      * Mirrors PatientService::assert_license — same gate, same operation constant,
      * same BookingException/503/CLINIC_LICENSE_BLOCKED mapping; no extra blanket rules.
-     *
-     * @param int $clinic_id Trusted Clinic scope of the pending registration.
      */
     private function assert_registration_license( int $clinic_id ): void {
         try {
