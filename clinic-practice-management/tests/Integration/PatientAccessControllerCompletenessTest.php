@@ -325,7 +325,10 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
                     $lastDenyEvent = $gateEvents[ count( $gateEvents ) - 1 ];
                     self::assertFalse( $lastDenyEvent['allowed'] );
                     self::assertSame( 403, $denyRes->get_status(), $method . ' ' . $route . ' must fail closed with 403 PROOF_FAILED.' );
-                    self::assertSame( PatientAccess::PROOF_FAILED_CODE, $denyRes->get_data()['code'] ?? null );
+                    $denyData = $denyRes->get_data();
+                    self::assertIsArray( $denyData );
+                    self::assertArrayHasKey( 'code', $denyData );
+                    self::assertSame( PatientAccess::PROOF_FAILED_CODE, $denyData['code'] );
 
                     // 2) Positive control (authorized linked/eligible user, or guest for registration) MUST also pass through PatientAccess.
                     $beforeAllow = count( $gateEvents );
@@ -368,14 +371,17 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
                         } finally {
                             remove_action( 'set_logged_in_cookie', $cookieHook, 10 );
                         }
-                        self::assertTrue( (bool) ( $step1Res['session_issued'] ?? false ) );
+                        self::assertArrayHasKey( 'session_issued', $step1Res );
+                        self::assertTrue( (bool) $step1Res['session_issued'] );
+                        self::assertArrayHasKey( 'user_id', $step1Res );
+                        self::assertArrayHasKey( 'rest_nonce', $step1Res );
                         self::assertNotSame( '', $step1Cookie );
                         $_COOKIE[ LOGGED_IN_COOKIE ] = $step1Cookie;
                         wp_set_current_user( (int) $step1Res['user_id'] );
 
                         $allowReq = new WP_REST_Request( $method, $route );
                         $allowReq->set_header( 'Content-Type', 'application/json' );
-                        $allowReq->set_header( 'X-WP-Nonce', (string) ( $step1Res['rest_nonce'] ?? '' ) );
+                        $allowReq->set_header( 'X-WP-Nonce', (string) $step1Res['rest_nonce'] );
                         $allowReq->set_body(
                             (string) wp_json_encode(
                                 [

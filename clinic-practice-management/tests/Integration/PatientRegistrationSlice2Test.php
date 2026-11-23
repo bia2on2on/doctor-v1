@@ -191,16 +191,25 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
             ]
         );
         self::assertSame( 400, $replayResp->get_status() );
-        self::assertSame( 'CLINIC_OTP_INVALID', $replayResp->get_data()['code'] ?? null );
+        $replayData = $replayResp->get_data();
+        self::assertIsArray( $replayData );
+        self::assertArrayHasKey( 'code', $replayData );
+        self::assertSame( 'CLINIC_OTP_INVALID', $replayData['code'] );
 
         // T9 / Fix B: Step-1 mobile-proof-only session MUST be refused on all clinical & booking endpoints.
         $meDenied = $this->dispatchRestWithNonce( 'GET', '/clinic/v1/patient/me', [], $step1['rest_nonce'] );
         self::assertSame( 403, $meDenied->get_status() );
-        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $meDenied->get_data()['code'] ?? null );
+        $meDeniedData = $meDenied->get_data();
+        self::assertIsArray( $meDeniedData );
+        self::assertArrayHasKey( 'code', $meDeniedData );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $meDeniedData['code'] );
 
         $visitsDenied = $this->dispatchRestWithNonce( 'GET', '/clinic/v1/visits', [], $step1['rest_nonce'] );
         self::assertSame( 403, $visitsDenied->get_status() );
-        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $visitsDenied->get_data()['code'] ?? null );
+        $visitsDeniedData = $visitsDenied->get_data();
+        self::assertIsArray( $visitsDeniedData );
+        self::assertArrayHasKey( 'code', $visitsDeniedData );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $visitsDeniedData['code'] );
 
         $holdDenied = $this->dispatchRestWithNonce(
             'POST',
@@ -213,7 +222,10 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
             $step1['rest_nonce']
         );
         self::assertSame( 403, $holdDenied->get_status() );
-        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $holdDenied->get_data()['code'] ?? null );
+        $holdDeniedData = $holdDenied->get_data();
+        self::assertIsArray( $holdDeniedData );
+        self::assertArrayHasKey( 'code', $holdDeniedData );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $holdDeniedData['code'] );
 
         // Step 2: submit profile + National ID WITHOUT OTP code.
         $auditBefore = (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_audit_logs' ) );
@@ -266,7 +278,8 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertSame( self::MOBILE_NEW, (string) $patient['mobile'] );
         self::assertSame( self::NID_NEW, (string) $patient['national_id'] );
         self::assertSame( '1993-07-21', (string) $patient['birth_date'] );
-        self::assertGreaterThan( 0, (int) ( $patient['identity_id'] ?? 0 ) );
+        self::assertArrayHasKey( 'identity_id', $patient );
+        self::assertGreaterThan( 0, (int) $patient['identity_id'] );
 
         // Account + binding active; WP user is pure patient; session holds both proofs + clinic scope; reg proof consumed.
         $account = $logins->find_account_by_user_id( $userId );
@@ -302,7 +315,10 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
             $step1['rest_nonce']
         );
         self::assertSame( 403, $step2Replay->get_status() );
-        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $step2Replay->get_data()['code'] ?? null );
+        $step2ReplayData = $step2Replay->get_data();
+        self::assertIsArray( $step2ReplayData );
+        self::assertArrayHasKey( 'code', $step2ReplayData );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $step2ReplayData['code'] );
 
         // Audit wrote PATIENT_REGISTERED without raw or masked NID, and rate limits hashed NID.
         $audits = App::db()->fetchAll(
@@ -311,10 +327,13 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertGreaterThan( $auditBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_audit_logs' ) ) );
         $foundRegAudit = false;
         foreach ( $audits as $row ) {
-            $blob = (string) ( $row['after_json'] ?? '' ) . (string) ( $row['meta_json'] ?? '' );
+            self::assertArrayHasKey( 'action', $row );
+            self::assertArrayHasKey( 'after_json', $row );
+            self::assertArrayHasKey( 'meta_json', $row );
+            $blob = (string) $row['after_json'] . (string) $row['meta_json'];
             self::assertStringNotContainsString( self::NID_NEW, $blob );
             self::assertStringNotContainsString( substr( self::NID_NEW, -4 ), $blob );
-            if ( 'PATIENT_REGISTERED' === (string) ( $row['action'] ?? '' ) ) {
+            if ( 'PATIENT_REGISTERED' === (string) $row['action'] ) {
                 $foundRegAudit = true;
             }
         }
@@ -632,7 +651,12 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
             $step1New['rest_nonce']
         );
         self::assertSame( 200, $witnessResp->get_status() );
-        self::assertTrue( $witnessResp->get_data()['data']['registered'] ?? false );
+        $witnessData = $witnessResp->get_data();
+        self::assertIsArray( $witnessData );
+        self::assertArrayHasKey( 'data', $witnessData );
+        self::assertIsArray( $witnessData['data'] );
+        self::assertArrayHasKey( 'registered', $witnessData['data'] );
+        self::assertTrue( $witnessData['data']['registered'] );
     }
 
     public function testNestedTransactionGuardFailsClosed(): void {
@@ -787,12 +811,32 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertSame( $this->clinicListed, $state['clinic_id'] );
         self::assertSame( self::MOBILE_NEW, $state['mobile'] );
 
+        $redirectUrl = PublicBookingShortcode::incomplete_registration_redirect_url();
+        self::assertStringEndsWith( '#complete-registration', $redirectUrl );
+
         // Public booking surface refuses booking continuation and points to #complete-registration.
         $bookingHtml = do_shortcode( '[cpms_public_booking clinic_id="' . $this->clinicListed . '"]' );
         self::assertStringContainsString( 'data-role="complete-registration-redirect"', $bookingHtml );
         self::assertStringContainsString( '#complete-registration', $bookingHtml );
         self::assertStringNotContainsString( 'hold_path', $bookingHtml );
         self::assertStringNotContainsString( 'confirm_path', $bookingHtml );
+
+        // Trying to hold a booking while incomplete fails closed at the gate.
+        $holdBlocked = $this->dispatchRestWithNonce(
+            'POST',
+            '/clinic/v1/booking/hold',
+            [
+                'clinician_id' => $this->clinicianListed,
+                'slot_date'    => gmdate( 'Y-m-d', time() + 3 * 86400 ),
+                'slot_time'    => '10:00:00',
+            ],
+            $step1['rest_nonce']
+        );
+        self::assertSame( 403, $holdBlocked->get_status() );
+        $holdBlockedData = $holdBlocked->get_data();
+        self::assertIsArray( $holdBlockedData );
+        self::assertArrayHasKey( 'code', $holdBlockedData );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $holdBlockedData['code'] );
 
         // Patient Portal renders #complete-registration Step 2 form and suppresses link-record-form.
         ob_start();
@@ -803,9 +847,41 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertStringContainsString( 'data-role="complete-reg-national-id"', $portalHtml );
         self::assertStringNotContainsString( 'data-role="link-record-form"', $portalHtml );
 
-        // Expired registration proof still marks account incomplete (has_valid_proof=false) so portal prompts Step 1 re-verify.
-        ( new PatientSessionProofStore() )->consume_registration_mobile_proof( $step1['user_id'], $this->clinicListed, self::MOBILE_NEW, time(), $step1['token'] );
-        $expiredState = App::patient_access()->registration_completion_state( $step1['user_id'] );
+        // Positive witness: completing Step 2 clears incomplete state and unlocks booking surface.
+        $completeResp = $this->dispatchRestWithNonce(
+            'POST',
+            '/clinic/v1/patient/register',
+            [
+                'clinic_id'   => $this->clinicListed,
+                'mobile'      => self::MOBILE_NEW,
+                'given_name'  => 'مریم',
+                'family_name' => 'تکمیل',
+                'national_id' => self::NID_NEW,
+                'birth_date'  => '1991-03-14',
+            ],
+            $step1['rest_nonce']
+        );
+        self::assertSame( 200, $completeResp->get_status() );
+        $afterState = App::patient_access()->registration_completion_state( $step1['user_id'] );
+        self::assertFalse( $afterState['incomplete'] );
+        self::assertFalse( $afterState['has_valid_proof'] );
+
+        $bookingUnlockedHtml = do_shortcode( '[cpms_public_booking clinic_id="' . $this->clinicListed . '"]' );
+        self::assertStringNotContainsString( 'data-role="complete-registration-redirect"', $bookingUnlockedHtml );
+        self::assertStringContainsString( 'hold_path', $bookingUnlockedHtml );
+
+        ob_start();
+        PatientPortalPage::render();
+        $portalAfterHtml = (string) ob_get_clean();
+        self::assertStringNotContainsString( 'id="complete-registration"', $portalAfterHtml );
+
+        // Separate expired-proof check: a pending Step-1 account whose reg proof expired keeps incomplete=true, has_valid_proof=false.
+        $expiredMobile = '09125550177';
+        $this->seedOtp( $this->clinicListed, $expiredMobile, '646566', OtpService::PURPOSE_VERIFY_MOBILE );
+        $expiredStep1 = $this->performStep1VerifyRest( $this->clinicListed, $expiredMobile, '646566' );
+        self::assertTrue( $expiredStep1['session_issued'] );
+        ( new PatientSessionProofStore() )->consume_registration_mobile_proof( $expiredStep1['user_id'], $this->clinicListed, $expiredMobile, time(), $expiredStep1['token'] );
+        $expiredState = App::patient_access()->registration_completion_state( $expiredStep1['user_id'] );
         self::assertTrue( $expiredState['incomplete'] );
         self::assertFalse( $expiredState['has_valid_proof'] );
     }
@@ -899,7 +975,10 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
                 ]
             );
             self::assertSame( 404, $optedOutVerifyResp->get_status() );
-            self::assertSame( 'CLINIC_NOT_FOUND', $optedOutVerifyResp->get_data()['code'] ?? null );
+            $optedOutVerifyData = $optedOutVerifyResp->get_data();
+            self::assertIsArray( $optedOutVerifyData );
+            self::assertArrayHasKey( 'code', $optedOutVerifyData );
+            self::assertSame( 'CLINIC_NOT_FOUND', $optedOutVerifyData['code'] );
 
             $optedOutRegResp = $this->dispatchRestWithNonce(
                 'POST',
@@ -1261,7 +1340,10 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
             ]
         );
         self::assertSame( 400, $verifyResp->get_status() );
-        self::assertSame( 'CLINIC_OTP_INVALID', $verifyResp->get_data()['code'] ?? null );
+        $verifyData = $verifyResp->get_data();
+        self::assertIsArray( $verifyData );
+        self::assertArrayHasKey( 'code', $verifyData );
+        self::assertSame( 'CLINIC_OTP_INVALID', $verifyData['code'] );
 
         $resp = $this->dispatchRestWithNonce(
             'POST',
@@ -1290,6 +1372,33 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertSame( $usersBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->wpdb()->users ) );
         self::assertSame( $patientsBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_patients' ) ) );
         self::assertSame( $loginsBefore, (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_patient_logins' ) ) );
+
+        // Positive witness: clinic-bound OTP token for the same opted-in clinic succeeds cleanly.
+        $witnessMobile = '09125550192';
+        $this->seedOtp( $this->clinicListed, $witnessMobile, '556677', OtpService::PURPOSE_VERIFY_MOBILE );
+        $witnessStep1 = $this->performStep1VerifyRest( $this->clinicListed, $witnessMobile, '556677' );
+        self::assertSame( 200, $witnessStep1['response']->get_status() );
+        self::assertTrue( $witnessStep1['session_issued'] );
+        $witnessStep2 = $this->dispatchRestWithNonce(
+            'POST',
+            '/clinic/v1/patient/register',
+            [
+                'clinic_id'   => $this->clinicListed,
+                'mobile'      => $witnessMobile,
+                'given_name'  => 'شاهد',
+                'family_name' => 'کلینیک‌دار',
+                'national_id' => self::NID_NEW,
+                'birth_date'  => '1993-07-21',
+            ],
+            $witnessStep1['rest_nonce']
+        );
+        self::assertSame( 200, $witnessStep2->get_status() );
+        $witnessStep2Data = $witnessStep2->get_data();
+        self::assertIsArray( $witnessStep2Data );
+        self::assertArrayHasKey( 'data', $witnessStep2Data );
+        self::assertIsArray( $witnessStep2Data['data'] );
+        self::assertArrayHasKey( 'registered', $witnessStep2Data['data'] );
+        self::assertTrue( $witnessStep2Data['data']['registered'] );
     }
 
     /**
@@ -1328,16 +1437,31 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
             remove_action( 'set_logged_in_cookie', $tokenHook, 10 );
         }
 
-        $payload       = $resp->get_data()['data'] ?? [];
-        $userId        = (int) ( $payload['user_id'] ?? 0 );
-        $sessionIssued = (bool) ( $payload['session_issued'] ?? false );
-        $restNonce     = (string) ( $payload['rest_nonce'] ?? '' );
+        $respData = $resp->get_data();
+        self::assertIsArray( $respData );
+        $userId              = 0;
+        $sessionIssued       = false;
+        $pendingRegistration = false;
+        $restNonce           = '';
+        if ( 200 === $resp->get_status() ) {
+            self::assertArrayHasKey( 'data', $respData );
+            self::assertIsArray( $respData['data'] );
+            $payload = $respData['data'];
+            self::assertArrayHasKey( 'user_id', $payload );
+            self::assertArrayHasKey( 'session_issued', $payload );
+            self::assertArrayHasKey( 'pending_registration', $payload );
+            self::assertArrayHasKey( 'rest_nonce', $payload );
+            $userId              = (int) $payload['user_id'];
+            $sessionIssued       = (bool) $payload['session_issued'];
+            $pendingRegistration = (bool) $payload['pending_registration'];
+            $restNonce           = (string) $payload['rest_nonce'];
+        }
 
         $result = [
             'response'             => $resp,
             'user_id'              => $userId,
             'session_issued'       => $sessionIssued,
-            'pending_registration' => (bool) ( $payload['pending_registration'] ?? false ),
+            'pending_registration' => $pendingRegistration,
             'rest_nonce'           => $restNonce,
             'token'                => $capturedToken,
             'cookie'               => $capturedCookie,
