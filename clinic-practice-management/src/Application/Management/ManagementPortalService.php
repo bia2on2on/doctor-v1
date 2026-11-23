@@ -616,7 +616,7 @@ final class ManagementPortalService {
 			if ( $trusted === null ) {
 				return self::failure();
 			}
-			App::clinicProfileService()->updateProfile( $actor_wp_user_id, $trusted, $input );
+			App::clinic_profile_service()->updateProfile( $actor_wp_user_id, $trusted, $input );
 		} catch ( \Throwable $e ) {
 			return self::failure();
 		}

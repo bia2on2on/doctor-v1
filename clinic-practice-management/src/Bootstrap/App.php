@@ -1451,8 +1451,7 @@ final class App
         return $repo;
     }
 
-    public static function clinicProfileService(): ClinicProfileService
-    {
+    public static function clinic_profile_service(): ClinicProfileService {
         static $service     = null;
         static $service_pid = null;
         if ( $service === null || $service_pid !== (int) getmypid() ) {
@@ -2768,7 +2767,7 @@ final class App
                 // Scope/Settings را resolve کند (نصبِ پیش از Migration / bootstrap
                 // تست‌ها). Provider فقط داخل هوک‌ها صدا زده می‌شود و آنجا هم
                 // fail-soft است (WpUpdateBridge).
-                $bridge = new WpUpdateBridge(static fn (): UpdateService => self::updateService());
+                $bridge = new WpUpdateBridge( static fn (): UpdateService => self::updateService() );
             } catch ( \Throwable $exception ) {
                 if ( null === $bridge ) {
                     throw $exception;

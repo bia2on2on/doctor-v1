@@ -356,7 +356,7 @@ final class ClinicianAdminPage
      *
      * @param array<string, mixed> $clinician
      */
-    private static function renderClinician(ClinicianRepository $repo, array $clinician, int $clinicId): void
+    private static function renderClinician(ClinicianRepository $repo, array $clinician, int $clinic_id): void
     {
         $cid = (int) $clinician['id'];
         $scheduleService = App::scheduleService();
@@ -369,7 +369,7 @@ final class ClinicianAdminPage
          * اصلی دارد (Migration 0011)؛ فهرست خالی ⇒ هیچ ردیف قابل ثبت نیست
          * (fail-closed — با قراردادِ جدیدی که Location صریح می‌خواهد سازگار است).
          */
-        $locations = App::location_repository()->listForClinic($clinicId);
+        $locations = App::location_repository()->listForClinic( $clinic_id );
         /*
          * Phase 6 Slice 6: نام Locationها برای نمایش در فهرست استثناها (همهٔ
          * Locationهای همین Clinic معتبر — FK ردیف را تضمین می‌کند) و مجموعهٔ

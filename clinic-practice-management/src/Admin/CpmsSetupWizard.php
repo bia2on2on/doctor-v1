@@ -1830,7 +1830,7 @@ final class CpmsSetupWizard
 
         // Delegate to canonical service (same path as other product paths)
         try {
-            App::clinicProfileService()->updateProfile($updatedBy, $trustedClinicId, [
+            App::clinic_profile_service()->updateProfile($updatedBy, $trustedClinicId, [
                 'name' => $name,
                 'address' => $address !== '' ? $address : null,
                 'phone' => $phone !== '' ? $phone : null,
