@@ -82,10 +82,24 @@ final class LoginRateLimiter
         // گیتِ بازیابی (PHP_INT_MAX) پس از این فیلتر دوباره هر نتیجه‌ای را
         // — شامل خطای محدودیت — دریافت می‌کند و یا آن را حفظ یا همان را
         // جایگزین می‌کند؛ هیچ‌یک از دو گیت نمی‌تواند دیگری را باز کند.
-        if ( ! $this->is_login_throttled( $username ) ) {
-            return $user;
+        try {
+            if ( ! $this->is_login_throttled( $username ) ) {
+                return $user;
+            }
+            $this->record( 'LOGIN_THROTTLED', $username, ClientIp::resolve() );
+        } catch (\Throwable) {
+            // Fail-closed: throttle housekeeping must never escape into the
+            // `authenticate` chain (e.g. the HMAC key could not be read or
+            // persisted). No cookie/session is issued, nothing is counted, no
+            // option is written, no OpLogger row is written, no retry — and the
+            // response is IDENTICAL for known/unknown accounts and for correct
+            // or wrong passwords.
+            return new \WP_Error(
+                'cpms_login_throttle_unavailable',
+                'سرویس محدودیت در دسترس نیست — کمی بعد دوباره تلاش کنید',
+                ['status' => 503]
+            );
         }
-        $this->record( 'LOGIN_THROTTLED', $username, ClientIp::resolve() );
 
         return new \WP_Error(
             'CLINIC_RATE_LIMITED',
@@ -100,16 +114,22 @@ final class LoginRateLimiter
     // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- Preserve the existing public callback.
     public function recordFailure( string $username, ?\WP_Error $error = null ): void
     {
-        $accounts = null !== $error && RestoreBarrierGate::blocked() ? RestoreBarrierGate::recovery_failure_accounts( $error ) : null;
-        if ( null !== $accounts ) {
-            foreach ( $accounts as $account ) {
-                if ( ! $this->is_login_throttled( $account ) ) {
-                    $this->count_failure( $account );
+        try {
+            $accounts = null !== $error && RestoreBarrierGate::blocked() ? RestoreBarrierGate::recovery_failure_accounts( $error ) : null;
+            if ( null !== $accounts ) {
+                foreach ( $accounts as $account ) {
+                    if ( ! $this->is_login_throttled( $account ) ) {
+                        $this->count_failure( $account );
+                    }
                 }
+                return;
             }
-            return;
+            $this->count_failure( $username );
+        } catch (\Throwable) {
+            // Fail-closed silence: wp_login_failed must never escape into core.
+            // Nothing counted, nothing logged, nothing written — the caller
+            // already holds the failure.
         }
-        $this->count_failure( $username );
     }
 
     public function is_login_throttled( string $username ): bool {
