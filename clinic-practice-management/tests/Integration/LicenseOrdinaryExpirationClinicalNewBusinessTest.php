@@ -438,6 +438,96 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
         }
     }
 
+    /**
+     * PR16-ROUND10 (reader fix): the Q3 tail of
+     * testExistingAppointmentRemainsActionableAfterAllNewServiceWindows reuses the
+     * already-admitted appointment and moves T0 behind admission, so its denial is
+     * attributable to post-T0 provenance as well as T1. This test keeps ONE fixed
+     * late signed term and three UNADMITTED pre-T0 appointments; every denial fires
+     * inside the license gate before any mutation (design §7.2 items 2 and 7;
+     * final Q3(a)).
+     */
+    public function testQ3FirstAdmissionUnadmittedPreT0AppointmentsDenyExactlyAtT1AndAfter(): void
+    {
+        // ONE fixed late signed term — T0 is never moved after admission (§7.2 item 7).
+        $t0 = time() - 10 * 86400; // signed 10 days ago (fixed)
+        $t1 = \ClinicCore\Domain\Licensing\LicenseStagePolicy::t1($t0); // half-open T1
+
+        // Fixtures are created while an ACTIVE license is installed; installing the
+        // expired term before creation would deny staff booking (new demand).
+        $this->expiresAt = time() + 86400;
+        $this->installOrdinaryExpiredLicense();
+
+        $slot_a = $this->makeSlot(2, '14:20');
+        $slot_b = $this->makeSlot(2, '15:20');
+        $slot_c = $this->makeSlot(2, '16:20');
+        $appt_a = App::bookingService()->createByStaff($this->secretaryUserId, $this->patientId, $this->clinicianId, $slot_a['date'], '14:20', null);
+        $appt_b = App::bookingService()->createByStaff($this->secretaryUserId, $this->patientId, $this->clinicianId, $slot_b['date'], '15:20', null);
+        $appt_c = App::bookingService()->createByStaff($this->secretaryUserId, $this->patientId, $this->clinicianId, $slot_c['date'], '16:20', null);
+        $ids = [ (int) $appt_a['appointment_id'], (int) $appt_b['appointment_id'], (int) $appt_c['appointment_id'] ];
+
+        // Backdate created_at/booked_at to BEFORE the fixed late T0 — the only
+        // provenance the gate reads (design §7.2 item 2).
+        $created = gmdate('Y-m-d H:i:s', $t0 - 10 * 86400);
+        foreach ( $ids as $id ) {
+            App::db()->update('cpms_appointments', ['created_at' => $created, 'booked_at' => $created], ['id' => $id]);
+        }
+
+        // The ONE fixed late signed term used by every call below.
+        $this->expiresAt = $t0;
+        $late = $this->installOrdinaryExpiredLicense();
+
+        // (1) Pre-T1 control via the REAL gate: an UNADMITTED pre-T0 pending/confirmed
+        //     appointment is first-admitted while now < T1.
+        $timezone = (string) App::db()->fetchValue(
+            'SELECT l.timezone FROM ' . App::db()->table('cpms_locations') . ' l JOIN '
+            . App::db()->table('cpms_appointments') . ' a ON a.location_id = l.id WHERE a.id = %d',
+            [$ids[0]]
+        );
+        $this->assertNotEmpty($timezone);
+        $arrival = new \DateTimeImmutable($slot_a['date'] . ' 00:00:00', new \DateTimeZone($timezone));
+        $arrival_utc = $arrival->setTimezone(new \DateTimeZone('UTC'));
+        \ClinicCore\Application\Visits\VisitService::setTestNowUtc($arrival_utc);
+        try {
+            $visit = $this->visitService($late, static fn (): int => $arrival_utc->getTimestamp())->checkIn($this->secretaryUserId, $this->patientId, $ids[0]);
+        } finally {
+            \ClinicCore\Application\Visits\VisitService::setTestNowUtc(null);
+        }
+        $this->assertSame('waiting', $visit['status']);
+        $this->assertSame($ids[0], (int) $visit['appointment_id']);
+
+        // (2) Exactly at T1 — same fixed term, UNADMITTED pre-T0 appointment: denied.
+        //     created_at < T0 and status qualify; the ONLY failing conjunct of
+        //     may_admit_booked_visit is `now < t1` (half-open boundary).
+        $t1_utc = (new \DateTimeImmutable('@' . $t1))->setTimezone(new \DateTimeZone('UTC'));
+        \ClinicCore\Application\Visits\VisitService::setTestNowUtc($t1_utc);
+        try {
+            $this->visitService($late, static fn (): int => $t1)->checkIn($this->secretaryUserId, $this->patientId, $ids[1]);
+            $this->fail('Q3(a): first admission exactly at T1 must be denied');
+        } catch (VisitException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+        } finally {
+            \ClinicCore\Application\Visits\VisitService::setTestNowUtc(null);
+        }
+
+        // (3) One hour after T1 — same fixed term, UNADMITTED pre-T0 appointment.
+        $late_utc = (new \DateTimeImmutable('@' . ( $t1 + 3600 )))->setTimezone(new \DateTimeZone('UTC'));
+        \ClinicCore\Application\Visits\VisitService::setTestNowUtc($late_utc);
+        try {
+            $this->visitService($late, static fn (): int => $t1 + 3600)->checkIn($this->secretaryUserId, $this->patientId, $ids[2]);
+            $this->fail('Q3(a): first admission after T1 must be denied');
+        } catch (VisitException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+        } finally {
+            \ClinicCore\Application\Visits\VisitService::setTestNowUtc(null);
+        }
+
+        // Denials happened before any persistent mutation: only the pre-T1
+        // control created a Visit.
+        $visits = (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . App::db()->table('cpms_visits') . ' WHERE patient_id = %d', [$this->patientId]);
+        $this->assertSame(1, $visits);
+    }
+
     public function testNewPatientAndWalkInDeniedFromT0ReturningGrantsNothing(): void
     {
         $this->expiresAt = time() - 60 * 86400;

@@ -56,6 +56,15 @@ final class AppServiceFactoryDependencyRebindTest extends WP_UnitTestCase
         self::assertTrue($reflection->hasProperty('installationSettings'));
     }
 
+    // Pin the backward-compat alias for the companion installer lane (PR16-ROUND10):
+    // tools/disposable-demo-installer calls App::locationService().
+    public function testLocationServiceBackwardCompatAliasDelegatesToNewAccessor(): void
+    {
+        self::assertTrue(method_exists(App::class, 'locationService'));
+        self::assertTrue(method_exists(App::class, 'location_service'));
+        self::assertSame(App::location_service(), App::locationService());
+    }
+
     public function testResetListNamesUsedByIntegrationSuitesAreDeclaredOnApp(): void
     {
         $reflection = new \ReflectionClass(App::class);

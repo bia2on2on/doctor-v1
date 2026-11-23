@@ -1514,6 +1514,18 @@ final class App
     }
 
     /**
+     * Backward-compat alias for `location_service()` — kept for the companion
+     * disposable-demo-installer lane, which still calls `App::locationService()`
+     * (tools/disposable-demo-installer/includes/class-cpms-demo-platform.php:1035)
+     * and cannot be edited in this production-only PR. The alias holds no state:
+     * no new static slot, no method-static memo, no singleton_pids ledger entry —
+     * it delegates immediately and inherits the callee's fork semantics.
+     */
+    public static function locationService(): LocationService { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy companion-lane alias; rename pending companion-owned PR
+        return self::location_service();
+    }
+
+    /**
      * سرویس مدیریت نقش سفارشی (Custom Role Slice 2) — Clinic-local،
      * authority از TrustedClinicEstablisher + AuthorizationService می‌آید.
      */
