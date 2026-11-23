@@ -279,19 +279,28 @@ final class RestoreBarrierGateTest extends WP_UnitTestCase {
             self::assertSame(1, $wpdb->update($wpdb->users, ['user_pass' => $legacy_hash], ['ID' => $user->ID]));
             clean_user_cache($user);
         }
-        $bucket = static fn (\WP_User $user): string => 'login-user:' . substr(hash('sha256', strtolower($user->user_login)), 0, 32);
+        // The throttle key is `login-user:` + the first 32 hex chars of the
+        // HMAC-SHA256 over the normalized login, keyed by the same HMAC key the
+        // plugin uses (CPMS_NID_HMAC_KEY constant else cpms_nid_hmac_key option).
+        $bucket = static function (\WP_User $user): string {
+            $key = (defined(\ClinicCore\Application\Auth\PatientNidHmac::CONST_KEY)
+                && '' !== constant(\ClinicCore\Application\Auth\PatientNidHmac::CONST_KEY))
+                ? constant(\ClinicCore\Application\Auth\PatientNidHmac::CONST_KEY)
+                : get_option(\ClinicCore\Application\Auth\PatientNidHmac::OPTION_KEY, '');
+            return 'login-user:' . substr(hash_hmac('sha256', 'login-user:' . strtolower(trim($user->user_login)), $key), 0, 32);
+        };
         $marks = static fn (): array => [
             $rate->peek($bucket($manager), $limiter::WINDOW_SEC),
             $rate->peek($bucket($patient), $limiter::WINDOW_SEC),
             (int) $db->fetchValue('SELECT COUNT(*) FROM %i WHERE message = %s', [$db->table('operational_logs'), 'LOGIN_FAILED']),
         ];
         $manager_hash = static fn (): string => (string) $db->fetchValue('SELECT user_pass FROM %i WHERE ID = %d', [$wpdb->users, $manager->ID]);
-        $rate_pattern = '/\A' . preg_quote('INSERT INTO ' . $db->table('rate_limits') . ' (window_key, window_id, window_sec, hits)', '/')
+        $rate_pattern = static fn (): string => '/\A' . preg_quote('INSERT INTO ' . $db->table('rate_limits') . ' (window_key, window_id, window_sec, hits)', '/')
             . '\s+VALUES \(\'' . preg_quote($bucket($manager), '/') . '\', [0-9]+, 900, 1\)\s+ON DUPLICATE KEY UPDATE\s+window_sec = VALUES\(window_sec\),\s+hits = hits \+ 1\z/';
         $hash_pattern = '/\AUPDATE `' . preg_quote($wpdb->users, '/') . "` SET `user_pass` = '[^']+', `user_activation_key` = '' WHERE `ID` = " . $manager->ID . '\z/';
         $hits = ['rate' => 0, 'hash' => 0];
         $watch = static function (string $sql) use ($rate_pattern, $hash_pattern, &$hits): string {
-            if (preg_match($rate_pattern, $sql) === 1) {
+            if (preg_match($rate_pattern(), $sql) === 1) {
                 ++$hits['rate'];
             }
             if (preg_match($hash_pattern, $sql) === 1) {
@@ -369,5 +378,68 @@ final class RestoreBarrierGateTest extends WP_UnitTestCase {
             return true;
         }
         return false;
+    }
+
+    /** PR19-FINAL (fix A): barrier active + recovery manager + empty key — fail-closed, no exception escapes. */
+    public function testBarrierRecoveryManagerWithEmptyKeyFailsClosedWithoutException(): void {
+        global $wpdb;
+
+        self::assertFalse(defined('CPMS_NID_HMAC_KEY'), 'CPMS_NID_HMAC_KEY must not be defined for this test');
+
+        // RB-17/RB-18 discipline (tests/Integration/RestoreBarrierGateTest.php:218-219, :279-280):
+        // set a known legacy hash so the positive witness reaches core's
+        // password check with the correct password (core otherwise rejects
+        // before wp_check_password, surfacing incorrect_password instead of
+        // the WP_User the positive witness requires).
+        $password = 'synthetic-restore-fix-witness';
+        $manager = self::factory()->user->create_and_get(['role' => 'administrator']);
+        $manager->add_cap('cpms_config');
+        $manager_hash = md5($password);
+        self::assertSame(1, $wpdb->update($wpdb->users, ['user_pass' => $manager_hash], ['ID' => $manager->ID]));
+        clean_user_cache($manager);
+
+        // Same restore discipline as the end-to-end key-row witness: save the
+        // prior option, clear the cache keys, restore in finally.
+        wp_cache_delete('cpms_nid_hmac_key', 'options');
+        wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
+        $prior_key = get_option('cpms_nid_hmac_key', null);
+
+        try {
+            self::assertTrue(add_option(RestoreBarrierStore::OPTION, 'test marker', '', false));
+
+            update_option('cpms_nid_hmac_key', '');
+            wp_cache_delete('cpms_nid_hmac_key', 'options');
+            wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
+
+            $result = wp_authenticate($manager->user_login, $password);
+
+            // An uncaught exception would fail the test at the wp_authenticate
+            // call above. The guard must fail closed with the same error the
+            // barrier already returns — no new error code.
+            self::assertInstanceOf(WP_Error::class, $result);
+            self::assertSame(RestoreBarrierGate::ERROR_CODE, $result->get_error_code());
+            $resultData = $result->get_error_data();
+            self::assertArrayHasKey('status', $resultData);
+            self::assertSame(503, $resultData['status']);
+
+            // Positive witness under the same setup: a valid key lets the
+            // recovery-manager authentication through the guard.
+            update_option('cpms_nid_hmac_key', bin2hex(random_bytes(32)));
+            wp_cache_delete('cpms_nid_hmac_key', 'options');
+            wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
+
+            $allowed = wp_authenticate($manager->user_login, $password);
+            self::assertInstanceOf(\WP_User::class, $allowed);
+            self::assertSame($manager->ID, $allowed->ID);
+        } finally {
+            delete_option(RestoreBarrierStore::OPTION);
+            if ($prior_key === null) {
+                delete_option('cpms_nid_hmac_key');
+            } else {
+                update_option('cpms_nid_hmac_key', $prior_key);
+            }
+            wp_cache_delete('cpms_nid_hmac_key', 'options');
+            wp_cache_delete('cpms_nid_hmac_key', 'notoptions');
+        }
     }
 }
