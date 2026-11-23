@@ -978,6 +978,8 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
             $optedOutVerifyData = $optedOutVerifyResp->get_data();
             self::assertIsArray( $optedOutVerifyData );
             self::assertArrayHasKey( 'code', $optedOutVerifyData );
+            self::assertArrayHasKey( 'message', $optedOutVerifyData );
+            self::assertArrayHasKey( 'data', $optedOutVerifyData );
             self::assertSame( 'CLINIC_NOT_FOUND', $optedOutVerifyData['code'] );
 
             $optedOutRegResp = $this->dispatchRestWithNonce(
@@ -1025,6 +1027,25 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
             );
             self::assertSame( 404, $nonexistentOtpResp->get_status() );
             self::assertSame( $optedOutOtpData, $nonexistentOtpResp->get_data() );
+
+            $nonexistentVerifyResp = $this->dispatchRest(
+                'POST',
+                '/clinic/v1/otp/verify',
+                [
+                    'clinic_id' => 999999,
+                    'mobile'    => $optOutMobile,
+                    'code'      => '334455',
+                    'purpose'   => OtpService::PURPOSE_VERIFY_MOBILE,
+                ]
+            );
+            self::assertSame( 404, $nonexistentVerifyResp->get_status() );
+            $nonexistentVerifyData = $nonexistentVerifyResp->get_data();
+            self::assertIsArray( $nonexistentVerifyData );
+            self::assertArrayHasKey( 'code', $nonexistentVerifyData );
+            self::assertArrayHasKey( 'message', $nonexistentVerifyData );
+            self::assertArrayHasKey( 'data', $nonexistentVerifyData );
+            self::assertSame( 'CLINIC_NOT_FOUND', $nonexistentVerifyData['code'] );
+            self::assertSame( $optedOutVerifyData, $nonexistentVerifyData );
 
             $nonexistentRegResp = $this->dispatchRestWithNonce(
                 'POST',
@@ -1318,6 +1339,252 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
             self::assertSame( $expectedAppts + 1, (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable ) );
         } finally {
             remove_filter( 'query', $bookingSpy, 5 );
+        }
+    }
+
+    public function testPatientRescheduleRefusesIncompleteProfileInsideTransactionAllowsStaffAndCancelAndPassesCompleteWitness(): void {
+        $db = App::db();
+
+        // Incomplete proved patient: valid national_id, MISSING birth_date.
+        $legacyMobile    = '09125550174';
+        $legacyPatientId = $this->insertPatient( $this->clinicListed, $legacyMobile, 'قدیمی', 'ناقص', self::NID_EXISTING, null );
+        $legacyUserId    = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_PATIENT ] );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $legacyUserId,
+            $this->clinicListed,
+            $legacyPatientId,
+            [
+                'mobile'             => $legacyMobile,
+                'seed_session_scope' => true,
+                'set_current_user'   => false,
+            ]
+        );
+
+        // Complete-profile proved patient witness.
+        $completeMobile    = '09125550175';
+        $completePatientId = $this->insertPatient( $this->clinicListed, $completeMobile, 'کامل', 'جابه', self::NID_CAP, '1992-05-10' );
+        $completeUserId    = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_PATIENT ] );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $completeUserId,
+            $this->clinicListed,
+            $completePatientId,
+            [
+                'mobile'             => $completeMobile,
+                'seed_session_scope' => true,
+                'set_current_user'   => false,
+            ]
+        );
+
+        $staffUserId = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_SECRETARY ] );
+        App::membership_service()->create_membership( $this->clinicListed, $staffUserId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $date1              = gmdate( 'Y-m-d', time() + 3 * 86400 );
+        $date2              = gmdate( 'Y-m-d', time() + 4 * 86400 );
+        $slotLegacyOld      = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $date1, '09:00:00' );
+        $slotLegacyTarget   = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $date1, '10:00:00' );
+        $slotStaffTarget    = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $date1, '11:00:00' );
+        $slotCompleteOld    = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $date2, '09:00:00' );
+        $slotCompleteTarget = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $date2, '10:00:00' );
+
+        $booking = App::bookingService();
+        ScopeContext::set( ClinicScope::forClinic( $this->clinicListed, $this->locationListed )->withOrganization( $this->orgId ) );
+        try {
+            $legacyAppt   = $booking->createByStaff( $staffUserId, $legacyPatientId, $this->clinicianListed, $date1, '09:00:00', 'نوبت ناقص', $slotLegacyOld );
+            $completeAppt = $booking->createByStaff( $staffUserId, $completePatientId, $this->clinicianListed, $date2, '09:00:00', 'نوبت کامل', $slotCompleteOld );
+        } finally {
+            ScopeContext::clear();
+        }
+        self::assertArrayHasKey( 'appointment_id', $legacyAppt );
+        self::assertArrayHasKey( 'appointment_id', $completeAppt );
+        $legacyApptId   = (int) $legacyAppt['appointment_id'];
+        $completeApptId = (int) $completeAppt['appointment_id'];
+
+        $apptsTable = $db->table( 'cpms_appointments' );
+        $holdsTable = $db->table( 'cpms_slot_holds' );
+        $slotsTable = $db->table( 'cpms_slots' );
+        $patsTable  = $db->table( 'cpms_patients' );
+        $auditTable = $db->table( 'cpms_audit_logs' );
+
+        $apptsBefore  = (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable );
+        $holdsBefore  = (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $holdsTable );
+        $auditsBefore = (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $auditTable );
+
+        $txStarts             = 0;
+        $txRollbacks          = 0;
+        $txCommits            = 0;
+        $txActive             = false;
+        $patientGateLockReads = 0;
+        $patientGateReadsInTx = 0;
+        $apptInserts          = 0;
+        $apptUpdates          = 0;
+        $holdInserts          = 0;
+        $slotCapacityWrites   = 0;
+        $auditInserts         = 0;
+
+        $rescheduleSpy = static function ( $query ) use (
+            $patsTable,
+            $holdsTable,
+            $apptsTable,
+            $slotsTable,
+            $auditTable,
+            &$txStarts,
+            &$txRollbacks,
+            &$txCommits,
+            &$txActive,
+            &$patientGateLockReads,
+            &$patientGateReadsInTx,
+            &$apptInserts,
+            &$apptUpdates,
+            &$holdInserts,
+            &$slotCapacityWrites,
+            &$auditInserts
+        ) {
+            $sql = trim( (string) $query );
+            if ( 1 === preg_match( '/^(?:\/\*cpms\*\/\s*)?(?:START\s+TRANSACTION|BEGIN)\b/i', $sql ) ) {
+                ++$txStarts;
+                $txActive = true;
+            }
+            if ( 1 === preg_match( '/^(?:\/\*cpms\*\/\s*)?ROLLBACK\b/i', $sql ) ) {
+                ++$txRollbacks;
+                $txActive = false;
+            }
+            if ( 1 === preg_match( '/^(?:\/\*cpms\*\/\s*)?COMMIT\b/i', $sql ) ) {
+                ++$txCommits;
+                $txActive = false;
+            }
+            if ( false !== stripos( $sql, $patsTable ) && false !== stripos( $sql, 'FOR UPDATE' ) ) {
+                ++$patientGateLockReads;
+                if ( $txActive ) {
+                    ++$patientGateReadsInTx;
+                }
+            }
+            if ( 1 === preg_match( '/^INSERT\s+INTO\s+`?' . preg_quote( $apptsTable, '/' ) . '`?\b/i', $sql ) ) {
+                ++$apptInserts;
+            }
+            if ( 1 === preg_match( '/^UPDATE\s+`?' . preg_quote( $apptsTable, '/' ) . '`?\b/i', $sql ) ) {
+                ++$apptUpdates;
+            }
+            if ( 1 === preg_match( '/^INSERT\s+INTO\s+`?' . preg_quote( $holdsTable, '/' ) . '`?\b/i', $sql ) ) {
+                ++$holdInserts;
+            }
+            if ( 1 === preg_match( '/^UPDATE\s+`?' . preg_quote( $slotsTable, '/' ) . '`?\b/i', $sql ) ) {
+                ++$slotCapacityWrites;
+            }
+            if ( 1 === preg_match( '/^INSERT\s+INTO\s+`?' . preg_quote( $auditTable, '/' ) . '`?\b/i', $sql ) ) {
+                ++$auditInserts;
+            }
+
+            return $query;
+        };
+
+        add_filter( 'query', $rescheduleSpy, 5 );
+        try {
+            // (a) Incomplete patient reschedule is denied inside the transaction with zero mutations.
+            PatientTwoProofTestHelper::acting_as( $legacyUserId );
+            $rescheduleEx = null;
+            try {
+                $booking->reschedule( $legacyUserId, $legacyApptId, $this->clinicianListed, $date1, '10:00:00', 'resched-legacy-' . uniqid(), $slotLegacyTarget );
+            } catch ( BookingException $e ) {
+                $rescheduleEx = $e;
+            }
+            self::assertInstanceOf( BookingException::class, $rescheduleEx );
+            self::assertSame( 'CLINIC_VALIDATION_FAILED', $rescheduleEx->errorCode );
+            self::assertSame( 400, $rescheduleEx->httpStatus );
+            self::assertGreaterThanOrEqual( 1, $txStarts );
+            self::assertSame( 1, $patientGateLockReads );
+            self::assertSame( 1, $patientGateReadsInTx );
+            self::assertGreaterThanOrEqual( 1, $txRollbacks );
+            self::assertSame( 0, $apptInserts );
+            self::assertSame( 0, $apptUpdates );
+            self::assertSame( 0, $holdInserts );
+            self::assertSame( 0, $slotCapacityWrites );
+            self::assertSame( 0, $auditInserts );
+            self::assertSame( $apptsBefore, (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable ) );
+            self::assertSame( $holdsBefore, (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $holdsTable ) );
+            self::assertSame( $auditsBefore, (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $auditTable ) );
+
+            $origApptRow = $db->fetchRow( 'SELECT status, rescheduled_to FROM ' . $apptsTable . ' WHERE id = %d', [ $legacyApptId ] );
+            self::assertIsArray( $origApptRow );
+            self::assertArrayHasKey( 'status', $origApptRow );
+            self::assertArrayHasKey( 'rescheduled_to', $origApptRow );
+            self::assertSame( 'confirmed', (string) $origApptRow['status'] );
+            self::assertNull( $origApptRow['rescheduled_to'] );
+
+            $oldSlotRow = $db->fetchRow( 'SELECT booked_count FROM ' . $slotsTable . ' WHERE id = %d', [ $slotLegacyOld ] );
+            self::assertIsArray( $oldSlotRow );
+            self::assertArrayHasKey( 'booked_count', $oldSlotRow );
+            self::assertSame( 1, (int) $oldSlotRow['booked_count'] );
+
+            $targetSlotRow = $db->fetchRow( 'SELECT booked_count FROM ' . $slotsTable . ' WHERE id = %d', [ $slotLegacyTarget ] );
+            self::assertIsArray( $targetSlotRow );
+            self::assertArrayHasKey( 'booked_count', $targetSlotRow );
+            self::assertSame( 0, (int) $targetSlotRow['booked_count'] );
+
+            // (b) Positive witness under the SAME spy: complete-profile patient reschedule succeeds.
+            $txStarts             = 0;
+            $txRollbacks          = 0;
+            $txCommits            = 0;
+            $txActive             = false;
+            $patientGateLockReads = 0;
+            $patientGateReadsInTx = 0;
+            $apptInserts          = 0;
+            $apptUpdates          = 0;
+            $holdInserts          = 0;
+            $slotCapacityWrites   = 0;
+            $auditInserts         = 0;
+
+            PatientTwoProofTestHelper::acting_as( $completeUserId );
+            $witnessRes = $booking->reschedule( $completeUserId, $completeApptId, $this->clinicianListed, $date2, '10:00:00', 'resched-complete-' . uniqid(), $slotCompleteTarget );
+            self::assertArrayHasKey( 'appointment_id', $witnessRes );
+            self::assertArrayHasKey( 'previous_appointment_id', $witnessRes );
+            self::assertArrayHasKey( 'status', $witnessRes );
+            self::assertGreaterThan( 0, (int) $witnessRes['appointment_id'] );
+            self::assertSame( $completeApptId, (int) $witnessRes['previous_appointment_id'] );
+            self::assertSame( 'confirmed', (string) $witnessRes['status'] );
+            self::assertGreaterThanOrEqual( 1, $txCommits );
+            self::assertSame( 1, $patientGateLockReads );
+            self::assertSame( 1, $patientGateReadsInTx );
+            self::assertSame( 1, $apptInserts );
+            self::assertGreaterThanOrEqual( 1, $apptUpdates );
+            self::assertGreaterThanOrEqual( 2, $slotCapacityWrites );
+            self::assertGreaterThanOrEqual( 1, $auditInserts );
+            self::assertSame( $apptsBefore + 1, (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable ) );
+
+            $completeOldSlot = $db->fetchRow( 'SELECT booked_count FROM ' . $slotsTable . ' WHERE id = %d', [ $slotCompleteOld ] );
+            self::assertIsArray( $completeOldSlot );
+            self::assertArrayHasKey( 'booked_count', $completeOldSlot );
+            self::assertSame( 0, (int) $completeOldSlot['booked_count'] );
+
+            $completeNewSlot = $db->fetchRow( 'SELECT booked_count FROM ' . $slotsTable . ' WHERE id = %d', [ $slotCompleteTarget ] );
+            self::assertIsArray( $completeNewSlot );
+            self::assertArrayHasKey( 'booked_count', $completeNewSlot );
+            self::assertSame( 1, (int) $completeNewSlot['booked_count'] );
+
+            // (c) Staff reschedule for the same incomplete patient succeeds without patient-profile gating.
+            $patientGateLockReads = 0;
+            $patientGateReadsInTx = 0;
+            ScopeContext::set( ClinicScope::forClinic( $this->clinicListed, $this->locationListed )->withOrganization( $this->orgId ) );
+            try {
+                $staffRes = $booking->rescheduleByStaff( $staffUserId, $legacyApptId, $this->clinicianListed, $date1, '11:00:00', 'resched-staff-' . uniqid(), $slotStaffTarget );
+            } finally {
+                ScopeContext::clear();
+            }
+            self::assertArrayHasKey( 'appointment_id', $staffRes );
+            self::assertArrayHasKey( 'previous_appointment_id', $staffRes );
+            self::assertArrayHasKey( 'status', $staffRes );
+            self::assertSame( $legacyApptId, (int) $staffRes['previous_appointment_id'] );
+            self::assertSame( 'confirmed', (string) $staffRes['status'] );
+            self::assertSame( 0, $patientGateLockReads );
+
+            // (d) Patient cancel by the same incomplete patient still succeeds.
+            PatientTwoProofTestHelper::acting_as( $legacyUserId );
+            $cancelRes = $booking->cancelByPatient( $legacyUserId, (int) $staffRes['appointment_id'], 'لغو توسط بیمار ناقص' );
+            self::assertArrayHasKey( 'appointment_id', $cancelRes );
+            self::assertArrayHasKey( 'status', $cancelRes );
+            self::assertSame( (int) $staffRes['appointment_id'], (int) $cancelRes['appointment_id'] );
+            self::assertSame( 'cancelled', (string) $cancelRes['status'] );
+        } finally {
+            remove_filter( 'query', $rescheduleSpy, 5 );
         }
     }
 

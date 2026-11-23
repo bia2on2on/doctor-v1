@@ -1731,6 +1731,10 @@ final class BookingService
                     // the persisted destination Slot, Location, and Clinic policy.
                     $this->assertWindowWithTimezone( (string) $new_slot['slot_date'], (string) $new_slot['slot_time'], $new_location_tz, $min_lead, $new_settings );
 
+                    if ( 'patient' === $actor ) {
+                        $this->assert_patient_profile_complete_for_booking( (int) $appt['patient_id'] );
+                    }
+
                     $dup = $this->appointments->findActiveForPatientSlot( (int) $appt['patient_id'], $new_slot_id, self::ACTIVE_STATUSES );
                     if ( $dup !== null && (int) $dup['id'] !== $appointment_id ) {
                         throw BookingException::of( 'CLINIC_DUPLICATE_APPOINTMENT', 'در اسلات مقصد نوبت Active دارید', 409 );

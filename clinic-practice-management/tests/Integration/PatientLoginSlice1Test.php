@@ -1061,7 +1061,9 @@ final class PatientLoginSlice1Test extends WP_UnitTestCase {
         self::assertSame( 1, $precheckSelectHits, 'Valid unique-NID staff edit must run the pre-check query once.' );
         self::assertSame( 1, $patientUpdateHits, 'Valid unique-NID staff edit must execute exactly 1 UPDATE cpms_patients statement.' );
         $updatedRow = App::db()->fetchRow( 'SELECT national_id FROM ' . $patientTable . ' WHERE id = %d', [ $this->patientPending ] );
-        self::assertSame( $uniqueNid, (string) ( $updatedRow['national_id'] ?? '' ) );
+        self::assertIsArray( $updatedRow );
+        self::assertArrayHasKey( 'national_id', $updatedRow );
+        self::assertSame( $uniqueNid, (string) $updatedRow['national_id'] );
         self::assertNull( $logins->find_binding( $this->userPending, $this->clinicA, $this->patientPending, true ), 'NID correction must close active binding (§7.6).' );
         self::assertNull( WP_Session_Tokens::get_instance( $this->userPending )->get( $token ), 'NID correction must destroy patient sessions (§7.6).' );
     }
