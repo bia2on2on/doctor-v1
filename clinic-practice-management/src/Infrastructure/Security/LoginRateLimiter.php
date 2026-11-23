@@ -79,32 +79,18 @@ final class LoginRateLimiter
             return $user;
         }
 
-        $key = $this->resolve_hmac_key();
-
-        if ( null === $key ) {
-            // کلید HMAC در دسترس نیست یا قابل نگهداری نیست: نتیجهٔ کنترل‌شدهٔ
-            // fail-closed (بدون پرتاب, بدون شمارش, بدون افشای کلید) — پیام
-            // برای همهٔ حساب‌ها یکسان است و هرگز نام کاربری یا کلید در آن نیست.
-            $this->log_unavailable( ClientIp::resolve() );
-            return new \WP_Error(
-                'cpms_login_throttle_unavailable',
-                'سرویس محدودیت در دسترس نیست — کمی بعد دوباره تلاش کنید',
-                [ 'status' => 503 ]
-            );
-        }
-
         // گیتِ بازیابی (PHP_INT_MAX) پس از این فیلتر دوباره هر نتیجه‌ای را
         // — شامل خطای محدودیت — دریافت می‌کند و یا آن را حفظ یا همان را
         // جایگزین می‌کند؛ هیچ‌یک از دو گیت نمی‌تواند دیگری را باز کند.
-        if ( ! $this->is_login_throttled_with_key( $username, $key ) ) {
+        if ( ! $this->is_login_throttled( $username ) ) {
             return $user;
         }
-        $this->record( 'LOGIN_THROTTLED', $username, ClientIp::resolve(), $key );
+        $this->record( 'LOGIN_THROTTLED', $username, ClientIp::resolve() );
 
         return new \WP_Error(
             'CLINIC_RATE_LIMITED',
             'تلاش‌های ناموفق زیاد بوده است — کمی بعد دوباره تلاش کنید',
-            [ 'status' => 429 ]
+            ['status' => 429]
         );
     }
 
@@ -127,33 +113,12 @@ final class LoginRateLimiter
     }
 
     public function is_login_throttled( string $username ): bool {
-        $key = $this->resolve_hmac_key();
-
-        // fail-closed: کلید در دسترس نیست ⇒ محدودیّت در نظر گرفته می‌شود (بدون پرتاب).
-        if ( null === $key ) {
-            $this->log_unavailable( ClientIp::resolve() );
-            return true;
-        }
-
-        return $this->is_login_throttled_with_key( $username, $key );
-    }
-
-    private function is_login_throttled_with_key( string $username, string $key ): bool {
         $ip = ClientIp::resolve();
         return ( null !== $ip && $this->isOver( 'login-ip:' . $ip, self::MAX_PER_IP ) )
-            || ( '' !== $username && $this->isOver( 'login-user:' . $this->user_key( $username, $key ), self::MAX_PER_USERNAME ) );
+            || ( '' !== $username && $this->isOver( 'login-user:' . $this->user_key( $username ), self::MAX_PER_USERNAME ) );
     }
 
     private function count_failure( string $username ): void {
-        $key = $this->resolve_hmac_key();
-
-        // کلید در دسترس نیست ⇒ هیچ سبدی شمرده نمی‌شود (شمارش نیازمند کلید است)؛
-        // فقط لاگ عملیاتی بدون مواد کلیدی.
-        if ( null === $key ) {
-            $this->log_unavailable( ClientIp::resolve() );
-            return;
-        }
-
         $ip = ClientIp::resolve();
         // تلاش ردشده در سقفی که به آن رسیده یا از آن گذشته است، آن سبد را
         // بیشتر نمی‌افزاید: شمارندهٔ هر سبد نزدیک سقف (IP ≈ ۲۰، نام کاربری
@@ -162,11 +127,11 @@ final class LoginRateLimiter
         if ( $ip !== null && ! $this->isOver( 'login-ip:' . $ip, self::MAX_PER_IP ) ) {
             $this->rate->hit( 'login-ip:' . $ip, self::MAX_PER_IP, self::WINDOW_SEC );
         }
-        if ( $username !== '' && ! $this->isOver( 'login-user:' . $this->user_key( $username, $key ), self::MAX_PER_USERNAME ) ) {
-            $this->rate->hit( 'login-user:' . $this->user_key( $username, $key ), self::MAX_PER_USERNAME, self::WINDOW_SEC );
+        if ( $username !== '' && ! $this->isOver( 'login-user:' . $this->user_key( $username ), self::MAX_PER_USERNAME ) ) {
+            $this->rate->hit( 'login-user:' . $this->user_key( $username ), self::MAX_PER_USERNAME, self::WINDOW_SEC );
         }
 
-        $this->record( 'LOGIN_FAILED', $username, $ip, $key );
+        $this->record( 'LOGIN_FAILED', $username, $ip );
     }
 
     /**
@@ -186,9 +151,9 @@ final class LoginRateLimiter
      * پیشوند `login-user:` جدا می‌شود، بنابراین هیچ کلید نام کاربری‌ای با
      * کلید `nid:` یکسان یا برابر نیست.
      */
-    private function user_key( string $username, string $key ): string {
+    private function user_key( string $username ): string {
         return substr(
-            hash_hmac( 'sha256', 'login-user:' . strtolower( trim( $username ) ), $key ),
+            hash_hmac( 'sha256', 'login-user:' . strtolower( trim( $username ) ), $this->hmac_key() ),
             0,
             32
         );
@@ -197,23 +162,10 @@ final class LoginRateLimiter
     /**
      * کلید HMAC موجود — همان منبع `PatientNidHmac`: ثابت `CPMS_NID_HMAC_KEY`
      * اگر تعریف شده و غیرتهی باشد، در غیر این صورت Option بدون Autoload با
-     * همان نام. هیچ Option یا Constant جدیدی اضافه نمی‌کند.
-     *
-     * هرگز پرتاب نمی‌کند و هیچ‌گونه بازنویسیِ خودکار در ROW موجود انجام
-     * نمی‌دهد (نه `update_option()`، نه بازنویسی در جا). اگر کلید در
-     * دسترس نباشد، `null` برمی‌گرداند تا فراخوان‌کننده نتیجهٔ fail-closed
-     * کنترل‌شده را صادر کند. اندیشه‌های جریان:
-     *  - Constant `CPMS_NID_HMAC_KEY` تعریف‌شده و غیرتهی ⇒ همان ثابت؛
-     *  - Optionِ موجود با مقدار معتبر غیرتهی ⇒ همان مقدار ذخ‌شده؛
-     *  - Optionِ موجود ولی خالی/نامعتبر ⇒ `null` (fail-closed، بدون نوشتن)؛
-     *  - Optionِ غایب ⇒ یک‌بار `add_option()` + بازخوانی cache-busted.
-     * پس از ساختِ Row، مقدار همیشه همان مقدار ذخ‌شده در جدول است: اگر
-     * نویسنده‌ای همزمان همان Row را بازنویسی کند، کلید یتیم می‌ماند
-     * (پذیرفته‌شده) ولی خواننده هیچ‌گاه کلید محلیِ ساخته‌شده درونِ این
-     * تابع را نخواهد آورد. انتظار می‌رود فراخوان‌کننده هیچ exceptionی
-     * در زنجیرهٔ `authenticate`/`wp_login_failed` را اجازهٔ فرار ندهد.
+     * همان نام (ساخته‌شده یک‌بار با random_bytes). هیچ Option یا Constant جدیدی
+     * اضافه نمی‌کند.
      */
-    private function resolve_hmac_key(): ?string {
+    private function hmac_key(): string {
         if ( defined( PatientNidHmac::CONST_KEY ) ) {
             $constant = constant( PatientNidHmac::CONST_KEY );
             if ( is_string( $constant ) && '' !== $constant ) {
@@ -221,78 +173,27 @@ final class LoginRateLimiter
             }
         }
 
-        if ( ! function_exists( 'get_option' ) ) {
-            return null;
+        if ( function_exists( 'get_option' ) ) {
+            $existing = get_option( PatientNidHmac::OPTION_KEY, '' );
+            if ( is_string( $existing ) && '' !== $existing ) {
+                return $existing;
+            }
+
+            if ( function_exists( 'add_option' ) ) {
+                $generated = bin2hex( random_bytes( 32 ) );
+                if ( add_option( PatientNidHmac::OPTION_KEY, $generated, '', 'no' ) ) {
+                    return $generated;
+                }
+                $reread = get_option( PatientNidHmac::OPTION_KEY, '' );
+                if ( is_string( $reread ) && '' !== $reread ) {
+                    return $reread;
+                }
+            }
+
+            throw new \RuntimeException( 'Failed to persist HMAC key' );
         }
 
-        // row بررسی می‌شود: `null` یعنی Rowِ چنین optionی وجود ندارد.
-        $existing = get_option( PatientNidHmac::OPTION_KEY, null );
-
-        if ( is_string( $existing ) && '' !== $existing ) {
-            return $existing;
-        }
-
-        if ( null !== $existing ) {
-            // Row وجود دارد ولی خالی است یا مقدار قابل استفاده نیست (مثلاً
-            // serialization داده شده یا نوع ناسازگار). بدون بازنویسی در جا —
-            // بدون نوشتن، بدون بازخوانی مجدد؛ `null` (fail-closed) را برگردان.
-            return null;
-        }
-
-        // Rowی وجود ندارد: آن را با add_option بسازید و سپس مقدار ذخ‌شده را
-        // (بدون کلید محلی) دوباره بخوانید — ببینید «شرایط رقابتی» در پایین.
-        return $this->bootstrap_hmac_key();
-    }
-
-    /**
-     * ساخت یک Row تازه‌ی optionی با add_option (autoload no). پس از موفقیت،
-     * مقدار ذخ‌شده را (با عبور از object cache) می‌خوانیم و همان را به‌جای
-     * کلید محلی ساخته شده می‌آوریم: اگر نویسنده‌ای همزمان همان Row را با
-     * مقدار دیگر نوشت، همان مقدار باقی‌مانده همان کلید معتبر است.
-     */
-    private function bootstrap_hmac_key(): ?string {
-        if ( ! function_exists( 'add_option' ) ) {
-            return null;
-        }
-
-        $generated = bin2hex( random_bytes( 32 ) );
-        add_option( PatientNidHmac::OPTION_KEY, $generated, '', 'no' );
-
-        // اگر add_option رد شد (مثلاً بین بررسی و ایجاد رقیب این Row را
-        // نوشت)، مقدار ذخ‌شده را همان‌طور بخوانید.
-        return $this->stored_hmac_key();
-    }
-
-    /**
-     * خوندن مقدار ذخ‌شده از Row یا Option (با عبور از object cache): فقط
-     * رشته‌ی غیر خالی معتبر است. به هیچ وجه استثنا نمی‌کند.
-     */
-    private function stored_hmac_key(): ?string {
-        if ( ! function_exists( 'get_option' ) ) {
-            return null;
-        }
-
-        if ( function_exists( 'wp_cache_delete' ) ) {
-            wp_cache_delete( PatientNidHmac::OPTION_KEY, 'options' );
-        }
-
-        $stored = get_option( PatientNidHmac::OPTION_KEY, null );
-
-        return ( is_string( $stored ) && '' !== $stored ) ? $stored : null;
-    }
-
-    /**
-     * لاگ عملیاتیِ هنگام عدم دسترس‌پذیری کلید — بدون هیچ مادهٔ کلیدی یا
-     * نام کاربری؛ فقط Ip و reason.
-     */
-    private function log_unavailable( ?string $ip ): void {
-        $this->log?->warning(
-            'LOGIN_THROTTLE_UNAVAILABLE',
-            [
-                'ip'     => $ip,
-                'reason' => 'hmac_key_unavailable',
-            ]
-        );
+        throw new \RuntimeException( 'No HMAC key source available' );
     }
 
     /**
@@ -304,16 +205,12 @@ final class LoginRateLimiter
      * تا زمانی که Phase 2 مدل Organization را بسازد، این رویدادها فقط در
      * لاگ عملیاتی می‌روند (ثبت‌شده در Deferred Register فاز 1B).
      */
-    private function record( string $action, string $username, ?string $ip, ?string $key = null ): void
+    private function record(string $action, string $username, ?string $ip): void
     {
-        $this->log?->warning(
-            $action,
-            [
-                // نام کاربری خام لاگ نمی‌شود (Enumeration/PII); بدون کلید نیز
-                // نباید هیش خام را در لاگ گذاشت
-                'username_hash' => ( null !== $key && '' !== $username ) ? $this->user_key( $username, $key ) : null,
-                'ip'            => $ip,
-            ]
-        );
+        $this->log?->warning($action, [
+            // نام کاربری خام لاگ نمی‌شود (Enumeration/PII)
+            'username_hash' => $this->user_key( $username ),
+            'ip' => $ip,
+        ]);
     }
 }
