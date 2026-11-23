@@ -27,12 +27,14 @@ use ClinicCore\Domain\Slots\DurationResolver;
 use ClinicCore\Domain\Time\Jalali;
 use ClinicCore\Domain\Time\PersianDigits;
 use ClinicCore\Domain\Validators\MobileValidator;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Domain\Validators\VisibleText;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 use ClinicCore\Infrastructure\Repository\AppointmentRepository;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
+use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Infrastructure\Repository\SlotRepository;
 use ClinicCore\Infrastructure\Security\Idempotency;
@@ -612,11 +614,12 @@ final class BookingService
                 $slot_time,
                 $slot_date
             ): int {
-                // New demand takes Organization -> Clinic -> Slot -> Location/capacity.
+                // New demand takes Account -> Organization -> Clinic -> Slot -> Location/capacity.
                 // Slot before Location is the established booking order: the
                 // independent staff-create race test requires the Slot lock to be
                 // held while the actor blocks on the Location row, and every other
                 // booking path follows the same order so no ABBA cycle exists.
+                $this->enforce_account_pending_appointment_cap( $wp_user_id, null );
                 $this->lock_booking_tenant_prefix( (int) $slot['clinic_id'] );
                 $locked_slot = $this->slots->findForUpdate( (int) $slot['id'] );
                 $this->assert_read_succeeded(
@@ -646,6 +649,7 @@ final class BookingService
                     $settings
                 );
                 $this->assert_patient_session_matches_clinic( $wp_user_id, (int) $locked_slot['clinic_id'] );
+                $this->assert_patient_profile_complete_for_booking( $patient_id_to_persist );
 
                 if ( ! $this->slots->atomicHold( (int) $locked_slot['id'] ) ) {
                     // FR-4.6: پاکت/کد/پیام دست‌نخورده — فقط دادهٔ الحاقیِ nearby_slots
@@ -957,6 +961,7 @@ final class BookingService
                     if ( $candidate_slot === null || (int) ( $candidate_slot['clinic_id'] ?? 0 ) !== $hold_clinic_id ) {
                         throw BookingException::of( 'CLINIC_SLOT_TAKEN', 'اسلات دیگر در دسترس نیست', 409 );
                     }
+                    $this->enforce_account_pending_appointment_cap( $wp_user_id, null );
                     $this->lock_booking_tenant_prefix( $hold_clinic_id );
 
                     $locked_hold = $this->db->fetchRowForUpdate(
@@ -1007,6 +1012,7 @@ final class BookingService
                     // existing Patient (frozen subject or single-linked
                     // Historical-NULL auto-bind). No Patient row is created here.
                     $patient_id = (int) $patient['id'];
+                    $this->assert_patient_profile_complete_for_booking( $patient_id );
 
                     $dup = $this->appointments->findActiveForPatientSlot( $patient_id, $slot_id, self::ACTIVE_STATUSES );
                     if ( $dup !== null ) {
@@ -1724,6 +1730,10 @@ final class BookingService
                     // Final timezone/window validation follows all lock waits, using
                     // the persisted destination Slot, Location, and Clinic policy.
                     $this->assertWindowWithTimezone( (string) $new_slot['slot_date'], (string) $new_slot['slot_time'], $new_location_tz, $min_lead, $new_settings );
+
+                    if ( 'patient' === $actor ) {
+                        $this->assert_patient_profile_complete_for_booking( (int) $appt['patient_id'] );
+                    }
 
                     $dup = $this->appointments->findActiveForPatientSlot( (int) $appt['patient_id'], $new_slot_id, self::ACTIVE_STATUSES );
                     if ( $dup !== null && (int) $dup['id'] !== $appointment_id ) {
@@ -3082,6 +3092,111 @@ final class BookingService
 
     private function patient_access(): PatientAccess {
         return $this->patient_access ?? App::patient_access();
+    }
+
+    private function assert_patient_profile_complete_for_booking( ?int $patient_id ): void {
+        if ( null === $patient_id || $patient_id <= 0 ) {
+            throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
+        }
+        $row = $this->db->fetchRowForUpdate(
+            'SELECT id, first_name, last_name, mobile, national_id, birth_date FROM ' . $this->db->table( 'cpms_patients' ) . ' WHERE id = %d LIMIT 1',
+            [ $patient_id ]
+        );
+        if ( '' !== (string) $this->db->wpdb()->last_error ) {
+            throw BookingException::of( self::LOCK_BUSY_CODE, self::LOCK_BUSY_TEXT, self::LOCK_BUSY_HTTP );
+        }
+        $this->assert_patient_profile_complete_row( $row );
+    }
+
+    /**
+     * @param array<string, mixed>|null $patient
+     */
+    private function assert_patient_profile_complete_row( ?array $patient ): void {
+        if ( null === $patient ) {
+            throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
+        }
+        $first_name  = trim( (string) ( $patient['first_name'] ?? '' ) );
+        $last_name   = trim( (string) ( $patient['last_name'] ?? '' ) );
+        $mobile      = trim( (string) ( $patient['mobile'] ?? '' ) );
+        $national_id = trim( (string) ( $patient['national_id'] ?? '' ) );
+        $birth_date  = trim( (string) ( $patient['birth_date'] ?? '' ) );
+        $valid_birth = 1 === preg_match( '/^(\d{4})-(\d{2})-(\d{2})$/', $birth_date, $birth_parts )
+            && '0000-00-00' !== $birth_date
+            && checkdate( (int) $birth_parts[2], (int) $birth_parts[3], (int) $birth_parts[1] );
+        if (
+            '' === $first_name
+            || '' === $last_name
+            || '' === $mobile
+            || '' === $national_id
+            || ! NationalIdValidator::isValid( $national_id )
+            || ! $valid_birth
+        ) {
+            throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
+        }
+    }
+
+    /**
+     * Enforces the per-account active future appointment cap (§8, MAX = 2)
+     * across all active proved bindings of the account inside the booking
+     * transaction, locking the account row outermost (`FOR UPDATE`).
+     */
+    private function enforce_account_pending_appointment_cap( int $wp_user_id, ?int $exclude_appointment_id = null ): void {
+        if ( $wp_user_id <= 0 ) {
+            return;
+        }
+        $logins = new PatientLoginRepository( $this->db );
+        if ( ! $logins->table_exists() ) {
+            return;
+        }
+
+        $account = $logins->find_account_by_user_id( $wp_user_id, true );
+        if ( null === $account ) {
+            return;
+        }
+        if ( PatientLoginRepository::STATE_ACTIVE !== (string) ( $account['state'] ?? '' ) ) {
+            throw BookingException::of( PatientAccess::PROOF_FAILED_CODE, PatientAccess::PROOF_FAILED_MESSAGE, 403 );
+        }
+
+        $all_bindings = $logins->find_active_bindings_for_user( $wp_user_id, null );
+        if ( [] === $all_bindings ) {
+            return;
+        }
+
+        $all_patient_ids = array_values(
+            array_unique(
+                array_filter(
+                    array_map(
+                        static fn ( array $b ): int => (int) ( $b['patient_id'] ?? 0 ),
+                        $all_bindings
+                    ),
+                    static fn ( int $id ): bool => $id > 0
+                )
+            )
+        );
+        if ( [] === $all_patient_ids ) {
+            return;
+        }
+
+        // §2.8 / §8 / §10: cap evaluation requires every active binding on the account
+        // to hold a valid two-factor proof in this session.
+        $proved_ids = $this->patient_access()->proved_patient_ids( $wp_user_id, null );
+        if ( [] !== array_diff( $all_patient_ids, $proved_ids ) ) {
+            throw BookingException::of( PatientAccess::PROOF_FAILED_CODE, PatientAccess::PROOF_FAILED_MESSAGE, 403 );
+        }
+
+        $today_utc    = $this->now()->format( 'Y-m-d' );
+        $active_count = $logins->count_active_future_appointments_for_patients(
+            $all_patient_ids,
+            $today_utc,
+            $exclude_appointment_id
+        );
+        if ( $active_count >= PatientLoginRepository::MAX_PENDING_APPOINTMENTS_PER_ACCOUNT ) {
+            throw BookingException::of(
+                'CLINIC_BOOKING_CAP_EXCEEDED',
+                'حداکثر ۲ نوبت فعال هم‌زمان برای هر حساب مجاز است',
+                422
+            );
+        }
     }
 
     private function assert_patient_session_matches_clinic( int $wp_user_id, int $expected_clinic_id ): void {

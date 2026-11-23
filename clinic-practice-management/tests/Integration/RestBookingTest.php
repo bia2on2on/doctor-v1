@@ -63,10 +63,11 @@ final class RestBookingTest extends WP_UnitTestCase
         $wpdb->query(
             $wpdb->prepare(
                 'INSERT INTO ' . $wpdb->prefix . 'cpms_patients
-                     (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
-                 VALUES (1, %s, "A", "Patient", %s, "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                     (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at)
+                 VALUES (1, %s, "A", "Patient", %s, %s, "1990-01-01", "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
                 'MR-REST-0001',
                 '09121110001',
+                PatientTwoProofTestHelper::next_valid_national_id(),
                 $now,
                 $now
             )
@@ -77,10 +78,11 @@ final class RestBookingTest extends WP_UnitTestCase
         $wpdb->query(
             $wpdb->prepare(
                 'INSERT INTO ' . $wpdb->prefix . 'cpms_patients
-                     (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
-                 VALUES (1, %s, "B", "Patient", %s, "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                     (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at)
+                 VALUES (1, %s, "B", "Patient", %s, %s, "1990-01-01", "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
                 'MR-REST-0002',
                 '09121110002',
+                PatientTwoProofTestHelper::next_valid_national_id(),
                 $now,
                 $now
             )

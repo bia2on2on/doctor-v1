@@ -65,6 +65,7 @@ final class PatientBoundaryWriterInventoryTest extends TestCase
         'src/Admin/FinanceDelegationPage.php'                               => 'GUARDED: delegates to FinanceDelegationService (G5 guard + revocation rules).',
         'src/Auth/RolesAndCapabilities.php'                                 => 'NOT NEEDED at this level: the role/capability registry; every widening decision lives in RoleCapabilitiesPage (H2 guards) and CustomRoleManagementService (G9 guard).',
         'src/Admin/StaffManagementPage.php'                                 => 'GUARDED: PatientAccountPolicy::guard()/is_patient_account() on every credential, role and status path.',
+        'src/Application/Auth/PatientRegistrationService.php'                => 'NOT NEEDED: creates pure ROLE_PATIENT WordPress user with opaque credentials during OTP-verified self-registration (no staff role, capability, or membership write).',
         'src/Application/Finance/FinanceDelegationService.php'              => 'GUARDED: G5 delegate()/revoke() patient checks plus strict prior-effect read.',
         'src/Application/Management/ManagementPortalService.php'            => 'GUARDED: patient checks on enroll, role, status, capability, scope and clinician link.',
         'src/Application/Membership/MembershipService.php'                  => 'NOT NEEDED: low-level primitive; every caller is an allowlisted, guarded service.',

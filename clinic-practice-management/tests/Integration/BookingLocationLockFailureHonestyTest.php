@@ -63,12 +63,14 @@ final class BookingLocationLockFailureHonestyTest extends WP_UnitTestCase
 
         $wpdb->query($wpdb->prepare(
             'INSERT INTO ' . $wpdb->prefix . 'cpms_patients
-                 (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
-             VALUES (1, %s, %s, %s, %s, %s, %s, %s)',
+                 (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at)
+             VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
             'MR-LOCK-' . $unique,
             'A',
             'Patient',
             $mobile,
+            PatientTwoProofTestHelper::next_valid_national_id(),
+            '1990-01-01',
             'active',
             $now,
             $now

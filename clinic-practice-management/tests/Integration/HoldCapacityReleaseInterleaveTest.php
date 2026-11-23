@@ -519,13 +519,14 @@ final class HoldCapacityReleaseInterleaveTest extends WP_UnitTestCase
         $this->mustQuery(
             $wpdb->prepare(
                 'INSERT INTO ' . $wpdb->prefix . 'cpms_patients
-                     (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
-                 VALUES (%d, %s, %s, %s, %s, "active", %s, %s)',
+                     (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at)
+                 VALUES (%d, %s, %s, %s, %s, %s, "1990-01-01", "active", %s, %s)',
                 $this->clinicId,
                 'MR-INT-' . strtoupper( substr( $tag, -6 ) ) . '-' . wp_generate_password( 4, false, false ),
                 'Interleave',
                 'Patient',
                 '0912' . str_pad( (string) ( abs( crc32( $tag ) ) % 10000000 ), 7, '0', STR_PAD_LEFT ),
+                PatientTwoProofTestHelper::next_valid_national_id(),
                 $now,
                 $now
             )

@@ -6,6 +6,7 @@ namespace ClinicCore\Rest;
 
 use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientBindingPromoter;
+use ClinicCore\Application\Auth\PatientRegistrationService;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Application\Patients\PatientService;
@@ -36,12 +37,31 @@ final class PatientController extends RestBase
     public function __construct(
         private readonly PatientService $patients,
         private readonly ?PatientAccess $patient_access = null,
-        private readonly ?PatientBindingPromoter $promoter = null
+        private readonly ?PatientBindingPromoter $promoter = null,
+        private readonly ?PatientRegistrationService $registration = null
     ) {
     }
 
     public function register_routes(): void
     {
+        register_rest_route(
+            self::NS,
+            '/patient/register',
+            [
+                'methods'             => WP_REST_Server::CREATABLE,
+                'permission_callback' => fn ( WP_REST_Request $request ) => $this->require_patient_register_access( $request ),
+                'callback'            => fn ( WP_REST_Request $request ) => $this->register( $request ),
+                'args'                => [
+                    'clinic_id'   => [ 'required' => false ],
+                    'mobile'      => [ 'required' => false, 'type' => 'string' ],
+                    'given_name'  => [ 'required' => false, 'type' => 'string' ],
+                    'family_name' => [ 'required' => false, 'type' => 'string' ],
+                    'national_id' => [ 'required' => false, 'type' => 'string' ],
+                    'birth_date'  => [ 'required' => false, 'type' => 'string' ],
+                ],
+            ]
+        );
+
         register_rest_route(
             self::NS,
             '/patient/link-record',
@@ -239,6 +259,57 @@ final class PatientController extends RestBase
             $fields,
             (int) $user->ID
         ));
+    }
+
+    /**
+     * Step 2 patient self-registration completion (§4, Slice 2 — two-step split).
+     */
+    private function register( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+        $query = $request->get_query_params();
+        if (
+            is_array( $query )
+            && (
+                array_key_exists( 'national_id', $query )
+                || array_key_exists( 'code', $query )
+                || array_key_exists( 'mobile', $query )
+                || array_key_exists( 'given_name', $query )
+                || array_key_exists( 'family_name', $query )
+                || array_key_exists( 'first_name', $query )
+                || array_key_exists( 'last_name', $query )
+                || array_key_exists( 'birth_date', $query )
+            )
+        ) {
+            return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );
+        }
+
+        $body            = $this->body_only( $request );
+        $clinic_raw      = $body['clinic_id'] ?? $request->get_header( 'X-CPMS-Clinic-Id' );
+        $clinic_id       = is_numeric( $clinic_raw ) ? (int) $clinic_raw : 0;
+        $raw_mobile      = is_string( $body['mobile'] ?? null ) ? (string) $body['mobile'] : '';
+        $raw_given_name  = is_string( $body['given_name'] ?? null ) ? (string) $body['given_name'] : '';
+        $raw_family_name = is_string( $body['family_name'] ?? null ) ? (string) $body['family_name'] : '';
+        $raw_nid         = is_string( $body['national_id'] ?? null ) ? (string) $body['national_id'] : '';
+        $raw_birth_date  = is_string( $body['birth_date'] ?? null ) ? (string) $body['birth_date'] : '';
+        $user_id         = (int) get_current_user_id();
+        $ip              = ClientIp::resolve() ?? '0.0.0.0';
+        $registration    = $this->registration ?? App::patient_registration_service();
+
+        if ( $clinic_id <= 0 || $user_id <= 0 ) {
+            return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );
+        }
+
+        return $this->wrap(
+            static fn (): array => $registration->register(
+                $user_id,
+                $clinic_id,
+                $raw_mobile,
+                $raw_given_name,
+                $raw_family_name,
+                $raw_nid,
+                $raw_birth_date,
+                $ip
+            )
+        );
     }
 
     /**

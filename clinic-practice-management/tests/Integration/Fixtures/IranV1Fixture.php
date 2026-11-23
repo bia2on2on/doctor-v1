@@ -96,6 +96,8 @@ trait IranV1Fixture
             [
                 'clinic_id' => $clinic_id, 'mrn' => 'IV1-' . bin2hex(random_bytes(5)),
                 'first_name' => $tag, 'last_name' => 'آزمایشی', 'mobile' => '09' . random_int(1000000000, 9999999999),
+                'national_id' => \ClinicCore\Tests\Support\PatientTwoProofTestHelper::next_valid_national_id(),
+                'birth_date' => '1990-01-01',
                 'status' => 'active', 'created_at' => $now, 'updated_at' => $now,
             ]
         ));

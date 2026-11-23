@@ -635,12 +635,24 @@ trait IsolatedSchema
 
     protected function insertPatient(string $mrn, string $now): int
     {
+        static $nidSeq = 1000;
+        ++$nidSeq;
+        $base = sprintf('049%06d', $nidSeq % 1000000);
+        $sum  = 0;
+        for ($i = 0; $i < 9; ++$i) {
+            $sum += (int) $base[$i] * (10 - $i);
+        }
+        $rem   = $sum % 11;
+        $check = $rem < 2 ? $rem : 11 - $rem;
+
         $this->insertRow($this->fixtureWpdb, $this->rawTable('cpms_patients'), [
             'clinic_id' => $this->clinicId,
             'mrn' => $mrn,
             'first_name' => 'Disposable',
             'last_name' => 'Patient',
             'mobile' => '0912' . str_pad((string) random_int(0, 9999999), 7, '0', STR_PAD_LEFT),
+            'national_id' => $base . (string) $check,
+            'birth_date' => '1990-01-01',
             'status' => 'active',
             'created_at' => $now,
             'updated_at' => $now,

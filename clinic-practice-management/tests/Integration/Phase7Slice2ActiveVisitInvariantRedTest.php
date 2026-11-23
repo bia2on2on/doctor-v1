@@ -217,13 +217,15 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
 
         $wpdb->query(
             $wpdb->prepare(
-                'INSERT INTO ' . $wpdb->prefix . 'cpms_patients (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
-                 VALUES (%d, %s, %s, %s, %s, "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                'INSERT INTO ' . $wpdb->prefix . 'cpms_patients (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at)
+                 VALUES (%d, %s, %s, %s, %s, %s, %s, "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
                 $this->clinicId,
                 'MR-P7S2-' . $unique,
                 'Active',
                 'Visit Patient',
                 '0912' . random_int(1000000, 9999999),
+                PatientTwoProofTestHelper::next_valid_national_id(),
+                '1990-01-01',
                 $now,
                 $now
             )

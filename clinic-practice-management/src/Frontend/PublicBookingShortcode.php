@@ -153,6 +153,8 @@ final class PublicBookingShortcode
     private const HOLD_PATH = '/booking/hold';
     private const CONFIRM_PATH = '/booking/confirm';
 
+    private const REGISTER_PATH = '/patient/register';
+
     private const CONTINUATION_ANONYMOUS = 'anonymous';
     private const CONTINUATION_PATIENT = 'patient';
     private const CONTINUATION_NONE = 'none';
@@ -218,9 +220,64 @@ final class PublicBookingShortcode
     public static function register(): void
     {
         add_shortcode(self::TAG, [self::class, 'render']);
+        add_action( 'template_redirect', [ self::class, 'redirect_incomplete_registration' ], 10 );
 
         // assets این سطح — ثبت/انکیو شرطی، کاملاً جدا از assets مدیریتی.
         PublicBookingAssets::register();
+    }
+
+    /**
+     * Canonical destination for patients who completed Step 1 (`verify_mobile`)
+     * but have not yet completed Step 2 profile + National ID registration.
+     */
+    public static function incomplete_registration_redirect_url(): string {
+        try {
+            $url = PatientPortalShell::portal_url();
+        } catch ( Throwable ) {
+            $url = '';
+        }
+
+        if ( '' === $url ) {
+            return '';
+        }
+
+        return $url . '#complete-registration';
+    }
+
+    /**
+     * Redirects logged-in patients with an incomplete Step-1 registration away
+     * from public booking pages to the Patient Portal profile completion step (T5).
+     */
+    public static function redirect_incomplete_registration(): void {
+        if ( is_admin() || wp_doing_ajax() || wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+            return;
+        }
+        if ( ! self::isOnCurrentPage() || ! is_user_logged_in() ) {
+            return;
+        }
+
+        $uid = (int) get_current_user_id();
+        if ( $uid <= 0 || ! PatientPortalPage::isPatientOnly( $uid ) ) {
+            return;
+        }
+
+        try {
+            $state = App::patient_access()->registration_completion_state( $uid );
+        } catch ( Throwable ) {
+            return;
+        }
+
+        if ( ! ( $state['incomplete'] ?? false ) ) {
+            return;
+        }
+
+        $target = self::incomplete_registration_redirect_url();
+        if ( '' === $target ) {
+            return;
+        }
+
+        wp_safe_redirect( $target );
+        exit;
     }
 
     /**
@@ -261,6 +318,16 @@ final class PublicBookingShortcode
         try {
             if ( \ClinicCore\Bootstrap\RuntimeSchemaGate::is_blocked() ) {
                 return \ClinicCore\Bootstrap\RuntimeSchemaGate::shortcode_markup();
+            }
+
+            if ( is_user_logged_in() ) {
+                $uid = (int) get_current_user_id();
+                if ( $uid > 0 && PatientPortalPage::isPatientOnly( $uid ) ) {
+                    $reg_state = App::patient_access()->registration_completion_state( $uid );
+                    if ( $reg_state['incomplete'] ?? false ) {
+                        return self::render_incomplete_registration_notice();
+                    }
+                }
             }
 
             $request = self::parse_request( $atts, $tag );
@@ -529,6 +596,43 @@ final class PublicBookingShortcode
     }
 
     /**
+     * Fallback notice rendered when an authenticated patient with an
+     * incomplete Step-1 registration reaches the shortcode directly without
+     * `template_redirect` running (e.g., direct shortcode evaluation): refuses
+     * booking continuation and links to `#complete-registration`.
+     */
+    private static function render_incomplete_registration_notice(): string {
+        PublicBookingAssets::enqueue();
+
+        $surface_id = self::surfaceId();
+        $target     = self::incomplete_registration_redirect_url();
+        $lines      = [];
+
+        $lines[] = sprintf(
+            '<div class="%1$s %1$s--closed" dir="rtl" lang="fa" data-state="%2$s" data-role="complete-registration-redirect" id="%3$s">',
+            esc_attr( self::ROOT_CLASS ),
+            esc_attr( self::STATE_ERROR ),
+            esc_attr( $surface_id )
+        );
+        $lines[] = sprintf(
+            '<p class="%1$s" role="status">%2$s</p>',
+            esc_attr( self::ROOT_CLASS . '__notice' ),
+            esc_html( 'برای ادامه رزرو نوبت، ابتدا تکمیل مشخصات ثبت‌نام خود را در پورتال بیمار انجام دهید.' )
+        );
+        if ( '' !== $target ) {
+            $lines[] = sprintf(
+                '<p><a class="%1$s" data-role="complete-registration-link" href="%2$s">%3$s</a></p>',
+                esc_attr( self::ROOT_CLASS . '__portal-link' ),
+                esc_url( $target ),
+                esc_html( 'تکمیل ثبت‌نام در پورتال بیمار' )
+            );
+        }
+        $lines[] = '</div>';
+
+        return implode( '', $lines );
+    }
+
+    /**
      * وضعیت `empty` — Clinic **معتبر** است ولی پزشک فعالی برای نوبت‌دهی ندارد.
      *
      * این وضعیت عمداً از `error` جداست: `error` یعنی «پیکربندیِ سطح خراب است»
@@ -763,10 +867,10 @@ final class PublicBookingShortcode
             ? self::resolve_patient_session_clinic_id()
             : null;
         if ( self::CONTINUATION_ANONYMOUS === $continuation ) {
-            $lines[] = self::render_auth_continuation( $surface_id, false );
+            $lines[] = self::render_auth_continuation( $surface_id, false, true );
         } elseif ( self::CONTINUATION_PATIENT === $continuation ) {
             if ( $is_discovery || $session_clinic_id !== $clinic_id ) {
-                $lines[] = self::render_auth_continuation( $surface_id, true );
+                $lines[] = self::render_auth_continuation( $surface_id, true, false );
             }
             $lines[] = self::render_patient_continuation( $surface_id, $clinic_ids, $session_clinic_id );
         }
@@ -1231,7 +1335,7 @@ final class PublicBookingShortcode
      * hold/confirm و بدون هیچ PHI — ورود فقط با شمارهٔ موبایل و کدِ پیامکی
      * روی مسیرهای موجودِ A2/A3 انجام می‌شود.
      */
-    private static function render_auth_continuation( string $surface_id, bool $hidden = false ): string
+    private static function render_auth_continuation( string $surface_id, bool $hidden = false, bool $allow_register = false ): string
     {
         $b = self::ROOT_CLASS;
         // Child ids use their own `cpms-auth-` namespace, not the root's
@@ -1274,6 +1378,13 @@ final class PublicBookingShortcode
             esc_attr( $b . '__btn' ),
             esc_html( 'دریافت کد تأیید' )
         );
+        if ( $allow_register ) {
+            $lines[] = sprintf(
+                '<button type="button" class="%1$s" data-auth-action="show-register">%2$s</button>',
+                esc_attr( $b . '__link-btn' ),
+                esc_html( 'بیمار جدید هستید؟ ثبت‌نام کنید' )
+            );
+        }
         $lines[] = '</div>';
 
         $lines[] = sprintf( '<div class="%1$s" data-auth-step="otp-code" hidden>', esc_attr( $b . '__auth-step' ) );
@@ -1298,6 +1409,94 @@ final class PublicBookingShortcode
             esc_html( 'تغییر شماره موبایل' )
         );
         $lines[] = '</div>';
+
+        if ( $allow_register ) {
+            $reg_mobile_id = $auth_ns . '-reg-mobile';
+            $reg_code_id   = $auth_ns . '-reg-code';
+            $reg_given_id  = $auth_ns . '-reg-given';
+            $reg_family_id = $auth_ns . '-reg-family';
+            $reg_nid_id    = $auth_ns . '-reg-nid';
+            $reg_birth_id  = $auth_ns . '-reg-birth';
+
+            $complete_reg_url = self::incomplete_registration_redirect_url();
+
+            $lines[] = sprintf(
+                '<div class="%1$s" data-auth-step="otp-register" data-register-path="%2$s"%3$s hidden>',
+                esc_attr( $b . '__auth-step' ),
+                esc_attr( self::REGISTER_PATH ),
+                '' !== $complete_reg_url ? ' data-complete-registration-url="' . esc_attr( $complete_reg_url ) . '"' : ''
+            );
+            $lines[] = sprintf(
+                '<label class="%1$s" for="%2$s">%3$s</label>',
+                esc_attr( $b . '__label' ),
+                esc_attr( $reg_mobile_id ),
+                esc_html( 'شماره موبایل (۱۱ رقم با پیش‌شماره ۰۹)' )
+            );
+            $lines[] = sprintf(
+                '<input type="tel" class="%1$s" id="%2$s" data-role="reg-mobile" inputmode="tel" maxlength="11" autocomplete="tel" placeholder="09XXXXXXXXX" dir="ltr">',
+                esc_attr( $b . '__input' ),
+                esc_attr( $reg_mobile_id )
+            );
+            $lines[] = sprintf(
+                '<div class="%1$s"><button type="button" class="%2$s" data-auth-action="reg-otp-request">%3$s</button>'
+                . '<button type="button" class="%4$s" data-auth-action="show-login">%5$s</button></div>',
+                esc_attr( $b . '__auth-actions' ),
+                esc_attr( $b . '__btn' ),
+                esc_html( 'دریافت کد تأیید ثبت‌نام' ),
+                esc_attr( $b . '__link-btn' ),
+                esc_html( 'قبلاً ثبت‌نام کرده‌اید؟ ورود با کد تأیید' )
+            );
+            $lines[] = '<div data-role="reg-code-step" hidden>';
+            $lines[] = sprintf(
+                '<label class="%1$s" for="%2$s">%3$s</label><input type="text" class="%4$s" id="%2$s" data-role="reg-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" dir="ltr">',
+                esc_attr( $b . '__label' ),
+                esc_attr( $reg_code_id ),
+                esc_html( 'کد ۶ رقمی پیامک‌شده' ),
+                esc_attr( $b . '__input' )
+            );
+            $lines[] = sprintf(
+                '<button type="button" class="%1$s" data-auth-action="reg-otp-verify">%2$s</button>',
+                esc_attr( $b . '__btn' ),
+                esc_html( 'تأیید کد پیامکی و ادامه' )
+            );
+            $lines[] = '</div>';
+            $lines[] = '<div data-role="reg-details" hidden>';
+            $lines[] = sprintf(
+                '<label class="%1$s" for="%2$s">%3$s</label><input type="text" class="%4$s" id="%2$s" data-role="reg-given-name" maxlength="120" autocomplete="given-name">',
+                esc_attr( $b . '__label' ),
+                esc_attr( $reg_given_id ),
+                esc_html( 'نام' ),
+                esc_attr( $b . '__input' )
+            );
+            $lines[] = sprintf(
+                '<label class="%1$s" for="%2$s">%3$s</label><input type="text" class="%4$s" id="%2$s" data-role="reg-family-name" maxlength="120" autocomplete="family-name">',
+                esc_attr( $b . '__label' ),
+                esc_attr( $reg_family_id ),
+                esc_html( 'نام خانوادگی' ),
+                esc_attr( $b . '__input' )
+            );
+            $lines[] = sprintf(
+                '<label class="%1$s" for="%2$s">%3$s</label><input type="text" class="%4$s" id="%2$s" data-role="reg-national-id" inputmode="numeric" maxlength="10" dir="ltr">',
+                esc_attr( $b . '__label' ),
+                esc_attr( $reg_nid_id ),
+                esc_html( 'کد ملی (۱۰ رقم)' ),
+                esc_attr( $b . '__input' )
+            );
+            $lines[] = sprintf(
+                '<label class="%1$s" for="%2$s">%3$s</label><input type="text" class="%4$s" id="%2$s" data-role="reg-birth-date" inputmode="numeric" maxlength="10" placeholder="YYYY-MM-DD" dir="ltr" autocomplete="bday">',
+                esc_attr( $b . '__label' ),
+                esc_attr( $reg_birth_id ),
+                esc_html( 'تاریخ تولد (میلادی YYYY-MM-DD)' ),
+                esc_attr( $b . '__input' )
+            );
+            $lines[] = sprintf(
+                '<button type="button" class="%1$s" data-auth-action="reg-submit">%2$s</button>',
+                esc_attr( $b . '__btn' ),
+                esc_html( 'تکمیل ثبت‌نام و ادامه رزرو' )
+            );
+            $lines[] = '</div>';
+            $lines[] = '</div>';
+        }
 
         // پیامِ وضعیتِ احراز — فقط متنِ خودِ سرور (envelope A2/A3) اینجا نشسته
         // می‌شود؛ هیچ تفسیر یا رشتهٔ جدیدی در مرورگر ساخته نمی‌شود.

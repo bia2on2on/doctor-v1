@@ -565,8 +565,8 @@ final class BookingRaceLossAlternativesTest extends WP_UnitTestCase
         // owner decision A (2026-11-09): shared mobile is never an ownership basis —
         // the booking actor must carry an active Patient link in the booking Clinic.
         $wpdb->query($wpdb->prepare(
-            'INSERT INTO ' . $db->table('cpms_patients') . ' (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at) VALUES (%d, %s, %s, %s, %s, "active", %s, %s)',
-            [self::FX_CLINIC_ID, 'MR-RL-' . strtoupper($label) . '-' . bin2hex(random_bytes(3)), 'Race', $label, $mobile, $now, $now]
+            'INSERT INTO ' . $db->table('cpms_patients') . ' (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at) VALUES (%d, %s, %s, %s, %s, %s, "1990-01-01", "active", %s, %s)',
+            [self::FX_CLINIC_ID, 'MR-RL-' . strtoupper($label) . '-' . bin2hex(random_bytes(3)), 'Race', $label, $mobile, PatientTwoProofTestHelper::next_valid_national_id(), $now, $now]
         ));
         $patientId = (int) $wpdb->insert_id;
         self::assertGreaterThan(0, $patientId, 'fixture: patient created');

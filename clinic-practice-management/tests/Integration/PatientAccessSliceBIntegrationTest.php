@@ -997,14 +997,16 @@ final class PatientAccessSliceBIntegrationTest extends WP_UnitTestCase {
         $db->insert(
             'cpms_patients',
             [
-                'clinic_id'  => $clinicId,
-                'mrn'        => $mrn,
-                'first_name' => $firstName,
-                'last_name'  => $lastName,
-                'mobile'     => $mobile,
-                'status'     => $status,
-                'created_at' => $now,
-                'updated_at' => $now,
+                'clinic_id'   => $clinicId,
+                'mrn'         => $mrn,
+                'first_name'  => $firstName,
+                'last_name'   => $lastName,
+                'mobile'      => $mobile,
+                'national_id' => PatientTwoProofTestHelper::next_valid_national_id(),
+                'birth_date'  => '1990-01-01',
+                'status'      => $status,
+                'created_at'  => $now,
+                'updated_at'  => $now,
             ]
         );
 

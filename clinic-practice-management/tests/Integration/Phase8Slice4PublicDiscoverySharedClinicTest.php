@@ -813,10 +813,12 @@ final class Phase8Slice4PublicDiscoverySharedClinicTest extends WP_UnitTestCase
             'first_name' => 'مشترک',
             'last_name' => 'بیمار',
             'mobile' => '09121234999',
+            'national_id' => PatientTwoProofTestHelper::next_valid_national_id(),
+            'birth_date' => '1990-01-01',
             'status' => 'active',
             'created_at' => $now,
             'updated_at' => $now,
-        ], ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s']);
+        ], ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s']);
         $this->insertRow('cpms_patient_user_links', [
             'clinic_id' => $this->clinicB,
             'patient_id' => $sharedPatientId,

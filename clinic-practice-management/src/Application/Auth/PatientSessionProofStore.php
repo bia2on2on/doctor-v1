@@ -28,10 +28,11 @@ use WP_Session_Tokens;
  */
 final class PatientSessionProofStore {
 
-    public const SESSION_TTL_SECONDS = 28800; // 8 hours, non-persistent.
-    public const PROOF_TTL_SECONDS   = 3600;  // 60 minutes absolute window.
-    public const KEY_MOBILE_PROOFS   = 'cpms_mobile_proofs';
-    public const KEY_BINDING_PROOFS  = 'cpms_proofs';
+    public const SESSION_TTL_SECONDS     = 28800; // 8 hours, non-persistent.
+    public const PROOF_TTL_SECONDS       = 3600;  // 60 minutes absolute window.
+    public const KEY_MOBILE_PROOFS       = 'cpms_mobile_proofs';
+    public const KEY_BINDING_PROOFS      = 'cpms_proofs';
+    public const KEY_REGISTRATION_PROOFS = 'cpms_reg_proofs';
 
     /** @var (callable(int): WP_Session_Tokens)|null */
     private $manager_resolver;
@@ -239,6 +240,217 @@ final class PatientSessionProofStore {
     }
 
     /**
+     * Records a clinic-bound mobile OTP registration proof inside an existing live session.
+     * Fails closed (returns false) if the session is missing, expired, or destroyed.
+     */
+    public function record_registration_mobile_proof(
+        int $wp_user_id,
+        int $clinic_id,
+        string $mobile,
+        ?int $now = null,
+        ?string $token = null
+    ): bool {
+        $normalized_mobile = MobileValidator::normalize( $mobile );
+        if ( $wp_user_id <= 0 || $clinic_id <= 0 || null === $normalized_mobile ) {
+            return false;
+        }
+
+        $now_ts        = $now ?? time();
+        $session_token = $this->resolve_token( $token );
+        $manager       = $this->resolve_manager( $wp_user_id );
+        if ( null === $manager || '' === $session_token ) {
+            return false;
+        }
+
+        $session = $this->get_live_session( $manager, $session_token, $now_ts );
+        if ( null === $session ) {
+            return false;
+        }
+
+        $proofs = isset( $session[ self::KEY_REGISTRATION_PROOFS ] ) && is_array( $session[ self::KEY_REGISTRATION_PROOFS ] )
+            ? $session[ self::KEY_REGISTRATION_PROOFS ]
+            : [];
+
+        $reg_key            = self::registration_key( $clinic_id, $normalized_mobile );
+        $proofs[ $reg_key ] = [
+            'clinic_id'  => $clinic_id,
+            'mobile'     => $normalized_mobile,
+            'at'         => gmdate( 'Y-m-d\TH:i:s\Z', $now_ts ),
+            'token_hash' => hash( 'sha256', $session_token ),
+        ];
+
+        $session[ self::KEY_REGISTRATION_PROOFS ] = $proofs;
+
+        if ( null === $this->get_live_session( $manager, $session_token, $now_ts ) ) {
+            return false;
+        }
+
+        $manager->update( $session_token, $session );
+
+        return null !== $this->get_live_session( $manager, $session_token, $now_ts );
+    }
+
+    /**
+     * Checks whether the current session holds a live, non-expired registration
+     * mobile proof bound to BOTH `$clinic_id` and `$mobile` on this exact session token.
+     */
+    public function has_valid_registration_mobile_proof(
+        int $wp_user_id,
+        int $clinic_id,
+        string $mobile,
+        ?int $now = null,
+        ?string $token = null
+    ): bool {
+        $normalized_mobile = MobileValidator::normalize( $mobile );
+        if ( $wp_user_id <= 0 || $clinic_id <= 0 || null === $normalized_mobile ) {
+            return false;
+        }
+
+        $now_ts        = $now ?? time();
+        $session_token = $this->resolve_token( $token );
+        $manager       = $this->resolve_manager( $wp_user_id );
+        if ( null === $manager || '' === $session_token ) {
+            return false;
+        }
+
+        $session = $this->get_live_session( $manager, $session_token, $now_ts );
+        if ( null === $session ) {
+            return false;
+        }
+
+        $proofs  = $session[ self::KEY_REGISTRATION_PROOFS ] ?? null;
+        $reg_key = self::registration_key( $clinic_id, $normalized_mobile );
+        if ( ! is_array( $proofs ) || ! isset( $proofs[ $reg_key ] ) || ! is_array( $proofs[ $reg_key ] ) ) {
+            return false;
+        }
+
+        $entry = $proofs[ $reg_key ];
+        if ( (int) ( $entry['clinic_id'] ?? 0 ) !== $clinic_id ) {
+            return false;
+        }
+        if ( ! hash_equals( $normalized_mobile, (string) ( $entry['mobile'] ?? '' ) ) ) {
+            return false;
+        }
+
+        return $this->is_entry_token_and_ttl_valid( $entry, $session_token, $now_ts );
+    }
+
+    /**
+     * Finds a live, non-expired registration mobile proof for `$mobile` in the
+     * current session and returns its `['clinic_id' => int, 'mobile' => string]`,
+     * or null if none is valid.
+     *
+     * @return array{clinic_id: int, mobile: string}|null
+     */
+    public function find_valid_registration_mobile_proof(
+        int $wp_user_id,
+        string $mobile,
+        ?int $now = null,
+        ?string $token = null
+    ): ?array {
+        $normalized_mobile = MobileValidator::normalize( $mobile );
+        if ( $wp_user_id <= 0 || null === $normalized_mobile ) {
+            return null;
+        }
+
+        $now_ts        = $now ?? time();
+        $session_token = $this->resolve_token( $token );
+        $manager       = $this->resolve_manager( $wp_user_id );
+        if ( null === $manager || '' === $session_token ) {
+            return null;
+        }
+
+        $session = $this->get_live_session( $manager, $session_token, $now_ts );
+        if ( null === $session ) {
+            return null;
+        }
+
+        $proofs = $session[ self::KEY_REGISTRATION_PROOFS ] ?? null;
+        if ( ! is_array( $proofs ) ) {
+            return null;
+        }
+
+        foreach ( $proofs as $entry ) {
+            if ( ! is_array( $entry ) ) {
+                continue;
+            }
+            $entry_clinic = (int) ( $entry['clinic_id'] ?? 0 );
+            $entry_mobile = (string) ( $entry['mobile'] ?? '' );
+            if ( $entry_clinic <= 0 || ! hash_equals( $normalized_mobile, $entry_mobile ) ) {
+                continue;
+            }
+            if ( $this->is_entry_token_and_ttl_valid( $entry, $session_token, $now_ts ) ) {
+                return [
+                    'clinic_id' => $entry_clinic,
+                    'mobile'    => $normalized_mobile,
+                ];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Consumes (removes) the registration mobile proof for `($clinic_id, $mobile)`
+     * after Step 2 registration completes so it cannot be replayed.
+     */
+    public function consume_registration_mobile_proof(
+        int $wp_user_id,
+        int $clinic_id,
+        string $mobile,
+        ?int $now = null,
+        ?string $token = null
+    ): bool {
+        $normalized_mobile = MobileValidator::normalize( $mobile );
+        if ( $wp_user_id <= 0 || $clinic_id <= 0 || null === $normalized_mobile ) {
+            return false;
+        }
+
+        $now_ts        = $now ?? time();
+        $session_token = $this->resolve_token( $token );
+        $manager       = $this->resolve_manager( $wp_user_id );
+        if ( null === $manager || '' === $session_token ) {
+            return false;
+        }
+
+        $session = $this->get_live_session( $manager, $session_token, $now_ts );
+        if ( null === $session ) {
+            return false;
+        }
+
+        $proofs = $session[ self::KEY_REGISTRATION_PROOFS ] ?? null;
+        if ( ! is_array( $proofs ) ) {
+            return true;
+        }
+
+        $reg_key = self::registration_key( $clinic_id, $normalized_mobile );
+        if ( ! array_key_exists( $reg_key, $proofs ) ) {
+            return true;
+        }
+
+        unset( $proofs[ $reg_key ] );
+        $session[ self::KEY_REGISTRATION_PROOFS ] = $proofs;
+
+        $manager->update( $session_token, $session );
+
+        return true;
+    }
+
+    /**
+     * Computes a `wp_rest` nonce bound to `$wp_user_id` and `$session_token`
+     * immediately after issuing a fresh auth cookie (when `$_COOKIE` is not yet populated).
+     */
+    public function create_rest_nonce_for_token( int $wp_user_id, string $session_token ): string {
+        if ( $wp_user_id <= 0 || '' === $session_token || ! function_exists( 'wp_nonce_tick' ) || ! function_exists( 'wp_hash' ) ) {
+            return '';
+        }
+
+        $tick = wp_nonce_tick( 'wp_rest' );
+
+        return substr( wp_hash( $tick . '|wp_rest|' . $wp_user_id . '|' . $session_token, 'nonce' ), -12, 10 );
+    }
+
+    /**
      * Computes the intersection of active DB bindings with live session proofs (§2.8).
      *
      * @param list<array{binding_id: int, clinic_id: int, patient_id: int, verified_at: string, mobile: string}> $active_bindings
@@ -337,6 +549,10 @@ final class PatientSessionProofStore {
 
     public static function binding_key( int $clinic_id, int $patient_id ): string {
         return $clinic_id . ':' . $patient_id;
+    }
+
+    public static function registration_key( int $clinic_id, string $normalized_mobile ): string {
+        return $clinic_id . ':' . $normalized_mobile;
     }
 
     private function is_mobile_entry_valid( array $session, string $normalized_mobile, string $session_token, int $now_ts ): bool {

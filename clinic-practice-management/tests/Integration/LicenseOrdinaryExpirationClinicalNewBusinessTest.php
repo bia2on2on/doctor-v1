@@ -69,11 +69,12 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
         $wpdb->query(
             $wpdb->prepare(
                 'INSERT INTO ' . $wpdb->prefix . 'cpms_patients
-                     (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
-                 VALUES (%d, %s, "Expiry", "Patient", %s, "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                     (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at)
+                 VALUES (%d, %s, "Expiry", "Patient", %s, %s, "1990-01-01", "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
                 $this->clinicId,
                 'MR-EXP-0001',
                 '09127770001',
+                PatientTwoProofTestHelper::next_valid_national_id(),
                 $now,
                 $now
             )
@@ -132,11 +133,12 @@ final class LicenseOrdinaryExpirationClinicalNewBusinessTest extends WP_UnitTest
         $wpdb->query(
             $wpdb->prepare(
                 'INSERT INTO ' . $wpdb->prefix . 'cpms_patients
-                     (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
-                 VALUES (%d, %s, "Bridge", "Patient", %s, "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                     (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at)
+                 VALUES (%d, %s, "Bridge", "Patient", %s, %s, "1990-01-01", "active", %s, %s)', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
                 $this->clinicId,
                 $mrnPrefix . '-' . bin2hex(random_bytes(3)),
                 $mobile,
+                PatientTwoProofTestHelper::next_valid_national_id(),
                 $now,
                 $now
             )
