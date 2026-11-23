@@ -87,7 +87,7 @@ final class LoginRateLimiter
                 return $user;
             }
             $this->record( 'LOGIN_THROTTLED', $username, ClientIp::resolve() );
-        } catch(\Throwable) {
+        } catch ( \Throwable ) {
             // Fail-closed: throttle housekeeping must never escape into the
             // `authenticate` chain (e.g. the HMAC key could not be read or
             // persisted). No cookie/session is issued, nothing is counted, no
@@ -125,7 +125,7 @@ final class LoginRateLimiter
                 return;
             }
             $this->count_failure( $username );
-        } catch(\Throwable) {
+        } catch ( \Throwable ) {
             // Fail-closed silence: wp_login_failed must never escape into core.
             // Nothing counted, nothing logged, nothing written — the caller
             // already holds the failure.
