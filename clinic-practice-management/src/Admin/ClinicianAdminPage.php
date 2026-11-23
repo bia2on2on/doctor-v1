@@ -133,7 +133,7 @@ final class ClinicianAdminPage
         }
 
         $repo      = App::clinicianRepository();
-        $clinic_id  = (int) $scope->clinicId; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- ClinicScope::$clinicId is the published scope API.
+        $clinic_id = (int) $scope->clinicId; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- ClinicScope::$clinicId is the published scope API.
         $selected  = self::schedule_target( self::requested_clinician_id(), $scope );
         ?>
 <div class="wrap" dir="rtl">
