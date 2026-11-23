@@ -570,14 +570,16 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
         $mobile = '0910' . str_pad( (string) random_int( 1000000, 9999999 ), 7, '0', STR_PAD_LEFT );
 
         $db->insert( 'cpms_patients', [
-            'clinic_id'  => $clinic_id,
-            'mrn'        => 'MRN-SUSP-' . bin2hex( random_bytes( 3 ) ),
-            'first_name' => 'بیمار',
-            'last_name'  => 'تست تعلیق',
-            'mobile'     => $mobile,
-            'status'     => 'active',
-            'created_at' => $now,
-            'updated_at' => $now,
+            'clinic_id'   => $clinic_id,
+            'mrn'         => 'MRN-SUSP-' . bin2hex( random_bytes( 3 ) ),
+            'first_name'  => 'بیمار',
+            'last_name'   => 'تست تعلیق',
+            'mobile'      => $mobile,
+            'national_id' => PatientTwoProofTestHelper::next_valid_national_id(),
+            'birth_date'  => '1990-01-01',
+            'status'      => 'active',
+            'created_at'  => $now,
+            'updated_at'  => $now,
         ] );
         $patient_id = (int) $db->wpdb_last_insert_id();
         $user_id    = (int) self::factory()->user->create( [ 'role' => 'subscriber' ] );

@@ -637,6 +637,180 @@ final class PatientAccess {
     }
 
     /**
+     * Evaluates whether a logged-in patient holds an incomplete Step-1
+     * self-registration (`STATE_PENDING`, zero active bindings, and either a
+     * live `cpms_reg_proofs` registration proof or profile-less Step-1 state).
+     *
+     * @return array{
+     *     incomplete: bool,
+     *     has_valid_proof: bool,
+     *     clinic_id: int|null,
+     *     mobile: string|null
+     * }
+     */
+    public function registration_completion_state(
+        int $wp_user_id,
+        ?int $now = null,
+        ?string $token = null
+    ): array {
+        $empty = [
+            'incomplete'      => false,
+            'has_valid_proof' => false,
+            'clinic_id'       => null,
+            'mobile'          => null,
+        ];
+
+        if ( null === $this->logins || ! $this->is_pure_patient_actor( $wp_user_id ) ) {
+            return $empty;
+        }
+
+        $account = $this->logins->find_account_by_user_id( $wp_user_id );
+        if ( null === $account || PatientLoginRepository::STATE_PENDING !== (string) ( $account['state'] ?? '' ) ) {
+            return $empty;
+        }
+
+        if ( [] !== $this->logins->find_active_bindings_for_user( $wp_user_id ) ) {
+            return $empty;
+        }
+
+        $mobile    = (string) ( $account['mobile'] ?? '' );
+        $reg_proof = $this->proofs->find_valid_registration_mobile_proof( $wp_user_id, $mobile, $now, $token );
+
+        $given_name  = $account['given_name'] ?? null;
+        $family_name = $account['family_name'] ?? null;
+        $profileless = ( null === $given_name || '' === trim( (string) $given_name ) )
+            && ( null === $family_name || '' === trim( (string) $family_name ) );
+
+        if ( null === $reg_proof && ! $profileless ) {
+            return $empty;
+        }
+
+        return [
+            'incomplete'      => true,
+            'has_valid_proof' => null !== $reg_proof,
+            'clinic_id'       => null !== $reg_proof ? $reg_proof['clinic_id'] : null,
+            'mobile'          => '' !== $mobile ? $mobile : null,
+        ];
+    }
+
+    /**
+     * Evaluates an actor/selector/proof gate for Step 2 `POST /clinic/v1/patient/register`.
+     *
+     * Only an authenticated, pure-patient `STATE_PENDING` account holding a live,
+     * non-expired `cpms_reg_proofs` mobile OTP proof bound to BOTH the target
+     * `$clinic_id` and its own mobile on the current session token may enter Step 2;
+     * anonymous guests, staff, multi-role, active, or cross-clinic requests are
+     * denied with the uniform §6.10 failure envelope.
+     *
+     * @return array{
+     *     allowed: bool,
+     *     http_status: int,
+     *     code: string,
+     *     message: string,
+     *     reason: string,
+     *     role: string
+     * }
+     */
+    public function authorize_register_request(
+        int $wp_user_id,
+        ?int $clinic_id = null,
+        bool $selector_invalid = false,
+        ?int $now = null,
+        ?string $token = null
+    ): array {
+        if ( $wp_user_id <= 0 ) {
+            return $this->observe_decision(
+                0,
+                $clinic_id,
+                null,
+                null,
+                'register',
+                $this->proof_failed_decision( 'unauthenticated', 'anonymous' )
+            );
+        }
+
+        $user         = $this->read_user( $wp_user_id );
+        $primary_role = ( null !== $user && [] !== $user['roles'] ) ? $user['roles'][0] : 'unknown';
+
+        if ( null === $user || ! $user['exists'] ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                null,
+                null,
+                'register',
+                $this->proof_failed_decision( 'unauthenticated', 'anonymous' )
+            );
+        }
+
+        if ( ! $this->is_pure_patient_user( $user ) || $this->has_scoped_staff_authority( $wp_user_id ) ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                null,
+                null,
+                'register',
+                $this->proof_failed_decision( 'patient_role_required', $primary_role )
+            );
+        }
+
+        if ( $selector_invalid || null === $clinic_id || $clinic_id <= 0 ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                null,
+                null,
+                'register',
+                $this->proof_failed_decision( 'invalid_selector', $primary_role )
+            );
+        }
+
+        if ( null === $this->logins ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                null,
+                null,
+                'register',
+                $this->proof_failed_decision( 'login_repository_required', $primary_role )
+            );
+        }
+
+        $account = $this->logins->find_account_by_user_id( $wp_user_id );
+        if ( null === $account || PatientLoginRepository::STATE_PENDING !== (string) ( $account['state'] ?? '' ) ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                null,
+                null,
+                'register',
+                $this->proof_failed_decision( 'pending_registration_required', $primary_role )
+            );
+        }
+
+        $account_mobile = (string) ( $account['mobile'] ?? '' );
+        if ( ! $this->proofs->has_valid_registration_mobile_proof( $wp_user_id, $clinic_id, $account_mobile, $now, $token ) ) {
+            return $this->observe_decision(
+                $wp_user_id,
+                $clinic_id,
+                null,
+                null,
+                'register',
+                $this->proof_failed_decision( 'registration_mobile_proof_required', $primary_role )
+            );
+        }
+
+        return $this->observe_decision(
+            $wp_user_id,
+            $clinic_id,
+            null,
+            null,
+            'register',
+            $this->allow_decision( $primary_role )
+        );
+    }
+
+    /**
      * Evaluates a patient REST request against authentication, patient-role
      * separation, two-factor session proofs, active bindings, and selectors (D1).
      *

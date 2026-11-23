@@ -878,14 +878,16 @@ final class PatientSessionScopeIntegrationTest extends WP_UnitTestCase
     {
         $now = App::db()->nowUtcSql();
         App::db()->insert('cpms_patients', [
-            'clinic_id'  => $clinicId,
-            'mrn'        => 'MR-M5M11-' . $tag . '-' . bin2hex(random_bytes(2)),
-            'first_name' => 'Patient',
-            'last_name'  => 'M5M11 ' . $tag,
-            'mobile'     => '0912' . sprintf('%07d', random_int(1000000, 9999999)),
-            'status'     => 'active',
-            'created_at' => $now,
-            'updated_at' => $now,
+            'clinic_id'   => $clinicId,
+            'mrn'         => 'MR-M5M11-' . $tag . '-' . bin2hex(random_bytes(2)),
+            'first_name'  => 'Patient',
+            'last_name'   => 'M5M11 ' . $tag,
+            'mobile'      => '0912' . sprintf('%07d', random_int(1000000, 9999999)),
+            'national_id' => PatientTwoProofTestHelper::next_valid_national_id(),
+            'birth_date'  => '1990-01-01',
+            'status'      => 'active',
+            'created_at'  => $now,
+            'updated_at'  => $now,
         ]);
 
         return App::db()->wpdb_last_insert_id();

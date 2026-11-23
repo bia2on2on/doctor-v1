@@ -12,6 +12,7 @@ use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Time\Jalali;
 use ClinicCore\Domain\Time\PersianDigits;
+use ClinicCore\Frontend\PatientOtpLogin;
 use ClinicCore\Frontend\PatientPortalShell;
 use ClinicCore\Frontend\PublicBookingShortcode;
 use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
@@ -365,7 +366,18 @@ final class PatientPortalPage
         $enrollment_options = self::enrollment_options( $user_id );
         $booking_clinics    = self::booking_clinics( $user_id, $enrollment_options );
         $has_mobile_proof   = self::has_account_mobile_proof( $user_id );
-        $link_clinics       = $has_mobile_proof ? self::link_record_clinics() : [];
+        try {
+            $reg_state = App::patient_access()->registration_completion_state( $user_id );
+        } catch ( \Throwable ) {
+            $reg_state = [
+                'incomplete'      => false,
+                'has_valid_proof' => false,
+                'clinic_id'       => null,
+                'mobile'          => null,
+            ];
+        }
+        $reg_incomplete = (bool) ( $reg_state['incomplete'] ?? false );
+        $link_clinics   = ( $has_mobile_proof && ! $reg_incomplete ) ? self::link_record_clinics() : [];
 
         // اصلاح بین‌فازی: «تماس با مطب» از Clinic Profileِ رسمی (cpms_clinics.phone)
         //ِ Clinicِ resolve‌شده از زمینهٔ قابل‌اعتمادِ پورتال (linked_recordsِ کاربر
@@ -392,9 +404,14 @@ final class PatientPortalPage
 
         $html = '<div class="wrap cpms-patient-portal" dir="rtl" style="max-width:860px">';
 
-        $html .= self::dashboard_section( $upcoming, $past, $inbox, $booking_clinics );
-        $html .= self::link_record_section( $has_mobile_proof, $link_clinics, $profile_records );
-        $html .= self::booking_section( $booking_clinics );
+        if ( $reg_incomplete ) {
+            $html .= self::complete_registration_section( $reg_state );
+        }
+        $html .= self::dashboard_section( $upcoming, $past, $inbox, $reg_incomplete ? [] : $booking_clinics );
+        if ( ! $reg_incomplete ) {
+            $html .= self::link_record_section( $has_mobile_proof, $link_clinics, $profile_records );
+            $html .= self::booking_section( $booking_clinics );
+        }
         $html .= '<section class="cpms-pp-section" data-role="appointments-section" id="appointments" aria-labelledby="cpms-pp-appointments-heading">';
         $html .= '<h2 id="cpms-pp-appointments-heading">نوبت‌های من</h2>';
         $html .= '<p class="description">سلام! نوبت‌های ثبت‌شده شما در این صفحه است. تغییرات نوبت با پیامک هم اطلاع داده می‌شود.</p>';
@@ -419,7 +436,7 @@ final class PatientPortalPage
         $html .= self::visits_section( $profile_records, $user_id );
         $html .= self::prescriptions_section( $profile_records, $user_id );
         $html .= self::files_section( $profile_records, $user_id );
-        $html .= self::config_script( $profile_records, $profile_initial );
+        $html .= self::config_script( $profile_records, $profile_initial, $reg_state );
         $html .= '</div>';
 
         echo $html; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- markup از پیش escape شده
@@ -689,8 +706,9 @@ final class PatientPortalPage
      *
      * @param array<int, array<string, mixed>> $records
      * @param array<string, mixed>|null        $initial
+     * @param array{incomplete: bool, has_valid_proof: bool, clinic_id: int|null, mobile: string|null}|null $reg_state
      */
-    private static function config_script( array $records = [], ?array $initial = null ): string {
+    private static function config_script( array $records = [], ?array $initial = null, ?array $reg_state = null ): string {
         $profile_records_payload = [];
 
         if ( is_array( $records ) ) {
@@ -720,31 +738,43 @@ final class PatientPortalPage
             ];
         }
 
+        $payload = [
+            'rest_root'               => untrailingslashit( rest_url( self::REST_NAMESPACE ) ),
+            'cancel_path'             => self::CANCEL_PATH,
+            'notifications_read_path' => self::NOTIFICATIONS_READ_PATH,
+            'profile_my_records_path' => '/patient/my-records',
+            'profile_me_path'         => '/patient/me',
+            'visits_path'             => '/visits',
+            'visit_detail_path'       => '/visits/{id}',
+            'prescriptions_path'      => '/prescriptions',
+            // Slice 7 — همان مسیرهای موجودِ C3/C4/E17 (بدون هیچ مسیر جدید)؛
+            // `{patient_id}`/`{id}` فقط سلکتورِ شیء هستند — مجوز با سرور است.
+            'files_path'              => '/patients/{patient_id}/files',
+            'files_stream_path'       => '/files/{id}/stream',
+            'my_records_path'         => '/patient/my-records',
+            'me_path'                 => '/patient/me',
+            // Existing C0a route only; the Clinic selector is re-authorized
+            // server-side and no clinic/patient authority is published.
+            'enroll_path'             => '/patient/enroll',
+            'link_record_path'        => '/patient/link-record',
+            'login_url'               => wp_login_url(),
+            'profile_records'         => $profile_records_payload,
+            'profile_initial'         => $profile_initial_payload,
+            'nonce'                   => wp_create_nonce( 'wp_rest' ),
+        ];
+
+        if ( is_array( $reg_state ) && ( $reg_state['incomplete'] ?? false ) ) {
+            $payload['register_incomplete']      = true;
+            $payload['register_has_valid_proof'] = (bool) ( $reg_state['has_valid_proof'] ?? false );
+            $payload['register_clinic_id']       = isset( $reg_state['clinic_id'] ) ? (int) $reg_state['clinic_id'] : null;
+            $payload['register_mobile']          = (string) ( $reg_state['mobile'] ?? '' );
+            $payload['register_path']            = '/patient/register';
+            $payload['otp_request_path']         = '/otp/request';
+            $payload['otp_verify_path']          = '/otp/verify';
+        }
+
         $json = wp_json_encode(
-            [
-                'rest_root'               => untrailingslashit( rest_url( self::REST_NAMESPACE ) ),
-                'cancel_path'             => self::CANCEL_PATH,
-                'notifications_read_path' => self::NOTIFICATIONS_READ_PATH,
-                'profile_my_records_path' => '/patient/my-records',
-                'profile_me_path'         => '/patient/me',
-                'visits_path'             => '/visits',
-                'visit_detail_path'       => '/visits/{id}',
-                'prescriptions_path'      => '/prescriptions',
-                // Slice 7 — همان مسیرهای موجودِ C3/C4/E17 (بدون هیچ مسیر جدید)؛
-                // `{patient_id}`/`{id}` فقط سلکتورِ شیء هستند — مجوز با سرور است.
-                'files_path'              => '/patients/{patient_id}/files',
-                'files_stream_path'       => '/files/{id}/stream',
-                'my_records_path'         => '/patient/my-records',
-                'me_path'                 => '/patient/me',
-                // Existing C0a route only; the Clinic selector is re-authorized
-                // server-side and no clinic/patient authority is published.
-                'enroll_path'             => '/patient/enroll',
-                'link_record_path'        => '/patient/link-record',
-                'login_url'               => wp_login_url(),
-                'profile_records'         => $profile_records_payload,
-                'profile_initial'         => $profile_initial_payload,
-                'nonce'                   => wp_create_nonce( 'wp_rest' ),
-            ],
+            $payload,
             JSON_HEX_TAG | JSON_HEX_AMP | JSON_UNESCAPED_UNICODE
         );
 
@@ -1248,6 +1278,109 @@ final class PatientPortalPage
      * @param list<array{id:int, name:string}> $clinics
      * @param list<array<string, mixed>>       $profile_records
      */
+    /**
+     * Step 2 registration completion section (`#complete-registration`) for
+     * logged-in patients whose Step-1 mobile OTP verification succeeded (`STATE_PENDING`,
+     * zero active bindings) but who have not yet submitted profile + National ID (T5).
+     *
+     * @param array{incomplete: bool, has_valid_proof: bool, clinic_id: int|null, mobile: string|null} $reg_state
+     */
+    private static function complete_registration_section( array $reg_state ): string {
+        $has_proof = (bool) ( $reg_state['has_valid_proof'] ?? false );
+        $clinic_id = isset( $reg_state['clinic_id'] ) ? (int) $reg_state['clinic_id'] : 0;
+        $mobile    = (string) ( $reg_state['mobile'] ?? '' );
+
+        $clinic_name = '';
+        if ( $clinic_id > 0 ) {
+            try {
+                $clinic      = App::clinicRepository()->find( $clinic_id );
+                $clinic_name = is_array( $clinic ) ? trim( (string) ( $clinic['name'] ?? '' ) ) : '';
+            } catch ( \Throwable ) {
+                $clinic_name = '';
+            }
+        }
+
+        $clinics = ( $has_proof && $clinic_id > 0 ) ? [] : PatientOtpLogin::eligible_register_clinics();
+
+        $html  = '<section class="cpms-pp-section cpms-pp-complete-registration" id="complete-registration" data-role="complete-registration-section" aria-labelledby="cpms-pp-complete-reg-heading">';
+        $html .= '<h2 id="cpms-pp-complete-reg-heading">تکمیل ثبت‌نام بیمار</h2>';
+        $html .= '<p class="description">';
+        if ( $has_proof && $clinic_id > 0 ) {
+            $html .= esc_html( 'تأیید شمارهٔ موبایل شما انجام شده است. برای فعال‌سازی حساب و ثبت پرونده، مشخصات زیر را وارد کنید.' );
+        } else {
+            $html .= esc_html( 'مهلت تأیید مرحلهٔ اول به پایان رسیده است. ابتدا مرکز درمانی و کد پیامکی را دوباره تأیید کنید و سپس مشخصات خود را ثبت نمایید.' );
+        }
+        $html .= '</p>';
+
+        $html .= '<form class="cpms-pp-link-record__form" data-role="complete-registration-form" method="post" novalidate>';
+        if ( '' !== $mobile ) {
+            $html .= '<p class="cpms-pp-complete-registration__mobile">شمارهٔ موبایل تأییدشده: <b dir="ltr">' . esc_html( $mobile ) . '</b></p>';
+        }
+
+        if ( $has_proof && $clinic_id > 0 ) {
+            if ( '' !== $clinic_name ) {
+                $html .= '<p class="cpms-pp-complete-registration__clinic">مرکز درمانی انتخابی: <b>' . esc_html( $clinic_name ) . '</b></p>';
+            }
+        } else {
+            $html .= '<div class="cpms-pp-link-record__field">';
+            $html .= '<label for="cpms-pp-complete-reg-clinic">مرکز درمانی</label>';
+            $html .= '<select id="cpms-pp-complete-reg-clinic" data-role="complete-reg-clinic" required>';
+            if ( count( $clinics ) !== 1 ) {
+                $html .= '<option value="">انتخاب مرکز درمانی…</option>';
+            }
+            foreach ( $clinics as $clinic ) {
+                $selected = count( $clinics ) === 1 ? ' selected' : '';
+                $html    .= '<option value="' . esc_attr( (string) $clinic['id'] ) . '"' . $selected . '>' . esc_html( (string) $clinic['name'] ) . '</option>';
+            }
+            $html .= '</select>';
+            $html .= '</div>';
+
+            $html .= '<div class="cpms-pp-link-record__actions">';
+            $html .= '<button type="button" class="cpms-pp-btn cpms-pp-btn--secondary" data-role="complete-reg-otp-request">دریافت کد تأیید پیامکی</button>';
+            $html .= '</div>';
+
+            $html .= '<div data-role="complete-reg-code-step" hidden>';
+            $html .= '<div class="cpms-pp-link-record__field">';
+            $html .= '<label for="cpms-pp-complete-reg-code">کد ۶ رقمی پیامک‌شده</label>';
+            $html .= '<input id="cpms-pp-complete-reg-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" dir="ltr" data-role="complete-reg-code">';
+            $html .= '</div>';
+            $html .= '<div class="cpms-pp-link-record__actions">';
+            $html .= '<button type="button" class="cpms-pp-btn cpms-pp-btn--primary" data-role="complete-reg-otp-verify">تأیید کد پیامکی</button>';
+            $html .= '</div>';
+            $html .= '</div>';
+        }
+
+        $details_hidden = ( $has_proof && $clinic_id > 0 ) ? '' : ' hidden';
+        $html          .= '<div data-role="complete-reg-details-step"' . $details_hidden . '>';
+        $html          .= '<div class="cpms-pp-link-record__field">';
+        $html          .= '<label for="cpms-pp-complete-reg-given">نام</label>';
+        $html          .= '<input id="cpms-pp-complete-reg-given" type="text" maxlength="120" autocomplete="given-name" data-role="complete-reg-given-name" required>';
+        $html          .= '</div>';
+        $html          .= '<div class="cpms-pp-link-record__field">';
+        $html          .= '<label for="cpms-pp-complete-reg-family">نام خانوادگی</label>';
+        $html          .= '<input id="cpms-pp-complete-reg-family" type="text" maxlength="120" autocomplete="family-name" data-role="complete-reg-family-name" required>';
+        $html          .= '</div>';
+        $html          .= '<div class="cpms-pp-link-record__field">';
+        $html          .= '<label for="cpms-pp-complete-reg-nid">کد ملی (۱۰ رقم)</label>';
+        $html          .= '<input id="cpms-pp-complete-reg-nid" type="text" inputmode="numeric" maxlength="10" dir="ltr" data-role="complete-reg-national-id" required>';
+        $html          .= '</div>';
+        $html          .= '<div class="cpms-pp-link-record__field">';
+        $html          .= '<label for="cpms-pp-complete-reg-birth">تاریخ تولد (میلادی YYYY-MM-DD)</label>';
+        $html          .= '<input id="cpms-pp-complete-reg-birth" type="text" inputmode="numeric" maxlength="10" placeholder="YYYY-MM-DD" dir="ltr" autocomplete="bday" data-role="complete-reg-birth-date" required>';
+        $html          .= '</div>';
+        $html          .= '<div class="cpms-pp-link-record__actions">';
+        $html          .= '<button type="submit" class="cpms-pp-btn cpms-pp-btn--primary" data-role="complete-reg-submit">تکمیل ثبت‌نام و فعال‌سازی حساب</button>';
+        $html          .= '</div>';
+        $html          .= '</div>';
+
+        $html .= '<div class="notice inline cpms-pp-link-record__notice cpms-pp-link-record__notice--error" role="alert" data-role="complete-reg-error" hidden><p></p></div>';
+        $html .= '<div class="notice inline cpms-pp-link-record__notice cpms-pp-link-record__notice--success" role="status" aria-live="polite" data-role="complete-reg-success" hidden><p></p></div>';
+        $html .= '</form>';
+        $html .= '</section>';
+
+        return $html;
+    }
+
     private static function link_record_section( bool $has_mobile_proof, array $clinics, array $profile_records ): string {
         if ( ! $has_mobile_proof ) {
             return '';

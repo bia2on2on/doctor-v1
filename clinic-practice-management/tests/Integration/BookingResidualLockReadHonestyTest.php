@@ -81,12 +81,14 @@ final class BookingResidualLockReadHonestyTest extends WP_UnitTestCase
 
         $wpdb->query($wpdb->prepare(
             'INSERT INTO ' . $wpdb->prefix . 'cpms_patients
-                 (clinic_id, mrn, first_name, last_name, mobile, status, created_at, updated_at)
-             VALUES (1, %s, %s, %s, %s, %s, %s, %s)',
+                 (clinic_id, mrn, first_name, last_name, mobile, national_id, birth_date, status, created_at, updated_at)
+             VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
             'MR-RESIDUAL-' . bin2hex(random_bytes(5)),
             'A',
             'Patient',
             '09121110001',
+            PatientTwoProofTestHelper::next_valid_national_id(),
+            '1990-01-01',
             'active',
             $now,
             $now

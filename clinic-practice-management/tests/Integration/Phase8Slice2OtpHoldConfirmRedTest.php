@@ -2033,10 +2033,12 @@ final class Phase8Slice2OtpHoldConfirmRedTest extends WP_UnitTestCase
             'first_name' => $firstName,
             'last_name' => $lastName,
             'mobile' => $mobile,
+            'national_id' => PatientTwoProofTestHelper::next_valid_national_id(),
+            'birth_date' => '1990-01-01',
             'status' => 'active',
             'created_at' => App::db()->nowUtcSql(),
             'updated_at' => App::db()->nowUtcSql(),
-        ], ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s'], 'patient');
+        ], ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s'], 'patient');
     }
 
     /**

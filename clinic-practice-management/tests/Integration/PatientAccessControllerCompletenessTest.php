@@ -4,9 +4,11 @@ declare( strict_types=1 );
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\OtpService;
 use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Otp\OtpPolicy;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Rest\PatientController;
 use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
@@ -29,6 +31,7 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
     use SignedExpirationFixture;
 
     private const EXPECTED_PATIENT_ENDPOINTS = [
+        'POST /clinic/v1/patient/register',
         'POST /clinic/v1/patient/link-record',
         'POST /clinic/v1/patient/enroll',
         'GET /clinic/v1/patient/my-records',
@@ -124,6 +127,7 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
         );
 
         $this->installSignedExpiration( time() + 30 * 86400 );
+        App::settingsFactory()->forClinic( $this->clinicA )->set( 'public.listing_opt_in', true );
         PatientTwoProofTestHelper::acting_as( 0 );
     }
 
@@ -321,37 +325,104 @@ final class PatientAccessControllerCompletenessTest extends WP_UnitTestCase {
                     $lastDenyEvent = $gateEvents[ count( $gateEvents ) - 1 ];
                     self::assertFalse( $lastDenyEvent['allowed'] );
                     self::assertSame( 403, $denyRes->get_status(), $method . ' ' . $route . ' must fail closed with 403 PROOF_FAILED.' );
-                    self::assertSame( PatientAccess::PROOF_FAILED_CODE, $denyRes->get_data()['code'] ?? null );
+                    $denyData = $denyRes->get_data();
+                    self::assertIsArray( $denyData );
+                    self::assertArrayHasKey( 'code', $denyData );
+                    self::assertSame( PatientAccess::PROOF_FAILED_CODE, $denyData['code'] );
 
-                    // 2) Positive control (authorized linked/eligible user) MUST also pass through PatientAccess.
+                    // 2) Positive control (authorized linked/eligible user, or guest for registration) MUST also pass through PatientAccess.
                     $beforeAllow = count( $gateEvents );
-                    PatientTwoProofTestHelper::acting_as( $this->patientUserLinked );
-                    $allowReq = new WP_REST_Request( $method, $route );
-                    $allowReq->set_header( 'X-WP-Nonce', wp_create_nonce( 'wp_rest' ) );
-                    if ( '/clinic/v1/patient/link-record' === $route ) {
+                    if ( '/clinic/v1/patient/register' === $route ) {
+                        PatientTwoProofTestHelper::acting_as( 0 );
+                        $nowSql = App::db()->nowUtcSql();
+                        $pepper = defined( 'CPMS_PEPPER' ) && '' !== (string) CPMS_PEPPER
+                            ? (string) CPMS_PEPPER
+                            : (string) get_option( 'cpms_otp_pepper', '' );
+                        if ( '' === $pepper ) {
+                            $pepper = bin2hex( random_bytes( 32 ) );
+                            update_option( 'cpms_otp_pepper', $pepper, 'no' );
+                        }
+                        $otpInserted = App::db()->insert(
+                            'cpms_otp_tokens',
+                            [
+                                'clinic_id'  => $this->clinicA,
+                                'mobile'     => '09120038888',
+                                'code_hash'  => OtpPolicy::hashCode( '445566', $pepper ),
+                                'purpose'    => 'verify_mobile',
+                                'expires_at' => gmdate( 'Y-m-d H:i:s', time() + 300 ) . '.000',
+                                'attempts'   => 0,
+                                'created_at' => $nowSql,
+                            ]
+                        );
+                        self::assertTrue( (bool) $otpInserted );
+                        $step1Cookie = '';
+                        $cookieHook  = static function ( string $cookie ) use ( &$step1Cookie ): void {
+                            $step1Cookie = $cookie;
+                        };
+                        add_action( 'set_logged_in_cookie', $cookieHook, 10, 1 );
+                        try {
+                            $step1Res = App::otpService()->verify(
+                                '09120038888',
+                                '445566',
+                                OtpService::PURPOSE_VERIFY_MOBILE,
+                                '127.0.0.1',
+                                $this->clinicA
+                            );
+                        } finally {
+                            remove_action( 'set_logged_in_cookie', $cookieHook, 10 );
+                        }
+                        self::assertArrayHasKey( 'session_issued', $step1Res );
+                        self::assertTrue( (bool) $step1Res['session_issued'] );
+                        self::assertArrayHasKey( 'user_id', $step1Res );
+                        self::assertArrayHasKey( 'rest_nonce', $step1Res );
+                        self::assertNotSame( '', $step1Cookie );
+                        $_COOKIE[ LOGGED_IN_COOKIE ] = $step1Cookie;
+                        wp_set_current_user( (int) $step1Res['user_id'] );
+
+                        $allowReq = new WP_REST_Request( $method, $route );
                         $allowReq->set_header( 'Content-Type', 'application/json' );
+                        $allowReq->set_header( 'X-WP-Nonce', (string) $step1Res['rest_nonce'] );
                         $allowReq->set_body(
                             (string) wp_json_encode(
                                 [
                                     'clinic_id'   => $this->clinicA,
-                                    'mobile'      => '09120030001',
-                                    'national_id' => '0010000003',
+                                    'mobile'      => '09120038888',
+                                    'given_name'  => 'Comp',
+                                    'family_name' => 'Registered',
+                                    'national_id' => '0499370899',
+                                    'birth_date'  => '1992-04-15',
                                 ]
                             )
                         );
-                    } elseif ( '/clinic/v1/patient/enroll' === $route ) {
-                        $allowReq->set_param( 'clinic_id', $this->clinicB );
-                        $allowReq->set_param( 'first_name', 'Enrolled' );
-                        $allowReq->set_param( 'last_name', 'Patient' );
-                        $allowReq->set_param( 'mobile', '09120039999' );
                     } else {
-                        $allowReq->set_param( 'clinic_id', $this->clinicA );
-                        if ( '/clinic/v1/patient/me' === $route ) {
-                            $allowReq->set_param( 'link_id', $this->linkA );
+                        PatientTwoProofTestHelper::acting_as( $this->patientUserLinked );
+                        $allowReq = new WP_REST_Request( $method, $route );
+                        $allowReq->set_header( 'X-WP-Nonce', wp_create_nonce( 'wp_rest' ) );
+                        if ( '/clinic/v1/patient/link-record' === $route ) {
+                            $allowReq->set_header( 'Content-Type', 'application/json' );
+                            $allowReq->set_body(
+                                (string) wp_json_encode(
+                                    [
+                                        'clinic_id'   => $this->clinicA,
+                                        'mobile'      => '09120030001',
+                                        'national_id' => '0010000003',
+                                    ]
+                                )
+                            );
+                        } elseif ( '/clinic/v1/patient/enroll' === $route ) {
+                            $allowReq->set_param( 'clinic_id', $this->clinicB );
+                            $allowReq->set_param( 'first_name', 'Enrolled' );
+                            $allowReq->set_param( 'last_name', 'Patient' );
+                            $allowReq->set_param( 'mobile', '09120039999' );
+                        } else {
+                            $allowReq->set_param( 'clinic_id', $this->clinicA );
+                            if ( '/clinic/v1/patient/me' === $route ) {
+                                $allowReq->set_param( 'link_id', $this->linkA );
+                            }
                         }
-                    }
-                    if ( in_array( $method, [ 'POST', 'PUT', 'PATCH' ], true ) && '/clinic/v1/patient/me' === $route ) {
-                        $allowReq->set_param( 'first_name', 'AllowedEdit' . $method );
+                        if ( in_array( $method, [ 'POST', 'PUT', 'PATCH' ], true ) && '/clinic/v1/patient/me' === $route ) {
+                            $allowReq->set_param( 'first_name', 'AllowedEdit' . $method );
+                        }
                     }
 
                     $allowRes = $server->dispatch( $allowReq );

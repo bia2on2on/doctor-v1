@@ -30,7 +30,9 @@ use ClinicCore\Admin\SmsSettingsPage;
 use ClinicCore\Application\Auth\OtpService;
 use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientBindingPromoter;
+use ClinicCore\Application\Auth\PatientCredentialGuard;
 use ClinicCore\Application\Auth\PatientNidHmac;
+use ClinicCore\Application\Auth\PatientRegistrationService;
 use ClinicCore\Application\Auth\PatientSessionProofStore;
 use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Application\Backup\BackupService;
@@ -233,6 +235,8 @@ final class App
     private static ?PatientSessionScope $patient_session_scope = null;
     private static bool $booted                                = false;
 
+    private static ?PatientCredentialGuard $patient_credential_guard = null;
+
     /**
      * N1 — نتیجهٔ پیش‌بررسیِ موتورِ دیتابیس (memoized در هر درخواست؛ موتور
      * سرور وسطِ یک درخواست عوض نمی‌شود). probe تستی این memo را دور می‌زند.
@@ -357,6 +361,7 @@ final class App
         // Bruteforce ای روی wp-login و احراز هویت REST وجود نداشت.
         self::loginRateLimiter()->register();
         self::patient_session_scope()->register_hooks();
+        self::patient_credential_guard()->register_hooks();
 
         add_filter('rest_request_before_callbacks', [RestClinicContext::class, 'beforeCallbacks'], 10, 3);
         // Phase 11 Slice 6 — the reception cancel route owns its trusted Clinic +
@@ -418,7 +423,7 @@ final class App
 				( new OtpController( self::otpService() ) )->register_routes();
 				( new SmsController( self::smsService() ) )->register_routes();
 				( new BookingController( self::bookingService(), self::patient_session_scope() ) )->register_routes();
-				( new PatientController( self::patientService(), self::patient_access(), self::patient_binding_promoter() ) )->register_routes();
+				( new PatientController( self::patientService(), self::patient_access(), self::patient_binding_promoter(), self::patient_registration_service() ) )->register_routes();
 				( new QueueController( self::visitService() ) )->register_routes();
 				( new ScheduleController( self::scheduleService() ) )->register_routes();
 				( new ClinicalController( self::clinicalService() ) )->register_routes();
@@ -2121,6 +2126,55 @@ final class App
                     false
                 );
             }
+        );
+    }
+
+    /**
+     * Resolves the §4.4 initial-credential guard for OTP-only patient accounts.
+     */
+    public static function patient_credential_guard(): PatientCredentialGuard {
+        if ( null === self::$patient_credential_guard ) {
+            self::$patient_credential_guard = new PatientCredentialGuard( self::db() );
+        }
+
+        return self::$patient_credential_guard;
+    }
+
+    /**
+     * Resolves the Slice 2 public patient self-registration service.
+     */
+    public static function patient_registration_service(): PatientRegistrationService {
+        return new PatientRegistrationService(
+            self::db(),
+            new PatientLoginRepository( self::db() ),
+            new PatientSessionProofStore(),
+            self::patient_session_scope(),
+            self::rate(),
+            new PatientNidHmac(),
+            new PatientIdentityRepository( self::db() ),
+            self::patient_identity_service(),
+            self::patient_identity_activator(),
+            self::audit(),
+            self::op(),
+            static function ( int $clinic_id, string $mobile, int $patient_id ): void {
+                $clinic_name = (string) ( self::db()->fetchValue(
+                    'SELECT name FROM ' . self::db()->table( 'cpms_clinics' ) . ' WHERE id = %d LIMIT 1',
+                    [ $clinic_id ]
+                ) ?? '' );
+                if ( '' === trim( $clinic_name ) ) {
+                    $clinic_name = 'مرکز درمانی';
+                }
+                self::smsService()->sendEvent(
+                    $clinic_id,
+                    \ClinicCore\Domain\Sms\SmsEvents::PATIENT_BINDING_VERIFIED,
+                    $mobile,
+                    [ 'clinic_name' => $clinic_name ],
+                    'patient_binding',
+                    $patient_id,
+                    false
+                );
+            },
+            self::patient_access()
         );
     }
 
