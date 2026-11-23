@@ -3098,7 +3098,9 @@ final class BookingService
             'SELECT id, first_name, last_name, mobile, national_id, birth_date FROM ' . $this->db->table( 'cpms_patients' ) . ' WHERE id = %d LIMIT 1',
             [ $patient_id ]
         );
-        $this->assert_read_succeeded( 'patient_profile', [ 'patient_id' => $patient_id ] );
+        if ( '' !== (string) $this->db->wpdb()->last_error ) {
+            throw BookingException::of( self::LOCK_BUSY_CODE, self::LOCK_BUSY_TEXT, self::LOCK_BUSY_HTTP );
+        }
         $this->assert_patient_profile_complete_row( $row );
     }
 
