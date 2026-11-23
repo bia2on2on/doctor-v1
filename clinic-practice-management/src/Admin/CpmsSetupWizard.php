@@ -1818,23 +1818,30 @@ final class CpmsSetupWizard
         // Resolve trusted clinicId — no raw payload clinic_id, no fixed IDs, no first-clinic fallback
         try {
             $scope = ScopeContext::tryGet() ?? App::scope();
-            $trustedClinicId = (int) $scope->clinicId;
+            $trusted_clinic_id = (int) $scope->clinicId;
         } catch (\Throwable $e) {
             // Fail-closed: scope required
             return 'زمینه کلینیک معتبر یافت نشد: ' . $e->getMessage();
         }
 
-        if ($trustedClinicId <= 0) {
+        if ( $trusted_clinic_id <= 0 ) {
             return 'زمینه کلینیک نامعتبر است.';
         }
 
-        // Delegate to canonical service (same path as other product paths)
+        // Delegate to canonical service (same path as other product paths).
+        // The wizard's public signature keeps its legacy camelCase parameter;
+        // bind a snake_case local for the canonical service call.
+        $updated_by = $updatedBy; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy signature parameter.
         try {
-            App::clinic_profile_service()->updateProfile($updatedBy, $trustedClinicId, [
-                'name' => $name,
-                'address' => $address !== '' ? $address : null,
-                'phone' => $phone !== '' ? $phone : null,
-            ]);
+            App::clinic_profile_service()->updateProfile(
+                $updated_by,
+                $trusted_clinic_id,
+                [
+                    'name'    => $name,
+                    'address' => $address !== '' ? $address : null,
+                    'phone'   => $phone !== '' ? $phone : null,
+                ]
+            );
         } catch (ClinicProfileException $e) {
             $code = $e->getErrorCode();
             $data = $e->getData();

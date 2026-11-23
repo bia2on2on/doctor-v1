@@ -133,7 +133,7 @@ final class ClinicianAdminPage
         }
 
         $repo = App::clinicianRepository();
-        $clinicId = (int) $scope->clinicId;
+        $clinic_id = (int) $scope->clinicId;
         $selected = self::schedule_target( self::requested_clinician_id(), $scope );
         ?>
 <div class="wrap" dir="rtl">
@@ -147,9 +147,9 @@ final class ClinicianAdminPage
         <?php endif; ?>
 
     <?php if ($selected === null) : ?>
-        <?php self::renderList($repo, $clinicId); ?>
+        <?php self::renderList( $repo, $clinic_id ); ?>
     <?php else : ?>
-        <?php self::renderClinician($repo, $selected, $clinicId); ?>
+        <?php self::render_clinician( $repo, $selected, $clinic_id ); ?>
     <?php endif; ?>
 </div>
         <?php
@@ -356,8 +356,7 @@ final class ClinicianAdminPage
      *
      * @param array<string, mixed> $clinician
      */
-    private static function renderClinician(ClinicianRepository $repo, array $clinician, int $clinic_id): void
-    {
+    private static function render_clinician( ClinicianRepository $repo, array $clinician, int $clinic_id ): void {
         $cid = (int) $clinician['id'];
         $scheduleService = App::scheduleService();
         $schedules = $scheduleService->list($cid);
