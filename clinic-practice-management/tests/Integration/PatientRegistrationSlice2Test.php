@@ -1401,7 +1401,7 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
 
         $apptsTable = $db->table( 'cpms_appointments' );
         $holdsTable = $db->table( 'cpms_slot_holds' );
-        $slotsTable = $db->table( 'cpms_slots' );
+        $slotsTable = $db->table( 'cpms_schedule_slots' );
         $patsTable  = $db->table( 'cpms_patients' );
         $auditTable = $db->table( 'cpms_audit_logs' );
 
@@ -1582,7 +1582,7 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
             self::assertArrayHasKey( 'appointment_id', $cancelRes );
             self::assertArrayHasKey( 'status', $cancelRes );
             self::assertSame( (int) $staffRes['appointment_id'], (int) $cancelRes['appointment_id'] );
-            self::assertSame( 'cancelled', (string) $cancelRes['status'] );
+            self::assertSame( 'cancelled_by_patient', (string) $cancelRes['status'] );
         } finally {
             remove_filter( 'query', $rescheduleSpy, 5 );
         }
