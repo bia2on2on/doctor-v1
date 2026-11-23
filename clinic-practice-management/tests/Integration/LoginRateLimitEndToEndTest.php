@@ -571,6 +571,15 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
             self::assertCount(1, $rowsAfterThirdCall);
             self::assertSame(2, (int) $rowsAfterThirdCall[0]['hits']);
             self::assertSame($rowsAfterSecondCall[0]['window_key'], $rowsAfterThirdCall[0]['window_key'], 'call 2 must reuse the bootstrapped key.');
+
+            // The bucket row must be provably derived from the stored key:
+            // login-user: + HMAC-SHA256(normalized username, stored key).
+            $expectedKey = 'login-user:' . substr(
+                hash_hmac('sha256', 'login-user:' . strtolower(trim($username)), $storedAfterFirstCall),
+                0,
+                32
+            );
+            self::assertSame($expectedKey, $rowsAfterThirdCall[0]['window_key'], 'the bucket must be derived from the bootstrapped key.');
         } finally {
             delete_option(PatientNidHmac::OPTION_KEY);
             wp_cache_delete(PatientNidHmac::OPTION_KEY, 'options');
