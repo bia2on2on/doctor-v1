@@ -582,7 +582,7 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         };
 
         $normalizeHtml = static function ( string $html ): string {
-            return (string) preg_replace( '/cpms-pp-login-[a-z0-9]+/i', 'cpms-pp-login-ID', $html );
+            return (string) preg_replace( '/cpms-patient-(?:otp|reg)-[a-z0-9]+/i', 'cpms-patient-ID', $html );
         };
 
         PatientTwoProofTestHelper::acting_as( 0 );
