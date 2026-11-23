@@ -199,10 +199,19 @@ final class LoginRateLimiter
      * اگر تعریف شده و غیرتهی باشد، در غیر این صورت Option بدون Autoload با
      * همان نام. هیچ Option یا Constant جدیدی اضافه نمی‌کند.
      *
-     * هرگز پرتاب نمی‌کند: اگر کلید در دسترس نباشد یا قابل نگهداری نباشد،
-     * `null` برمی‌گرداند تا فراخوان‌کننده نتیجهٔ fail-closed کنترل‌شده را
-     * صادر کند. انتظار می‌رود فراخوان‌کننده هیچ exceptionی در زنجیرهٔ
-     * `authenticate`/`wp_login_failed` را اجازهٔ فرار ندهد.
+     * هرگز پرتاب نمی‌کند و هیچ‌گونه بازنویسیِ خودکار در ROW موجود انجام
+     * نمی‌دهد (نه `update_option()`، نه بازنویسی در جا). اگر کلید در
+     * دسترس نباشد، `null` برمی‌گرداند تا فراخوان‌کننده نتیجهٔ fail-closed
+     * کنترل‌شده را صادر کند. اندیشه‌های جریان:
+     *  - Constant `CPMS_NID_HMAC_KEY` تعریف‌شده و غیرتهی ⇒ همان ثابت؛
+     *  - Optionِ موجود با مقدار معتبر غیرتهی ⇒ همان مقدار ذخ‌شده؛
+     *  - Optionِ موجود ولی خالی/نامعتبر ⇒ `null` (fail-closed، بدون نوشتن)؛
+     *  - Optionِ غایب ⇒ یک‌بار `add_option()` + بازخوانی cache-busted.
+     * پس از ساختِ Row، مقدار همیشه همان مقدار ذخ‌شده در جدول است: اگر
+     * نویسنده‌ای همزمان همان Row را بازنویسی کند، کلید یتیم می‌ماند
+     * (پذیرفته‌شده) ولی خواننده هیچ‌گاه کلید محلیِ ساخته‌شده درونِ این
+     * تابع را نخواهد آورد. انتظار می‌رود فراخوان‌کننده هیچ exceptionی
+     * در زنجیرهٔ `authenticate`/`wp_login_failed` را اجازهٔ فرار ندهد.
      */
     private function resolve_hmac_key(): ?string {
         if ( defined( PatientNidHmac::CONST_KEY ) ) {
@@ -225,31 +234,14 @@ final class LoginRateLimiter
 
         if ( null !== $existing ) {
             // Row وجود دارد ولی خالی است یا مقدار قابل استفاده نیست (مثلاً
-            // serialization داده شده یا نوع ناسازگار). `add_option()` روی این
-            // Row رد می‌شود، پس آن را در جا repar کنیم (update_option با
-            // autoload no) و سپس مقدار ذخ‌شده را دوباره بخوانیم.
-            return $this->repair_hmac_key();
+            // serialization داده شده یا نوع ناسازگار). بدون بازنویسی در جا —
+            // بدون نوشتن، بدون بازخوانی مجدد؛ `null` (fail-closed) را برگردان.
+            return null;
         }
 
         // Rowی وجود ندارد: آن را با add_option بسازید و سپس مقدار ذخ‌شده را
         // (بدون کلید محلی) دوباره بخوانید — ببینید «شرایط رقابتی» در پایین.
         return $this->bootstrap_hmac_key();
-    }
-
-    /**
-     * Repair یک optionی که موجود اما نامعتبر است: کلید تازه ژنرات می‌کند
-     * (random_bytes) و با update_option (autoload no) در جای خود می‌نویسد؛
-     * سپس مقدار ذخ‌شده را توسط wp_cache_delete دوباره می‌خواند.
-     */
-    private function repair_hmac_key(): ?string {
-        if ( ! function_exists( 'update_option' ) ) {
-            return null;
-        }
-
-        $generated = bin2hex( random_bytes( 32 ) );
-        update_option( PatientNidHmac::OPTION_KEY, $generated, 'no' );
-
-        return $this->stored_hmac_key();
     }
 
     /**

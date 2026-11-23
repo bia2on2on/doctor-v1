@@ -523,31 +523,30 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
         self::assertSame(LoginRateLimiter::MAX_PER_USERNAME + 1, (int) $ipRowsAfter[0]['hits'], 'the IP bucket grows by exactly one failure.');
     }
 
-    /** (16) Option empty-but-present: correct-password login succeeds; the option is repaired and reused by the second call. */
-    public function testEmptyOptionIsRepairedAndCorrectPasswordSucceeds(): void
+    /** (16) Missing option row: bootstrapped on the first call; below-ceiling correct password succeeds. */
+    public function testMissingOptionBootstrapsOnFirstCallAndSucceeds(): void
     {
         $password = 'e2e-password-123';
-        $username = 'lrl_e2e_repair_success_' . bin2hex(random_bytes(4));
+        $username = 'lrl_e2e_bootstrap_' . bin2hex(random_bytes(4));
         $user_id  = wp_create_user($username, $password, $username . '@e2e.test');
 
         $prevOption = get_option(PatientNidHmac::OPTION_KEY, null);
         try {
-            // State: the option ROW exists with an EMPTY value (manager scenario).
+            // State: the option ROW does not exist at all.
             delete_option(PatientNidHmac::OPTION_KEY);
             wp_cache_delete(PatientNidHmac::OPTION_KEY, 'options');
-            add_option(PatientNidHmac::OPTION_KEY, '', '', 'no');
-            self::assertSame('', get_option(PatientNidHmac::OPTION_KEY, null));
+            self::assertNull(get_option(PatientNidHmac::OPTION_KEY, null));
 
             // Call 1: correct password, below the ceiling — must succeed.
             $result = wp_authenticate($username, $password);
             self::assertInstanceOf(\WP_User::class, $result);
             self::assertSame($user_id, $result->ID);
 
-            // The option is now non-empty (repaired).
+            // The option is now non-empty (bootstrapped on the first call).
             $storedAfterFirstCall = (string) get_option(PatientNidHmac::OPTION_KEY, '');
             self::assertNotSame('', $storedAfterFirstCall);
 
-            // Call 2: below-ceiling failure — counted.
+            // Call 2: below-ceiling failure — counted under the bootstrapped key.
             wp_authenticate($username, 'wrong-password-1');
 
             $db    = App::db();
@@ -559,7 +558,7 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
             self::assertCount(1, $rowsAfterSecondCall);
             self::assertSame(1, (int) $rowsAfterSecondCall[0]['hits']);
 
-            // Call 3: same key — the bucket and the option stay unchanged.
+            // Call 3: the same key — the bucket and the option stay unchanged.
             wp_authenticate($username, 'wrong-password-2');
 
             $storedAfterSecondCall = (string) get_option(PatientNidHmac::OPTION_KEY, '');
@@ -568,10 +567,10 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
                 []
             );
 
-            self::assertSame($storedAfterFirstCall, $storedAfterSecondCall, 'the repaired key must stay stable across calls.');
+            self::assertSame($storedAfterFirstCall, $storedAfterSecondCall, 'the bootstrapped key must stay stable across calls.');
             self::assertCount(1, $rowsAfterThirdCall);
             self::assertSame(2, (int) $rowsAfterThirdCall[0]['hits']);
-            self::assertSame($rowsAfterSecondCall[0]['window_key'], $rowsAfterThirdCall[0]['window_key'], 'second call must use the same key.');
+            self::assertSame($rowsAfterSecondCall[0]['window_key'], $rowsAfterThirdCall[0]['window_key'], 'call 2 must reuse the bootstrapped key.');
         } finally {
             delete_option(PatientNidHmac::OPTION_KEY);
             wp_cache_delete(PatientNidHmac::OPTION_KEY, 'options');
@@ -581,45 +580,63 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
         }
     }
 
-    /** (17) Same state: wrong password is counted under the repaired key — the exact row is provable. */
-    public function testWrongPasswordIsCountedUnderRepairedKey(): void
+    /** (17) Option empty-but-present: correct password is rejected with the controlled error — never self-repaired, never counted. */
+    public function testEmptyOptionRowFailsClosedWithoutSelfRepair(): void
     {
         $password = 'e2e-password-123';
-        $username = 'lrl_e2e_repair_fail_' . bin2hex(random_bytes(4));
-        wp_create_user($username, $password, $username . '@e2e.test');
+        $username = 'lrl_e2e_empty_row_' . bin2hex(random_bytes(4));
+        $user_id  = wp_create_user($username, $password, $username . '@e2e.test');
 
         $prevOption = get_option(PatientNidHmac::OPTION_KEY, null);
         try {
+            // State: the option ROW exists with an EMPTY value (manager scenario).
             delete_option(PatientNidHmac::OPTION_KEY);
             wp_cache_delete(PatientNidHmac::OPTION_KEY, 'options');
             add_option(PatientNidHmac::OPTION_KEY, '', '', 'no');
             self::assertSame('', get_option(PatientNidHmac::OPTION_KEY, null));
 
-            $result = wp_authenticate($username, 'wrong-password-1');
-
+            // Call 1: correct password — the row is present but unusable, so
+            // fail-closed: controlled 503, never a repair write.
+            $result = wp_authenticate($username, $password);
             self::assertInstanceOf(WP_Error::class, $result);
-            self::assertSame('incorrect_password', $result->get_error_code());
-            self::assertNotSame('cpms_login_throttle_unavailable', $result->get_error_code());
+            self::assertSame('cpms_login_throttle_unavailable', $result->get_error_code());
+            $data = $result->get_error_data();
+            self::assertArrayHasKey('status', $data);
+            self::assertSame(503, $data['status']);
 
-            $storedKey = (string) get_option(PatientNidHmac::OPTION_KEY, '');
-            self::assertNotSame('', $storedKey);
+            // The empty row must NOT be self-repaired — the stored value
+            // remains empty after the authenticate chain ran.
+            self::assertSame('', get_option(PatientNidHmac::OPTION_KEY, null), 'an unusable row must not be self-repaired.');
 
-            $expectedKey = 'login-user:' . substr(
-                hash_hmac('sha256', 'login-user:' . strtolower(trim($username)), $storedKey),
-                0,
-                32
-            );
+            // Wrong password: identical controlled error, never counted.
+            $wrong = wp_authenticate($username, 'wrong-password-1');
+            self::assertInstanceOf(WP_Error::class, $wrong);
+            self::assertSame($result->get_error_code(), $wrong->get_error_code());
+            self::assertSame($result->get_error_message(), $wrong->get_error_message());
+            self::assertSame($result->get_error_data(), $wrong->get_error_data());
 
+            // Known and unknown accounts get the identical response — no oracle.
+            $unknown = wp_authenticate('lrl_e2e_empty_row_unknown_' . bin2hex(random_bytes(4)), $password);
+            self::assertInstanceOf(WP_Error::class, $unknown);
+            self::assertSame($result->get_error_code(), $unknown->get_error_code());
+            self::assertSame($result->get_error_message(), $unknown->get_error_message());
+            self::assertSame($result->get_error_data(), $unknown->get_error_data());
+
+            // Counted in no bucket — neither key nor IP row was created.
             $db    = App::db();
-            $rows  = $db->fetchAll(
-                'SELECT window_key, hits FROM ' . $db->table('cpms_rate_limits') . " WHERE window_key LIKE 'login-user:%'",
+            $table = $db->table('cpms_rate_limits');
+            $users = $db->fetchAll(
+                'SELECT window_key, hits FROM ' . $table . " WHERE window_key LIKE 'login-user:%'",
                 []
             );
+            $ips = $db->fetchAll(
+                'SELECT window_key, hits FROM ' . $table . " WHERE window_key LIKE 'login-ip:%'",
+                []
+            );
+            self::assertSame([], $users, 'the unusable-row path must never count a username bucket.');
+            self::assertSame([], $ips, 'the unusable-row path must never count an IP bucket.');
 
-            self::assertCount(1, $rows);
-            self::assertSame(1, (int) $rows[0]['hits']);
-            self::assertSame($expectedKey, $rows[0]['window_key'], 'the failure must be counted under the repaired key.');
-            self::assertMatchesRegularExpression('/^login-user:[0-9a-f]{32}$/', $rows[0]['window_key']);
+            self::assertGreaterThan(0, $user_id);
         } finally {
             delete_option(PatientNidHmac::OPTION_KEY);
             wp_cache_delete(PatientNidHmac::OPTION_KEY, 'options');
@@ -634,8 +651,9 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
     {
         // Simulate the persist failure with the narrowest official filter:
         // 'pre_option' masks cpms_nid_hmac_key with an unusable value, so the
-        // repair re-read can never yield a usable key even though the real
-        // update_option write succeeded. Restored in finally (strict).
+        // resolver can never see a usable key even though the stored option row
+        // is perfectly readable. Restored in finally (strict).
+        $prevOption = get_option(PatientNidHmac::OPTION_KEY, null);
         $intercepted = static function ($value, string $option, $default) {
             if ($option === PatientNidHmac::OPTION_KEY) {
                 return '';
@@ -681,6 +699,10 @@ final class LoginRateLimitEndToEndTest extends WP_UnitTestCase
         } finally {
             remove_filter('pre_option', $intercepted, 10);
         }
+
+        // The option row must be exactly as it was before the masked calls —
+        // the unusable-value path must never perform a write (no self-repair).
+        self::assertSame($prevOption, get_option(PatientNidHmac::OPTION_KEY, null), 'the masked path must never write the key option.');
 
         self::assertGreaterThan(0, $user_id);
         self::assertInstanceOf(WP_Error::class, $known);
