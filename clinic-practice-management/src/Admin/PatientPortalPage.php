@@ -227,12 +227,12 @@ final class PatientPortalPage
             return $result;
         }
 
-        if ( ! is_user_logged_in() || ! self::isPatientOnly( wp_get_current_user() ) ) {
+        $route = (string) $request->get_route();
+        if ( 1 !== preg_match( '#^/wp/v2/users(?:/|$)#i', $route ) ) {
             return $result;
         }
 
-        $route = (string) $request->get_route();
-        if ( 1 !== preg_match( '#^/wp/v2/users(?:/|$)#i', $route ) ) {
+        if ( ! is_user_logged_in() || ! self::isPatientOnly( wp_get_current_user() ) ) {
             return $result;
         }
 

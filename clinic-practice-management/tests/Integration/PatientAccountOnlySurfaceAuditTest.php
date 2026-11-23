@@ -162,9 +162,9 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
             RolesAndCapabilities::ROLE_PATIENT
         );
 
-        $logins = new PatientLoginRepository( $db );
-        $logins->insert_pending_account( $this->userAccountActive, self::MOBILE_ACCOUNT_ACTIVE, 'بیمار', 'بدون‌پرونده' );
-        $logins->activate_account( $this->userAccountActive );
+        $logins          = new PatientLoginRepository( $db );
+        $activeAccountId = $logins->insert_pending_account( $this->userAccountActive, self::MOBILE_ACCOUNT_ACTIVE, 'بیمار', 'بدون‌پرونده' );
+        $logins->activate_account_from_pending( $activeAccountId, $this->userAccountActive );
         $logins->insert_pending_account( $this->userAccountPending, self::MOBILE_ACCOUNT_PENDING, 'بیمار', 'درانتظار' );
 
         $this->installSignedExpiration( time() + 30 * 86400 );
@@ -179,7 +179,7 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         $_POST                     = [];
         $_REQUEST                  = [];
         $_SERVER['REQUEST_METHOD'] = 'GET';
-        unset( $GLOBALS['pagenow'] );
+        unset( $GLOBALS['pagenow'], $_COOKIE[ LOGGED_IN_COOKIE ] );
         App::resetScope();
         parent::tearDown();
     }
@@ -572,7 +572,7 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
             self::assertStringNotContainsString( self::NID_EXISTING, $portalHtml );
             self::assertStringNotContainsString( self::MOBILE_CLINIC_PATIENT, $portalHtml );
             self::assertStringNotContainsString( 'Private Audit Clinic Z', $portalHtml );
-            self::assertStringNotContainsString( 'data-role="booking-section"', $portalHtml );
+            self::assertStringNotContainsString( 'data-role="booking-patient-chooser"', $portalHtml );
         }
 
         // Step-1 pending sees complete-registration section and incomplete booking notice without hold/confirm paths.
@@ -582,19 +582,21 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         $step1PortalHtml = (string) ob_get_clean();
         self::assertStringContainsString( 'id="complete-registration"', $step1PortalHtml );
         self::assertStringNotContainsString( 'data-role="link-record-section"', $step1PortalHtml );
+        self::assertStringNotContainsString( 'data-role="booking-section"', $step1PortalHtml );
 
         $step1ShortcodeHtml = PublicBookingShortcode::render( [ 'clinic_id' => $this->clinicPublic ] );
         self::assertStringContainsString( 'data-role="complete-registration-redirect"', $step1ShortcodeHtml );
         self::assertStringNotContainsString( 'hold_path', $step1ShortcodeHtml );
         self::assertStringNotContainsString( 'confirm_path', $step1ShortcodeHtml );
 
-        // Account-only sees link-record UI (requires NID) and zero patient chooser on shortcode.
+        // Account-only sees link-record UI (requires NID), empty booking state, and zero patient chooser on shortcode.
         $this->activateSession( $accountOnly );
         ob_start();
         PatientPortalPage::render();
         $accountPortalHtml = (string) ob_get_clean();
         self::assertStringContainsString( 'data-role="link-record-section"', $accountPortalHtml );
         self::assertStringContainsString( 'data-role="link-record-national-id"', $accountPortalHtml );
+        self::assertStringContainsString( 'data-role="booking-empty-state"', $accountPortalHtml );
 
         $accountShortcodeHtml = PublicBookingShortcode::render( [ 'clinic_id' => $this->clinicPublic ] );
         self::assertStringNotContainsString( 'data-role="booking-patient-chooser"', $accountShortcodeHtml );
