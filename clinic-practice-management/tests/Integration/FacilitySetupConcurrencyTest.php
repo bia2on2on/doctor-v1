@@ -26,6 +26,7 @@ use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use ClinicCore\Infrastructure\Repository\ScheduleRepository;
 use ClinicCore\Settings\Settings;
 use ClinicCore\Settings\SettingsFactory;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 require_once __DIR__ . '/RealTableMigrations.php';
@@ -343,7 +344,7 @@ final class FacilitySetupConcurrencyTest extends WP_UnitTestCase
         if (function_exists('posix_kill')) {
             posix_kill(getmypid(), SIGKILL);
         }
-        exit(0);
+        ForkChildExit::terminate(0);
     }
 
     /** The production service graph, bound to one explicit connection. */

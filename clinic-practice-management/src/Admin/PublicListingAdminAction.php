@@ -34,6 +34,12 @@ final class PublicListingAdminAction {
 		if ( ! wp_verify_nonce( $nonce, 'cpms_public_listing_' . $authorized_clinic_id ) ) {
 			return false;
 		}
+		// Three-stage license (design §7.3 staff/settings row, final 2026-11-17): Stage 3 is view-only.
+		$license_decision = App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+		if ( ! $license_decision->allowed ) {
+			App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $license_decision->reason ] );
+			return false;
+		}
 		$enabled = isset( $_POST['cpms_public_listing_enabled'] ) && '1' === $_POST['cpms_public_listing_enabled'];
 		try {
 			$settings = App::settingsFactory()->forClinic( $authorized_clinic_id );

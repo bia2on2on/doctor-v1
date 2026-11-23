@@ -6,6 +6,7 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Audit\HashChain;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 /**
@@ -284,11 +285,14 @@ final class AuditAppendConcurrencyTest extends WP_UnitTestCase
         }
 
         $pids = [];
+        $outcome_files = [];
+        $tag = bin2hex(random_bytes(8));
         // Ensure parent session holds no open transaction lock on cpms_audit_logs
         // before forked children acquire FOR UPDATE on tail + guard.
         App::db()->wpdb()->query('COMMIT');
 
         for ($i = 0; $i < $count; $i++) {
+            $outcome_files[$i] = sys_get_temp_dir() . '/cpms-audit-ins-' . $tag . '-' . $i . '.out';
             $pid = pcntl_fork();
             if ($pid === -1) {
                 $this->fail('pcntl_fork failed');
@@ -378,16 +382,19 @@ final class AuditAppendConcurrencyTest extends WP_UnitTestCase
                 if ($mysqli instanceof \mysqli) {
                     @$mysqli->close();
                 }
-                exit($exit);
+                @file_put_contents($outcome_files[$i], (string) $exit);
+                ForkChildExit::terminate(0);
             }
-            $pids[] = $pid;
+            $pids[$i] = $pid;
         }
 
         $success = 0;
         $failed = 0;
-        foreach ($pids as $pid) {
+        foreach ($pids as $i => $pid) {
             pcntl_waitpid($pid, $status);
-            if (pcntl_wifexited($status) && pcntl_wexitstatus($status) === 0) {
+            $raw = @file_get_contents($outcome_files[$i]);
+            @unlink($outcome_files[$i]);
+            if ($raw === '0') {
                 $success++;
             } else {
                 $failed++;
@@ -416,7 +423,10 @@ final class AuditAppendConcurrencyTest extends WP_UnitTestCase
             $this->markTestSkipped('pcntl_fork not available');
         }
         $pids = [];
+        $outcome_files = [];
+        $tag = bin2hex(random_bytes(8));
         for ($i = 0; $i < $count; $i++) {
+            $outcome_files[$i] = sys_get_temp_dir() . '/cpms-audit-hold-' . $tag . '-' . $i . '.out';
             $pid = pcntl_fork();
             if ($pid === -1) {
                 $this->fail('pcntl_fork failed');
@@ -450,14 +460,17 @@ final class AuditAppendConcurrencyTest extends WP_UnitTestCase
                 if ($mysqli instanceof \mysqli) {
                     @$mysqli->close();
                 }
-                exit($exit);
+                @file_put_contents($outcome_files[$i], (string) $exit);
+                ForkChildExit::terminate(0);
             }
-            $pids[] = $pid;
+            $pids[$i] = $pid;
         }
         $successes = 0;
-        foreach ($pids as $pid) {
+        foreach ($pids as $i => $pid) {
             pcntl_waitpid($pid, $status);
-            if (pcntl_wifexited($status) && pcntl_wexitstatus($status) === 0) {
+            $raw = @file_get_contents($outcome_files[$i]);
+            @unlink($outcome_files[$i]);
+            if ($raw === '0') {
                 $successes++;
             }
         }

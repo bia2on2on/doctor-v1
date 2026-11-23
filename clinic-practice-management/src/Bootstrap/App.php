@@ -194,23 +194,46 @@ final class App
     private const DB_ENGINE_LOG_WINDOW = 21600;
 
     private static ?CpmsDb $db = null;
-    private static ?OpLogger $op = null;
-    private static ?AuditLogger $audit = null;
-    private static ?JobQueue $jobs = null;
-    private static ?RateLimiter $rate = null;
-    private static ?LoginRateLimiter $loginRateLimiter = null;
-    private static ?Idempotency $idem = null;
-    private static ?SettingsFactory $settingsFactory = null;
+
+    /**
+     * Builder-PID ledger for the DB-bound singletons guarded in this class
+     * (LICENSE-FIX-7). A singleton built before pcntl_fork() holds PHP
+     * resources whose descriptors are copied into every child and stay
+     * unsynchronized there (the mysqlnd socket of the pre-fork `$wpdb` is
+     * owned by the parent and by every sibling fork at once). A forked
+     * child that issues a query on such a shared descriptor — e.g. the
+     * license-gate evidence read on the write path
+     * (Integration Phase6ScheduleShiftConcurrencyRedTest::testConcurrent
+     * OverlappingCreatesLeaveExactlyOneActiveRow; parent in pcntl_waitpid,
+     * child in poll_schedule_timeout, SHOW FULL PROCESSLIST idle) — can
+     * interleave frames and park forever with no server-side work. Each
+     * slot records the PID that built its singleton; a mismatch rebuilds
+     * a private instance for the current process, a match returns the
+     * byte-identical singleton.
+     *
+     * @var array<string, int>
+     */
+    private static array $singleton_pids = [];
+
+    private static ?OpLogger $op                               = null;
+    private static ?AuditLogger $audit                         = null;
+    private static ?JobQueue $jobs                             = null;
+    private static ?RateLimiter $rate                          = null;
+    private static ?LoginRateLimiter $login_rate_limiter       = null;
+    private static ?Idempotency $idem                          = null;
+    private static ?SettingsFactory $settings_factory          = null;
     private static ?InstallationSettings $installationSettings = null;
-    private static ?MigrationRunner $migrations = null;
-    private static ?JobsDispatcher $dispatcher = null;
-    private static ?SmsProviderRegistry $providers = null;
-    private static ?CredentialVault $vault = null;
-    private static ?SmsService $smsService = null;
-    private static ?LicenseGate $licenseGate = null;
-    private static ?VisitService $visitService = null;
+    private static ?MigrationRunner $migrations                = null;
+    private static ?JobsDispatcher $dispatcher                 = null;
+    private static ?SmsProviderRegistry $providers             = null;
+    private static ?CredentialVault $vault                     = null;
+    private static ?SmsService $sms_service                    = null;
+    private static ?LicenseService $licenses                   = null;
+    private static ?VendorGateway $gateway                     = null;
+    private static ?LicenseGate $license_gate                  = null;
+    private static ?VisitService $visit_service                = null;
     private static ?PatientSessionScope $patient_session_scope = null;
-    private static bool $booted = false;
+    private static bool $booted                                = false;
 
     private static ?PatientCredentialGuard $patient_credential_guard = null;
 
@@ -1349,10 +1372,13 @@ final class App
      */
     public static function visitService(): VisitService
     {
-        if (self::$visitService === null) {
+        if ( self::$visit_service !== null && self::singleton_pid_matches( 'visit_service' ) ) {
+            return self::$visit_service;
+        }
+        try {
             $db = self::db();
             $op = self::op();
-            self::$visitService = new VisitService(
+            self::$visit_service = new VisitService(
                 $db,
                 new VisitRepository($db),
                 new AppointmentRepository($db),
@@ -1371,23 +1397,28 @@ final class App
                 ),
                 new MembershipRepository($db)
             );
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$visit_service ) {
+                throw $exception;
+            }
         }
+        self::singleton_pid_record( 'visit_service' );
 
-        return self::$visitService;
+        return self::$visit_service;
     }
 
     public static function scheduleService(): ScheduleService
     {
         static $schedule = null;
         static $deps     = null;
-        $current_deps    = [ self::db(), self::locationRepository(), self::jobs(), self::audit(), self::op() ];
+        $current_deps    = [ self::db(), self::location_repository(), self::jobs(), self::audit(), self::op() ];
         if ( $schedule === null || $deps !== $current_deps ) {
             $db       = self::db();
             $schedule = new ScheduleService(
                 $db,
                 new ScheduleRepository( $db ),
                 new MembershipRepository( $db ),
-                self::locationRepository(),
+                self::location_repository(),
                 self::jobs(),
                 self::audit(),
                 self::op()
@@ -1425,16 +1456,23 @@ final class App
         return $repo;
     }
 
-    public static function clinicProfileService(): ClinicProfileService
-    {
-        static $service = null;
-        if ($service === null) {
-            $service = new ClinicProfileService(
-                self::db(),
-                self::clinicRepository(),
-                self::authorization_service(),
-                self::audit()
-            );
+    public static function clinic_profile_service(): ClinicProfileService {
+        static $service     = null;
+        static $service_pid = null;
+        if ( $service === null || $service_pid !== (int) getmypid() ) {
+            try {
+                $service = new ClinicProfileService(
+                    self::db(),
+                    self::clinicRepository(),
+                    self::authorization_service(),
+                    self::audit()
+                );
+            } catch ( \Throwable $exception ) {
+                if ( null === $service ) {
+                    throw $exception;
+                }
+            }
+            $service_pid = (int) getmypid();
         }
 
         return $service;
@@ -1443,8 +1481,7 @@ final class App
     /**
      * ریپوی canonical شعبه‌ها (cpms_locations) — Phase 4 Location master data.
      */
-    public static function locationRepository(): LocationRepository
-    {
+    public static function location_repository(): LocationRepository {
         static $repo   = null;
         static $db_ref = null;
         if ( $repo === null || $db_ref !== self::db() ) {
@@ -1459,19 +1496,38 @@ final class App
      * سرویس Location master data — CREATE + UPDATE name/timezone
      * (trusted Clinic + CONFIG scoped + IANA timezone + parity-safe denial).
      */
-    public static function locationService(): LocationService
-    {
-        static $service = null;
-        if ($service === null) {
-            $service = new LocationService(
-                self::db(),
-                self::locationRepository(),
-                self::authorization_service(),
-                self::audit()
-            );
+    public static function location_service(): LocationService {
+        static $service     = null;
+        static $service_pid = null;
+        if ( $service === null || $service_pid !== (int) getmypid() ) {
+            try {
+                $service = new LocationService(
+                    self::db(),
+                    self::location_repository(),
+                    self::authorization_service(),
+                    self::audit()
+                );
+            } catch ( \Throwable $exception ) {
+                if ( null === $service ) {
+                    throw $exception;
+                }
+            }
+            $service_pid = (int) getmypid();
         }
 
         return $service;
+    }
+
+    /**
+     * Backward-compat alias for `location_service()` — kept for the companion
+     * disposable-demo-installer lane, which still calls `App::locationService()`
+     * (tools/disposable-demo-installer/includes/class-cpms-demo-platform.php:1035)
+     * and cannot be edited in this production-only PR. The alias holds no state:
+     * no new static slot, no method-static memo, no singleton_pids ledger entry —
+     * it delegates immediately and inherits the callee's fork semantics.
+     */
+    public static function locationService(): LocationService { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy companion-lane alias; rename pending companion-owned PR
+        return self::location_service();
     }
 
     /**
@@ -1479,15 +1535,23 @@ final class App
      * authority از TrustedClinicEstablisher + AuthorizationService می‌آید.
      */
     public static function custom_role_management_service(): \ClinicCore\Application\Roles\CustomRoleManagementService {
-        static $service = null;
-        if ( $service === null ) {
-            $service = new \ClinicCore\Application\Roles\CustomRoleManagementService(
-                new \ClinicCore\Application\Scope\TrustedClinicEstablisher( self::db(), new MembershipRepository( self::db() ) ),
-                self::authorization_service(),
-                new \ClinicCore\Infrastructure\Repository\CustomRoleRepository( self::db() ),
-                self::audit(),
-                self::db()
-            );
+        static $service     = null;
+        static $service_pid = null;
+        if ( $service === null || $service_pid !== (int) getmypid() ) {
+            try {
+                $service = new \ClinicCore\Application\Roles\CustomRoleManagementService(
+                    new \ClinicCore\Application\Scope\TrustedClinicEstablisher( self::db(), new MembershipRepository( self::db() ) ),
+                    self::authorization_service(),
+                    new \ClinicCore\Infrastructure\Repository\CustomRoleRepository( self::db() ),
+                    self::audit(),
+                    self::db()
+                );
+            } catch ( \Throwable $exception ) {
+                if ( null === $service ) {
+                    throw $exception;
+                }
+            }
+            $service_pid = (int) getmypid();
         }
 
         return $service;
@@ -1498,16 +1562,24 @@ final class App
      * membership-only، Clinic-local، bounded-delegation، Auditشده.
      */
     public static function custom_role_assignment_service(): \ClinicCore\Application\Roles\CustomRoleAssignmentService {
-        static $service = null;
-        if ( $service === null ) {
-            $service = new \ClinicCore\Application\Roles\CustomRoleAssignmentService(
-                new \ClinicCore\Application\Scope\TrustedClinicEstablisher( self::db(), new MembershipRepository( self::db() ) ),
-                self::authorization_service(),
-                new MembershipRepository( self::db() ),
-                new \ClinicCore\Infrastructure\Repository\CustomRoleRepository( self::db() ),
-                self::audit(),
-                self::db()
-            );
+        static $service     = null;
+        static $service_pid = null;
+        if ( $service === null || $service_pid !== (int) getmypid() ) {
+            try {
+                $service = new \ClinicCore\Application\Roles\CustomRoleAssignmentService(
+                    new \ClinicCore\Application\Scope\TrustedClinicEstablisher( self::db(), new MembershipRepository( self::db() ) ),
+                    self::authorization_service(),
+                    new MembershipRepository( self::db() ),
+                    new \ClinicCore\Infrastructure\Repository\CustomRoleRepository( self::db() ),
+                    self::audit(),
+                    self::db()
+                );
+            } catch ( \Throwable $exception ) {
+                if ( null === $service ) {
+                    throw $exception;
+                }
+            }
+            $service_pid = (int) getmypid();
         }
 
         return $service;
@@ -1518,13 +1590,21 @@ final class App
      * bootstrap؛ مجوز نهایی پس از آن فقط از MembershipService/AuthorizationService.
      */
     public static function first_practice_setup_service(): \ClinicCore\Application\Onboarding\FirstPracticeSetupService {
-        static $service = null;
-        if ( $service === null ) {
-            $service = new \ClinicCore\Application\Onboarding\FirstPracticeSetupService(
-                self::db(),
-                new MembershipRepository( self::db() ),
-                self::audit()
-            );
+        static $service     = null;
+        static $service_pid = null;
+        if ( $service === null || $service_pid !== (int) getmypid() ) {
+            try {
+                $service = new \ClinicCore\Application\Onboarding\FirstPracticeSetupService(
+                    self::db(),
+                    new MembershipRepository( self::db() ),
+                    self::audit()
+                );
+            } catch ( \Throwable $exception ) {
+                if ( null === $service ) {
+                    throw $exception;
+                }
+            }
+            $service_pid = (int) getmypid();
         }
 
         return $service;
@@ -1534,12 +1614,20 @@ final class App
      * سرویس عضویت (Phase 2 — C4 primitives / P2-D1).
      */
     public static function membership_service(): MembershipService {
-        static $service = null;
-        if ( $service === null ) {
-            $service = new MembershipService(
-                self::db(),
-                new MembershipRepository( self::db() )
-            );
+        static $service     = null;
+        static $service_pid = null;
+        if ( $service === null || $service_pid !== (int) getmypid() ) {
+            try {
+                $service = new MembershipService(
+                    self::db(),
+                    new MembershipRepository( self::db() )
+                );
+            } catch ( \Throwable $exception ) {
+                if ( null === $service ) {
+                    throw $exception;
+                }
+            }
+            $service_pid = (int) getmypid();
         }
 
         return $service;
@@ -1912,12 +2000,20 @@ final class App
      * `POST /clinic/v1/patient/enroll` remains the sole authority.
      */
     public static function patient_enrollment_options(): PatientEnrollmentOptions {
-        static $options = null;
-        if ( $options === null ) {
-            $options = new PatientEnrollmentOptions(
-                new PatientEnrollmentRepository( self::db() ),
-                self::licenseService()
-            );
+        static $options     = null;
+        static $options_pid = null;
+        if ( $options === null || $options_pid !== (int) getmypid() ) {
+            try {
+                $options = new PatientEnrollmentOptions(
+                    new PatientEnrollmentRepository( self::db() ),
+                    self::licenseService()
+                );
+            } catch ( \Throwable $exception ) {
+                if ( null === $options ) {
+                    throw $exception;
+                }
+            }
+            $options_pid = (int) getmypid();
         }
 
         return $options;
@@ -1957,8 +2053,15 @@ final class App
     }
 
     public static function patient_session_scope(): PatientSessionScope {
-        if ( null === self::$patient_session_scope ) {
-            self::$patient_session_scope = new PatientSessionScope( self::db() );
+        if ( null === self::$patient_session_scope || ! self::singleton_pid_matches( 'patient_session_scope' ) ) {
+            try {
+                self::$patient_session_scope = new PatientSessionScope( self::db() );
+            } catch ( \Throwable $exception ) {
+                if ( null === self::$patient_session_scope ) {
+                    throw $exception;
+                }
+            }
+            self::singleton_pid_record( 'patient_session_scope' );
         }
         self::$patient_session_scope->register_hooks();
 
@@ -2053,6 +2156,7 @@ final class App
             self::patient_identity_activator(),
             self::audit(),
             self::op(),
+            self::licenseGate(),
             static function ( int $clinic_id, string $mobile, int $patient_id ): void {
                 $clinic_name = (string) ( self::db()->fetchValue(
                     'SELECT name FROM ' . self::db()->table( 'cpms_clinics' ) . ' WHERE id = %d LIMIT 1',
@@ -2080,7 +2184,10 @@ final class App
      */
     public static function providers(): SmsProviderRegistry
     {
-        if (self::$providers === null) {
+        if ( self::$providers !== null && self::singleton_pid_matches( 'providers' ) ) {
+            return self::$providers;
+        }
+        try {
             $registry = new SmsProviderRegistry();
             $registry->register(new LogSmsProvider(self::op()));
             // Phase 2 (§A-3 / RT-6): `sms.generic` **per-Clinic** است. اگر همین‌جا
@@ -2095,7 +2202,12 @@ final class App
                 do_action('cpms_sms_provider', $registry);
             }
             self::$providers = $registry;
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$providers ) {
+                throw $exception;
+            }
         }
+        self::singleton_pid_record( 'providers' );
 
         return self::$providers;
     }
@@ -2122,14 +2234,22 @@ final class App
      */
     public static function licenseGate(): LicenseGate
     {
-        if (self::$licenseGate === null) {
-            self::$licenseGate = new SignedLicenseGate( // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- Existing singleton property.
+        if ( self::$license_gate !== null && self::singleton_pid_matches( 'licenseGate' ) ) {
+            return self::$license_gate;
+        }
+        try {
+            self::$license_gate = new SignedLicenseGate(
                 self::licenseService(),
                 new \ClinicCore\Infrastructure\Repository\ReturningPatientRepository( self::db() )
             );
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$license_gate ) {
+                throw $exception;
+            }
         }
+        self::singleton_pid_record( 'licenseGate' );
 
-        return self::$licenseGate;
+        return self::$license_gate;
     }
 
     /**
@@ -2137,43 +2257,54 @@ final class App
      */
     public static function licenseService(): LicenseService
     {
-        static $licenses = null;
-        if ($licenses === null) {
-            $licenses = new LicenseService(
-                new LicenseRepository(self::db()),
+        if ( self::$licenses !== null && self::singleton_pid_matches( 'licenses' ) ) {
+            return self::$licenses;
+        }
+        try {
+            self::$licenses = new LicenseService(
+                new LicenseRepository( self::db() ),
                 self::licenseGateway(),
                 self::db(),
                 new LicensePolicy()
             );
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$licenses ) {
+                throw $exception;
+            }
         }
+        self::singleton_pid_record( 'licenses' );
 
-        return $licenses;
+        return self::$licenses;
     }
 
     public static function licenseGateway(): VendorGateway
     {
-        static $gateway = null;
-        if ($gateway === null) {
-            try {
-                $serverUrl = (string) self::settings()->get('license.server_url', '');
-            } catch (\Throwable) {
-                $serverUrl = ''; // قبل از Migration — غیرفعال (NOT_CONFIGURED)
-            }
-            $gateway = new HttpVendorGateway(['server_url' => $serverUrl]);
+        if ( self::$gateway !== null && self::singleton_pid_matches( 'gateway' ) ) {
+            return self::$gateway;
         }
+        try {
+            $server_url = (string) self::settings()->get( 'license.server_url', '' );
+        } catch ( \Throwable ) {
+            $server_url = ''; // قبل از Migration — غیرفعال (NOT_CONFIGURED)
+        }
+        self::$gateway = new HttpVendorGateway( [ 'server_url' => $server_url ] );
+        self::singleton_pid_record( 'gateway' );
 
-        return $gateway;
+        return self::$gateway;
     }
 
     public static function smsService(): SmsService
     {
-        if (self::$smsService === null) {
+        if ( self::$sms_service !== null && self::singleton_pid_matches( 'sms_service' ) ) {
+            return self::$sms_service;
+        }
+        try {
             // Phase 2 (§5-D / RT-4 / RT-6): این سرویس دیگر یک `Settings`
             // Clinic-مشخص را در لحظهٔ ساخت نمی‌گیرد، بلکه کارخانهٔ per-Clinic +
             // یک resolverِ scope می‌گیرد. پس:
             //  (۱) ساختنش به هیچ Clinic‌ای نیاز ندارد ⇒ مرزِ tick نمی‌افتد؛
             //  (۲) singleton بودنش بی‌خطر است ⇒ Clinicِ bootstrap میخ نمی‌شود.
-            self::$smsService = new SmsService(
+            self::$sms_service = new SmsService(
                 self::db(),
                 self::settingsFactory(),
                 self::providers(),
@@ -2183,28 +2314,100 @@ final class App
                 self::jobs(),
                 static fn (): int => self::scope()->clinicId
             );
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$sms_service ) {
+                throw $exception;
+            }
         }
+        self::singleton_pid_record( 'sms_service' );
 
-        return self::$smsService;
+        return self::$sms_service;
     }
 
     // ============ DI ============
 
+    /**
+     * True when this process recorded ownership of singleton slot $slot.
+     * An absent slot, or one recorded by another (fork-parent) process,
+     * returns false, which obliges the accessor to rebuild.
+     *
+     * @param string $slot Ledger key (identical to the class-static name).
+     */
+    private static function singleton_pid_matches( string $slot ): bool {
+        return isset( self::$singleton_pids[ $slot ] ) && self::$singleton_pids[ $slot ] === (int) getmypid();
+    }
+
+    /**
+     * Record that this process built singleton slot $slot.
+     *
+     * @param string $slot Ledger key (identical to the class-static name).
+     */
+    private static function singleton_pid_record( string $slot ): void {
+        self::$singleton_pids[ $slot ] = (int) getmypid();
+    }
+
     public static function db(): CpmsDb
     {
-        if (self::$db === null) {
-            global $wpdb;
-            self::$db = new CpmsDb($wpdb);
+        global $wpdb;
+        if ( self::$db !== null && self::singleton_pid_matches( 'db' ) ) {
+            return self::$db;
         }
+        try {
+            if ( null === self::$db ) {
+                self::$db = new CpmsDb( $wpdb );
+            } else {
+                // Forked process reusing the inherited pre-fork singleton:
+                // give it a private connection (see the ledger docblock
+                // above); fall back to the inherited singleton if a fresh
+                // one cannot be built, i.e. never worse than before.
+                self::$db = self::forked_db_copy( $wpdb ) ?? new CpmsDb( $wpdb );
+            }
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$db ) {
+                throw $exception;
+            }
+        }
+        self::singleton_pid_record( 'db' );
 
         return self::$db;
     }
 
+    /**
+     * Build a private CpmsDb for this process on a fresh connection, the
+     * same pattern the Integration fork helpers use for child connections.
+     * Returns null when the DB constants are unavailable or the fresh
+     * connection cannot be built.
+     */
+    private static function forked_db_copy( \wpdb $inherited ): ?CpmsDb {
+        if ( ! defined( 'DB_HOST' ) || ! defined( 'DB_USER' ) || ! defined( 'DB_NAME' ) ) {
+            return null;
+        }
+        try {
+            $fresh = new \wpdb( DB_USER, defined( 'DB_PASSWORD' ) ? DB_PASSWORD : '', DB_NAME, DB_HOST );
+            if ( ! method_exists( $fresh, 'set_prefix' ) ) {
+                return null;
+            }
+            $fresh->set_prefix( $inherited->prefix );
+
+            return new CpmsDb( $fresh );
+        } catch ( \Throwable ) {
+            return null;
+        }
+    }
+
     public static function op(): OpLogger
     {
-        if (self::$op === null) {
-            self::$op = new OpLogger(self::db());
+        if ( self::$op !== null && self::singleton_pid_matches( 'op' ) ) {
+            return self::$op;
         }
+        try {
+            self::$op = new OpLogger(self::db());
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$op ) {
+                throw $exception;
+            }
+        }
+        self::singleton_pid_record( 'op' );
 
         return self::$op;
     }
@@ -2215,14 +2418,22 @@ final class App
      * از همان ذخیره‌سازی Override عضویت و همان موتور مجوز استفاده می‌کند.
      */
     public static function finance_delegation_service(): FinanceDelegationService {
-        static $service = null;
-        if ( $service === null ) {
-            $service = new FinanceDelegationService(
-                self::db(),
-                new MembershipRepository( self::db() ),
-                self::membership_service(),
-                self::audit()
-            );
+        static $service     = null;
+        static $service_pid = null;
+        if ( $service === null || $service_pid !== (int) getmypid() ) {
+            try {
+                $service = new FinanceDelegationService(
+                    self::db(),
+                    new MembershipRepository( self::db() ),
+                    self::membership_service(),
+                    self::audit()
+                );
+            } catch ( \Throwable $exception ) {
+                if ( null === $service ) {
+                    throw $exception;
+                }
+            }
+            $service_pid = (int) getmypid();
         }
 
         return $service;
@@ -2232,17 +2443,25 @@ final class App
      * Dedicated Management Portal orchestration (reads + authorized writes).
      */
     public static function management_portal_service(): ManagementPortalService {
-        static $service = null;
-        if ( $service === null ) {
-            $service = new ManagementPortalService(
-                self::organization_clinic_provisioning_service(),
-                self::authorization_service(),
-                new \ClinicCore\Application\Scope\TrustedClinicEstablisher( self::db(), new MembershipRepository( self::db() ) ),
-                new MembershipRepository( self::db() ),
-                new LocationRepository( self::db() ),
-                new ClinicianRepository( self::db() ),
-                new ClinicRepository( self::db() )
-            );
+        static $service     = null;
+        static $service_pid = null;
+        if ( $service === null || $service_pid !== (int) getmypid() ) {
+            try {
+                $service = new ManagementPortalService(
+                    self::organization_clinic_provisioning_service(),
+                    self::authorization_service(),
+                    new \ClinicCore\Application\Scope\TrustedClinicEstablisher( self::db(), new MembershipRepository( self::db() ) ),
+                    new MembershipRepository( self::db() ),
+                    new LocationRepository( self::db() ),
+                    new ClinicianRepository( self::db() ),
+                    new ClinicRepository( self::db() )
+                );
+            } catch ( \Throwable $exception ) {
+                if ( null === $service ) {
+                    throw $exception;
+                }
+            }
+            $service_pid = (int) getmypid();
         }
 
         return $service;
@@ -2254,21 +2473,29 @@ final class App
      * is transport-agnostic, so the frontend portal can drive it without wp-admin.
      */
     public static function facility_setup_service(): \ClinicCore\Application\Onboarding\FacilitySetupService {
-        static $service = null;
-        if ( $service === null ) {
-            $service = new \ClinicCore\Application\Onboarding\FacilitySetupService(
-                self::db(),
-                self::organization_clinic_provisioning_service(),
-                self::locationService(),
-                self::locationRepository(),
-                self::authorization_service(),
-                self::membership_service(),
-                new MembershipRepository( self::db() ),
-                self::clinicianRepository(),
-                self::scheduleService(),
-                self::settingsFactory(),
-                self::audit()
-            );
+        static $service     = null;
+        static $service_pid = null;
+        if ( $service === null || $service_pid !== (int) getmypid() ) {
+            try {
+                $service = new \ClinicCore\Application\Onboarding\FacilitySetupService(
+                    self::db(),
+                    self::organization_clinic_provisioning_service(),
+                    self::location_service(),
+                    self::location_repository(),
+                    self::authorization_service(),
+                    self::membership_service(),
+                    new MembershipRepository( self::db() ),
+                    self::clinicianRepository(),
+                    self::scheduleService(),
+                    self::settingsFactory(),
+                    self::audit()
+                );
+            } catch ( \Throwable $exception ) {
+                if ( null === $service ) {
+                    throw $exception;
+                }
+            }
+            $service_pid = (int) getmypid();
         }
 
         return $service;
@@ -2280,46 +2507,86 @@ final class App
 
     public static function audit(): AuditLogger
     {
-        if (self::$audit === null) {
-            self::$audit = new AuditLogger(self::db(), self::op());
+        if ( self::$audit !== null && self::singleton_pid_matches( 'audit' ) ) {
+            return self::$audit;
         }
+        try {
+            self::$audit = new AuditLogger(self::db(), self::op());
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$audit ) {
+                throw $exception;
+            }
+        }
+        self::singleton_pid_record( 'audit' );
 
         return self::$audit;
     }
 
     public static function jobs(): JobQueue
     {
-        if (self::$jobs === null) {
+        if ( self::$jobs !== null && self::singleton_pid_matches( 'jobs' ) ) {
+            return self::$jobs;
+        }
+        try {
             // Phase 17 — the queue persists; the fast wake-up is an advisory hint.
             self::$jobs = new JobQueue( self::db(), self::op(), new JobWake() );
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$jobs ) {
+                throw $exception;
+            }
         }
+        self::singleton_pid_record( 'jobs' );
 
         return self::$jobs;
     }
 
     public static function loginRateLimiter(): LoginRateLimiter
     {
-        if (self::$loginRateLimiter === null) {
-            self::$loginRateLimiter = new LoginRateLimiter(self::rate(), self::op());
+        if ( self::$login_rate_limiter !== null && self::singleton_pid_matches( 'login_rate_limiter' ) ) {
+            return self::$login_rate_limiter;
         }
+        try {
+            self::$login_rate_limiter = new LoginRateLimiter( self::rate(), self::op() );
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$login_rate_limiter ) {
+                throw $exception;
+            }
+        }
+        self::singleton_pid_record( 'login_rate_limiter' );
 
-        return self::$loginRateLimiter;
+        return self::$login_rate_limiter;
     }
 
     public static function rate(): RateLimiter
     {
-        if (self::$rate === null) {
-            self::$rate = new RateLimiter(self::db());
+        if ( self::$rate !== null && self::singleton_pid_matches( 'rate' ) ) {
+            return self::$rate;
         }
+        try {
+            self::$rate = new RateLimiter(self::db());
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$rate ) {
+                throw $exception;
+            }
+        }
+        self::singleton_pid_record( 'rate' );
 
         return self::$rate;
     }
 
     public static function idem(): Idempotency
     {
-        if (self::$idem === null) {
-            self::$idem = new Idempotency(self::db());
+        if ( self::$idem !== null && self::singleton_pid_matches( 'idem' ) ) {
+            return self::$idem;
         }
+        try {
+            self::$idem = new Idempotency(self::db());
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$idem ) {
+                throw $exception;
+            }
+        }
+        self::singleton_pid_record( 'idem' );
 
         return self::$idem;
     }
@@ -2367,11 +2634,19 @@ final class App
      */
     public static function settingsFactory(): SettingsFactory
     {
-        if (self::$settingsFactory === null) {
-            self::$settingsFactory = new SettingsFactory(self::db(), self::audit());
+        if ( self::$settings_factory !== null && self::singleton_pid_matches( 'settings_factory' ) ) {
+            return self::$settings_factory;
         }
+        try {
+            self::$settings_factory = new SettingsFactory( self::db(), self::audit() );
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$settings_factory ) {
+                throw $exception;
+            }
+        }
+        self::singleton_pid_record( 'settings_factory' );
 
-        return self::$settingsFactory;
+        return self::$settings_factory;
     }
 
     /**
@@ -2439,13 +2714,21 @@ final class App
 
     public static function migrations(): MigrationRunner
     {
-        if (self::$migrations === null) {
+        if ( self::$migrations !== null && self::singleton_pid_matches( 'migrations' ) ) {
+            return self::$migrations;
+        }
+        try {
             self::$migrations = new MigrationRunner(
                 self::db(),
                 self::op(),
                 CPMS_PLUGIN_DIR . 'src/Migrations'
             );
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$migrations ) {
+                throw $exception;
+            }
         }
+        self::singleton_pid_record( 'migrations' );
 
         return self::$migrations;
     }
@@ -2518,7 +2801,9 @@ final class App
         // درخواستی که Scope را عوض می‌کند) نمونهٔ Clinicِ اول برای Clinicِ دوم
         // برگردانده می‌شد — یعنی نشتِ پیکربندیِ بین‌Clinic.
         $key = $settings->clinicId();
-        if ( ! isset( self::$update_services[ $key ] ) ) {
+        if ( ! isset( self::$update_services[ $key ] )
+            || ! self::singleton_pid_matches( 'update_services:' . $key )
+        ) {
             try {
                 $server_url = (string) $settings->get( 'license.server_url', '' );
             } catch ( \Throwable ) {
@@ -2529,6 +2814,7 @@ final class App
                 self::licenseService(),
                 new HttpUpdateMetadataGateway( [ 'server_url' => $server_url ] )
             );
+            self::singleton_pid_record( 'update_services:' . $key );
         }
 
         return self::$update_services[ $key ];
@@ -2540,13 +2826,21 @@ final class App
      */
     public static function wpUpdateBridge(): WpUpdateBridge
     {
-        static $bridge = null;
-        if ($bridge === null) {
-            // Phase 2 (رگرسیون 1f8b36d): سرویس Lazy — App::boot نباید
-            // Scope/Settings را resolve کند (نصبِ پیش از Migration / bootstrap
-            // تست‌ها). Provider فقط داخل هوک‌ها صدا زده می‌شود و آنجا هم
-            // fail-soft است (WpUpdateBridge).
-            $bridge = new WpUpdateBridge(static fn (): UpdateService => self::updateService());
+        static $bridge     = null;
+        static $bridge_pid = null;
+        if ( $bridge === null || $bridge_pid !== (int) getmypid() ) {
+            try {
+                // Phase 2 (رگرسیون 1f8b36d): سرویس Lazy — App::boot نباید
+                // Scope/Settings را resolve کند (نصبِ پیش از Migration / bootstrap
+                // تست‌ها). Provider فقط داخل هوک‌ها صدا زده می‌شود و آنجا هم
+                // fail-soft است (WpUpdateBridge).
+                $bridge = new WpUpdateBridge( static fn (): UpdateService => self::updateService() );
+            } catch ( \Throwable $exception ) {
+                if ( null === $bridge ) {
+                    throw $exception;
+                }
+            }
+            $bridge_pid = (int) getmypid();
         }
 
         return $bridge;
@@ -2567,7 +2861,9 @@ final class App
         $settings = self::clinic_settings_or_null();
         $key      = null === $settings ? 'installation' : 'clinic:' . $settings->clinicId();
 
-        if ( ! isset( self::$health_services[ $key ] ) ) {
+        if ( ! isset( self::$health_services[ $key ] )
+            || ! self::singleton_pid_matches( 'health_services:' . $key )
+        ) {
             self::$health_services[ $key ] = new SystemHealthService(
                 self::db(),
                 $settings,
@@ -2577,6 +2873,7 @@ final class App
                 self::updateService(),
                 self::op()
             );
+            self::singleton_pid_record( 'health_services:' . $key );
         }
 
         return self::$health_services[ $key ];
@@ -2584,7 +2881,10 @@ final class App
 
     public static function dispatcher(): JobsDispatcher
     {
-        if (self::$dispatcher === null) {
+        if ( self::$dispatcher !== null && self::singleton_pid_matches( 'dispatcher' ) ) {
+            return self::$dispatcher;
+        }
+        try {
             $queue = self::jobs();
             $db = self::db();
             $op = self::op();
@@ -2722,7 +3022,12 @@ final class App
                 });
 
             self::$dispatcher = $dispatcher;
+        } catch ( \Throwable $exception ) {
+            if ( null === self::$dispatcher ) {
+                throw $exception;
+            }
         }
+        self::singleton_pid_record( 'dispatcher' );
 
         return self::$dispatcher;
     }

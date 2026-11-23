@@ -473,6 +473,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function create_clinic( int $actor_wp_user_id, int $organization_id, array $input ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			// FIX 3 — Iranian address: validate province/city via offline catalog (Persian RTL, no external service).
 			try {
@@ -510,6 +513,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function update_clinic_profile( int $actor_wp_user_id, int $organization_id, int $clinic_id, array $input ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			// FIX 3 — Iranian address: validate province/city via offline catalog (Persian RTL, no external service).
 			try {
@@ -534,6 +540,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function set_clinic_status( int $actor_wp_user_id, int $organization_id, int $clinic_id, bool $active ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			$this->organizations->set_clinic_status( $actor_wp_user_id, $organization_id, $clinic_id, $active );
 		} catch ( \Throwable $e ) {
@@ -552,6 +561,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function designate_clinic_manager( int $actor_wp_user_id, int $organization_id, int $clinic_id, int $target_wp_user_id ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			$this->organizations->designate_clinic_manager( $actor_wp_user_id, $organization_id, $clinic_id, $target_wp_user_id );
 		} catch ( \Throwable $e ) {
@@ -567,6 +579,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function set_organization_manager( int $actor_wp_user_id, int $organization_id, int $target_wp_user_id, bool $active ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			$this->organizations->set_manager( $actor_wp_user_id, $organization_id, $target_wp_user_id, $active );
 		} catch ( \Throwable $e ) {
@@ -584,6 +599,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function update_clinic_settings( int $actor_wp_user_id, int $clinic_id, array $input ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			// FIX 3 — Iranian address: validate province/city via offline catalog (Persian RTL, no external service).
 			try {
@@ -598,7 +616,7 @@ final class ManagementPortalService {
 			if ( $trusted === null ) {
 				return self::failure();
 			}
-			App::clinicProfileService()->updateProfile( $actor_wp_user_id, $trusted, $input );
+			App::clinic_profile_service()->updateProfile( $actor_wp_user_id, $trusted, $input );
 		} catch ( \Throwable $e ) {
 			return self::failure();
 		}
@@ -623,6 +641,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function create_location( int $actor_wp_user_id, int $clinic_id, array $input ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		$trusted = $this->clinic_manager_scope( $actor_wp_user_id, $clinic_id, true );
 		if ( $trusted === null ) {
 			return self::failure();
@@ -651,7 +672,7 @@ final class ManagementPortalService {
 			// retained for callers that rely on the portal-level SAVEPOINT.
 			$this->db()->transactional(
 				function () use ( $actor_wp_user_id, $trusted, $input ) {
-					App::locationService()->createLocation( $actor_wp_user_id, $trusted, $input );
+					App::location_service()->createLocation( $actor_wp_user_id, $trusted, $input );
 				}
 			);
 		} catch ( LocationException $e ) {
@@ -673,6 +694,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function update_location( int $actor_wp_user_id, int $clinic_id, int $location_id, array $input ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		$trusted = $this->clinic_manager_scope( $actor_wp_user_id, $clinic_id, true );
 		if ( $trusted === null || $location_id <= 0 ) {
 			return self::failure();
@@ -703,7 +727,7 @@ final class ManagementPortalService {
 			// boundary is retained for the nested SAVEPOINT contract.
 			$this->db()->transactional(
 				function () use ( $actor_wp_user_id, $trusted, $location_id, $input ) {
-					App::locationService()->updateLocation( $actor_wp_user_id, $trusted, $location_id, $input );
+					App::location_service()->updateLocation( $actor_wp_user_id, $trusted, $location_id, $input );
 				}
 			);
 		} catch ( \Throwable $e ) {
@@ -721,6 +745,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function set_location_active( int $actor_wp_user_id, int $clinic_id, int $location_id, bool $active ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		$trusted = $this->clinic_manager_scope( $actor_wp_user_id, $clinic_id, true );
 		if ( $trusted === null || $location_id <= 0 ) {
 			return self::failure();
@@ -736,7 +763,7 @@ final class ManagementPortalService {
 			// D6 audit atomicity: status write + mandatory audit in one boundary.
 			$this->db()->transactional(
 				function () use ( $actor_wp_user_id, $trusted, $location_id, $active, $location ) {
-					App::locationService()->set_active( $actor_wp_user_id, $trusted, $location_id, $active );
+					App::location_service()->set_active( $actor_wp_user_id, $trusted, $location_id, $active );
 
 					$this->audit_change(
 						$active ? 'LOCATION_ACTIVATED' : 'LOCATION_DEACTIVATED',
@@ -773,6 +800,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function assign_built_in_role( int $actor_wp_user_id, int $clinic_id, int $target_wp_user_id, string $role_key ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		if ( ! $this->may_assign_role( $role_key ) ) {
 			// Input-level refusal: unknown/non-operational role keys (including
 			// manager and any WordPress role) are never assignable here.
@@ -838,6 +868,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function assign_custom_role( int $actor_wp_user_id, int $clinic_id, int $target_wp_user_id, string $role_key ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		if ( ! CustomRolePolicy::is_well_formed_role_key( $role_key ) || $target_wp_user_id <= 0 ) {
 			return self::failure();
 		}
@@ -909,6 +942,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function enroll_staff( int $actor_wp_user_id, int $clinic_id, string $identifier, string $role_key ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		$identifier = trim( $identifier );
 		if ( '' === $identifier ) {
 			return self::invalid( 'نام کاربری یا ایمیل کاربر الزامی است.' );
@@ -1022,6 +1058,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function set_staff_status( int $actor_wp_user_id, int $clinic_id, int $membership_id, bool $active ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		$trusted = $this->clinic_manager_scope( $actor_wp_user_id, $clinic_id, true );
 		if ( $trusted === null ) {
 			return self::failure();
@@ -1093,6 +1132,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function set_staff_locations( int $actor_wp_user_id, int $clinic_id, int $membership_id, array $location_ids ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		$location_ids = array_values( array_unique( array_filter( array_map( 'intval', $location_ids ), static fn( int $id ): bool => $id > 0 ) ) );
 
 		$trusted = $this->clinic_manager_scope( $actor_wp_user_id, $clinic_id, true );
@@ -1217,6 +1259,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function set_staff_capability( int $actor_wp_user_id, int $clinic_id, int $membership_id, string $capability, string $effect ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		if ( ! in_array( $capability, RolesAndCapabilities::ALL_CAPS, true ) || ! in_array( $effect, array( 'grant', 'deny', 'clear' ), true ) ) {
 			return self::failure();
 		}
@@ -1330,6 +1375,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function register_clinician( int $actor_wp_user_id, int $clinic_id, string $full_name, string $specialty, int $wp_user_id = 0 ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		$full_name = trim( $full_name );
 
 		$trusted = $this->clinic_manager_scope( $actor_wp_user_id, $clinic_id, true );
@@ -1443,6 +1491,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function create_schedule( int $actor_wp_user_id, int $clinic_id, int $clinician_id, int $location_id, int $day_of_week, string $start_time, string $end_time ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		if ( $clinician_id <= 0 || $location_id <= 0 || $day_of_week < 0 || $day_of_week > 6 ) {
 			return self::failure();
 		}
@@ -1774,6 +1825,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function start_facility_setup( int $actor_wp_user_id, int $organization_id, string $facility_type, string $structure, string $display_name ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			App::facility_setup_service()->start( $actor_wp_user_id, $organization_id, $facility_type, $structure, $display_name );
 		} catch ( \Throwable $e ) {
@@ -1789,6 +1843,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function acknowledge_facility_outpatient( int $actor_wp_user_id, int $organization_id ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			App::facility_setup_service()->acknowledge_outpatient( $actor_wp_user_id, $organization_id, true );
 		} catch ( \Throwable $e ) {
@@ -1802,6 +1859,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function add_facility_site( int $actor_wp_user_id, int $organization_id, string $label, string $address ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			App::facility_setup_service()->add_site( $actor_wp_user_id, $organization_id, $label, $address );
 		} catch ( \Throwable $e ) {
@@ -1817,6 +1877,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function add_facility_clinic( int $actor_wp_user_id, int $organization_id, string $name, string $site_key, string $timezone ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			App::facility_setup_service()->add_clinic(
 				$actor_wp_user_id,
@@ -1839,6 +1902,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function add_facility_room( int $actor_wp_user_id, int $organization_id, string $clinic_key, string $name, string $site_key ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			App::facility_setup_service()->add_room(
 				$actor_wp_user_id,
@@ -1861,6 +1927,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function designate_facility_manager( int $actor_wp_user_id, int $organization_id, string $clinic_key, int $target_wp_user_id ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			App::facility_setup_service()->designate_manager( $actor_wp_user_id, $organization_id, $clinic_key, $target_wp_user_id );
 		} catch ( \Throwable $e ) {
@@ -1880,6 +1949,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function designate_facility_manager_by_identifier( int $actor_wp_user_id, int $organization_id, string $clinic_key, string $identifier ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		$identifier = trim( $identifier );
 		if ( '' === $identifier ) {
 			// Invalid INPUT (empty field), distinct from an authorization refusal.
@@ -1983,6 +2055,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function assign_facility_clinician( int $actor_wp_user_id, int $organization_id, string $clinic_key, int $target_wp_user_id, string $full_name, array $room_keys ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			App::facility_setup_service()->assign_clinician(
 				$actor_wp_user_id,
@@ -2005,6 +2080,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function add_facility_schedule( int $actor_wp_user_id, int $organization_id, string $clinic_key, int $clinician_id, string $room_key, int $day_of_week, string $start_time, string $end_time ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			App::facility_setup_service()->add_weekly_schedule(
 				$actor_wp_user_id,
@@ -2032,6 +2110,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function save_facility_booking_policy( int $actor_wp_user_id, int $organization_id, string $clinic_key, array $input ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			App::facility_setup_service()->save_booking_policy( $actor_wp_user_id, $organization_id, $clinic_key, $input );
 		} catch ( \Throwable $e ) {
@@ -2070,6 +2151,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function save_clinic_booking_policy( int $actor_wp_user_id, int $clinic_id, array $input ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		$trusted = $this->clinic_manager_scope( $actor_wp_user_id, $clinic_id );
 		if ( $trusted === null ) {
 			return self::failure();
@@ -2110,6 +2194,9 @@ final class ManagementPortalService {
 	 * @return array{ok:bool, message:string, notice?:string}
 	 */
 	public function activate_facility_setup( int $actor_wp_user_id, int $organization_id ): array {
+		if ( $this->settings_write_blocked() ) {
+			return self::failure();
+		}
 		try {
 			App::facility_setup_service()->activate( $actor_wp_user_id, $organization_id, true );
 		} catch ( \Throwable $e ) {
@@ -2234,6 +2321,23 @@ final class ManagementPortalService {
 		}
 
 		return self::operational_failure();
+	}
+
+	/**
+	 * Three-stage license (design §7.3 staff/settings row, final 2026-11-17):
+	 * at/after T1 the management surface is view-only; only offline license
+	 * activation/renewal remains writable. Every write refuses with the same
+	 * uniform non-disclosing failure as any other authorization refusal.
+	 */
+	private function settings_write_blocked(): bool {
+		$gate = \ClinicCore\Bootstrap\App::licenseGate();
+		$decision = $gate->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+		if ( $decision->allowed ) {
+			return false;
+		}
+		\ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+
+		return true;
 	}
 
 	/**

@@ -8,7 +8,6 @@ use ClinicCore\Application\Patients\PatientEnrollmentOptions;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
-use ClinicCore\Domain\Licensing\PostExpirationPolicy;
 use ClinicCore\Infrastructure\Repository\PatientEnrollmentRepository;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use WP_UnitTestCase;
@@ -44,8 +43,11 @@ final class PatientEnrollmentOptionsTest extends WP_UnitTestCase
         $this->user = (int) self::factory()->user->create(
             [ 'role' => RolesAndCapabilities::ROLE_PATIENT, 'user_login' => 'enrollment_options' ]
         );
-        $this->t0 = strtotime( '-3 months' );
-        $this->now = $this->t0 + DAY_IN_SECONDS;
+        // Wall clock stays in wall-clock Stage 1 for the fixture below (installed at
+        // setUp with this same expiry); the policy stage is driven by the injected
+        // clock in $this->now, so both boundary frames agree at Stage 1 here.
+        $this->t0 = time() + 30 * DAY_IN_SECONDS;
+        $this->now = $this->t0 - DAY_IN_SECONDS; // Stage 1
         $this->org = (int) $db->fetchValue( 'SELECT organization_id FROM ' . $db->table( 'cpms_clinics' ) . ' WHERE id = %d', [ 1 ] );
 
         $db->insert( 'cpms_clinics', [
@@ -162,9 +164,9 @@ final class PatientEnrollmentOptionsTest extends WP_UnitTestCase
             'patient_id' => $source,
             'clinician_id' => $clinician,
             'status' => 'consultation_completed',
-            'visit_date' => gmdate( 'Y-m-d', $this->t0 - DAY_IN_SECONDS ),
-            'check_in_at' => gmdate( 'Y-m-d H:i:s', $this->t0 - DAY_IN_SECONDS ),
-            'consultation_completed_at' => gmdate( 'Y-m-d H:i:s', $this->t0 - 1 ),
+            'visit_date' => gmdate( 'Y-m-d', time() - DAY_IN_SECONDS ),
+            'check_in_at' => gmdate( 'Y-m-d H:i:s', time() - DAY_IN_SECONDS ),
+            'consultation_completed_at' => gmdate( 'Y-m-d H:i:s', time() - 1 ),
             'active' => 0,
             'created_at' => $stamp,
             'updated_at' => $stamp,
@@ -319,33 +321,46 @@ final class PatientEnrollmentOptionsTest extends WP_UnitTestCase
 
     public function testPostExpirationRequiresStrictPreT0ReturningEvidence(): void
     {
-        App::db()->delete( 'cpms_visits', [ 'patient_id' => (int) App::db()->fetchValue( 'SELECT id FROM ' . App::db()->table( 'cpms_patients' ) . ' WHERE clinic_id = %d AND identity_id = %d', [ 1, $this->identity ] ) ] );
-
+        // Final Q1(a) (2026-11-17): even the strictly-pre-T0 completed encounter installed by
+        // setUp grants no destination preview from T0 — the returning-evidence window is retired.
+        $this->now = $this->t0 + DAY_IN_SECONDS; // Stage 2
         $result = $this->for_user();
 
         $this->assertSame( PatientEnrollmentOptions::STATE_UNAVAILABLE, $result['state'] );
         $this->assertSame( [], $result['clinics'] );
     }
 
-    public function testPatientSelfDoesNotInheritTheOneMonthReceptionWindow(): void
+    public function testPatientSelfPreviewClosedFromT0(): void
     {
         App::db()->delete( 'cpms_visits', [ 'patient_id' => (int) App::db()->fetchValue( 'SELECT id FROM ' . App::db()->table( 'cpms_patients' ) . ' WHERE clinic_id = %d AND identity_id = %d', [ 1, $this->identity ] ) ] );
-        $this->now = PostExpirationPolicy::deadline( $this->t0, 1 ) - 1;
+        $this->now = \ClinicCore\Domain\Licensing\LicenseStagePolicy::t1( $this->t0 ) - 1; // Stage 2 — preview closed from T0 (final Q1(a))
 
         $result = $this->for_user();
 
-        $this->assertSame( PatientEnrollmentOptions::STATE_UNAVAILABLE, $result['state'], 'New/unverified patients are reception-only after T0, not online-self-enrollable.' );
+        $this->assertSame( PatientEnrollmentOptions::STATE_UNAVAILABLE, $result['state'], 'Final Q1(a): no destination preview from T0; patient self-enrollment is closed in Stage 2 and Stage 3.' );
         $this->assertSame( [], $result['clinics'] );
     }
 
-    public function testSixMonthWindowIsHalfOpenAndStrictlyServerComputed(): void
+    public function testEnrollmentUnavailableFromT0ThroughT1(): void
     {
-        $deadline = PostExpirationPolicy::deadline( $this->t0, 6 );
+        // Final Q1(a) (2026-11-17): the six-Gregorian-month preview window is retired.
+        // Preview is ELIGIBLE only before T0; from T0 it is closed — at T0, at T1−1s, at T1.
+        $t1 = \ClinicCore\Domain\Licensing\LicenseStagePolicy::t1( $this->t0 );
 
-        $this->now = $deadline - 1;
+        $this->now = $this->t0 - 1;
         $this->assertSame( PatientEnrollmentOptions::STATE_ELIGIBLE, $this->for_user()['state'] );
 
-        $this->now = $deadline;
+        $this->now = $this->t0;
+        $result = $this->for_user();
+        $this->assertSame( PatientEnrollmentOptions::STATE_UNAVAILABLE, $result['state'] );
+        $this->assertSame( [], $result['clinics'] );
+
+        $this->now = $t1 - 1;
+        $result = $this->for_user();
+        $this->assertSame( PatientEnrollmentOptions::STATE_UNAVAILABLE, $result['state'] );
+        $this->assertSame( [], $result['clinics'] );
+
+        $this->now = $t1;
         $result = $this->for_user();
         $this->assertSame( PatientEnrollmentOptions::STATE_UNAVAILABLE, $result['state'] );
         $this->assertSame( [], $result['clinics'] );

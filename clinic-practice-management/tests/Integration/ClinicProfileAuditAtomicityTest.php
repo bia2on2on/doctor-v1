@@ -98,7 +98,7 @@ final class ClinicProfileAuditAtomicityTest extends WP_UnitTestCase
         $this->failAuditInserts();
         $threw = false;
         try {
-            App::clinicProfileService()->updateProfile($this->managerId, $this->clinicId, [
+            App::clinic_profile_service()->updateProfile($this->managerId, $this->clinicId, [
                 'name' => self::NEW_NAME,
                 'address' => 'new address',
                 'phone' => '02111111111',
@@ -118,7 +118,7 @@ final class ClinicProfileAuditAtomicityTest extends WP_UnitTestCase
         self::assertSame($depthBefore, $this->savepointDepth(), 'SAVEPOINT depth must be restored');
 
         // Authorized retry: mutation + audit commit together with explicit attribution.
-        $result = App::clinicProfileService()->updateProfile($this->managerId, $this->clinicId, [
+        $result = App::clinic_profile_service()->updateProfile($this->managerId, $this->clinicId, [
             'name' => self::NEW_NAME,
             'address' => 'new address',
             'phone' => '02111111111',

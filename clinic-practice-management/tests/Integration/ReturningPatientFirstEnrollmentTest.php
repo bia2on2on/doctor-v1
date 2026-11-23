@@ -13,7 +13,6 @@ use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Domain\Licensing\LicenseGate;
-use ClinicCore\Domain\Licensing\PostExpirationPolicy;
 use ClinicCore\Domain\Licensing\SignedLicenseGate;
 use ClinicCore\Infrastructure\Repository\AppointmentRepository;
 use ClinicCore\Infrastructure\Repository\PatientIdentityRepository;
@@ -136,6 +135,9 @@ final class ReturningPatientFirstEnrollmentTest extends WP_UnitTestCase
 
     public function testSameOrganizationFirstVisitEnrollsWithoutCopyingForeignPhiAndEnablesAuthorizedNewService(): void
     {
+        // Final Q1(a) (2026-11-17): enrollment fixtures live in Stage 1 (now < T0); from T0 every
+        // new patient row / self-enrollment is denied — see testEnrollmentDeniedAtT1Boundary.
+        $this->now = $this->t0 - 1;
         $db = App::db();
         $source = $db->fetchRow('SELECT * FROM ' . $db->table('cpms_patients') . ' WHERE id = %d', [$this->source]);
         $this->assertSame(0, (int) $db->fetchValue('SELECT COUNT(*) FROM ' . $db->table('cpms_patients') . ' WHERE clinic_id = %d', [$this->clinic]));
@@ -155,7 +157,7 @@ final class ReturningPatientFirstEnrollmentTest extends WP_UnitTestCase
         $this->assertCount(1, $visible);
         $this->assertSame($created['patient_id'], (int) $visible[0]['id']);
         $this->assertTrue($this->gate()->assert(LicenseGate::OP_VISIT_CHECKIN, ['clinic_id' => $this->clinic, 'patient_id' => $created['patient_id']])->allowed);
-        $this->assertFalse($this->gate()->assert(LicenseGate::OP_APPOINTMENT_BOOK, ['clinic_id' => $this->clinic, 'patient_id' => $created['patient_id']])->allowed);
+        $this->assertTrue($this->gate()->assert(LicenseGate::OP_APPOINTMENT_BOOK, ['clinic_id' => $this->clinic, 'patient_id' => $created['patient_id']])->allowed); // Stage 1: ordinary RBAC
         $this->assertSame(0, (int) $db->fetchValue('SELECT COUNT(*) FROM ' . $db->table('cpms_appointments')));
         $this->assertStringNotContainsString('SOURCE-ONLY', wp_json_encode($created));
 
@@ -219,9 +221,11 @@ final class ReturningPatientFirstEnrollmentTest extends WP_UnitTestCase
     }
 
     /** @dataProvider sixMonthBoundary */
-    public function testExactSixMonthBoundaryIsHalfOpen(int $offset, bool $allowed): void
+    public function testEnrollmentDeniedAtT1Boundary(int $offset, bool $allowed): void
     {
-        $this->now = PostExpirationPolicy::deadline($this->t0, 6) + $offset;
+        // Final Q1(a) (2026-11-17): the six-month boundary is retired; enrollment is denied
+        // from T0 itself and stays denied at/after T1. Boundary inputs are now relative to T1.
+        $this->now = \ClinicCore\Domain\Licensing\LicenseStagePolicy::t1($this->t0) + $offset;
         if (!$allowed) {
             $this->denied('CLINIC_LICENSE_BLOCKED');
             return;
@@ -232,7 +236,7 @@ final class ReturningPatientFirstEnrollmentTest extends WP_UnitTestCase
 
     public static function sixMonthBoundary(): array
     {
-        return ['one second before' => [-1, true], 'exact deadline' => [0, false], 'one second after' => [1, false]];
+        return ['one second before T1' => [-1, false], 'exact T1' => [0, false], 'one second after T1' => [1, false]];
     }
 
     /** @dataProvider insufficientEncounter */
@@ -254,12 +258,14 @@ final class ReturningPatientFirstEnrollmentTest extends WP_UnitTestCase
 
     public function testRepeatedEnrollmentCannotCreateAnotherRecordOrOverwriteExistingLink(): void
     {
+        $this->now = $this->t0 - 1; // Stage 1 success fixture
         $this->service()->enroll_current_patient($this->clinic, $this->fields());
         $this->denied('CLINIC_VALIDATION_FAILED', null, array_replace($this->fields(), ['mobile' => '09128880003']));
     }
 
     public function testFinalAuditFailureRollsBackEnrollmentAndIdentityEdge(): void
     {
+        $this->now = $this->t0 - 1; // Stage 1: denial must come from the audit boundary, not the license
         global $wpdb;
         $before = $this->counts();
         $scope = ScopeContext::tryGet();
@@ -303,11 +309,12 @@ final class ReturningPatientFirstEnrollmentTest extends WP_UnitTestCase
     {
         $secretary = (int) self::factory()->user->create(['role' => 'cpms_secretary']);
         App::replaceExplicitScope(ClinicScope::forClinic($this->clinic));
-        $this->now = PostExpirationPolicy::deadline($this->t0, 1) - 1;
+        // Final Q1(a) (2026-11-17): staff/reception patient creation is denied from T0 itself.
+        $this->now = $this->t0 - 1; // Stage 1 success fixture
         $created = $this->service()->create($this->fields() + ['identity_id' => $this->identity, 'wp_user_id' => $this->user, 'returning' => true], $secretary);
         $identity = (int) App::db()->fetchValue('SELECT identity_id FROM ' . App::db()->table('cpms_patients') . ' WHERE id = %d', [$created['id']]);
         $this->assertNotSame($this->identity, $identity);
-        $this->now++;
+        $this->now = $this->t0; // Stage 2: denied from T0 regardless of returning evidence
         $before = $this->counts();
         try {
             $this->service()->create(array_replace($this->fields(), ['mobile' => '09127770001']), $secretary);
@@ -321,7 +328,7 @@ final class ReturningPatientFirstEnrollmentTest extends WP_UnitTestCase
     public function testRestEnrollmentRequiresNonceAndPatientRoleThenReturnsOnlyLocalSelector(): void
     {
         // Exercise the actual production App wiring with wall-clock signed T0.
-        $this->installSignedExpiration(strtotime('-3 months'));
+        $this->installSignedExpiration(strtotime('+1 day')); // Stage 1 in wall-clock: enrollment contract fixtures run before T0
         $before = $this->counts();
         $withoutNonce = $this->dispatch($this->user, false);
         $this->assertSame(403, $withoutNonce->get_status());

@@ -22,6 +22,7 @@ use ClinicCore\Infrastructure\Repository\CustomRoleRepository;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use RuntimeException;
 use Throwable;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 use ClinicCore\Tests\Support\CustomRoleLockWaitFixture;
 
@@ -601,7 +602,7 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                             $wpdb2->close();
                         }
                         fclose($childPipe);
-                        exit(0);
+                        ForkChildExit::terminate(0);
                     } catch (Throwable $exception) {
                         fwrite($childPipe, 'ERROR:' . get_class($exception) . "\n");
                         fflush($childPipe);
@@ -609,7 +610,7 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                             $wpdb2->close();
                         }
                         fclose($childPipe);
-                        exit(1);
+                        ForkChildExit::terminate(1);
                     }
                 }
 
@@ -906,8 +907,10 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                 }
             }
 
-            self::assertTrue(pcntl_wifexited($childStatus), 'Child B must exit normally after A commits. Child result: ' . $childOutcome);
-            self::assertSame(0, pcntl_wexitstatus($childStatus), 'Child B must not encounter a connection or infrastructure error. Child result: ' . $childOutcome);
+            // Child hygiene: B either exits 0 or ends via the fork-child lifetime guard
+            // (SIGKILL) — both skip inherited-socket teardown. The RESULT/ERROR pipe line
+            // asserted below carries the authoritative verdict, including infra failure.
+            self::assertTrue(ForkChildExit::childTerminatedCleanly($childStatus), 'Child B must terminate cleanly after A commits (exit 0 or lifetime-guard hard exit). Child result: ' . $childOutcome);
             self::assertSame(
                 'denied:' . CustomRoleAssignmentException::CODE_DEFINITION_NOT_ACTIVE,
                 $childOutcome,
@@ -1338,6 +1341,17 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
         }
         foreach ($clinicIds as $clinicId) {
             $db->query('DELETE FROM ' . $db->table('cpms_clinics') . ' WHERE id = %d', [$clinicId]);
+        }
+
+        // 5) Durable: the parent test transaction was COMMITted durably above
+        // (raw COMMIT on the harness connection), so this cleanup's DELETEs sit
+        // in a fresh transaction that tearDown()'s ROLLBACK would undo —
+        // resurrecting the committed Clinic/user/membership rows for every
+        // later suite in the shared database (same pattern and comment as
+        // InterruptedSetupRecoveryTest.php and CustomRoleArchivalConcurrencyTest.php).
+        global $wpdb;
+        if ($wpdb->query('COMMIT') === false) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+            self::fail('cleanup must commit its fixture removal durably (tearDown rolls back the harness transaction)');
         }
     }
 

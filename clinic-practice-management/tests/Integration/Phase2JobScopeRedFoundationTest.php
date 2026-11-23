@@ -125,7 +125,7 @@ final class Phase2JobScopeRedFoundationTest extends WP_UnitTestCase
      * `App::$settingsFactory` (per-Clinic cache), so that is the static this
      * harness now has to capture/restore.
      */
-    private const APP_STATICS = ['settingsFactory', 'dispatcher', 'smsService', 'providers'];
+    private const APP_STATICS = ['settings_factory', 'dispatcher', 'sms_service', 'providers'];
 
     private RecordingSmsProvider $recorder;
 

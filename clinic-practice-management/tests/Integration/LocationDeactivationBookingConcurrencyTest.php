@@ -30,6 +30,7 @@ use ClinicCore\Infrastructure\Sms\CredentialVault;
 use ClinicCore\Infrastructure\Sms\SmsProviderRegistry;
 use ClinicCore\Settings\Settings;
 use ClinicCore\Settings\SettingsFactory;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 /**
@@ -352,7 +353,7 @@ final class LocationDeactivationBookingConcurrencyTest extends WP_UnitTestCase
         @unlink($outcomeFile);
         @unlink($goFile);
 
-        if ($ready === null || !pcntl_wifexited($status) || pcntl_wexitstatus($status) !== 0) {
+        if ($ready === null || !ForkChildExit::childTerminatedCleanly($status)) {
             return ['result' => 'fatal', 'detail' => 'worker did not become ready or exit cleanly'];
         }
 
@@ -453,7 +454,7 @@ final class LocationDeactivationBookingConcurrencyTest extends WP_UnitTestCase
         foreach ($workerSpecs as $kind => $paths) {
             if (isset($pids[$kind])) {
                 pcntl_waitpid($pids[$kind], $status);
-                if (!pcntl_wifexited($status) || pcntl_wexitstatus($status) !== 0) {
+                if (!ForkChildExit::childTerminatedCleanly($status)) {
                     $outcomes[$kind] = ['result' => 'fatal', 'detail' => 'worker process did not exit cleanly'];
                     continue;
                 }
@@ -560,7 +561,7 @@ final class LocationDeactivationBookingConcurrencyTest extends WP_UnitTestCase
                 'detail' => $e->getMessage(),
             ]));
         }
-        exit(0);
+        ForkChildExit::terminate(0);
     }
 
     /** @param array<string, array{ready: string, outcome: string}> $workerSpecs */

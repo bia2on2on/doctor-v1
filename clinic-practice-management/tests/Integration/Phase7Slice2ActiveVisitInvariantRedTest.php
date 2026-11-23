@@ -31,6 +31,7 @@ use ClinicCore\Infrastructure\Sms\SmsProviderRegistry;
 use ClinicCore\Settings\Settings;
 use ClinicCore\Settings\SettingsFactory;
 use Throwable;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 /**
@@ -1036,7 +1037,7 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
 
         foreach ($pids as $i => $pid) {
             pcntl_waitpid($pid, $status);
-            if (!pcntl_wifexited($status) || pcntl_wexitstatus($status) !== 0) {
+            if (!ForkChildExit::childTerminatedCleanly($status)) {
                 $crashed[] = $i;
             }
         }
@@ -1060,7 +1061,7 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
 
     /**
      * Child body: fresh connection -> explicit scope -> real services ->
-     * barrier -> one production mutation -> outcome file -> exit(0).
+     * barrier -> one production mutation -> outcome file -> lifetime-guard termination.
      *
      * @param array<string, mixed> $worker
      */
@@ -1071,7 +1072,7 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
             global $wpdb;
             $wdb = new \wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
             if (!method_exists($wdb, 'set_prefix')) {
-                exit(9);
+                ForkChildExit::terminate(9);
             }
             $wdb->set_prefix($wpdb->prefix);
             $wpdb = $wdb;
@@ -1145,7 +1146,7 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
         if ($wdb instanceof \wpdb) {
             @$wdb->close();
         }
-        exit(0);
+        ForkChildExit::terminate(0);
     }
 
     /**

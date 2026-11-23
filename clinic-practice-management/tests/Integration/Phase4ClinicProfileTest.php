@@ -109,7 +109,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
         $newAddr = 'خیابان نو، پلاک ۹۹';
         $newPhone = '02122223333';
 
-        $result = App::clinicProfileService()->updateProfile($this->actorConfigA, $this->clinicA, [
+        $result = App::clinic_profile_service()->updateProfile($this->actorConfigA, $this->clinicA, [
             'name' => $newName,
             'address' => $newAddr,
             'phone' => $newPhone,
@@ -154,7 +154,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
     {
         $this->expectException(ClinicProfileException::class);
         try {
-            App::clinicProfileService()->updateProfile(0, $this->clinicA, ['name' => 'x']);
+            App::clinic_profile_service()->updateProfile(0, $this->clinicA, ['name' => 'x']);
         } catch (ClinicProfileException $e) {
             $this->assertSame(ClinicProfileException::AUTH_REQUIRED, $e->getErrorCode());
             $this->assertSame(401, $e->getHttpStatus());
@@ -168,7 +168,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
     {
         $this->expectException(ClinicProfileException::class);
         try {
-            App::clinicProfileService()->updateProfile($this->actorConfigA, 0, ['name' => 'x']);
+            App::clinic_profile_service()->updateProfile($this->actorConfigA, 0, ['name' => 'x']);
         } catch (ClinicProfileException $e) {
             $this->assertSame(ClinicProfileException::SCOPE_REQUIRED, $e->getErrorCode());
             $row = $this->clinicRow($this->clinicA);
@@ -182,7 +182,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
         $this->expectException(ClinicProfileException::class);
         $nonExistent = 999999;
         try {
-            App::clinicProfileService()->updateProfile($this->actorConfigA, $nonExistent, ['name' => 'x']);
+            App::clinic_profile_service()->updateProfile($this->actorConfigA, $nonExistent, ['name' => 'x']);
         } catch (ClinicProfileException $e) {
             $this->assertSame(ClinicProfileException::NOT_FOUND, $e->getErrorCode());
             $this->assertSame(404, $e->getHttpStatus());
@@ -199,7 +199,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
 
         $this->expectException(ClinicProfileException::class);
         try {
-            App::clinicProfileService()->updateProfile($this->actorSuspendedA, $this->clinicA, ['name' => 'new']);
+            App::clinic_profile_service()->updateProfile($this->actorSuspendedA, $this->clinicA, ['name' => 'new']);
         } catch (ClinicProfileException $e) {
             $this->assertSame(ClinicProfileException::PERMISSION_DENIED, $e->getErrorCode());
             $row = $this->clinicRow($this->clinicA);
@@ -212,7 +212,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
     {
         $this->expectException(ClinicProfileException::class);
         try {
-            App::clinicProfileService()->updateProfile($this->actorNoMembership, $this->clinicA, ['name' => 'new']);
+            App::clinic_profile_service()->updateProfile($this->actorNoMembership, $this->clinicA, ['name' => 'new']);
         } catch (ClinicProfileException $e) {
             $this->assertSame(ClinicProfileException::PERMISSION_DENIED, $e->getErrorCode());
             $row = $this->clinicRow($this->clinicA);
@@ -229,7 +229,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
 
         $this->expectException(ClinicProfileException::class);
         try {
-            App::clinicProfileService()->updateProfile($this->actorNoConfigA, $this->clinicA, ['name' => 'new']);
+            App::clinic_profile_service()->updateProfile($this->actorNoConfigA, $this->clinicA, ['name' => 'new']);
         } catch (ClinicProfileException $e) {
             $this->assertSame(ClinicProfileException::PERMISSION_DENIED, $e->getErrorCode());
             $row = $this->clinicRow($this->clinicA);
@@ -246,7 +246,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
 
         $this->expectException(ClinicProfileException::class);
         try {
-            App::clinicProfileService()->updateProfile($this->actorConfigA, $this->clinicB, ['name' => 'hacked B']);
+            App::clinic_profile_service()->updateProfile($this->actorConfigA, $this->clinicB, ['name' => 'hacked B']);
         } catch (ClinicProfileException $e) {
             $this->assertSame(ClinicProfileException::PERMISSION_DENIED, $e->getErrorCode());
             $rowB = $this->clinicRow($this->clinicB);
@@ -264,7 +264,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
 
         $this->expectException(ClinicProfileException::class);
         try {
-            App::clinicProfileService()->updateProfile($this->actorConfigA, $this->clinicA, ['name' => '   ', 'address' => 'addr', 'phone' => '123']);
+            App::clinic_profile_service()->updateProfile($this->actorConfigA, $this->clinicA, ['name' => '   ', 'address' => 'addr', 'phone' => '123']);
         } catch (ClinicProfileException $e) {
             $this->assertSame(ClinicProfileException::VALIDATION, $e->getErrorCode());
             $row = $this->clinicRow($this->clinicA);
@@ -282,7 +282,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
         $long = str_repeat('a', 191);
         $this->expectException(ClinicProfileException::class);
         try {
-            App::clinicProfileService()->updateProfile($this->actorConfigA, $this->clinicA, ['name' => $long]);
+            App::clinic_profile_service()->updateProfile($this->actorConfigA, $this->clinicA, ['name' => $long]);
         } catch (ClinicProfileException $e) {
             $this->assertSame(ClinicProfileException::VALIDATION, $e->getErrorCode());
             $row = $this->clinicRow($this->clinicA);
@@ -299,7 +299,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
         $long = str_repeat('b', 256);
         $this->expectException(ClinicProfileException::class);
         try {
-            App::clinicProfileService()->updateProfile($this->actorConfigA, $this->clinicA, ['name' => 'valid', 'address' => $long]);
+            App::clinic_profile_service()->updateProfile($this->actorConfigA, $this->clinicA, ['name' => 'valid', 'address' => $long]);
         } catch (ClinicProfileException $e) {
             $this->assertSame(ClinicProfileException::VALIDATION, $e->getErrorCode());
             $row = $this->clinicRow($this->clinicA);
@@ -316,7 +316,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
         $long = str_repeat('1', 33);
         $this->expectException(ClinicProfileException::class);
         try {
-            App::clinicProfileService()->updateProfile($this->actorConfigA, $this->clinicA, ['name' => 'valid', 'phone' => $long]);
+            App::clinic_profile_service()->updateProfile($this->actorConfigA, $this->clinicA, ['name' => 'valid', 'phone' => $long]);
         } catch (ClinicProfileException $e) {
             $this->assertSame(ClinicProfileException::VALIDATION, $e->getErrorCode());
             $row = $this->clinicRow($this->clinicA);
@@ -334,7 +334,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
         global $wpdb;
         $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_audit_logs WHERE action = "CLINIC_PROFILE_UPDATED" AND resource_id = ' . $this->clinicA);
 
-        $resultNoop = App::clinicProfileService()->updateProfile($this->actorConfigA, $this->clinicA, [
+        $resultNoop = App::clinic_profile_service()->updateProfile($this->actorConfigA, $this->clinicA, [
             'name' => self::OLD_NAME_A,
             'address' => self::OLD_ADDR_A,
             'phone' => self::OLD_PHONE_A,
@@ -343,7 +343,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
         $countNoop = $wpdb->get_var($wpdb->prepare('SELECT COUNT(*) FROM ' . $wpdb->prefix . 'cpms_audit_logs WHERE action = %s AND resource_id = %d', 'CLINIC_PROFILE_UPDATED', $this->clinicA));
         $this->assertSame('0', (string) ($countNoop ?? '0'), 'audit not logged on noop');
 
-        $resultReal = App::clinicProfileService()->updateProfile($this->actorConfigA, $this->clinicA, [
+        $resultReal = App::clinic_profile_service()->updateProfile($this->actorConfigA, $this->clinicA, [
             'name' => 'نام واقعی جدید',
             'address' => null,
             'phone' => null,
@@ -360,7 +360,7 @@ final class Phase4ClinicProfileTest extends WP_UnitTestCase
         $beforeAtomic = $this->clinicRow($this->clinicA);
         $beforeName = $beforeAtomic['name'];
         try {
-            App::clinicProfileService()->updateProfile($this->actorConfigA, $this->clinicA, [
+            App::clinic_profile_service()->updateProfile($this->actorConfigA, $this->clinicA, [
                 'name' => 'نام اتمیک',
                 'phone' => str_repeat('9', 33),
             ]);

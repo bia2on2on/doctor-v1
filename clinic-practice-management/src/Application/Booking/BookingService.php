@@ -2075,6 +2075,10 @@ final class BookingService
                 throw BookingException::of('CLINIC_NOT_FOUND', 'نوبت یافت نشد', 404);
             }
             $this->assertAppointmentWithinExplicitScope($appt);
+            // Three-stage license (design §7.3): staff-manual no-show is existing-record
+            // maintenance in Stage 2 (RBAC + reason + actor audit); at/after T1 every
+            // appointment-state mutation is denied (read remains available).
+            $this->assertLicense( LicenseGate::OP_APPOINTMENT_NOSHOW );
 
             $toState = $this->machineCheck((string) $appt['status'], 'no_show', 'staff');
             $this->assertNoActiveVisit($appointmentId);

@@ -233,7 +233,7 @@ final class ClinicalService
      */
     public function addNote(int $actorUserId, int $visitId, array $input): array
     {
-        $visit = $this->requireVisit( $visitId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
+        $visit = $this->require_visit_for_write( $visitId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
         /*
          * Phase 1B B-02 — trusted Clinic boundary BEFORE permission checks and
          * before any mutation: membership in Clinic B never authorizes using
@@ -364,6 +364,7 @@ final class ClinicalService
         if ($existing === null) {
             throw ClinicalException::of('CLINIC_NOT_FOUND', 'یادداشت یافت نشد', 404);
         }
+        $this->assert_visit_writable( $this->requireVisit( (int) $existing['visit_id'] ) );
         if ((int) $existing['is_archived'] === 1) {
             throw ClinicalException::of('CLINIC_POLICY_VIOLATION', 'یادداشت آرشیو شده قابل ویرایش نیست', 409);
         }
@@ -466,7 +467,7 @@ final class ClinicalService
     {
         $this->requireRole($actorUserId, 'doctor', 'ثبت نسخه');
         $this->requireCap($actorUserId, RolesAndCapabilities::RX_CREATE, 'rx');
-        $visit = $this->requireVisit($visitId);
+        $visit = $this->require_visit_for_write( $visitId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy camelCase parameter
         $this->requireOwnVisit($actorUserId, $visit);
         // Phase 3 Slice 5 — مالکیت شیء (ویزیتِ خودش) شرطِ لازمِ دوم است؛ مجوز
         // `cpms_rx_create` باید روی Clinicِ پایدارِ ویزیت اثبات شود.
@@ -588,6 +589,7 @@ final class ClinicalService
             if ($rx === null) {
                 throw ClinicalException::of('CLINIC_NOT_FOUND', 'نسخه یافت نشد', 404);
             }
+            $this->assert_visit_writable( $this->requireVisit( (int) $rx['visit_id'] ) );
             $this->require_own_clinician_for_update( $actorUserId, (int) $rx['clinician_id'], 'نسخه یافت نشد' ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- Existing legacy parameter naming preserved.
             if ((string) $rx['status'] === 'finalized') {
                 throw ClinicalException::of('CLINIC_INVALID_TRANSITION', 'این نسخه قبلاً نهایی شده است', 409, ['status' => 'finalized']);
@@ -666,6 +668,7 @@ final class ClinicalService
             if ($rx === null) {
                 throw ClinicalException::of('CLINIC_NOT_FOUND', 'نسخه یافت نشد', 404);
             }
+            $this->assert_visit_writable( $this->requireVisit( (int) $rx['visit_id'] ) );
             if ((string) $rx['status'] === 'voided') {
                 throw ClinicalException::of('CLINIC_INVALID_TRANSITION', 'این نسخه قبلاً ابطال شده است', 409, ['status' => 'voided']);
             }
@@ -716,7 +719,7 @@ final class ClinicalService
     {
         $this->requireRole($actorUserId, 'doctor', 'ثبت توصیه');
         $this->requireCap($actorUserId, RolesAndCapabilities::REC_CREATE, 'rec');
-        $visit = $this->requireVisit($visitId);
+        $visit = $this->require_visit_for_write( $visitId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy camelCase parameter
         // Phase 3 Slice 5 — مجوز Clinic-scoped روی Clinicِ پایدارِ ویزیت
         $this->authorizeScoped(
             $actorUserId,
@@ -797,7 +800,7 @@ final class ClinicalService
     {
         $this->requireRole($actorUserId, 'doctor', 'ثبت پیگیری');
         $this->requireCap($actorUserId, RolesAndCapabilities::REC_CREATE, 'rec');
-        $visit = $this->requireVisit($visitId);
+        $visit = $this->require_visit_for_write( $visitId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy camelCase parameter
         // Phase 3 Slice 5 — همان قاعده برای پیگیری (Clinicِ پایدارِ ویزیت)
         $this->authorizeScoped(
             $actorUserId,
@@ -884,7 +887,7 @@ final class ClinicalService
     {
         $this->requireRole($actorUserId, 'doctor', 'پایان ویزیت');
         $this->requireCap($actorUserId, RolesAndCapabilities::CONSULT_COMPLETE, 'complete');
-        $visit = $this->requireVisit($visitId);
+        $visit = $this->require_visit_for_write( $visitId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy camelCase parameter
         // Phase 3 Slice 5 — رد **پیش از** هر validation/transition (هیچ جهشی
         // در cpms_visits و هیچ ردیفِ history نوشته نمی‌شود)
         $this->authorizeScoped(
@@ -949,7 +952,7 @@ final class ClinicalService
         if ($reason === '') {
             throw ClinicalException::of('CLINIC_VALIDATION_FAILED', 'دلیل بازگشایی الزامی است', 422);
         }
-        $visit = $this->requireVisit($visitId);
+        $visit = $this->require_visit_for_write( $visitId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy camelCase parameter
         // Phase 3 Slice 5 — Reopen مجوزِ خودش را Clinic-scoped می‌خواهد
         $this->authorizeScoped(
             $actorUserId,
@@ -1629,6 +1632,34 @@ final class ClinicalService
     /**
      * @return array<string, mixed>
      */
+    /**
+     * Three-stage license (design §7.2 items 4–8, final Q-decisions 2026-11-17):
+     * every clinical write is an existing-Visit finish-lane write. From T1 onwards
+     * the Visit itself must have been opened before T1 and remain active and
+     * non-terminal; before T1 it stays ordinary RBAC. Denial reuses the
+     * non-enumerating CLINIC_LICENSE_BLOCKED envelope.
+     */
+    private function assert_visit_writable( array $visit ): void {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert(
+            \ClinicCore\Domain\Licensing\LicenseGate::OP_VISIT_FINISH,
+            \ClinicCore\Domain\Licensing\VisitLicenseContext::from_row( $visit )
+        );
+        if ( ! $decision->allowed ) {
+            \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_VISIT_FINISH, 'reason' => $decision->reason, 'visit_id' => (int) ( $visit['id'] ?? 0 ) ] );
+            throw ClinicalException::of( 'CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازه ثبت تغییرات بالینی را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند', 503 );
+        }
+    }
+
+    /**
+     * requireVisit + three-stage license assert for every clinical write lane.
+     */
+    private function require_visit_for_write( int $visit_id ): array {
+        $visit = $this->requireVisit( $visit_id );
+        $this->assert_visit_writable( $visit );
+
+        return $visit;
+    }
+
     private function requireVisit(int $visitId): array
     {
         $visit = $this->visits->find($visitId);

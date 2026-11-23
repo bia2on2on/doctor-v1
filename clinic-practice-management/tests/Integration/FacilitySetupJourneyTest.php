@@ -629,7 +629,7 @@ final class FacilitySetupJourneyTest extends WP_UnitTestCase
 
         // Inactive room is refused for assignment and scheduling.
         $room = $service->add_room($this->actor, $this->org, $a['key'], FacilitySetupService::new_request_key(), 'اتاق غیرفعال', $site);
-        App::locationService()->set_active($this->actor, (int) $a['clinic_id'], (int) $room['location_id'], false);
+        App::location_service()->set_active($this->actor, (int) $a['clinic_id'], (int) $room['location_id'], false);
         $doctor = $this->makeUser('fs_doc2', 'subscriber');
         $this->assertRefused('inactive_location', fn () => $service->assign_clinician($this->actor, $this->org, $a['key'], $doctor, 'دکتر آزمون', [$room['key']]));
         $assigned = $service->assign_clinician($this->actor, $this->org, $a['key'], $doctor, 'دکتر آزمون', ['primary']);
@@ -783,7 +783,7 @@ final class FacilitySetupJourneyTest extends WP_UnitTestCase
         self::assertSame('suspended', (string) App::membership_service()->membership_for((int) $b['clinic_id'], $accountant)['status']);
 
         // An inactive Location is refused for a location-scoped role.
-        App::locationService()->set_active($this->actor, (int) $b['clinic_id'], (int) $roomB['location_id'], false);
+        App::location_service()->set_active($this->actor, (int) $b['clinic_id'], (int) $roomB['location_id'], false);
         $reception = $this->makeUser('fs_staff_rec', 'subscriber');
         $this->assertRefused('inactive_location', fn () => $service->assign_staff($this->actor, $this->org, $b['key'], $reception, RolesAndCapabilities::ROLE_SECRETARY, 'locations', [$roomB['key']], []));
         self::assertNull(App::membership_service()->membership_for((int) $b['clinic_id'], $reception));

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 /**
@@ -279,7 +280,10 @@ final class ConcurrencyTest extends WP_UnitTestCase
         }
 
         $pids = [];
+        $outcome_files = [];
+        $tag = bin2hex(random_bytes(8));
         for ($i = 0; $i < $count; $i++) {
+            $outcome_files[$i] = sys_get_temp_dir() . '/cpms-conc-' . $tag . '-' . $i . '.out';
             $pid = pcntl_fork();
             if ($pid === -1) {
                 $this->fail('pcntl_fork failed');
@@ -311,15 +315,18 @@ final class ConcurrencyTest extends WP_UnitTestCase
                 if ($mysqli instanceof \mysqli) {
                     @$mysqli->close();
                 }
-                exit($exitCode);
+                @file_put_contents($outcome_files[$i], (string) $exitCode);
+                ForkChildExit::terminate(0);
             }
-            $pids[] = $pid;
+            $pids[$i] = $pid;
         }
 
         $successes = 0;
-        foreach ($pids as $pid) {
+        foreach ($pids as $i => $pid) {
             pcntl_waitpid($pid, $status);
-            if (pcntl_wifexited($status) && pcntl_wexitstatus($status) === 0) {
+            $raw = @file_get_contents($outcome_files[$i]);
+            @unlink($outcome_files[$i]);
+            if ($raw === '0') {
                 $successes++;
             }
         }

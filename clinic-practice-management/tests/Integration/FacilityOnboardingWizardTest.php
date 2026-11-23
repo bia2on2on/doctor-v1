@@ -74,7 +74,7 @@ final class FacilityOnboardingWizardTest extends WP_UnitTestCase {
   $this->authorize(); $clinicId=App::scope()->clinicId;
   global $wpdb; $wpdb->query('SET FOREIGN_KEY_CHECKS=0'); $wpdb->query('DELETE FROM '.$wpdb->prefix.'cpms_locations WHERE clinic_id='.(int)$clinicId); $wpdb->query('SET FOREIGN_KEY_CHECKS=1');
   self::assertFalse(CpmsSetupWizard::step_is_complete('locations', App::settings()));
-  App::locationRepository()->create($clinicId,'مکان اصلی','main-'.wp_generate_password(6,false,false),'Asia/Tehran', gmdate('Y-m-d H:i:s'));
+  App::location_repository()->create($clinicId,'مکان اصلی','main-'.wp_generate_password(6,false,false),'Asia/Tehran', gmdate('Y-m-d H:i:s'));
   self::assertTrue(CpmsSetupWizard::step_is_complete('locations', App::settings()));
  }
  public function testFinishBlockedForMedicalBuildingAndMissingRequiredReported(): void {
@@ -93,8 +93,8 @@ final class FacilityOnboardingWizardTest extends WP_UnitTestCase {
   update_user_meta($uid,'cpms_onboarding_facility_type','doctor_practice'); update_user_meta($uid,'cpms_onboarding_structure','single');
   CpmsSetupWizard::save_facility(App::settings(),['facility_type'=>'doctor_practice','structure'=>'single'],$uid);
   CpmsSetupWizard::saveClinic(App::settings(),['clinic_name'=>'مطب کامل'],$uid);
-  $locs=App::locationRepository()->listForClinic($clinicId);
-  if ($locs===[]) { App::locationRepository()->create($clinicId,'مکان اصلی','main-'.wp_generate_password(6,false,false),'Asia/Tehran', gmdate('Y-m-d H:i:s')); $locs=App::locationRepository()->listForClinic($clinicId); }
+  $locs=App::location_repository()->listForClinic($clinicId);
+  if ($locs===[]) { App::location_repository()->create($clinicId,'مکان اصلی','main-'.wp_generate_password(6,false,false),'Asia/Tehran', gmdate('Y-m-d H:i:s')); $locs=App::location_repository()->listForClinic($clinicId); }
   $locationId=(int)$locs[0]['id'];
   $wpdb->query('SET FOREIGN_KEY_CHECKS=0'); $wpdb->query('DELETE FROM '.$wpdb->prefix.'cpms_clinicians WHERE clinic_id='.(int)$clinicId); $wpdb->query('SET FOREIGN_KEY_CHECKS=1');
   App::clinicianRepository()->create($clinicId,['full_name'=>'پزشک کامل']);

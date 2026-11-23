@@ -441,9 +441,20 @@ final class UpdateRightsEnforcementTest extends WP_UnitTestCase
         $this->assertTrue($state['needs_renewal']);
 
         $gate = new SignedLicenseGate($service);
+        // Final 2026-11-17: at Stage 2 (now < T1) the uncontextualized denial lanes
+        // are the new-demand lanes, uncontextualized SMS (no persisted care link) and
+        // Q4a refunds; the finish-lane/service-maintenance lanes stay open until T1.
+        $stage2_open = [
+            LicenseGate::OP_INVOICE_CREATE,
+            LicenseGate::OP_VISIT_FINISH,
+            LicenseGate::OP_PAYMENT_RECORD,
+            LicenseGate::OP_APPOINTMENT_NOSHOW,
+            LicenseGate::OP_SETTINGS_WRITE,
+            LicenseGate::OP_FILE_UPLOAD,
+        ];
         foreach (SignedLicenseGate::BLOCKED_UNDER_RESTRICTION as $operation) {
             $this->assertSame(
-                $operation === LicenseGate::OP_INVOICE_CREATE,
+                in_array($operation, $stage2_open, true),
                 $gate->assert($operation)->allowed,
                 'Update rights do not override the Owner clinical policy'
             );
@@ -463,7 +474,7 @@ final class UpdateRightsEnforcementTest extends WP_UnitTestCase
         $this->assertFalse($blocked['available']);
         $this->assertSame('update_rights_expired', $blocked['reason']);
         $this->assertFalse($gate->assert(LicenseGate::OP_APPOINTMENT_BOOK)->allowed);
-        $this->assertTrue($gate->assert(LicenseGate::OP_PATIENT_CREATE, ['reception' => true])->allowed);
+        $this->assertFalse($gate->assert(LicenseGate::OP_PATIENT_CREATE, ['reception' => true])->allowed); // Final Q1(a): no new patient row from T0, reception-shaped or not
     }
 
     public function testTheRightsDecisionUsesSignedIntegersOnlyAndNoLocalClock(): void

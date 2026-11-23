@@ -33,6 +33,7 @@ use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use DateTimeImmutable;
 use DateTimeZone;
 use WP_REST_Request;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 /**
@@ -86,6 +87,13 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
 
     private int $orgId = 0;
     private int $clinicId = 0;
+    // True once this test COMMITted the harness transaction (race-visibility
+    // fixtures). The purge in tearDown() must then commit its DELETEs too, or
+    // the harness ROLLBACK at parent::tearDown() resurrects the committed Clinic
+    // rows for every later suite in the shared database (same failure class as
+    // the documented CustomRoleLifecycleTest cascade; fork-children no longer
+    // drop the parent session, so the outer ROLLBACK really rolls back now).
+    private bool $fixtureCommitted = false;
     private int $locTehran = 0;
     private int $locKiritimati = 0;
     private int $locNiue = 0;
@@ -714,6 +722,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
 
         // Make fixture writes visible to all independent sessions before fork.
         $wpdb->query('COMMIT'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+        $this->fixtureCommitted = true;
         $prefix = $wpdb->prefix;
         $writerPipes = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         $bookingPipes = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
@@ -736,7 +745,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
                 fclose($bookingParent);
                 fclose($bookingChild);
                 $this->locationTimezoneWriterChild($writerChild, $this->locNewYork);
-                exit(2);
+                ForkChildExit::terminate(2);
             }
             if ($writerFork < 1) {
                 self::fail('pcntl_fork failed for the independent Location writer');
@@ -764,7 +773,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
                     $time,
                     $slotId
                 );
-                exit(2);
+                ForkChildExit::terminate(2);
             }
             if ($bookingFork < 1) {
                 self::fail('pcntl_fork failed for the independent BookingService actor');
@@ -828,8 +837,8 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
             $bookingStatus = $this->waitForChildExit($bookingPid, self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS);
             self::assertIsInt($writerStatus, 'writer must exit within the bounded cleanup window');
             self::assertIsInt($bookingStatus, 'booking actor must exit within the bounded cleanup window');
-            self::assertTrue(pcntl_wifexited($writerStatus) && pcntl_wexitstatus($writerStatus) === 0, 'writer must commit its intended Location timezone update');
-            self::assertTrue(pcntl_wifexited($bookingStatus) && pcntl_wexitstatus($bookingStatus) === 0, 'booking actor must terminate cleanly after the rejection');
+            self::assertTrue(ForkChildExit::childTerminatedCleanly($writerStatus), 'writer must commit its intended Location timezone update');
+            self::assertTrue(ForkChildExit::childTerminatedCleanly($bookingStatus), 'booking actor must terminate cleanly after the rejection');
 
             self::assertSame('America/New_York', $this->locationTimezone($this->locNewYork), 'final validation must consume the writer-committed authoritative timezone');
             self::assertSame($before['appointments'], (int) $wpdb->get_var($wpdb->prepare(
@@ -1361,7 +1370,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
             if (!$updated) {
                 @fwrite($pipe, "writer_error\n");
                 $mysqli->rollback();
-                exit(2);
+                ForkChildExit::terminate(2);
             }
             @fwrite($pipe, 'writer_locked:' . $mysqli->thread_id . "\n");
             // The writer is already locked when this wait starts. Thirty seconds
@@ -1372,16 +1381,16 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
             $command = $this->readSynchronizationLine($pipe, self::RACE_WRITER_COMMAND_TIMEOUT_SECONDS);
             if ($command === 'commit') {
                 $mysqli->commit();
-                exit(0);
+                ForkChildExit::terminate(0);
             }
             $mysqli->rollback();
-            exit(3);
+            ForkChildExit::terminate(3);
         } catch (\Throwable $e) {
             @fwrite($pipe, "writer_error\n");
             if ($mysqli instanceof \mysqli) {
                 @$mysqli->rollback();
             }
-            exit(2);
+            ForkChildExit::terminate(2);
         } finally {
             if ($mysqli instanceof \mysqli) {
                 @$mysqli->close();
@@ -1458,13 +1467,13 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
             $outcome['connection_id'] = $connectionId;
             $outcome['own_wpdb_connected'] = true;
             @fwrite($pipe, json_encode($outcome, JSON_UNESCAPED_UNICODE) . "\n");
-            exit(0);
+            ForkChildExit::terminate(0);
         } catch (\Throwable $e) {
             @fwrite($pipe, json_encode([
                 'result' => 'fatal',
                 'detail' => get_class($e) . ': ' . $e->getMessage(),
             ], JSON_UNESCAPED_UNICODE) . "\n");
-            exit(2);
+            ForkChildExit::terminate(2);
         } finally {
             ScopeContext::clear();
             if ($wdb instanceof \wpdb) {
@@ -2072,6 +2081,14 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
             $wpdb->query($wpdb->prepare('DELETE FROM ' . $db->table('cpms_organizations') . ' WHERE id = %d', $this->orgId)); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         }
         $wpdb->query('SET FOREIGN_KEY_CHECKS = 1'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+        if ($this->fixtureCommitted) {
+            // The fixture was COMMITted for the forked sessions, so this
+            // cleanup's DELETEs sit in a fresh transaction that tearDown's
+            // ROLLBACK would undo — resurrecting the Clinic rows. Commit them.
+            if ($wpdb->query('COMMIT') === false) { // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                self::fail('cleanup must commit its fixture removal durably (tearDown rolls back the harness transaction)');
+            }
+        }
     }
 
     private function purgeJobs(): void

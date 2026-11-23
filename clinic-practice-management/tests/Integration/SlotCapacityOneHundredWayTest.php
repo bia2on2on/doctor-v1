@@ -7,6 +7,7 @@ namespace ClinicCore\Tests\Integration;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Repository\SlotRepository;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 /**
@@ -97,7 +98,10 @@ final class SlotCapacityOneHundredWayTest extends WP_UnitTestCase
     private function runOneHundredContenders(): int
     {
         $children = [];
+        $outcome_files = [];
+        $tag = bin2hex(random_bytes(8));
         for ($i = 0; $i < 100; $i++) {
+            $outcome_files[$i] = sys_get_temp_dir() . '/cpms-slotcap-' . $tag . '-' . $i . '.out';
             $pid = pcntl_fork();
             if ($pid === -1) {
                 $this->fail('pcntl_fork failed');
@@ -106,15 +110,18 @@ final class SlotCapacityOneHundredWayTest extends WP_UnitTestCase
                 // ===== child: اتصال مستقل + مسیر واقعی تولید =====
                 usleep(random_int(0, 3000)); // پخش تلاش اتصال (محدودیت max_connections)
                 $won = $this->childAtomicBook();
-                exit($won ? 1 : 0);
+                @file_put_contents($outcome_files[$i], $won ? 'won' : 'lost');
+                ForkChildExit::terminate(0);
             }
-            $children[] = $pid;
+            $children[$i] = $pid;
         }
 
         $winners = 0;
-        foreach ($children as $pid) {
+        foreach ($children as $i => $pid) {
             pcntl_waitpid($pid, $status);
-            if (pcntl_wifexited($status) && pcntl_wexitstatus($status) === 1) {
+            $raw = @file_get_contents($outcome_files[$i]);
+            @unlink($outcome_files[$i]);
+            if ($raw === 'won') {
                 $winners++;
             }
         }
@@ -132,7 +139,7 @@ final class SlotCapacityOneHundredWayTest extends WP_UnitTestCase
 
             return (new SlotRepository($cpms))->atomicBook($this->slotId);
         } catch (\Throwable) {
-            exit(3);
+            ForkChildExit::terminate(3);
         }
     }
 

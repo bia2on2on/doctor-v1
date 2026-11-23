@@ -352,6 +352,12 @@ final class StaffManagementPage
         // current_user_can() is not Clinic authorization; the scoped write guard below is authoritative.
         check_admin_referer(self::NONCE_ACTION);
 
+        if ( self::settings_writes_blocked() ) {
+            set_transient( self::NOTICE_KEY, self::LICENSE_BLOCKED_MESSAGE, 60 );
+            wp_safe_redirect( admin_url( 'admin.php?page=' . self::PAGE_SLUG ) );
+            exit;
+        }
+
         $raw_mode         = isset( $_POST['mode'] ) ? wp_unslash( $_POST['mode'] ) : 'create';
         $mode             = is_string( $raw_mode ) ? sanitize_key( $raw_mode ) : 'create';
         $mode             = in_array( $mode, [ 'update', 'attach_existing' ], true ) ? $mode : 'create';
@@ -404,6 +410,12 @@ final class StaffManagementPage
         }
         check_admin_referer( 'cpms_staff_toggle_' . $user_id );
 
+        if ( self::settings_writes_blocked() ) {
+            set_transient( self::NOTICE_KEY, self::LICENSE_BLOCKED_MESSAGE, 60 );
+            wp_safe_redirect( admin_url( 'admin.php?page=' . self::PAGE_SLUG ) );
+            exit;
+        }
+
         $raw_state     = isset( $_GET['state'] ) ? wp_unslash( $_GET['state'] ) : '';
         $state         = is_string( $raw_state ) ? $raw_state : '';
         $raw_clinic_id = isset( $_GET['clinic_id'] ) && is_scalar( $_GET['clinic_id'] ) ? wp_unslash( (string) $_GET['clinic_id'] ) : null;
@@ -429,6 +441,12 @@ final class StaffManagementPage
         }
         check_admin_referer( 'cpms_staff_password_' . $user_id );
 
+        if ( self::settings_writes_blocked() ) {
+            set_transient( self::NOTICE_KEY, self::LICENSE_BLOCKED_MESSAGE, 60 );
+            wp_safe_redirect( admin_url( 'admin.php?page=' . self::PAGE_SLUG ) );
+            exit;
+        }
+
         $raw_clinic_id = isset( $_GET['clinic_id'] ) && is_scalar( $_GET['clinic_id'] ) ? wp_unslash( (string) $_GET['clinic_id'] ) : null;
         $clinic_id     = $raw_clinic_id !== null ? absint( $raw_clinic_id ) : null;
         $result        = self::initiatePasswordReset( $user_id, (int) get_current_user_id(), $clinic_id );
@@ -452,6 +470,10 @@ final class StaffManagementPage
      * @return array{error:string, display_name:string}
      */
     public static function initiatePasswordReset( int $user_id, int $updated_by, ?int $clinic_id = null ): array { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy method name: renaming it is a cross-file API change outside Slice 3B.
+        if ( self::settings_writes_blocked() ) {
+            return ['error' => self::LICENSE_BLOCKED_MESSAGE, 'display_name' => ''];
+        }
+
         $authorization = self::authorize_staff_write( $updated_by, $clinic_id, $user_id );
         if ( $authorization['error'] !== '' ) {
             return ['error' => $authorization['error'], 'display_name' => ''];
@@ -566,7 +588,12 @@ final class StaffManagementPage
      *
      * @return array{error:string, generated:string, user_id:int}
      */
-    public static function upsertUser( array $in, int $updated_by ): array { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy method name: renaming it is a cross-file API change outside Slice 3B.
+    // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy method name kept (cross-file API; see note above).
+    public static function upsertUser( array $in, int $updated_by ): array {
+        if ( self::settings_writes_blocked() ) {
+            return ['error' => self::LICENSE_BLOCKED_MESSAGE, 'generated' => '', 'user_id' => 0];
+        }
+ // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy method name: renaming it is a cross-file API change outside Slice 3B.
         if ( $updated_by <= 0 || ! is_user_logged_in() || (int) get_current_user_id() !== $updated_by ) {
             return ['error' => 'کاربر احراز هویت‌شده برای این عملیات معتبر نیست.', 'generated' => '', 'user_id' => 0];
         }
@@ -832,6 +859,10 @@ final class StaffManagementPage
      * @return array{error:string, generated:string, user_id:int}
      */
     public static function attachExistingUser( array $in, int $updated_by ): array { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy method name: renaming it is a cross-file API change outside Slice 3B.
+        if ( self::settings_writes_blocked() ) {
+            return ['error' => self::LICENSE_BLOCKED_MESSAGE, 'generated' => '', 'user_id' => 0];
+        }
+
         if ( $updated_by <= 0 || ! is_user_logged_in() || (int) get_current_user_id() !== $updated_by ) {
             return ['error' => 'کاربر احراز هویت‌شده برای این عملیات معتبر نیست.', 'generated' => '', 'user_id' => 0];
         }
@@ -926,6 +957,10 @@ final class StaffManagementPage
      * @return array{error:string}
      */
     public static function toggleUser( int $user_id, string $state, int $updated_by, ?int $clinic_id = null ): array { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy method name: renaming it is a cross-file API change outside Slice 3B.
+        if ( self::settings_writes_blocked() ) {
+            return ['error' => self::LICENSE_BLOCKED_MESSAGE];
+        }
+
         $authorization = self::authorize_staff_write( $updated_by, $clinic_id, $user_id );
         if ( $authorization['error'] !== '' ) {
             return ['error' => $authorization['error']];
@@ -1162,6 +1197,10 @@ final class StaffManagementPage
 
     /** @return array{error:string,notice:string,clinic_id:int} */
     private static function write_custom_role_assignment( int $target_user_id, string $role_key, int $updated_by, ?int $clinic_id, bool $suspended_only ): array {
+        if ( self::settings_writes_blocked() ) {
+            return ['error' => self::LICENSE_BLOCKED_MESSAGE, 'notice' => '', 'clinic_id' => 0];
+        }
+
         if ( $updated_by <= 0 ) {
             return ['error' => 'درخواست انتساب نامعتبر است.', 'notice' => '', 'clinic_id' => 0];
         }
@@ -1192,6 +1231,19 @@ final class StaffManagementPage
                 : 'این کارمند از قبل همین نقش سفارشی را داشت؛ هیچ تغییری ثبت نشد.' ),
             'clinic_id' => (int) $assigned['clinic_id'],
         ];
+    }
+
+    private const LICENSE_BLOCKED_MESSAGE = 'مجوز سامانه اجازهٔ این تغییر را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند.';
+
+    /** Three-stage license (design §7.3 staff/settings row, final 2026-11-17). */
+    private static function settings_writes_blocked(): bool {
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE );
+        if ( $decision->allowed ) {
+            return false;
+        }
+        \ClinicCore\Bootstrap\App::op()->warning( 'license.blocked', [ 'operation' => \ClinicCore\Domain\Licensing\LicenseGate::OP_SETTINGS_WRITE, 'reason' => $decision->reason ] );
+
+        return true;
     }
 
     /** پیام فارسیِ محدود برای کدهای دلیلِ انتساب (هرگز مقدار خامِ درخواست). */

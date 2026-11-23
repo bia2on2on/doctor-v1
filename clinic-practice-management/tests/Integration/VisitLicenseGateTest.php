@@ -118,9 +118,15 @@ final class VisitLicenseGateTest extends WP_UnitTestCase
         $dt = new \DateTimeImmutable($local_day . ' 14:00:00', $tz);
         $arrival = new \DateTimeImmutable($local_day . ' 09:00:00', $tz);
         \ClinicCore\Application\Visits\VisitService::setTestNowUtc($arrival->setTimezone(new \DateTimeZone('UTC')));
-        $apptId = $this->makeAppointment($dt->format('Y-m-d'), $dt->format('H:i:s'));
+        // Three-stage license — Stage 2 (T0 ≤ now < T1): a durable pre-T0
+        // pending/confirmed appointment may first-admit while now < T1
+        // (design §7.2 items 2 and 7; final Q3(a)). T0 = arrival − 7 days.
+        $arrival_utc = $arrival->setTimezone(new \DateTimeZone('UTC'))->getTimestamp();
+        $t0 = $arrival_utc - 7 * 86400;
+        $t1 = $arrival_utc + 30 * 86400;
+        $apptId = $this->makeAppointment($dt->format('Y-m-d'), $dt->format('H:i:s'), $t0 - 86400);
 
-        $visit = $this->service(new FakeLicenseGate(false))->checkIn($this->secretaryUserId, $this->patientId, $apptId);
+        $visit = $this->service(new FakeLicenseGate(false, $t0, $t1, $arrival_utc))->checkIn($this->secretaryUserId, $this->patientId, $apptId);
 
         $this->assertSame('waiting', $visit['status']);
         $this->assertSame('scheduled', $visit['source']);
@@ -136,8 +142,12 @@ final class VisitLicenseGateTest extends WP_UnitTestCase
         $dt = new \DateTimeImmutable($local_day . ' 14:00:00', $tz);
         $arrival = new \DateTimeImmutable($local_day . ' 09:00:00', $tz);
         \ClinicCore\Application\Visits\VisitService::setTestNowUtc($arrival->setTimezone(new \DateTimeZone('UTC')));
-        $apptId = $this->makeAppointment($dt->format('Y-m-d'), $dt->format('H:i:s'));
-        $svc = $this->service(new FakeLicenseGate(false));
+        // Stage 2 fixture (see the check-in test above): pre-T0 appointment, now < T1.
+        $arrival_utc = $arrival->setTimezone(new \DateTimeZone('UTC'))->getTimestamp();
+        $t0 = $arrival_utc - 7 * 86400;
+        $t1 = $arrival_utc + 30 * 86400;
+        $apptId = $this->makeAppointment($dt->format('Y-m-d'), $dt->format('H:i:s'), $t0 - 86400);
+        $svc = $this->service(new FakeLicenseGate(false, $t0, $t1, $arrival_utc));
 
         $visit = $svc->checkIn($this->secretaryUserId, $this->patientId, $apptId);
 
@@ -150,6 +160,123 @@ final class VisitLicenseGateTest extends WP_UnitTestCase
 
         $completed = $svc->transition($this->doctorUserId, (int) $visit['id'], 'complete');
         $this->assertSame('consultation_completed', $completed['status']);
+    }
+
+    // ================= §19 — Continuity-stage boundary witnesses (design §7.2 item 7; Q3(a)) =================
+
+    public function testCheckInOfAppointmentCreatedAfterT0IsDeniedInContinuityStage(): void
+    {
+        $tz = new \DateTimeZone('Asia/Tehran');
+        $local_day = (new \DateTimeImmutable('now', $tz))->format('Y-m-d');
+        $dt = new \DateTimeImmutable($local_day . ' 14:00:00', $tz);
+        $arrival = new \DateTimeImmutable($local_day . ' 09:00:00', $tz);
+        \ClinicCore\Application\Visits\VisitService::setTestNowUtc($arrival->setTimezone(new \DateTimeZone('UTC')));
+        $arrival_utc = $arrival->setTimezone(new \DateTimeZone('UTC'))->getTimestamp();
+        $t0 = $arrival_utc - 7 * 86400;
+        $t1 = $arrival_utc + 30 * 86400;
+        // Appointment created INSIDE stage 2 (after T0) — not grandfathered by continuity.
+        $apptId = $this->makeAppointment($dt->format('Y-m-d'), $dt->format('H:i:s'), $t0 + 86400);
+
+        try {
+            $this->service(new FakeLicenseGate(false, $t0, $t1, $arrival_utc))->checkIn($this->secretaryUserId, $this->patientId, $apptId);
+            $this->fail('Expected CLINIC_LICENSE_BLOCKED');
+        } catch (VisitException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+            $this->assertSame(503, $e->httpStatus);
+        }
+
+        $count = App::db()->fetchRow(
+            'SELECT COUNT(*) AS n FROM ' . App::db()->table('cpms_visits') . ' WHERE patient_id = %d',
+            [$this->patientId]
+        );
+        $this->assertSame(0, (int) $count['n']);
+    }
+
+    public function testCheckInOfPreExistingAppointmentIsDeniedAtT1Boundary(): void
+    {
+        $tz = new \DateTimeZone('Asia/Tehran');
+        $local_day = (new \DateTimeImmutable('now', $tz))->format('Y-m-d');
+        $dt = new \DateTimeImmutable($local_day . ' 14:00:00', $tz);
+        $arrival = new \DateTimeImmutable($local_day . ' 09:00:00', $tz);
+        $arrival_utc = $arrival->setTimezone(new \DateTimeZone('UTC'))->getTimestamp();
+        $t0 = $arrival_utc - 7 * 86400;
+        $t1 = $arrival_utc + 30 * 86400;
+        // Q3(a): exactly at T1 (and after) every first admission is denied — half-open boundary.
+        $t1_utc = (new \DateTimeImmutable('@' . $t1))->setTimezone(new \DateTimeZone('UTC'));
+        \ClinicCore\Application\Visits\VisitService::setTestNowUtc($t1_utc);
+        $apptId = $this->makeAppointment($dt->format('Y-m-d'), $dt->format('H:i:s'), $t0 - 86400);
+
+        try {
+            $this->service(new FakeLicenseGate(false, $t0, $t1, $t1))->checkIn($this->secretaryUserId, $this->patientId, $apptId);
+            $this->fail('Expected CLINIC_LICENSE_BLOCKED');
+        } catch (VisitException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+            $this->assertSame(503, $e->httpStatus);
+        }
+
+        $count = App::db()->fetchRow(
+            'SELECT COUNT(*) AS n FROM ' . App::db()->table('cpms_visits') . ' WHERE patient_id = %d',
+            [$this->patientId]
+        );
+        $this->assertSame(0, (int) $count['n']);
+    }
+
+    public function testNewDemandStaysDeniedInContinuityStage(): void
+    {
+        $tz = new \DateTimeZone('Asia/Tehran');
+        $local_day = (new \DateTimeImmutable('now', $tz))->format('Y-m-d');
+        $arrival = new \DateTimeImmutable($local_day . ' 09:00:00', $tz);
+        \ClinicCore\Application\Visits\VisitService::setTestNowUtc($arrival->setTimezone(new \DateTimeZone('UTC')));
+        $arrival_utc = $arrival->setTimezone(new \DateTimeZone('UTC'))->getTimestamp();
+        $t0 = $arrival_utc - 7 * 86400;
+        $t1 = $arrival_utc + 30 * 86400;
+        $gate = new FakeLicenseGate(false, $t0, $t1, $arrival_utc);
+
+        // (i) Gate-level: booking/new demand is denied from T0 (final Q1(a)/Q2(a)).
+        $book = $gate->assert(LicenseGate::OP_APPOINTMENT_BOOK, []);
+        $this->assertFalse($book->allowed);
+        $reschedule = $gate->assert(LicenseGate::OP_APPOINTMENT_RESCHEDULE, []);
+        $this->assertFalse($reschedule->allowed);
+
+        // (ii) Service-level: walk-in stays blocked through the whole stack; no Visit row.
+        try {
+            $this->service($gate)->walkIn($this->secretaryUserId, $this->patientId, $this->clinicianId);
+            $this->fail('Expected CLINIC_LICENSE_BLOCKED');
+        } catch (VisitException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+            $this->assertSame(503, $e->httpStatus);
+        }
+
+        $count = App::db()->fetchRow(
+            'SELECT COUNT(*) AS n FROM ' . App::db()->table('cpms_visits') . ' WHERE patient_id = %d',
+            [$this->patientId]
+        );
+        $this->assertSame(0, (int) $count['n']);
+    }
+
+    public function testAllowedCheckInProvesLicenseGateWasConsulted(): void
+    {
+        $tz = new \DateTimeZone('Asia/Tehran');
+        $local_day = (new \DateTimeImmutable('now', $tz))->format('Y-m-d');
+        $dt = new \DateTimeImmutable($local_day . ' 14:00:00', $tz);
+        $arrival = new \DateTimeImmutable($local_day . ' 09:00:00', $tz);
+        \ClinicCore\Application\Visits\VisitService::setTestNowUtc($arrival->setTimezone(new \DateTimeZone('UTC')));
+        $arrival_utc = $arrival->setTimezone(new \DateTimeZone('UTC'))->getTimestamp();
+        $t0 = $arrival_utc - 7 * 86400;
+        $t1 = $arrival_utc + 30 * 86400;
+        $apptId = $this->makeAppointment($dt->format('Y-m-d'), $dt->format('H:i:s'), $t0 - 86400);
+
+        $gate = new FakeLicenseGate(false, $t0, $t1, $arrival_utc);
+        $this->service($gate)->checkIn($this->secretaryUserId, $this->patientId, $apptId);
+
+        $this->assertArrayHasKey(0, $gate->calls);
+        $first = $gate->calls[0];
+        $this->assertArrayHasKey('operation', $first);
+        $this->assertArrayHasKey('context', $first);
+        $this->assertArrayHasKey('appointment_created_at', $first['context']);
+        $ops = array_column($gate->calls, 'operation');
+        $this->assertContains(LicenseGate::OP_VISIT_CHECKIN, $ops);
+        $this->assertSame(1, count(array_filter($ops, static fn ($op) => LicenseGate::OP_VISIT_CHECKIN === $op)));
     }
 
     protected function tearDown(): void
@@ -187,10 +314,12 @@ final class VisitLicenseGateTest extends WP_UnitTestCase
         return $userId;
     }
 
-    private function makeAppointment(string $slotDate, string $slotTime): int
+    private function makeAppointment(string $slotDate, string $slotTime, ?int $createdAtUtc = null): int
     {
         global $wpdb;
         $now = App::db()->nowUtcSql();
+        // created_at pre-T0 for continuity-stage fixtures (design §7.2 item 2); default = now.
+        $created_at = null === $createdAtUtc ? $now : gmdate('Y-m-d H:i:s', $createdAtUtc) . '.000';
 
         $wpdb->query(
             $wpdb->prepare(
@@ -219,9 +348,9 @@ final class VisitLicenseGateTest extends WP_UnitTestCase
                 $slotDate,
                 $slotTime,
                 (new \DateTimeImmutable($slotDate . ' ' . $slotTime, new \DateTimeZone('Asia/Tehran')))->add(new \DateInterval('PT20M'))->format('H:i:s'),
-                $now,
-                $now,
-                $now
+                $created_at,
+                $created_at,
+                $created_at
             )
         );
 
@@ -230,19 +359,56 @@ final class VisitLicenseGateTest extends WP_UnitTestCase
 }
 
 /**
- * Gate تزریقی تست — تصمیم ثابت، بدون I/O (قرارداد ADR-0023).
+ * Gate تزریقی تست — حداقل قوانین صریحِ سه‌مرحله‌ای؛ پیش‌فرض انکار است و
+ * هیچ منطق تولید را آینه نمی‌کند (design §7.2; final Q3(a)):
+ *   - OP_VISIT_CHECKIN: فقط در Stage 2 (T0 ≤ now < T1) و فقط برای نوبتِ
+ *     pre-T0 (appointment_created_at < T0) با وضعیت pending/confirmed.
+ *   - OP_VISIT_FINISH: فقط برای ویزیت بازِ پیشین (visit_opened === true)؛
+ *     در Stage 3 (now ≥ T1) فقط اگر ویزیت پیش از T1 باز شده باشد.
+ *   - هر عملیات دیگر (از جمله OP_APPOINTMENT_BOOK و walk-in) همیشه رد است.
+ * بدون تزریق صریح T0/T1/now همه‌چیز رد می‌شود (fail-closed).
  */
 final class FakeLicenseGate implements LicenseGate
 {
-    public function __construct(private readonly bool $allowed)
-    {
+    /** @var list<array{operation: string, context: array<string, mixed>}> */
+    public array $calls = [];
+
+    public function __construct(
+        private readonly bool $allowed,
+        private readonly ?int $expiresAtUtc = null,
+        private readonly ?int $t1Utc = null,
+        private readonly ?int $nowUtc = null
+    ) {
     }
 
     public function assert(string $operation, array $context = []): LicenseDecision
     {
-        return $this->allowed
-            ? LicenseDecision::allow()
-            : LicenseDecision::deny('license:expired');
+        $this->calls[] = [ 'operation' => $operation, 'context' => $context ];
+        if ( $this->allowed ) {
+            return LicenseDecision::allow();
+        }
+        if ( LicenseGate::OP_VISIT_FINISH === $operation && true === ( $context['visit_opened'] ?? false ) ) {
+            // Safe-finish lane: an already-opened Visit stays finishable; from T1 only if created_at < T1.
+            if ( null !== $this->t1Utc && null !== $this->nowUtc && $this->nowUtc >= $this->t1Utc ) {
+                $visit_created = $context['visit_created_at'] ?? null;
+                if ( ! is_int( $visit_created ) || $visit_created <= 0 || $visit_created >= $this->t1Utc ) {
+                    return LicenseDecision::deny( 'license:expired' );
+                }
+            }
+            return LicenseDecision::allow();
+        }
+        if ( null !== $this->expiresAtUtc && null !== $this->t1Utc && null !== $this->nowUtc
+            && $this->nowUtc >= $this->expiresAtUtc && $this->nowUtc < $this->t1Utc
+            && LicenseGate::OP_VISIT_CHECKIN === $operation ) {
+            // Stage 2 (design §7.2 items 2 and 7): pre-T0 pending/confirmed only, and only while now < T1.
+            $created = $context['appointment_created_at'] ?? null;
+            $status  = (string) ( $context['appointment_status'] ?? '' );
+            if ( is_int( $created ) && $created > 0 && $created < $this->expiresAtUtc
+                && in_array( $status, [ 'pending', 'confirmed' ], true ) ) {
+                return LicenseDecision::allow();
+            }
+        }
+        return LicenseDecision::deny( 'license:expired' );
     }
 
     public function state(): string
@@ -252,6 +418,6 @@ final class FakeLicenseGate implements LicenseGate
 
     public function isReadOnly(): bool
     {
-        return !$this->allowed;
+        return ! $this->allowed;
     }
 }

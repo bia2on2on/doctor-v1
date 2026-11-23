@@ -84,6 +84,7 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Application\Jobs\HoldsExpireHandler;
 use ClinicCore\Domain\Booking\BookingException;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 require_once __DIR__ . '/IsolatedSchema.php';
@@ -909,16 +910,16 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
         // while the parent or a sibling is still active, or wipe the mirror
         // dir out from under the parent). Disable shutdown cleanup in THIS
         // process before anything else; then try SIGKILL; whether or not
-        // posix_kill exists or succeeds, exit(0) is fail-closed.
+        // posix_kill exists or succeeds, the lifetime guard is fail-closed.
         self::disableFatalCleanupForThisProcess();
         if (!function_exists('posix_kill')) {
             fwrite(STDERR, '[hold-race] child pid=' . getmypid() . ' posix_kill unavailable; exiting with shutdown cleanup disabled' . PHP_EOL);
-            exit(0);
+            ForkChildExit::terminate(0);
         }
         if (!@posix_kill(getmypid(), SIGKILL)) {
             fwrite(STDERR, '[hold-race] child pid=' . getmypid() . ' SIGKILL failed; exiting with shutdown cleanup disabled' . PHP_EOL);
         }
-        exit(0);
+        ForkChildExit::terminate(0);
     }
 
     /**

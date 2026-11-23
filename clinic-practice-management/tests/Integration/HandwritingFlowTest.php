@@ -129,7 +129,26 @@ final class HandwritingFlowTest extends WP_UnitTestCase
         $this->assertSame(1, (int) $persisted['client_revision']);
         $this->assertCount(1, $persisted['strokes']);
         // Existing consultation can still complete after all new-service windows.
-        $this->installSignedExpiration(time() - 220 * 86400);
+        // The finish lane is lawful here only because this Visit was opened before
+        // T1: backdate its created_at into its real opening window (< T1) before
+        // installing the 220-day-old expiry (Stage 3 wall-clock).
+        $stage3T0 = time() - 220 * 86400;
+        $stage3T1 = PostExpirationPolicy::deadline($stage3T0, 1);
+        App::db()->update(
+            'cpms_visits',
+            ['created_at' => gmdate('Y-m-d H:i:s', $stage3T1 - 60) . '.000'],
+            ['id' => (int) $doc['visit_id']]
+        );
+        $this->installSignedExpiration($stage3T0);
+        // New business is closed from T0 (design final Q2(a)): opening a new
+        // walk-in consultation must be denied with the license block code.
+        try {
+            $this->makeConsultation();
+            $this->fail('Stage 3: opening a new walk-in visit must be denied');
+        } catch (VisitException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+            $this->assertSame(503, $e->httpStatus);
+        }
         $note = App::clinicalService()->addNote($this->doctorUserId, (int) $doc['visit_id'], [
             'category' => 'chief_complaint', 'visibility' => 'patient_visible', 'content_text' => 'Essential documentation after expiry',
         ]);
@@ -160,6 +179,9 @@ final class HandwritingFlowTest extends WP_UnitTestCase
 
         // 2. Stage 2 (T0 <= now < T1)
         $visitStage2 = $this->makeConsultation();
+        // Opened in Stage 1 so the Stage-2/Stage-3 new-business ban does not deny it;
+        // its created_at is backdated into the boundary window in step 3.
+        $visitBoundary = $this->makeConsultation();
         $this->installSignedExpiration(time() - 1);
         $docStage2 = $svc->createDocument($this->doctorUserId, $visitStage2, 'Stage 2', []);
         $pageStage2 = $svc->addPage($this->doctorUserId, (int) $docStage2['id'], []);
@@ -177,7 +199,15 @@ final class HandwritingFlowTest extends WP_UnitTestCase
         // 3. Stage 3 exact half-open boundaries: T1 - 1 (Stage 2) and T1 (Stage 3)
         $t0 = strtotime('2026-01-31 12:00:00 UTC');
         $t1 = PostExpirationPolicy::deadline($t0, 1);
-        $visitBoundary = $this->makeConsultation();
+        // New business is closed from T0 (design final Q2(a)): opening a new
+        // walk-in consultation at Stage 2 must be denied with the license block code.
+        try {
+            $this->makeConsultation();
+            $this->fail('Stage 2: opening a new walk-in visit must be denied');
+        } catch (VisitException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+            $this->assertSame(503, $e->httpStatus);
+        }
         App::db()->update('cpms_visits', ['created_at' => gmdate('Y-m-d H:i:s', $t1 - 1) . '.000'], ['id' => $visitBoundary]);
         $this->installSignedExpiration($t0);
 

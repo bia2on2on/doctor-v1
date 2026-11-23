@@ -1148,7 +1148,7 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
     public function testAdditionalLocationCreationUnderExplicitAuthorizedClinicAndCrossClinicIsolation(): void {
         // clinicMember can create location in Clinic A
         wp_set_current_user( $this->clinicMember );
-        $loc = App::locationService()->createLocation( $this->clinicMember, $this->clinicA, [
+        $loc = App::location_service()->createLocation( $this->clinicMember, $this->clinicA, [
             'name' => 'شعبه دوم مطب',
             'slug' => 'second-' . bin2hex( random_bytes( 3 ) ),
             'timezone' => 'Asia/Tehran',
@@ -1158,7 +1158,7 @@ final class ClinicLifecycleManagementTest extends WP_UnitTestCase {
 
         // Same actor must NOT create location in Clinic B via forged clinic_id
         try {
-            App::locationService()->createLocation( $this->clinicMember, $this->clinicB, [
+            App::location_service()->createLocation( $this->clinicMember, $this->clinicB, [
                 'name' => 'شعبه جعلی',
                 'slug' => 'hijack-' . bin2hex( random_bytes( 3 ) ),
                 'timezone' => 'Asia/Tehran',

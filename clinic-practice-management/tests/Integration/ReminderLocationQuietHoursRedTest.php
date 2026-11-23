@@ -56,9 +56,9 @@ final class ReminderLocationQuietHoursRedTest extends WP_UnitTestCase
         $refClass = new \ReflectionClass(App::class);
         foreach (
             [
-                'db', 'op', 'audit', 'jobs', 'rate', 'loginRateLimiter', 'idem',
-                'settingsFactory', 'migrations', 'dispatcher', 'providers', 'vault',
-                'smsService', 'licenseGate', 'visitService', 'installationSettings',
+                'db', 'op', 'audit', 'jobs', 'rate', 'login_rate_limiter', 'idem',
+                'settings_factory', 'migrations', 'dispatcher', 'providers', 'vault',
+                'sms_service', 'license_gate', 'visit_service', 'installationSettings',
             ] as $propName
         ) {
             if ($refClass->hasProperty($propName)) {

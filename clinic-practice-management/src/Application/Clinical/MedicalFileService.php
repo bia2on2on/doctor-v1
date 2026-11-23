@@ -302,6 +302,28 @@ final class MedicalFileService
         ];
     }
 
+    /**
+     * Three-stage license seam for uploads (design §7.3 clinical-file-upload row).
+     * The decision uses a server-derived VisitLicenseContext; a missing visit row
+     * yields an unopened context (fail-closed at/after T0).
+     */
+    private function assert_upload_allowed( ?int $visit_id ): void {
+        $license_context = [ 'visit_id' => (int) ( $visit_id ?? 0 ) ];
+        if ( $visit_id !== null && $visit_id > 0 ) {
+            $visit = \ClinicCore\Bootstrap\App::db()->fetchRow(
+                'SELECT * FROM ' . \ClinicCore\Bootstrap\App::db()->table( 'cpms_visits' ) . ' WHERE id = %d LIMIT 1', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                [ $visit_id ]
+            );
+            if ( is_array( $visit ) ) {
+                $license_context = \ClinicCore\Domain\Licensing\VisitLicenseContext::from_row( $visit );
+            }
+        }
+        $decision = \ClinicCore\Bootstrap\App::licenseGate()->assert( \ClinicCore\Domain\Licensing\LicenseGate::OP_FILE_UPLOAD, $license_context );
+        if ( ! $decision->allowed ) {
+            throw ClinicalException::of( 'CLINIC_LICENSE_BLOCKED', 'مجوز سامانه اجازه آپلود فایل را نمی‌دهد؛ سوابق قابل مشاهده باقی می‌مانند', 503 );
+        }
+    }
+
     // ================= Soft Delete (سرویسی — F-5) =================
 
     public function softDelete(int $actorUserId, int $fileId): void
@@ -379,6 +401,11 @@ final class MedicalFileService
         string $visibility,
         ?array $selected_patient = null
     ): array {
+        // Three-stage license (design §7.3 clinical-file-upload row; Decision 3):
+        // Stage 2 preserves existing upload behavior; Stage 3 requires an
+        // already-opened Visit (created_at < T1, active, non-terminal) — the
+        // safe-finish lane above — and denies uploads otherwise. Records stay readable.
+        $this->assert_upload_allowed( $visitId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing camelCase local
         if (!in_array($category, self::CATEGORIES, true)) {
             throw ClinicalException::of('CLINIC_VALIDATION_FAILED', 'دسته‌بندی فایل نامعتبر است', 422, ['category' => $category]);
         }

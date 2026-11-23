@@ -115,18 +115,65 @@ final class FinanceFlowTest extends WP_UnitTestCase
         parent::tearDown();
     }
 
-    public function testAuthorizedFinanceContinuesAfterSixMonthWindowAndStillHonorsDenies(): void
+    public function testAuthorizedFinanceFollowThroughInStage2ThenReadOnlyStage3(): void
     {
+        // Final three-stage policy (design §6.1/§7, decisions 2026-11-17) replaces the
+        // historical one/six-month grants: after T0 the demand lanes close, and the
+        // test's completed Visit is NOT an already-opened Visit (VisitLicenseContext
+        // derives visit_opened from active+ACTIVE_STATUSES), so Stage-3 invoice/payment
+        // is closed too. The journey is now: Stage 2 (T0, one Gregorian month of
+        // existing-care follow-through) → then T1+ (Stage 3) denies everything this
+        // test used to expect success for.
+        // Both Visits are opened BEFORE the signed T0 is installed: from T0
+        // (Stage 2) on every new-business write (walk-in admission) is denied,
+        // so making a completed Visit mid-Stage-2 would throw CLINIC_LICENSE_BLOCKED.
         $visitId = $this->makeCompletedVisit();
-        $this->installSignedExpiration(time() - 220 * 86400);
+        // A second, still-open invoice on a separately completed visit — left unpaid
+        // so the Stage-3 payment attempt below reaches the license check, not a
+        // balance/transition rejection.
+        $openVisitId = $this->makeCompletedVisit();
+
+        // Stage 2 — existing-care follow-through stays allowed under ordinary RBAC.
+        $this->installSignedExpiration(time() - 86400); // T0 = yesterday → Stage 2
         $invoice = $this->finance()->issueInvoice($this->secretaryUserId, [
             'visit_id' => $visitId,
             'items' => [['description' => 'Authorized existing care', 'unit_price' => 100000, 'quantity' => 1]],
         ]);
+        $this->assertNotEmpty($invoice);
         $paid = $this->finance()->recordPayment($this->secretaryUserId, (int) $invoice['id'], ['amount' => 100000, 'method' => 'cash'], $this->uuid());
         $this->assertGreaterThan(0, (int) $paid['payment_id']);
-        $refund = $this->finance()->refundPayment($this->secretaryUserId, (int) $paid['payment_id'], 'Authorized refund', ['amount' => 10000]);
-        $this->assertNotEmpty($refund);
+        $openInvoice = $this->finance()->issueInvoice($this->secretaryUserId, [
+            'visit_id' => $openVisitId,
+            'items' => [['description' => 'Open balance to carry into Stage 3', 'unit_price' => 40000, 'quantity' => 1]],
+        ]);
+        $this->assertNotEmpty($openInvoice);
+
+        // Stage 3 — T1+ (one Gregorian month after the signed T0) is read-only.
+        $this->installSignedExpiration(time() - 220 * 86400); // T0+220d → past T1 (Stage 3)
+
+        // A completed Visit is not an already-opened Visit: the finance finish lane is closed.
+        try {
+            $this->finance()->issueInvoice($this->secretaryUserId, [
+                'visit_id' => $visitId,
+                'items' => [['description' => 'Stage 3 unproven invoice', 'unit_price' => 100000, 'quantity' => 1]],
+            ]);
+            $this->fail('Stage 3: invoice for a completed Visit must be denied');
+        } catch (FinanceException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+        }
+        try {
+            $this->finance()->recordPayment($this->secretaryUserId, (int) $openInvoice['id'], ['amount' => 5000, 'method' => 'cash'], $this->uuid());
+            $this->fail('Stage 3: payment on an open invoice whose Visit is completed (not already-opened) must be denied');
+        } catch (FinanceException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+        }
+        // Final Q4a(a) (2026-11-17): at/after T1 every historical refund is denied — no exception.
+        try {
+            $this->finance()->refundPayment($this->secretaryUserId, (int) $paid['payment_id'], 'Historical refund after T1', ['amount' => 10000]);
+            $this->fail('Final Q4a(a): historical refunds are denied at/after T1');
+        } catch (FinanceException $e) {
+            $this->assertSame('CLINIC_LICENSE_BLOCKED', $e->errorCode);
+        }
         $this->assertNotEmpty($this->finance()->receipt($this->secretaryUserId, (int) $invoice['id']));
         $this->assertNotEmpty($this->finance()->summary($this->secretaryUserId));
         $this->assertTrue(App::audit()->verifyChain(500)['ok']);
