@@ -56,7 +56,7 @@ final class AuditChainTest extends WP_UnitTestCase
 
         $this->assertArrayNotHasKey('otp_code', $decoded, 'OTP در Audit ممنوع است');
         $this->assertArrayNotHasKey('password', $decoded, 'رمز در Audit ممنوع است');
-        $this->assertSame('***4567', $decoded['mobile'], 'موبایل باید Mask شود');
+        $this->assertSame('[nid-redacted]', $decoded['mobile'], 'موبایلِ ۱۱ رقمی باید fail-closed حذف شود');
         $this->assertSame('ok', $decoded['note']);
     }
 
@@ -101,7 +101,7 @@ final class AuditChainTest extends WP_UnitTestCase
         $this->assertArrayNotHasKey('OTP_Code', $decoded);
         $this->assertArrayNotHasKey('Password', $decoded);
         $this->assertArrayNotHasKey('API_KEY', $decoded);
-        $this->assertSame('***4567', $decoded['mobile'], 'Masking دست‌نخورده می‌ماند');
+        $this->assertSame('[nid-redacted]', $decoded['mobile'], 'موبایلِ ۱۱ رقمی نباید هیچ رقمی باقی بگذارد');
     }
 
     public function testTamperingBreaksChain(): void

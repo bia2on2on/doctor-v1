@@ -8,6 +8,7 @@ namespace ClinicCore\Infrastructure\Audit;
 
 use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 
@@ -246,19 +247,56 @@ final class AuditLogger
             if (in_array(mb_strtolower($key), self::FORBIDDEN_KEYS, true)) {
                 continue; // حذف کامل — تطبیق دقیق نام کلید (case-insensitive) — F1-8
             }
-            if (in_array($key, self::MASK_KEYS, true) && is_string($v) && strlen($v) >= 4) {
-                $out[$key] = '***' . substr($v, -4);
+            // B0-PR3: کد ملی هرگز (حتی Maskشده) در Audit نمی‌آید. برخلاف
+            // MASK_KEYS که ۴ رقمِ آخر را نگه می‌دارند، این کلید کامل حذف می‌شود.
+            if ( mb_strtolower( $key ) === 'national_id' ) {
+                // سیاست مالک: خودِ نام فیلد هم نباید وارد payload شود.
                 continue;
             }
-            if (is_array($v)) {
-                $out[$key] = $this->sanitize($v);
+            $base_key = NationalIdValidator::redact_digits( $key );
+            $safe_key = $base_key;
+            $suffix   = 2;
+            while ( array_key_exists( $safe_key, $out ) && $suffix <= 101 ) {
+                $safe_key = $base_key . '~' . $suffix;
+                ++$suffix;
+            }
+            if ( array_key_exists( $safe_key, $out ) ) {
+                $safe_key = '[collision-overflow]';
+            }
+            if ( in_array( $key, self::MASK_KEYS, true ) && is_string( $v ) && strlen( $v ) >= 4 ) {
+                // `phone` is a structured field: redact exact NID-shaped runs,
+                // but preserve the legacy tail mask for longer phone numbers.
+                // Other sensitive fields retain fail-closed long-run redaction.
+                $safe = $key === 'phone'
+                    ? NationalIdValidator::redact_nid_candidates( $v )
+                    : NationalIdValidator::redact_digits( $v );
+                $out[ $safe_key ] = $safe !== $v ? $safe : '***' . substr( $v, -4 );
                 continue;
             }
-            if (is_string($v) && mb_strlen($v) > 2000) {
-                $out[$key] = mb_substr($v, 0, 2000) . '…[truncated]';
+            if ( is_object( $v ) ) {
+                // Do not allow JsonSerializable properties to bypass recursion.
+                $class       = NationalIdValidator::redact_digits( get_class( $v ) );
+                $out[ $safe_key ] = '[object:' . $class . ']';
                 continue;
             }
-            $out[$key] = $v;
+            if ( is_array( $v ) ) {
+                $out[ $safe_key ] = $this->sanitize( $v );
+                continue;
+            }
+            if ( is_string( $v ) ) {
+                // B0-PR3: متنِ آزاد می‌تواند ارقامِ کد ملی را در خود داشته باشد
+                // (دلیل لغو، یادداشت، ...). قبل از هر ذخیره، ارقام را جمع‌بندی می‌کند.
+                $safe        = NationalIdValidator::redact_digits( $v );
+                $out[ $safe_key ] = mb_strlen( $safe ) > 2000 ? mb_substr( $safe, 0, 2000 ) . '…[truncated]' : $safe;
+                continue;
+            }
+            if ( is_int( $v ) || is_float( $v ) ) {
+                // ورودیِ عددیِ ۱۰ رقمی هم نباید از اسکنِ رشته‌ای عبور کند.
+                $safe        = NationalIdValidator::redact_digits( (string) $v );
+                $out[ $safe_key ] = $safe === (string) $v ? $v : $safe;
+                continue;
+            }
+            $out[ $safe_key ] = $v;
         }
 
         return $out;
