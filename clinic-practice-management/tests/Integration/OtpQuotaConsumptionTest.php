@@ -238,9 +238,11 @@ final class OtpQuotaConsumptionTest extends WP_UnitTestCase
      * asserts on the real cpms_rate_limits table:
      *  - the DERIVED day and hour keys each reached exactly 4 hits, i.e. all
      *    four spellings shared one bucket in the production path;
-     *  - no row of cpms_rate_limits contains the raw digits. This is not a count
-     *    of every bucket row in the table: `rateRowsContaining()` only scans for
-     *    raw digits, and the guard row is checked for existence, not counted.
+     *  - neither tested spelling of this fixture's digits occurs in any scanned
+     *    row: `rateRowsContaining()` scans EVERY row of cpms_rate_limits, but
+     *    only for the two needles passed below (the 11-digit local form and its
+     *    10-digit tail). It is not a general "no raw data anywhere" check, and
+     *    the guard row is checked for existence, not counted.
      * The ip bucket is deliberately excluded: it is IP-keyed and out of scope.
      */
     public function testFourRealRequestsInFourSpellingsChargeOneDerivedBucket(): void
@@ -267,9 +269,10 @@ final class OtpQuotaConsumptionTest extends WP_UnitTestCase
         }
 
         // The production path charged the DERIVED keys of this number (day and
-        // hour at 4 each, plus a guard row), and no row of cpms_rate_limits
-        // contains the raw digits. This is not a count of every bucket row in
-        // the table: `rateRowsContaining()` only scans for raw digits.
+        // hour at 4 each, plus a guard row), and neither tested spelling of this
+        // fixture's digits occurs in any scanned row. `rateRowsContaining()`
+        // scans every row of cpms_rate_limits, but only for the two needles
+        // asserted below — not a general "no raw data anywhere" check.
         $dayKey = $this->bucketKey('otp-day', $local);
         $hourKey = $this->bucketKey('otp-hour', $local);
         $guardKey = $this->bucketKey('otp-send-guard', $local);
