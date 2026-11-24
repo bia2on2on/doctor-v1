@@ -359,8 +359,10 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
             return $statement;
         };
 
-        $show_before     = $db->wpdb()->show_errors();
-        $suppress_before = $db->wpdb()->suppress_errors();
+        // wpdb::show_errors()/suppress_errors() are SETTERS whose default argument is `true`,
+        // so calling them bare would mutate the very setting meant to be snapshotted.
+        $show_before     = $db->wpdb()->show_errors;
+        $suppress_before = $db->wpdb()->suppress_errors;
         $message         = '';
         $code            = '';
         $ini             = (string) ini_get('error_log');
@@ -401,8 +403,8 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         foreach (['cpms_clinics', 'cpms_organizations', 'cpms_patients', 'cpms_patient_logins'] as $short) {
             self::assertSame(0, (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$db->table($short)]), $short . ' holds no rows');
         }
-        self::assertSame($show_before, $db->wpdb()->show_errors(), 'the previous show_errors setting is restored');
-        self::assertSame($suppress_before, $db->wpdb()->suppress_errors(), 'the previous suppress_errors setting is restored');
+        self::assertSame($show_before, $db->wpdb()->show_errors, 'the previous show_errors setting is restored');
+        self::assertSame($suppress_before, $db->wpdb()->suppress_errors, 'the previous suppress_errors setting is restored');
     }
 
     /** RB-39: a plan built from one dump refuses a different, stable dump with zero writes. */
@@ -510,8 +512,13 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         $ledger  = $db->table('schema_migrations');
         $version = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
 
+        // The dumper writes a marker for every cpms table, so a real table is always declared:
+        // the only honest "never declares" target is a name the dump cannot contain.
+        $undeclared = $db->table('cpms_never_declared');
+        self::assertNotContains($undeclared, (new RestoreDumpReader($this->dump_file))->tables(), 'the dump must not declare this table');
+
         $dump = (string) file_get_contents($this->dump_file);
-        $tail = "\nINSERT INTO `" . $db->table('cpms_services') . "` (`id`) VALUES ('1');\n";
+        $tail = "\nINSERT INTO `" . $undeclared . "` (`id`) VALUES ('1');\n";
         self::assertTrue(file_put_contents($this->dump_file, $dump . $tail) > 0);
 
         $writes = [];
@@ -572,10 +579,16 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         $plan    = $loader->preflight(new RestoreDumpReader($this->dump_file), $version);
 
         $rollbacks = 0;
-        $filter    = static function (string $statement) use (&$rollbacks): string {
-            if ('/*cpms*/ ROLLBACK' === $statement) {
+        $filter    = static function (string $statement) use (&$rollbacks, $logins): string {
+            // The load must actually fail for the rollback path to be reached at all.
+            if (str_starts_with($statement, 'UPDATE `' . $logins . '` SET state = \'closed\'')) {
+                return 'UPDATE `' . $logins . '` SET cpms_no_such_column = 1';
+            }
+            // The integration bootstrap (priority 20) has already rewritten the marked
+            // transaction into a savepoint: an undo reaches us as ROLLBACK TO SAVEPOINT.
+            if (preg_match('/\AROLLBACK TO SAVEPOINT /', $statement) === 1) {
                 ++$rollbacks;
-                return '/*cpms*/ ROLLBACK TO SAVEPOINT cpms_no_such_savepoint';
+                return 'ROLLBACK TO SAVEPOINT cpms_no_such_savepoint';
             }
             return $statement;
         };

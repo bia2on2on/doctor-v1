@@ -127,7 +127,9 @@ final class RestoreDumpReader {
         }
         $this->assert_same_file();
         $handle = @fopen( $this->path, 'rb' );
-        if ( false === $handle ) {
+        // Fail closed: a stream PHP reports as ended at offset 0 cannot be read, so it is
+        // refused here instead of being mistaken for an empty dump further down.
+        if ( false === $handle || feof( $handle ) ) {
             throw BackupException::of( 'RESTORE_DUMP_UNREADABLE', 'The restore dump is not readable.' );
         }
 
