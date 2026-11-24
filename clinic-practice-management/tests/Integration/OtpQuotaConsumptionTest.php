@@ -229,6 +229,94 @@ final class OtpQuotaConsumptionTest extends WP_UnitTestCase
     }
 
     /**
+     * (h2) Mission 3, reviewer finding: (h) charges the DERIVED key through the
+     * helper, so it proves the derivation agrees with itself, not that the real
+     * request path lands on it. This drives FOUR real OTP requests through
+     * OtpService::request() — one per accepted spelling of the same number —
+     * with the cooldown switched off the way OtpFlowTest.php:418 does, and then
+     * asserts on the real cpms_rate_limits table:
+     *  - exactly ONE day/hour counter pair was charged (4 hits each), i.e. all
+     *    four spellings shared one bucket in production;
+     *  - the stored mobile-bearing keys are exactly the derived ones — no raw
+     *    digits in any rate-limit key.
+     * The ip bucket is deliberately excluded: it is IP-keyed and out of scope.
+     */
+    public function testFourRealRequestsInFourSpellingsChargeOneDerivedBucket(): void
+    {
+        $local = '09125556677';
+        $forms = ['09125556677', '9125556677', '+989125556677', '0098912556677'];
+
+        // Four issuances need headroom above the default daily cap of 3, or the
+        // 4th request would be refused instead of counted. The caps are pinned
+        // here so the test states its own budget; the assertion is about which
+        // KEY is charged, not about the cap.
+        App::settings()->set('otp.cooldown_sec', 0);
+        App::settings()->set('otp.daily_max', 10);
+        App::settings()->set('otp.hourly_max', 10);
+        Settings::flushCache();
+        $this->assertSame(10, (int) App::settings()->get('otp.daily_max'), 'precondition: the daily cap leaves room for four real requests');
+        $this->assertSame(10, (int) App::settings()->get('otp.hourly_max'), 'precondition: the hourly cap leaves room for four real requests');
+
+        foreach ($forms as $index => $form) {
+            $this->assertSame($local, MobileValidator::normalize($form), 'precondition: ' . $form . ' is an accepted spelling');
+            $this->issue($form);
+            $this->assertSame($index + 1, $this->dayHits($local), 'real request #' . ($index + 1) . ' charged the shared day bucket');
+            $this->assertSame($index + 1, $this->hourHits($local), 'real request #' . ($index + 1) . ' charged the shared hour bucket');
+        }
+
+        // Exactly one HMAC key set for this number: the two mobile-bearing
+        // buckets plus the send-guard row, all carrying the derived prefix.
+        $dayKey = $this->bucketKey('otp-day', $local);
+        $hourKey = $this->bucketKey('otp-hour', $local);
+        $guardKey = $this->bucketKey('otp-send-guard', $local);
+        $this->assertNotSame($dayKey, $hourKey);
+        $this->assertSame(4, $this->counter($dayKey, self::DAY), 'the production path charged exactly this day key');
+        $this->assertSame(4, $this->counter($hourKey, self::HOUR), 'the production path charged exactly this hour key');
+        $this->assertSame(0, $this->rateRowsContaining($local), 'no stored row may contain the raw number');
+        $this->assertSame(0, $this->rateRowsContaining(substr($local, 1)), 'nor its 10-digit form without the leading zero');
+        $this->assertGreaterThan(0, (int) App::db()->fetchValue(
+            'SELECT COUNT(*) FROM ' . App::db()->table('cpms_rate_limits') . ' WHERE window_key = %s',
+            [$guardKey]
+        ), 'witness: the per-mobile guard row is derived with the same carrier');
+    }
+
+    /**
+     * (i2) Mission 3, reviewer finding: (i) proves the helper ignores a raw key,
+     * but not that the PRODUCTION path ignores one. This pre-seeds a raw-key row
+     * for the current window, then issues a real request for the same number and
+     * asserts the request did not read that row's counter: the derived counter is
+     * charged from zero and the raw row is left exactly as seeded.
+     */
+    public function testARealRequestIgnoresAPreSeededRawKeyRow(): void
+    {
+        $mobile = '09128889900';
+        App::settings()->set('otp.cooldown_sec', 0);
+        Settings::flushCache();
+
+        // The legacy shape this PR retired, seeded at a value the daily cap (3)
+        // would refuse if the request still read it.
+        global $wpdb;
+        $table = $wpdb->prefix . 'cpms_rate_limits';
+        $rawKey = 'otp-day:' . $mobile;
+        $windowId = intdiv(time(), self::DAY);
+        $wpdb->query($wpdb->prepare(
+            "INSERT INTO {$table} (window_key, window_id, window_sec, hits) VALUES (%s, %d, %d, %d)", // phpcs:ignore WordPress.DB.PreparedSQL
+            $rawKey,
+            $windowId,
+            self::DAY,
+            99
+        ));
+        $this->assertSame(99, $this->counter($rawKey, self::DAY), 'precondition: the raw legacy row exists at 99');
+
+        // A real request must not inherit that counter: the quota starts fresh
+        // and the challenge is issued instead of being refused as a limit.
+        $this->issue($mobile);
+        $this->assertSame(1, $this->dayHits($mobile), 'the derived counter starts from zero, so the raw row was not read');
+        $this->assertSame(99, $this->counter($rawKey, self::DAY), 'the legacy raw row is untouched — nothing migrates and nothing reads it');
+        $this->assertGreaterThan(0, $this->latestChallengeId($mobile), 'the request was allowed despite the raw row sitting at 99');
+    }
+
+    /**
      * (i) Regression guard for the helpers above: they must read the keys the
      * SERVER writes, not a private copy of the derivation. A charge added only
      * with the key the helper itself derives is visible to dayHits() by construction, so the
