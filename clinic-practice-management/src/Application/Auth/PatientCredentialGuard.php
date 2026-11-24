@@ -251,16 +251,8 @@ final class PatientCredentialGuard {
         if ( 'UNKNOWN' === $state ) {
             return true;
         }
-        if ( $access->is_shared_patient_account( $user ) ) {
-            return false;
-        }
 
-        $login_state = $access->has_live_patient_login_account( (int) $user->ID );
-        if ( null === $login_state ) {
-            return true;
-        }
-
-        return $login_state;
+        return ! $access->is_shared_patient_account( $user );
     }
 
     private function is_xmlrpc_context(): bool {

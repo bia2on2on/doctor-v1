@@ -3079,6 +3079,12 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
                     );
                 }
 
+                $cookiesIssued = 0;
+                $cookieSpy     = static function () use ( &$cookiesIssued ): void {
+                    ++$cookiesIssued;
+                };
+                add_action( 'set_auth_cookie', $cookieSpy, 10 );
+                add_action( 'set_logged_in_cookie', $cookieSpy, 10 );
                 add_filter( 'send_auth_cookies', $suppress, 10, 1 );
                 try {
                     if ( 'legacy_role_patient' !== $label ) {
@@ -3086,9 +3092,19 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
                         $pass = 'R5T5ResetPass123!';
                     }
                     $signon = wp_signon( [ 'user_login' => $user->user_login, 'user_password' => $pass, 'remember' => false ], false );
-                    self::assertInstanceOf( WP_User::class, $signon, $label );
+                    if ( 'legacy_role_patient' === $label ) {
+                        // OWNER DECISION CLARIFICATION (PR22 Round 6): pure ROLE_PATIENT-only without login row is denied WP password sign-on.
+                        self::assertInstanceOf( WP_Error::class, $signon, $label );
+                        self::assertSame( PatientCredentialGuard::ERROR_CODE, $signon->get_error_code(), $label );
+                        self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $signon->get_error_message(), $label );
+                        self::assertSame( 0, $cookiesIssued, $label );
+                    } else {
+                        self::assertInstanceOf( WP_User::class, $signon, $label );
+                    }
                 } finally {
                     remove_filter( 'send_auth_cookies', $suppress, 10 );
+                    remove_action( 'set_logged_in_cookie', $cookieSpy, 10 );
+                    remove_action( 'set_auth_cookie', $cookieSpy, 10 );
                 }
 
                 PatientTwoProofTestHelper::acting_as( $uid );
@@ -3139,11 +3155,35 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         self::assertFalse( App::patient_access()->is_shared_patient_account( $legacyUser ) );
         self::assertFalse( App::patient_access()->is_shared_patient_account( $otpUser ) );
 
-        $preMail = static fn (): bool => true;
+        $preMail        = static fn (): bool => true;
+        $suppressCookie = static fn (): bool => false;
+        $prevRemoteAddr = $_SERVER['REMOTE_ADDR'] ?? null;
+        unset( $_SERVER['REMOTE_ADDR'] );
         add_filter( 'pre_wp_mail', $preMail, 1 );
         try {
             foreach ( [ 'otp_patient' => $otpUser, 'legacy_patient' => $legacyUser ] as $label => $u ) {
-                $origHash = (string) $u->user_pass;
+                $origHash      = (string) $u->user_pass;
+                $cookiesIssued = 0;
+                $cookieSpy     = static function () use ( &$cookiesIssued ): void {
+                    ++$cookiesIssued;
+                };
+                add_action( 'set_auth_cookie', $cookieSpy, 10 );
+                add_action( 'set_logged_in_cookie', $cookieSpy, 10 );
+                add_filter( 'send_auth_cookies', $suppressCookie, 10, 1 );
+                try {
+                    $authRes   = wp_authenticate( $u->user_login, $this->patientKnownPass );
+                    $signonRes = wp_signon( [ 'user_login' => $u->user_login, 'user_password' => $this->patientKnownPass, 'remember' => false ], false );
+                } finally {
+                    remove_filter( 'send_auth_cookies', $suppressCookie, 10 );
+                    remove_action( 'set_logged_in_cookie', $cookieSpy, 10 );
+                    remove_action( 'set_auth_cookie', $cookieSpy, 10 );
+                }
+                self::assertInstanceOf( WP_Error::class, $authRes, $label );
+                self::assertSame( PatientCredentialGuard::ERROR_CODE, $authRes->get_error_code(), $label );
+                self::assertInstanceOf( WP_Error::class, $signonRes, $label );
+                self::assertSame( PatientCredentialGuard::ERROR_CODE, $signonRes->get_error_code(), $label );
+                self::assertSame( 0, $cookiesIssued, $label );
+
                 self::assertFalse( apply_filters( 'allow_password_reset', true, (int) $u->ID ), $label );
                 $ret = retrieve_password( $u->user_login );
                 self::assertInstanceOf( WP_Error::class, $ret, $label );
@@ -3210,6 +3250,11 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
             self::assertSame( $unkHashBefore, (string) $unkAfter->user_pass );
         } finally {
             remove_filter( 'pre_wp_mail', $preMail, 1 );
+            if ( null === $prevRemoteAddr ) {
+                unset( $_SERVER['REMOTE_ADDR'] );
+            } else {
+                $_SERVER['REMOTE_ADDR'] = $prevRemoteAddr;
+            }
         }
     }
 
@@ -3414,6 +3459,196 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
                 unset( $_SERVER['REMOTE_ADDR'] );
             } else {
                 $_SERVER['REMOTE_ADDR'] = $prevRemoteAddr;
+            }
+        }
+    }
+
+    /**
+     * Round 6 T9: proves pure `ROLE_PATIENT`-only accounts across all login-row states —
+     * (i) no login row, (ii) live login row, (iii) closed login row (`STATE_CLOSED` via
+     * `PatientLoginRepository::close_account()`), and (iv) lookup failure `UNKNOWN` via
+     * exact-SQL `query` filter — are denied `wp_authenticate()` and `wp_signon()` with
+     * `cpms_patient_otp_required` / `PROOF_FAILED_MESSAGE` and zero cookies even when given
+     * a real known WP password whose stored `user_pass` hash remains unchanged and still
+     * verifies via `wp_check_password()`, plus XML-RPC remains blocked; while controls
+     * (`patient+subscriber`, `patient+customer`, plain `subscriber`, plain `customer`,
+     * `administrator`, `doctor`, and `patient+doctor`) all authenticate.
+     */
+    public function testRound6T9PureRolePatientOnlyAllLoginStatesAndUnknownDeniedWpPasswordAuthWhileControlsPass(): void {
+        global $wpdb;
+
+        if ( ! class_exists( wp_xmlrpc_server::class ) && defined( 'ABSPATH' ) && defined( 'WPINC' ) ) {
+            $ixrFile    = ABSPATH . WPINC . '/class-IXR.php';
+            $serverFile = ABSPATH . WPINC . '/class-wp-xmlrpc-server.php';
+            if ( file_exists( $ixrFile ) ) {
+                require_once $ixrFile;
+            }
+            if ( file_exists( $serverFile ) ) {
+                require_once $serverFile;
+            }
+        }
+        self::assertTrue( class_exists( wp_xmlrpc_server::class ) );
+
+        $createdCustomerRole = false;
+        if ( null === get_role( 'customer' ) ) {
+            add_role( 'customer', 'Customer', [ 'read' => true ] );
+            $createdCustomerRole = true;
+        }
+
+        $knownPass      = 'R6T9KnownPass123!';
+        $prevRemoteAddr = $_SERVER['REMOTE_ADDR'] ?? null;
+        unset( $_SERVER['REMOTE_ADDR'] );
+        $suppressCookie = static fn (): bool => false;
+
+        try {
+            $logins = new PatientLoginRepository( App::db() );
+
+            // (i) Pure ROLE_PATIENT with no cpms_patient_logins row.
+            $noRowId = $this->createUser( 'r6_t9_norow_' . uniqid(), $knownPass, RolesAndCapabilities::ROLE_PATIENT );
+
+            // (ii) Pure ROLE_PATIENT with live active cpms_patient_logins row.
+            $liveId  = $this->createUser( 'r6_t9_live_' . uniqid(), $knownPass, RolesAndCapabilities::ROLE_PATIENT );
+            $liveAid = $logins->insert_pending_account( $liveId, '09128880101', 'تی۹', 'فعال' );
+            $logins->activate_account_from_pending( $liveAid, $liveId );
+
+            // (iii) Pure ROLE_PATIENT with closed cpms_patient_logins row (real STATE_CLOSED).
+            $closedId  = $this->createUser( 'r6_t9_closed_' . uniqid(), $knownPass, RolesAndCapabilities::ROLE_PATIENT );
+            $closedAid = $logins->insert_pending_account( $closedId, '09128880102', 'تی۹', 'بسته' );
+            $logins->activate_account_from_pending( $closedAid, $closedId );
+            self::assertTrue( $logins->close_account( $closedId ) );
+            $closedRow = $logins->find_account_by_user_id( $closedId );
+            self::assertIsArray( $closedRow );
+            self::assertSame( PatientLoginRepository::STATE_CLOSED, (string) $closedRow['state'] );
+
+            // (iv) Pure ROLE_PATIENT with lookup failure UNKNOWN.
+            $unkId = $this->createUser( 'r6_t9_unk_' . uniqid(), $knownPass, RolesAndCapabilities::ROLE_PATIENT );
+
+            $deniedCases = [
+                'no_login_row'           => [ 'uid' => $noRowId, 'fault' => false ],
+                'live_login_row'         => [ 'uid' => $liveId, 'fault' => false ],
+                'closed_login_row'       => [ 'uid' => $closedId, 'fault' => false ],
+                'unknown_lookup_failure' => [ 'uid' => $unkId, 'fault' => true ],
+            ];
+
+            foreach ( $deniedCases as $label => $cfg ) {
+                $uid  = (int) $cfg['uid'];
+                $user = get_userdata( $uid );
+                self::assertInstanceOf( WP_User::class, $user, $label );
+                $origHash = (string) $user->user_pass;
+                self::assertTrue( wp_check_password( $knownPass, $origHash, $uid ), $label . ':pre_check' );
+
+                $orgTable     = App::db()->table( 'cpms_organization_memberships' );
+                $exactSql     = 'SELECT id FROM ' . $orgTable . " WHERE wp_user_id = {$uid} AND status = 'active' LIMIT 1";
+                $hits         = 0;
+                $fault        = static function ( mixed $query ) use ( $exactSql, $orgTable, &$hits ): mixed {
+                    if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                        ++$hits;
+                        return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+                    }
+                    return $query;
+                };
+                $prevSuppress = (bool) $wpdb->suppress_errors( true );
+
+                $cookiesIssued = 0;
+                $cookieSpy     = static function () use ( &$cookiesIssued ): void {
+                    ++$cookiesIssued;
+                };
+                add_action( 'set_auth_cookie', $cookieSpy, 10 );
+                add_action( 'set_logged_in_cookie', $cookieSpy, 10 );
+                add_filter( 'send_auth_cookies', $suppressCookie, 10, 1 );
+                if ( $cfg['fault'] ) {
+                    add_filter( 'query', $fault, 5 );
+                }
+                try {
+                    $authRes   = wp_authenticate( $user->user_login, $knownPass );
+                    $signonRes = wp_signon( [ 'user_login' => $user->user_login, 'user_password' => $knownPass, 'remember' => false ], false );
+                    $xmlRes    = ( new wp_xmlrpc_server() )->wp_getUsersBlogs( [ $user->user_login, $knownPass ] );
+                } finally {
+                    if ( $cfg['fault'] ) {
+                        remove_filter( 'query', $fault, 5 );
+                    }
+                    $wpdb->suppress_errors( $prevSuppress );
+                    remove_filter( 'send_auth_cookies', $suppressCookie, 10 );
+                    remove_action( 'set_logged_in_cookie', $cookieSpy, 10 );
+                    remove_action( 'set_auth_cookie', $cookieSpy, 10 );
+                }
+
+                if ( $cfg['fault'] ) {
+                    self::assertGreaterThanOrEqual( 2, $hits, $label );
+                }
+
+                self::assertInstanceOf( WP_Error::class, $authRes, $label );
+                self::assertSame( PatientCredentialGuard::ERROR_CODE, $authRes->get_error_code(), $label );
+                self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $authRes->get_error_message(), $label );
+
+                self::assertInstanceOf( WP_Error::class, $signonRes, $label );
+                self::assertSame( PatientCredentialGuard::ERROR_CODE, $signonRes->get_error_code(), $label );
+                self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $signonRes->get_error_message(), $label );
+                self::assertSame( 0, $cookiesIssued, $label );
+
+                self::assertInstanceOf( IXR_Error::class, $xmlRes, $label );
+                self::assertSame( 403, $xmlRes->code, $label );
+
+                $afterUser = get_userdata( $uid );
+                self::assertInstanceOf( WP_User::class, $afterUser, $label );
+                self::assertSame( $origHash, (string) $afterUser->user_pass, $label );
+                self::assertTrue( wp_check_password( $knownPass, (string) $afterUser->user_pass, $uid ), $label . ':post_check' );
+            }
+
+            // Positive controls in the same test.
+            $patSubId = $this->createUser( 'r6_t9_patsub_' . uniqid(), $knownPass, RolesAndCapabilities::ROLE_PATIENT );
+            $patSub   = get_userdata( $patSubId );
+            self::assertInstanceOf( WP_User::class, $patSub );
+            $patSub->add_role( 'subscriber' );
+            $patSubAid = $logins->insert_pending_account( $patSubId, '09128880103', 'تی۹', 'مشترک' );
+            $logins->activate_account_from_pending( $patSubAid, $patSubId );
+
+            $patCustId = $this->createUser( 'r6_t9_patcust_' . uniqid(), $knownPass, RolesAndCapabilities::ROLE_PATIENT );
+            $patCust   = get_userdata( $patCustId );
+            self::assertInstanceOf( WP_User::class, $patCust );
+            $patCust->add_role( 'customer' );
+
+            $plainSubId  = $this->createUser( 'r6_t9_sub_' . uniqid(), $knownPass, 'subscriber' );
+            $plainCustId = $this->createUser( 'r6_t9_cust_' . uniqid(), $knownPass, 'customer' );
+            $adminId     = $this->createUser( 'r6_t9_admin_' . uniqid(), $knownPass, 'administrator' );
+            $mixedId     = $this->createUser( 'r6_t9_mixed_' . uniqid(), $knownPass, RolesAndCapabilities::ROLE_PATIENT );
+            $mixedUser   = get_userdata( $mixedId );
+            self::assertInstanceOf( WP_User::class, $mixedUser );
+            $mixedUser->add_role( RolesAndCapabilities::ROLE_DOCTOR );
+
+            $controls = [
+                'patient_plus_subscriber' => [ 'uid' => $patSubId, 'pass' => $knownPass ],
+                'patient_plus_customer'   => [ 'uid' => $patCustId, 'pass' => $knownPass ],
+                'plain_subscriber'        => [ 'uid' => $plainSubId, 'pass' => $knownPass ],
+                'plain_customer'          => [ 'uid' => $plainCustId, 'pass' => $knownPass ],
+                'administrator'           => [ 'uid' => $adminId, 'pass' => $knownPass ],
+                'doctor'                  => [ 'uid' => $this->staffDoctorUser, 'pass' => $this->staffDoctorPass ],
+                'patient_plus_doctor'     => [ 'uid' => $mixedId, 'pass' => $knownPass ],
+            ];
+
+            add_filter( 'send_auth_cookies', $suppressCookie, 10, 1 );
+            try {
+                foreach ( $controls as $ctrlLabel => $cfg ) {
+                    $ctrlUser = get_userdata( (int) $cfg['uid'] );
+                    self::assertInstanceOf( WP_User::class, $ctrlUser, $ctrlLabel );
+                    $ctrlAuth   = wp_authenticate( $ctrlUser->user_login, (string) $cfg['pass'] );
+                    $ctrlSignon = wp_signon( [ 'user_login' => $ctrlUser->user_login, 'user_password' => (string) $cfg['pass'], 'remember' => false ], false );
+                    self::assertInstanceOf( WP_User::class, $ctrlAuth, $ctrlLabel . ':auth' );
+                    self::assertSame( (int) $cfg['uid'], $ctrlAuth->ID, $ctrlLabel . ':auth_id' );
+                    self::assertInstanceOf( WP_User::class, $ctrlSignon, $ctrlLabel . ':signon' );
+                    self::assertSame( (int) $cfg['uid'], $ctrlSignon->ID, $ctrlLabel . ':signon_id' );
+                }
+            } finally {
+                remove_filter( 'send_auth_cookies', $suppressCookie, 10 );
+            }
+        } finally {
+            if ( null === $prevRemoteAddr ) {
+                unset( $_SERVER['REMOTE_ADDR'] );
+            } else {
+                $_SERVER['REMOTE_ADDR'] = $prevRemoteAddr;
+            }
+            if ( $createdCustomerRole ) {
+                remove_role( 'customer' );
             }
         }
     }
