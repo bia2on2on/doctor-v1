@@ -6,7 +6,7 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Visits\VisitException;
-use ClinicCore\Tests\Support\ForkChildExit;
+use ClinicCore\Tests\Support\ExternalRaceWorker;
 use WP_UnitTestCase;
 
 /**
@@ -14,7 +14,7 @@ use WP_UnitTestCase;
  * دقیقاً یکی موفق، دیگری CLINIC_INVALID_TRANSITION.
  *
  * دو لایه اثبات (الگوی ConcurrencyTest F3):
- *  1. DB-level: دو پرداز موازی واقعی (pcntl_fork + اتصال mysqli مستقل) Conditional
+ *  1. DB-level: دو پرداز موازی واقعی (external proc_open workers + اتصال mysqli مستقل) Conditional
  *     UPDATE `status='in_consultation'` → فقط یکی affected_rows=1.
  *  2. Service-level: تکرار complete از خود VisitService → دومی
  *     CLINIC_INVALID_TRANSITION (ماشین + Row Lock).
@@ -101,22 +101,11 @@ final class VisitConcurrencyTest extends WP_UnitTestCase
      */
     public function testParallelCompleteExactlyOneSucceeds(): void
     {
-        $diag = ['test' => 'VisitConcurrency::testParallelCompleteExactlyOneSucceeds'];
-
         $visitId = $this->committedVisitInConsultation();
-
-        if (!function_exists('pcntl_fork')) {
-            $this->markTestSkipped('pcntl_fork not available (CI Linux has it)');
-        }
+        $diag = ['test' => 'VisitConcurrency::testParallelCompleteExactlyOneSucceeds'];
 
         $sql = 'UPDATE ' . App::db()->table('cpms_visits') .
             ' SET status = "consultation_completed", consultation_completed_at = ? WHERE id = ? AND status = "in_consultation"';
-
-        \ClinicCore\Tests\Support\ConnectionDiagnostics::emit($diag + [
-            'phase' => 'pre_fork',
-            'wpdb' => \ClinicCore\Tests\Support\ConnectionDiagnostics::wpdbState(App::db()->wpdb()),
-            'filters' => \ClinicCore\Tests\Support\ConnectionDiagnostics::queryFilters(),
-        ]);
 
         $successes = $this->forkWorkers(2, $sql, $visitId);
 
@@ -259,63 +248,34 @@ final class VisitConcurrencyTest extends WP_UnitTestCase
         return $visitId;
     }
 
-    // ================= Fork orchestration (الگوی ConcurrencyTest) =================
+    // ================= External race orchestration =================
 
     private function forkWorkers(int $count, string $sql, int $visitId): int
     {
-        $pids = [];
-        $outcome_files = [];
+        // External proc_open workers: no descriptor inherited from this
+        // harness process, so a graceful exit(0) in a worker cannot run
+        // mysqlnd on the shared session. Exit 0 = clean job done.
+        $script = dirname(__DIR__) . '/bin/fork-race-atomic-worker.php';
         $tag = bin2hex(random_bytes(8));
+        $outcomeFiles = [];
+        $workers = [];
         for ($i = 0; $i < $count; $i++) {
-            $outcome_files[$i] = sys_get_temp_dir() . '/cpms-visitconc-' . $tag . '-' . $i . '.out';
-            $pid = pcntl_fork();
-            if ($pid === -1) {
-                $this->fail('pcntl_fork failed');
-            }
-            if ($pid === 0) {
-                /*
-                 * Child: اتصال مستقل + یک Conditional UPDATE.
-                 * هر خطا → exit(1): اگر استثنا فرار کند PHPUnitِ کپی‌شده ادامه می‌دهد.
-                 */
-                $exitCode = 1;
-                $mysqli = null;
-                try {
-                    $mysqli = $this->freshMysqli();
-                    \ClinicCore\Tests\Support\ConnectionDiagnostics::emit([
-                        'test' => 'VisitConcurrency::testParallelCompleteExactlyOneSucceeds',
-                        'phase' => 'child_own_connection',
-                        'worker' => $i,
-                        'own_thread_id' => \ClinicCore\Tests\Support\ConnectionDiagnostics::threadId($mysqli),
-                        'inherited_wpdb_thread_id' => \ClinicCore\Tests\Support\ConnectionDiagnostics::threadId(App::db()->wpdb()->dbh ?? null),
-                        'inherited_wpdb_ready' => (bool) (App::db()->wpdb()->ready ?? false),
-                        'filters' => \ClinicCore\Tests\Support\ConnectionDiagnostics::queryFilters()['count'],
-                    ]);
-                    $stmt = $mysqli->prepare($sql);
-                    if ($stmt !== false) {
-                        $ts = gmdate('Y-m-d H:i:s') . '.000';
-                        if ($stmt->bind_param('si', $ts, $visitId)) {
-                            $stmt->execute();
-                            $exitCode = $stmt->affected_rows === 1 ? 0 : 1;
-                            $stmt->close();
-                        }
-                    }
-                } catch (\Throwable $e) {
-                    $exitCode = 1;
-                }
-                if ($mysqli instanceof \mysqli) {
-                    @$mysqli->close();
-                }
-                @file_put_contents($outcome_files[$i], (string) $exitCode);
-                ForkChildExit::terminate(0);
-            }
-            $pids[$i] = $pid;
+            $outcomeFiles[$i] = sys_get_temp_dir() . '/cpms-visitconc-' . $tag . '-' . $i . '.out';
+            @unlink($outcomeFiles[$i]);
+            $workers[$i] = ExternalRaceWorker::launch($script, [
+                'mode' => 'conditional_update',
+                'sql_b64' => base64_encode($sql),
+                'id' => $visitId,
+                'outcome' => $outcomeFiles[$i],
+            ]);
         }
 
         $successes = 0;
-        foreach ($pids as $i => $pid) {
-            pcntl_waitpid($pid, $status);
-            $raw = @file_get_contents($outcome_files[$i]);
-            @unlink($outcome_files[$i]);
+        foreach ($workers as $i => $worker) {
+            $code = $worker->waitForExit(20.0);
+            self::assertSame(0, $code, 'external race worker ' . $i . ' must exit with status 0 (task ' . $tag . ')');
+            $raw = @file_get_contents($outcomeFiles[$i]);
+            @unlink($outcomeFiles[$i]);
             if ($raw === '0') {
                 $successes++;
             }

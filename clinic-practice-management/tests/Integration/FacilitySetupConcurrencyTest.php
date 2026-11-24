@@ -5,28 +5,13 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Admin\FacilitySetupPage;
-use ClinicCore\Application\Authorization\AuthorizationService;
-use ClinicCore\Application\Booking\ScheduleService;
-use ClinicCore\Application\Location\LocationService;
-use ClinicCore\Application\Membership\MembershipService;
-use ClinicCore\Application\Onboarding\FacilitySetupException;
 use ClinicCore\Application\Onboarding\FacilitySetupService;
 use ClinicCore\Application\Onboarding\OrganizationClinicProvisioningService;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
-use ClinicCore\Infrastructure\Audit\AuditLogger;
-use ClinicCore\Infrastructure\Db\CpmsDb;
-use ClinicCore\Infrastructure\Logging\OpLogger;
-use ClinicCore\Infrastructure\Queue\JobQueue;
-use ClinicCore\Infrastructure\Repository\ClinicianRepository;
-use ClinicCore\Infrastructure\Repository\CustomRoleRepository;
-use ClinicCore\Infrastructure\Repository\LocationRepository;
-use ClinicCore\Infrastructure\Repository\MembershipRepository;
-use ClinicCore\Infrastructure\Repository\ScheduleRepository;
 use ClinicCore\Settings\Settings;
-use ClinicCore\Settings\SettingsFactory;
-use ClinicCore\Tests\Support\ForkChildExit;
+use ClinicCore\Tests\Support\ExternalRaceWorker;
 use WP_UnitTestCase;
 
 require_once __DIR__ . '/RealTableMigrations.php';
@@ -36,8 +21,8 @@ require_once __DIR__ . '/RealTableMigrations.php';
  *
  * A coordinator (this process, its own MySQL connection) acts as manager A: it
  * opens a transaction, takes the Organization row lock and is in the middle of
- * its own step. Manager B is an independent forked worker with a NEW MySQL
- * connection running the real product step (add_clinic / add_room /
+ * its own step. Manager B is an independent external worker (proc_open) with a
+ * NEW MySQL connection running the real product step (add_clinic / add_room /
  * assign_clinician). The test proves — from InnoDB's own lock tables, not by
  * timing — that B is in LOCK WAIT on the Organization PRIMARY record held by the
  * coordinator's connection, lets A finish and commit, and then asserts the
@@ -48,8 +33,8 @@ require_once __DIR__ . '/RealTableMigrations.php';
  * Fixtures are COMMITTED (independent connections only see committed rows);
  * cleanup is manual in tearDown. The coordinator uses a raw START TRANSACTION
  * (the integration bootstrap turns CpmsDb transactions into savepoints of the
- * test transaction), and a worker ends with SIGKILL so PHP's shutdown never sends
- * COM_QUIT over the MySQL socket it inherited from this process.
+ * test transaction), and the external worker inherits no descriptor of this
+ * process, so its graceful exit(0) is honest.
  */
 final class FacilitySetupConcurrencyTest extends WP_UnitTestCase
 {
@@ -70,7 +55,7 @@ final class FacilitySetupConcurrencyTest extends WP_UnitTestCase
     protected function setUp(): void
     {
         parent::setUp();
-        self::assertTrue(function_exists('pcntl_fork'), 'precondition: CI must provide pcntl for real independent workers');
+        self::assertTrue(function_exists('proc_open'), 'precondition: CI must provide proc_open for real independent workers');
         $this->withRealTables(static fn (): array => App::migrations()->migrate());
         Settings::flushCache();
         App::resetScope();
@@ -208,8 +193,8 @@ final class FacilitySetupConcurrencyTest extends WP_UnitTestCase
 
     /**
      * Manager A (this connection) holds the Organization row lock inside its own
-     * transaction; manager B (forked worker, new connection) runs the real step and
-     * must be observed in InnoDB LOCK WAIT on that record before A proceeds.
+     * transaction; manager B (external worker, new connection) runs the real step
+     * and must be observed in InnoDB LOCK WAIT on that record before A proceeds.
      *
      * @param array<string, string> $task
      * @return array{outcome: array<string, mixed>, lock_wait: array<string, mixed>|null, still_waiting: bool, coordinator: int, parent: array<string, mixed>, error: string}
@@ -222,7 +207,8 @@ final class FacilitySetupConcurrencyTest extends WP_UnitTestCase
         $ready = $tag . '-ready.json';
         $go = $tag . '-go';
         $outcomeFile = $tag . '-outcome.json';
-        $pid = -1;
+        $script = dirname(__DIR__) . '/bin/fork-race-wp-worker.php';
+        $worker = null;
         $lockWait = null;
         $stillWaiting = false;
         $parent = [];
@@ -239,13 +225,22 @@ final class FacilitySetupConcurrencyTest extends WP_UnitTestCase
             if ($this->org !== (int) ($locked['id'] ?? 0)) {
                 throw new \RuntimeException('coordinator could not lock the Organization row');
             }
-            $pid = pcntl_fork();
-            if (-1 === $pid) {
-                throw new \RuntimeException('pcntl_fork failed');
-            }
-            if (0 === $pid) {
-                $this->childWorker($task, $ready, $go, $outcomeFile);
-            }
+            $worker = ExternalRaceWorker::launch($script, [
+                'mode' => 'facility_setup_step',
+                'actor' => $this->actor,
+                'organization_id' => $this->org,
+                'task_kind' => (string) $task['task'],
+                'request_key' => (string) ($task['request_key'] ?? ''),
+                'name' => (string) ($task['name'] ?? ''),
+                'site_key' => (string) ($task['site_key'] ?? ''),
+                'clinic_key' => (string) ($task['clinic_key'] ?? ''),
+                'room_key' => (string) ($task['room_key'] ?? 'primary'),
+                'user' => (int) ($task['user'] ?? 0),
+                'timezone' => self::TZ,
+                'ready_file' => $ready,
+                'go_file' => $go,
+                'outcome_file' => $outcomeFile,
+            ]);
             $workerConnection = $this->waitForReady($ready);
             if ($workerConnection <= 0 || $workerConnection === $coordinator) {
                 throw new \RuntimeException('worker connection not ready or not independent');
@@ -268,11 +263,20 @@ final class FacilitySetupConcurrencyTest extends WP_UnitTestCase
             }
         }
         $outcome = ['result' => 'fatal', 'detail' => 'worker not started'];
-        if ($pid > 0) {
-            pcntl_waitpid($pid, $status);
+        if ($worker instanceof ExternalRaceWorker) {
+            // Exit 0 is the only accepted termination; a crashed worker is a
+            // harness failure, never a race outcome. The unconditional
+            // terminate() runs only after the bounded wait reaps the worker.
+            $rc = $worker->waitForExit(15.0);
+            $worker->terminate();
             $raw = @file_get_contents($outcomeFile);
             $decoded = false === $raw ? null : json_decode($raw, true);
             $outcome = is_array($decoded) ? $decoded : ['result' => 'fatal', 'detail' => 'worker outcome missing'];
+            if (0 !== $rc && 'fatal' !== ($outcome['result'] ?? null)) {
+                $outcome = ['result' => 'fatal', 'detail' => 'worker exited with status ' . $rc];
+            } elseif (0 !== $rc) {
+                $outcome['detail'] = (string) ($outcome['detail'] ?? '') . ' (worker exited with status ' . $rc . ')';
+            }
         }
         self::assertSame('', $error, 'coordinator step completed');
 
@@ -296,79 +300,6 @@ final class FacilitySetupConcurrencyTest extends WP_UnitTestCase
         self::assertSame('PRIMARY', strtoupper((string) ($wait['lock_index'] ?? '')), $label . ': Organization primary-key record');
         self::assertSame('RECORD', strtoupper((string) ($wait['lock_type'] ?? '')), $label . ': a row-record lock');
         self::assertTrue($race['still_waiting'], $label . ': the worker was still waiting after manager A finished its own step (overlap, not a sequential run)');
-    }
-
-    /**
-     * Forked worker: new connection, real FacilitySetupService on it. Never returns.
-     *
-     * @param array<string, string> $task
-     */
-    private function childWorker(array $task, string $readyFile, string $goFile, string $outcomeFile): void
-    {
-        try {
-            global $wpdb;
-            $workerDb = new \wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
-            $workerDb->set_prefix($wpdb->prefix);
-            $wpdb = $workerDb;
-            remove_all_filters('query');
-            $workerDb->has_connected = false;
-            $workerDb->init_charset();
-            $workerDb->check_connection();
-            $workerDb->query('SET SESSION innodb_lock_wait_timeout = 30'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-            wp_cache_flush();
-            wp_set_current_user($this->actor);
-            $connection = (int) $workerDb->get_var('SELECT CONNECTION_ID()'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-            $service = $this->serviceOn(new CpmsDb($workerDb));
-            file_put_contents($readyFile, wp_json_encode(['connection_id' => $connection]));
-            $deadline = microtime(true) + 20.0;
-            while (!is_file($goFile) && microtime(true) < $deadline) {
-                usleep(1000);
-            }
-            if (!is_file($goFile)) {
-                throw new \RuntimeException('worker barrier timed out');
-            }
-            $result = match ($task['task']) {
-                'clinic' => (int) $service->add_clinic($this->actor, $this->org, $task['request_key'], $task['name'], $task['site_key'], self::TZ)['clinic_id'],
-                'room' => (int) $service->add_room($this->actor, $this->org, $task['clinic_key'], $task['request_key'], $task['name'], $task['site_key'])['location_id'],
-                'clinician' => (int) $service->assign_clinician($this->actor, $this->org, $task['clinic_key'], (int) $task['user'], $task['name'], [$task['room_key']])['clinician_id'],
-                default => throw new \InvalidArgumentException('unknown task'),
-            };
-            file_put_contents($outcomeFile, wp_json_encode(['result' => 'ok', 'id' => $result]));
-        } catch (FacilitySetupException $e) {
-            file_put_contents($outcomeFile, wp_json_encode(['result' => 'refused', 'reason' => $e->reason()]));
-        } catch (\Throwable $e) {
-            file_put_contents($outcomeFile, wp_json_encode(['result' => 'error', 'class' => get_class($e), 'detail' => $e->getMessage()]));
-        }
-        // Never run PHP shutdown in the fork: destructors would send COM_QUIT over
-        // the MySQL socket inherited from the parent and end the parent's session.
-        if (function_exists('posix_kill')) {
-            posix_kill(getmypid(), SIGKILL);
-        }
-        ForkChildExit::terminate(0);
-    }
-
-    /** The production service graph, bound to one explicit connection. */
-    private function serviceOn(CpmsDb $db): FacilitySetupService
-    {
-        $op = new OpLogger($db);
-        $audit = new AuditLogger($db, $op);
-        $memberships = new MembershipRepository($db);
-        $locations = new LocationRepository($db);
-        $authz = new AuthorizationService($memberships, new CustomRoleRepository($db));
-
-        return new FacilitySetupService(
-            $db,
-            new OrganizationClinicProvisioningService($db, $audit),
-            new LocationService($db, $locations, $authz, $audit),
-            $locations,
-            $authz,
-            new MembershipService($db, $memberships),
-            $memberships,
-            new ClinicianRepository($db),
-            new ScheduleService($db, new ScheduleRepository($db), $memberships, $locations, new JobQueue($db, $op), $audit, $op),
-            new SettingsFactory($db, $audit),
-            $audit
-        );
     }
 
     private function waitForReady(string $readyFile): int

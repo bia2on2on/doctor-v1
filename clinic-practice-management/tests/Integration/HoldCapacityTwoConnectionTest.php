@@ -32,13 +32,16 @@
  *    semantics: SAVEPOINT on an idle connection is accepted; real DDL
  *    implicitly commits and destroys prior savepoints (which is why
  *    migrations run before any savepoint exists).
- *  - Deterministic overlap, no sleep-race (pcntl backend): a pcntl_fork()ed
- *    worker signals readiness through a file barrier; the test then proves
- *    from InnoDB's own lock tables (performance_schema on MySQL,
- *    information_schema innodb_lock_waits on MariaDB) that the worker is in
- *    LOCK WAIT behind the coordinator's connection on the expected table
- *    before releasing it. No sleep picks the winner.
- *  - Same-file fallback (no pcntl backend): runtimes without pcntl_fork()
+ *  - Deterministic overlap, no sleep-race (external-worker backend): a
+ *    proc_open() external worker (tests/bin/fork-race-wp-worker.php) signals
+ *    readiness through a file barrier; the test then proves from InnoDB's
+ *    own lock tables (performance_schema on MySQL, information_schema
+ *    innodb_lock_waits on MariaDB) that the worker is in LOCK WAIT behind
+ *    the coordinator's connection on the expected table before releasing it.
+ *    No sleep picks the winner. The worker inherits no descriptor of this
+ *    process (tests/Support/ExternalRaceWorker.php), so its graceful exit(0)
+ *    is honest — never a shared-session mysqlnd teardown.
+ *  - Same-file fallback (no proc_open backend): runtimes without proc_open()
  *    (e.g. php-wasm) execute a deterministic fallback instead: an
  *    independent connection is parked FOR UPDATE on the target row by a
  *    coordinator, an independent production worker with
@@ -47,7 +50,7 @@
  *    rolls back, a fresh production worker succeeds, and a third is rejected
  *    with CLINIC_SLOT_TAKEN. It cannot observe the lock-wait edge itself and
  *    cannot construct a true simultaneous-entry race; those properties
- *    belong to the pcntl backend. Final-state assertions are identical.
+ *    belong to the external-worker backend. Final-state assertions are identical.
  *  - Failure injection without fabricated errors: a test-only wpdb subclass
  *    rewrites the target table to a missing one, so the REAL driver reports
  *    a real failure; counters assert exactly-once fault delivery. There are
@@ -58,21 +61,22 @@
  *    HoldsExpireHandler) with genuinely overlapping connections.
  *  - It does NOT prove deadlock-freedom, fairness, crash recovery, or
  *    anything about deployments outside a single test process.
- *  - The forked workers cannot read the parent's uncommitted WP session
+ *  - The external workers cannot read the parent's uncommitted WP session
  *    rows. Each worker builds its stack with a PatientSessionScope seeded
- *    from the session arrays captured in the parent before forking (the
+ *    from the session arrays captured in the parent before launch (the
  *    class's documented session_reader/clinics_reader seams; the empty
  *    live-link snapshot is consistent with the disposable schema having no
  *    global link rows), a pure always-allow ActiveLicenseGate (the global
  *    SignedLicenseGate singleton is bound to the parent connection and must
- *    not be touched from a fork), and its own SmsService/JobQueue bound to
+ *    not be touched from a worker), and its own SmsService/JobQueue bound to
  *    the disposable connection. In-process assertions use the production
- *    wiring (App::licenseGate()) instead.
+ *    wiring (App::licenseGate()) instead. The external worker rebuilds this
+ *    exact stack on its own connection (tests/Support/DisposableSchemaChildStack).
  *  - Execution status is tracked in the commit/PR that lands this file.
- *    The no-pcntl fallback backend was executed on MariaDB 11.4.13 (see the
- *    run logs of the PR #330 continuation); the pcntl backend itself only
- *    runs where pcntl_fork() exists (CI). Do not claim the pcntl backend
- *    passed anywhere it did not run.
+ *    The no-worker fallback backend was executed on MariaDB 11.4.13 (see the
+ *    run logs of the PR #330 continuation); the external-worker backend itself
+ *    runs where proc_open() exists (CI). Do not claim the external-worker
+ *    backend passed anywhere it did not run.
  *
  * PR #330 — two-connection capacity proof (red-first). All fixtures are
  * disposable; nothing here may run on a shared database.
@@ -84,7 +88,7 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Application\Jobs\HoldsExpireHandler;
 use ClinicCore\Domain\Booking\BookingException;
-use ClinicCore\Tests\Support\ForkChildExit;
+use ClinicCore\Tests\Support\ExternalRaceWorker;
 use WP_UnitTestCase;
 
 require_once __DIR__ . '/IsolatedSchema.php';
@@ -100,14 +104,14 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
     private const GO_DEADLINE_SEC = 20.0;
     private const CHILD_EXIT_TIMEOUT_SEC = 10.0;
 
-    /** @var array<int, int> PIDs that survived bounded SIGKILL escalation; tearDown fails loudly when non-empty. */
+    /** @var array<int, int> PIDs (workers or children) that survived bounded termination; tearDown fails loudly when non-empty. */
     private array $reapFailures = [];
 
     protected function setUp(): void
     {
         parent::setUp();
-        // pcntl_fork() decides the backend at test level (pcntl backend when
-        // available, deterministic connection fallback otherwise).
+        // proc_open() decides the backend at test level (external-worker backend
+        // when available, deterministic connection fallback otherwise).
 
         $this->createDisposableSchema('t2c');
         $this->migrateDisposableSchema();
@@ -120,14 +124,13 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
     protected function tearDown(): void
     {
         try {
-            // FAIL CLOSED: any fork that cannot be confirmed dead — via
-            // reapFailures (Known/SIGKILL-unconfirmed) or via the fork
-            // registry (exception/fatal path) — blocks the drop; the schema
-            // is retained loudly and the shutdown backstop honors it.
-            $pending = array_unique(array_merge($this->reapFailures, self::pendingChildPids()));
+            // FAIL CLOSED: any worker that cannot be confirmed stopped —
+            // reapFailures — blocks the drop; the schema is retained loudly
+            // and the shutdown backstop honors it.
+            $pending = array_unique($this->reapFailures);
             sort($pending);
             if ($pending !== []) {
-                $this->blockDisposableSchemaDrop('forked children unconfirmed reaped; pids=' . implode(',', $pending));
+                $this->blockDisposableSchemaDrop('race workers unconfirmed stopped; pids=' . implode(',', $pending));
             }
             $this->dropDisposableSchema();
         } finally {
@@ -142,12 +145,12 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
         $date   = gmdate('Y-m-d', time() + 3 * 86400);
         $slotId = $this->insertSlot(1, 0, $date);
 
-        if ( ! $this->pcntlAvailable() ) {
-            $this->markRace('scenario=1', 'backend=fallback pcntl=absent forked proof NOT executed');
+        if ( ! $this->workerAvailability() ) {
+            $this->markRace('scenario=1', 'backend=fallback workers=absent external-worker proof NOT executed');
             $this->runScenarioOneConnectionFallback( $slotId, $date );
             return;
         }
-        $this->markRace('scenario=1', 'backend=pcntl pcntl=present');
+        $this->markRace('scenario=1', 'backend=external-workers workers=present');
 
         $tag       = sys_get_temp_dir() . '/' . $this->fileTag . '-race1';
         $readyA    = $tag . '-ready-a';
@@ -158,14 +161,16 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
         $readyB    = $tag . '-ready-b';
         $outcomeB  = $tag . '-outcome-b.json';
         $raceFiles = [ $readyA, $goA, $holdDoneA, $commitA, $outcomeA, $readyB, $outcomeB ];
-        $pids      = [];
+        /** @var list<ExternalRaceWorker> $workers */
+        $workers   = [];
+        $script    = dirname(__DIR__) . '/bin/fork-race-wp-worker.php';
 
         // The whole forked race lives inside try/finally so coordination files
         // and child PIDs are ALWAYS reaped — on assertion failure exactly as on
         // success. The catch preserves the workers' non-sensitive outcome JSON
         // (result/error code only) on STDERR; nothing is retried or ignored.
         try {
-        // Competitor A (fork): takes the canonical tenant-prefix locks
+        // Competitor A (external worker): takes the canonical tenant-prefix locks
         // (Organization -> Clinic) AND the Slot row lock, in the same order
         // production's lock_booking_tenant_prefix() uses, waits for GO, runs
         // the production hold(), signals completion, waits for COMMIT, then
@@ -184,44 +189,49 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
         // same order removes the inversion; the assertion strength is unchanged
         // (B must still be observed blocked behind A before GO, still blocked
         // after hold(), and must still lose with CLINIC_SLOT_TAKEN).
-        // Fail-closed pre-registration guard: intent begins BEFORE the fork
-        // and resolves only after the child is registered (or confirmed not
-        // forked). A fatal/exit in between keeps the intent nonzero, so the
-        // tearDown drop and the shutdown backstop both refuse.
-        self::noteForkIntentBegin();
-        $pidA = pcntl_fork();
-        if (0 === $pidA) {
-            // Forked child: never run the inherited shutdown cleanup (kills
-            // the schema under the parent/sibling). Disable at birth.
-            self::disableFatalCleanupForThisProcess();
-            $this->childCompetitorHold($readyA, $goA, $holdDoneA, $commitA, $outcomeA, $slotId, $date, $this->userAId, $this->capturedSessions[$this->userAId]);
-        }
-        if (is_int($pidA) && $pidA > 0) {
-            self::noteForkedChild($pidA);
-        }
-        self::noteForkIntentResolved();
-        $pids[] = is_int($pidA) ? $pidA : 0;
-        self::assertNotFalse($pidA);
-        self::assertGreaterThan(0, $pidA, 'competitor A fork');
+        // Fail-closed launch guard: the external worker holds NO descriptor of
+        // this process (see ExternalRaceWorker); if it dies before writing
+        // ready, the bounded wait below fails the test and the finally unlinks
+        // coordination files — the schema drop then proceeds normally.
+        $workerA = ExternalRaceWorker::launch($script, [
+            'mode' => 'hold_competitor',
+            'db_name' => $this->disposableDb,
+            'ready_file' => $readyA,
+            'go_file' => $goA,
+            'hold_done_file' => $holdDoneA,
+            'commit_file' => $commitA,
+            'outcome_file' => $outcomeA,
+            'slot_id' => $slotId,
+            'date' => $date,
+            'user_id' => $this->userAId,
+            'clinician_id' => $this->clinicianId,
+            'organization_id' => $this->organizationId,
+            'clinic_id' => $this->clinicId,
+            'token' => $this->capturedTokens[$this->userAId] ?? '',
+            'session' => $this->capturedSessions[$this->userAId] ?? [],
+        ]);
+        $workers[] = $workerA;
+        self::assertTrue($workerA->pid() > 0, 'competitor A launch');
         self::assertTrue($this->waitForFile($readyA, self::READY_TIMEOUT_SEC), 'competitor A never signalled readiness');
         $coordinatorConnection = $this->readConnectionIdFromFile($readyA);
         self::assertGreaterThan(0, $coordinatorConnection);
 
-        // Competitor B (fork): runs the same production hold() on its own
+        // Competitor B (external worker): runs the same production hold() on its own
         // connection; it must block behind A.
-        self::noteForkIntentBegin();
-        $pidB = pcntl_fork();
-        if (0 === $pidB) {
-            self::disableFatalCleanupForThisProcess();
-            $this->childCompetingHoldLoser($readyB, $outcomeB, $slotId, $date, $this->userBId, $this->capturedSessions[$this->userBId]);
-        }
-        if (is_int($pidB) && $pidB > 0) {
-            self::noteForkedChild($pidB);
-        }
-        self::noteForkIntentResolved();
-        $pids[] = is_int($pidB) ? $pidB : 0;
-        self::assertNotFalse($pidB);
-        self::assertGreaterThan(0, $pidB, 'competitor B fork');
+        $workerB = ExternalRaceWorker::launch($script, [
+            'mode' => 'hold_loser',
+            'db_name' => $this->disposableDb,
+            'ready_file' => $readyB,
+            'outcome_file' => $outcomeB,
+            'slot_id' => $slotId,
+            'date' => $date,
+            'user_id' => $this->userBId,
+            'clinician_id' => $this->clinicianId,
+            'token' => $this->capturedTokens[$this->userBId] ?? '',
+            'session' => $this->capturedSessions[$this->userBId] ?? [],
+        ]);
+        $workers[] = $workerB;
+        self::assertTrue($workerB->pid() > 0, 'competitor B launch');
         self::assertTrue($this->waitForFile($readyB, self::READY_TIMEOUT_SEC), 'competitor B never signalled readiness');
         $workerConnection = $this->readConnectionIdFromFile($readyB);
         self::assertGreaterThan(0, $workerConnection);
@@ -252,13 +262,13 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
 
         // Release A; B unblocks, sees the capacity consumed, and must lose.
         file_put_contents($commitA, 'go');
-        // Bounded, status-checked wait: children are terminated and reaped
+        // Bounded, status-checked wait: workers are waited and reaped
         // before control can ever reach schema teardown, never indefinitely.
-        $reapedA = $this->waitForChildExit($pidA, self::CHILD_EXIT_TIMEOUT_SEC, 'scenario=1');
-        $reapedB = $this->waitForChildExit($pidB, self::CHILD_EXIT_TIMEOUT_SEC, 'scenario=1');
-        self::assertTrue($reapedA, 'competitor A child (pid ' . $pidA . ') did not terminate/reap within ' . self::CHILD_EXIT_TIMEOUT_SEC . 's of the COMMIT release');
-        self::assertTrue($reapedB, 'competitor B child (pid ' . $pidB . ') did not terminate/reap within ' . self::CHILD_EXIT_TIMEOUT_SEC . 's of the COMMIT release');
-        // $pids stays populated: the finally reap is idempotent (ECHILD => skip).
+        $reapedA = $workerA->waitForExit(self::CHILD_EXIT_TIMEOUT_SEC);
+        $reapedB = $workerB->waitForExit(self::CHILD_EXIT_TIMEOUT_SEC);
+        self::assertSame(0, $reapedA, 'competitor A worker (pid ' . $workerA->pid() . ') did not exit 0 within ' . self::CHILD_EXIT_TIMEOUT_SEC . 's of the COMMIT release');
+        self::assertSame(0, $reapedB, 'competitor B worker (pid ' . $workerB->pid() . ') did not exit 0 within ' . self::CHILD_EXIT_TIMEOUT_SEC . 's of the COMMIT release');
+        // Workers stay registered in $workers: the finally is idempotent (terminate() no-ops on exited workers).
 
         $outcomeBJson = json_decode((string) @file_get_contents($outcomeB), true);
         self::assertIsArray($outcomeBJson, 'B must write its outcome');
@@ -273,7 +283,7 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
             fwrite(STDERR, '[hold-race diagnostic] ' . $this->describeRaceFiles($raceFiles) . PHP_EOL);
             throw $e;
         } finally {
-            $this->reapRaceChildren($pids, $raceFiles, 'scenario=1');
+            $this->reapWorkers($workers, $raceFiles, 'scenario=1');
         }
     }
 
@@ -285,12 +295,12 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
         $slotId = $this->insertSlot(2, 1, $date);
         $holdId = $this->insertHold($slotId, $this->userAId, gmdate('Y-m-d H:i:s', time() - 3600) . '.000', 'active');
 
-        if ( ! $this->pcntlAvailable() ) {
-            $this->markRace('scenario=2', 'backend=fallback pcntl=absent forked proof NOT executed');
+        if ( ! $this->workerAvailability() ) {
+            $this->markRace('scenario=2', 'backend=fallback workers=absent external-worker proof NOT executed');
             $this->runScenarioTwoConnectionFallback( $slotId, $holdId );
             return;
         }
-        $this->markRace('scenario=2', 'backend=pcntl pcntl=present');
+        $this->markRace('scenario=2', 'backend=external-workers workers=present');
 
         $tag       = sys_get_temp_dir() . '/' . $this->fileTag . '-race2';
         $readyA    = $tag . '-ready-a';
@@ -298,49 +308,39 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
         $readyB    = $tag . '-ready-b';
         $outcomeB  = $tag . '-outcome-b.json';
         $raceFiles = [ $readyA, $goA, $readyB, $outcomeB ];
-        $pids      = [];
+        /** @var list<ExternalRaceWorker> $workers */
+        $workers   = [];
+        $script    = dirname(__DIR__) . '/bin/fork-race-wp-worker.php';
 
-        // Same guarantee as scenario 1: race files and child PIDs are always
-        // reaped; worker outcome JSON reaches STDERR on failure only.
+        // Same guarantee as scenario 1: race files and workers are always
+        // terminated/closed; worker outcome JSON reaches STDERR on failure only.
         try {
-        // Coordinator A (fork): holds the Hold row's record lock exactly where
-        // confirm() takes it (HOLD before SLOT), signals readiness, waits for GO.
-        // Fail-closed pre-registration guard: intent begins BEFORE the fork
-        // and resolves only after the child is registered (or confirmed not
-        // forked). A fatal/exit in between keeps the intent nonzero, so the
-        // tearDown drop and the shutdown backstop both refuse.
-        self::noteForkIntentBegin();
-        $pidA = pcntl_fork();
-        if (0 === $pidA) {
-            self::disableFatalCleanupForThisProcess();
-            $this->childHoldLockHolder($readyA, $goA, $holdId);
-        }
-        if (is_int($pidA) && $pidA > 0) {
-            self::noteForkedChild($pidA);
-        }
-        self::noteForkIntentResolved();
-        $pids[] = is_int($pidA) ? $pidA : 0;
-        self::assertNotFalse($pidA);
-        self::assertGreaterThan(0, $pidA);
+        // Coordinator A (external worker): holds the Hold row's record lock
+        // exactly where confirm() takes it (HOLD before SLOT), signals
+        // readiness, waits for GO.
+        $workerA = ExternalRaceWorker::launch($script, [
+            'mode' => 'hold_lock_holder',
+            'db_name' => $this->disposableDb,
+            'ready_file' => $readyA,
+            'go_file' => $goA,
+            'hold_id' => $holdId,
+        ]);
+        $workers[] = $workerA;
+        self::assertTrue($workerA->pid() > 0);
         self::assertTrue($this->waitForFile($readyA, self::READY_TIMEOUT_SEC), 'coordinator A never signalled readiness');
         $coordinatorConnection = $this->readConnectionIdFromFile($readyA);
         self::assertGreaterThan(0, $coordinatorConnection);
 
-        // Worker B (fork): the production HoldsExpireHandler on its own
-        // connection; it must block on the Hold row until A releases it.
-        self::noteForkIntentBegin();
-        $pidB = pcntl_fork();
-        if (0 === $pidB) {
-            self::disableFatalCleanupForThisProcess();
-            $this->childExpiryWorker($readyB, $outcomeB);
-        }
-        if (is_int($pidB) && $pidB > 0) {
-            self::noteForkedChild($pidB);
-        }
-        self::noteForkIntentResolved();
-        $pids[] = is_int($pidB) ? $pidB : 0;
-        self::assertNotFalse($pidB);
-        self::assertGreaterThan(0, $pidB);
+        // Worker B (external worker): the production HoldsExpireHandler on its
+        // own connection; it must block on the Hold row until A releases it.
+        $workerB = ExternalRaceWorker::launch($script, [
+            'mode' => 'hold_expiry_worker',
+            'db_name' => $this->disposableDb,
+            'ready_file' => $readyB,
+            'outcome_file' => $outcomeB,
+        ]);
+        $workers[] = $workerB;
+        self::assertTrue($workerB->pid() > 0);
         self::assertTrue($this->waitForFile($readyB, self::READY_TIMEOUT_SEC), 'expiry worker never signalled readiness');
         $workerConnection = $this->readConnectionIdFromFile($readyB);
 
@@ -351,13 +351,13 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
 
         // Release A's hold lock; B expires the hold and frees capacity for real.
         file_put_contents($goA, 'go');
-        // Bounded, status-checked wait: children are terminated and reaped
+        // Bounded, status-checked wait: workers are waited and reaped
         // before control can ever reach schema teardown, never indefinitely.
-        $reapedA = $this->waitForChildExit($pidA, self::CHILD_EXIT_TIMEOUT_SEC, 'scenario=2');
-        $reapedB = $this->waitForChildExit($pidB, self::CHILD_EXIT_TIMEOUT_SEC, 'scenario=2');
-        self::assertTrue($reapedA, 'competitor A child (pid ' . $pidA . ') did not terminate/reap within ' . self::CHILD_EXIT_TIMEOUT_SEC . 's of the hold-release signal');
-        self::assertTrue($reapedB, 'expiry worker child (pid ' . $pidB . ') did not terminate/reap within ' . self::CHILD_EXIT_TIMEOUT_SEC . 's of the hold-release signal');
-        // $pids stays populated: the finally reap is idempotent (ECHILD => skip).
+        $reapedA = $workerA->waitForExit(self::CHILD_EXIT_TIMEOUT_SEC);
+        $reapedB = $workerB->waitForExit(self::CHILD_EXIT_TIMEOUT_SEC);
+        self::assertSame(0, $reapedA, 'competitor A worker (pid ' . $workerA->pid() . ') did not exit 0 within ' . self::CHILD_EXIT_TIMEOUT_SEC . 's of the hold-release signal');
+        self::assertSame(0, $reapedB, 'expiry worker (pid ' . $workerB->pid() . ') did not exit 0 within ' . self::CHILD_EXIT_TIMEOUT_SEC . 's of the hold-release signal');
+        // Workers stay registered in $workers: the finally is idempotent (terminate() no-ops on exited workers).
         $outcomeBJson = json_decode((string) @file_get_contents($outcomeB), true);
         self::assertIsArray($outcomeBJson, 'worker B must write its outcome');
         self::assertSame('ok', $outcomeBJson['result'] ?? '');
@@ -392,22 +392,24 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
             fwrite(STDERR, '[hold-race diagnostic] ' . $this->describeRaceFiles($raceFiles) . PHP_EOL);
             throw $e;
         } finally {
-            $this->reapRaceChildren($pids, $raceFiles, 'scenario=2');
+            $this->reapWorkers($workers, $raceFiles, 'scenario=2');
         }
     }
 
     /**
-     * CI guard (GitHub Actions only): the integration job MUST provide
-     * ext-pcntl so the two-connection race scenarios execute their pcntl
-     * backend instead of silently falling back to the deterministic
-     * connection fallback — no green suite may carry an unproven race backend.
+     * CI guard (GitHub Actions only): the integration job MUST be able to
+     * launch the external race workers so the two-connection race scenarios
+     * execute their external-worker backend instead of silently falling back
+     * to the deterministic connection fallback — no green suite may carry an
+     * unproven race backend.
      *
      * Soundness argument: both scenarios select their backend purely on
-     * pcntl_available() (=== function_exists('pcntl_fork')). Therefore, on a
-     * green CI job that also passes this assertion, the fallback was
-     * unreachable and every scenario's intrinsic assertions (InnoDB LOCK WAIT
-     * edge, still-blocked invariant, bounded children reaping, outcome
-     * semantics) were satisfied on the pcntl path.
+     * workerAvailability() (=== function_exists('proc_open') && PHP_BINARY &&
+     * the worker script). Therefore, on a green CI job that also passes this
+     * assertion, the fallback was unreachable and every scenario's intrinsic
+     * assertions (InnoDB LOCK WAIT edge, still-blocked invariant, bounded
+     * worker waits, outcome semantics) were satisfied on the external-worker
+     * path.
      *
      * Limits: this proves capability + green outcome only — it does not record
      * marker lines, process timings, or InnoDB internals; it proves nothing
@@ -415,14 +417,15 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
      * degrades to skipping). It weakens nothing: the fallback remains fully
      * functional and authoritative off-CI.
      */
-    public function testPcntlForkIsAvailableOnCiRuns(): void
+    public function testExternalRaceWorkersAvailableOnCiRuns(): void
     {
         if ('true' !== (string) getenv('GITHUB_ACTIONS')) {
-            self::markTestSkipped('ext-pcntl is enforced only on CI (GITHUB_ACTIONS=true); local run, nothing asserted');
+            self::markTestSkipped('the external race worker backend is enforced only on CI (GITHUB_ACTIONS=true); local run, nothing asserted');
             return;
         }
-        self::assertTrue(function_exists('pcntl_fork'), 'CI integration job must provide ext-pcntl, else both race scenarios silently execute their fallback');
-        self::assertTrue(function_exists('pcntl_waitpid'), 'CI integration job must provide pcntl_waitpid for bounded, status-checked child reaping');
+        self::assertTrue(function_exists('proc_open'), 'CI integration job must provide proc_open, else both race scenarios silently execute their fallback');
+        self::assertTrue(defined('PHP_BINARY') && PHP_BINARY !== '', 'CI integration job must provide PHP_BINARY for the external race workers');
+        self::assertFileExists(dirname(__DIR__) . '/bin/fork-race-wp-worker.php', 'CI must see the external race worker script');
     }
 
     // ================= scenario 3a: injected conversion failure =================
@@ -514,15 +517,18 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
 
     }
 
-    // ================= no-pcntl backend + in-process fault helper =================
+    // ================= no-worker fallback backend + in-process fault helper =================
 
-    private function pcntlAvailable(): bool
+    private function workerAvailability(): bool
     {
-        return function_exists('pcntl_fork');
+        return function_exists('proc_open')
+            && defined('PHP_BINARY')
+            && PHP_BINARY !== ''
+            && is_file(dirname(__DIR__) . '/bin/fork-race-wp-worker.php');
     }
 
     /**
-     * Deterministic single-process fallback for scenario 1 (no pcntl_fork).
+     * Deterministic single-process fallback for scenario 1 (no proc_open backend).
      * It proves a weaker but honest property: an independent production
      * connection really WAITS for the Slot row's InnoDB lock held by the
      * coordinator (bounded by its own innodb_lock_wait_timeout=1) and is then
@@ -531,7 +537,7 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
      * succeeds and consumes the last unit; a third is rejected with
      * CLINIC_SLOT_TAKEN. It does NOT demonstrate two competitors entering
      * hold() simultaneously nor observe the lock-wait edge — those belong to
-     * the pcntl backend. Final-state assertions are identical to it.
+     * the external-worker backend. Final-state assertions are identical to it.
      */
     private function runScenarioOneConnectionFallback( int $slotId, string $date ): void
     {
@@ -609,7 +615,7 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
     }
 
     /**
-     * Deterministic single-process fallback for scenario 2 (no pcntl_fork).
+     * Deterministic single-process fallback for scenario 2 (no proc_open backend).
      * The coordinator holds the Hold row's X lock; the production
      * HoldsExpireHandler on an independent connection with
      * innodb_lock_wait_timeout=1 blocks on its first write, fails, and rolls
@@ -763,321 +769,6 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
         }
     }
 
-    // ================= forked workers =================
-
-    /**
-     * Coordinator competitor: pre-locks the tenant prefix (Organization ->
-     * Clinic) and the Slot row in the canonical production order
-     * (lock_booking_tenant_prefix: Organization -> Clinic -> Slot), so the
-     * forked competitor cannot form a two-transaction lock-order inversion.
-     */
-    private function childCompetitorHold(string $readyFile, string $goFile, string $holdDoneFile, string $commitFile, string $outcomeFile, int $slotId, string $date, int $userId, array $session): void
-    {
-        $conn = null;
-        try {
-            $conn = $this->newDisposableConnection();
-            $connectionId = (int) $conn->get_var('SELECT CONNECTION_ID()');
-            $conn->query('START TRANSACTION');
-            $orgLocked = (int) $conn->get_var($conn->prepare('SELECT id FROM ' . $conn->prefix . 'cpms_organizations WHERE id = %d FOR UPDATE', $this->organizationId));
-            if ($orgLocked !== $this->organizationId) {
-                throw new \RuntimeException('coordinator could not lock the Organization row');
-            }
-            $clinicLocked = (int) $conn->get_var($conn->prepare('SELECT id FROM ' . $conn->prefix . 'cpms_clinics WHERE id = %d FOR UPDATE', $this->clinicId));
-            if ($clinicLocked !== $this->clinicId) {
-                throw new \RuntimeException('coordinator could not lock the Clinic row');
-            }
-            $locked = $conn->get_var($conn->prepare('SELECT id FROM ' . $conn->prefix . 'cpms_schedule_slots WHERE id = %d FOR UPDATE', $slotId));
-            if ((int) $locked !== $slotId) {
-                throw new \RuntimeException('coordinator could not lock the Slot row');
-            }
-            file_put_contents($readyFile, (string) $connectionId);
-
-            $this->waitForGo($goFile);
-
-            $stack = $this->stackOn($conn, true, $userId, $session);
-            $stack['service']->hold($userId, $this->clinicianId, $date, '09:00:00', $slotId);
-            file_put_contents($holdDoneFile, 'done');
-
-            $this->waitForGo($commitFile);
-            $conn->query('COMMIT');
-            file_put_contents($outcomeFile, (string) json_encode(['result' => 'ok']));
-        } catch (\Throwable $e) {
-            try {
-                if (null !== $conn) {
-                    $conn->query('ROLLBACK');
-                }
-            } catch (\Throwable $ignored) {
-                // connection already gone
-            }
-            file_put_contents($outcomeFile, (string) json_encode(['result' => 'error', 'code' => $e instanceof BookingException ? $e->errorCode : get_class($e)]));
-        } finally {
-            $this->childExit();
-        }
-    }
-
-    /** Losing competitor: attempts the same production hold; expected to be rejected. */
-    private function childCompetingHoldLoser(string $readyFile, string $outcomeFile, int $slotId, string $date, int $userId, array $session): void
-    {
-        $conn = null;
-        try {
-            $conn = $this->newDisposableConnection();
-            file_put_contents($readyFile, (string) (int) $conn->get_var('SELECT CONNECTION_ID()'));
-
-            $stack = $this->stackOn($conn, true, $userId, $session);
-            $conn->query('START TRANSACTION');
-            try {
-                $stack['service']->hold($userId, $this->clinicianId, $date, '09:00:00', $slotId);
-                $conn->query('COMMIT');
-                file_put_contents($outcomeFile, (string) json_encode(['result' => 'ok']));
-            } catch (BookingException $e) {
-                $conn->query('ROLLBACK');
-                file_put_contents($outcomeFile, (string) json_encode(['result' => 'refused', 'code' => $e->errorCode]));
-            }
-        } catch (\Throwable $e) {
-            try {
-                if (null !== $conn) {
-                    $conn->query('ROLLBACK');
-                }
-            } catch (\Throwable $ignored) {
-                // connection already gone
-            }
-            file_put_contents($outcomeFile, (string) json_encode(['result' => 'error', 'code' => get_class($e)]));
-        } finally {
-            $this->childExit();
-        }
-    }
-
-    /** Coordinator for scenario 2: holds the Hold-row record lock where confirm() takes it. */
-    private function childHoldLockHolder(string $readyFile, string $goFile, int $holdId): void
-    {
-        $conn = null;
-        try {
-            $conn = $this->newDisposableConnection();
-            $connectionId = (int) $conn->get_var('SELECT CONNECTION_ID()');
-            $conn->query('START TRANSACTION');
-            $locked = $conn->get_var($conn->prepare('SELECT id FROM ' . $conn->prefix . 'cpms_slot_holds WHERE id = %d FOR UPDATE', $holdId));
-            if ((int) $locked !== $holdId) {
-                throw new \RuntimeException('coordinator could not lock the Hold row');
-            }
-            file_put_contents($readyFile, (string) $connectionId);
-            $this->waitForGo($goFile);
-            $conn->query('COMMIT');
-        } catch (\Throwable $e) {
-            try {
-                if (null !== $conn) {
-                    $conn->query('ROLLBACK');
-                }
-            } catch (\Throwable $ignored) {
-                // connection already gone
-            }
-        } finally {
-            $this->childExit();
-        }
-    }
-
-    /** Expiry worker: the production HoldsExpireHandler on its own connection. */
-    private function childExpiryWorker(string $readyFile, string $outcomeFile): void
-    {
-        $conn = null;
-        try {
-            $conn = $this->newDisposableConnection();
-            $connectionId = (int) $conn->get_var('SELECT CONNECTION_ID()');
-            $conn->query('START TRANSACTION');
-            $db = new \ClinicCore\Infrastructure\Db\CpmsDb($conn);
-            file_put_contents($readyFile, (string) $connectionId);
-            $freed = (new HoldsExpireHandler($db))([]);
-            $conn->query('COMMIT');
-            file_put_contents($outcomeFile, (string) json_encode(['result' => 'ok', 'freed' => (int) $freed]));
-        } catch (\Throwable $e) {
-            try {
-                if (null !== $conn) {
-                    $conn->query('ROLLBACK');
-                }
-            } catch (\Throwable $ignored) {
-                // connection already gone
-            }
-            file_put_contents($outcomeFile, (string) json_encode(['result' => 'error', 'code' => get_class($e)]));
-        } finally {
-            $this->childExit();
-        }
-    }
-
-    /** Confirm with optional fault injection on its own connection (failure scenarios). */
-    private function childExit(): void
-    {
-        // A forked child must NEVER run the inherited shutdown cleanup (the
-        // IsolatedSchema backstop would DROP the shared disposable schema
-        // while the parent or a sibling is still active, or wipe the mirror
-        // dir out from under the parent). Disable shutdown cleanup in THIS
-        // process before anything else; then try SIGKILL; whether or not
-        // posix_kill exists or succeeds, the lifetime guard is fail-closed.
-        self::disableFatalCleanupForThisProcess();
-        if (!function_exists('posix_kill')) {
-            fwrite(STDERR, '[hold-race] child pid=' . getmypid() . ' posix_kill unavailable; exiting with shutdown cleanup disabled' . PHP_EOL);
-            ForkChildExit::terminate(0);
-        }
-        if (!@posix_kill(getmypid(), SIGKILL)) {
-            fwrite(STDERR, '[hold-race] child pid=' . getmypid() . ' SIGKILL failed; exiting with shutdown cleanup disabled' . PHP_EOL);
-        }
-        ForkChildExit::terminate(0);
-    }
-
-    /**
-     * Confirms one forked child is gone. TRUE only when (a) waitpid returned
-     * this child's pid (reaped by us), or (b) waitpid failed with errno
-     * ECHILD (the child no longer exists — already reaped here). WNOHANG
-     * "still running" (0) returns false. ANY other error — EINTR, unexpected
-     * errno we cannot interpret, or pcntl_waitpid missing — returns false:
-     * silence or interruption is never accepted as proof of death. On a
-     * TRUE result the child is removed from the fork registry; on false it
-     * stays registered, so tearDown / the shutdown backstop refuse to DROP.
-     */
-    private function pollChildConfirmedGone(int $pid): bool
-    {
-        if ($pid <= 0) {
-            return true; // nothing to wait for, nothing registered
-        }
-        if (!function_exists('pcntl_waitpid')) {
-            return false;
-        }
-        $status = 0;
-        $res = @pcntl_waitpid($pid, $status, WNOHANG);
-        if ($res === $pid) {
-            self::noteChildConfirmedReaped($pid);
-            return true;
-        }
-        if ($res === 0) {
-            return false; // still running
-        }
-        $errno = function_exists('pcntl_get_last_error') ? pcntl_get_last_error() : -1;
-        $echild = defined('PCNTL_ECHILD') ? PCNTL_ECHILD : 10; // Linux ECHILD
-        if ($errno === $echild) {
-            self::noteChildConfirmedReaped($pid);
-            return true;
-        }
-        $this->markRace('reap', sprintf('waitpid errno=%d for pid=%d treated as UNCONFIRMED (fail-closed)', $errno, $pid));
-        return false;
-    }
-
-    /**
-     * Reap forked competitors (bounded) and delete every coordination file
-     * this test created. Safe on any exit path: already-reaped pids are
-     * skipped (ECHILD), missing files are ignored. Children that survive
-     * bounded SIGKILL escalation are recorded in $reapFailures and make
-     * tearDown fail loudly. On the failure path the callers first dump
-     * describeRaceFiles() output to STDERR so the children's result/error
-     * codes remain visible — assertions are never weakened for the sake of
-     * cleanup.
-     *
-     * @param array<int, int> $pids
-     * @param array<int, string> $files
-     * @param string $tag identifies the scenario in the diagnostic marker
-     */
-    private function reapRaceChildren(array $pids, array $files, string $tag): void
-    {
-        $knownPids = count(array_filter($pids, static fn ($pid): bool => (int) $pid > 0));
-        if (!function_exists('pcntl_waitpid')) {
-            foreach ($files as $file) {
-                @unlink($file);
-            }
-            // NOTE: pcntl_fork may exist while pcntl_waitpid does not — any
-            // fork made by this test remains in the IsolatedSchema registry,
-            // so tearDown/backstop refuse to DROP. Loud, never silent.
-            $this->markRace($tag, 'pcntl_waitpid unavailable: fork confirmations impossible; forked children (if any) remain registered; schema drop is blocked; coordination files unlinked');
-            return;
-        }
-        $deadline  = microtime(true) + 5.0;
-        $remaining = $pids;
-        while ($remaining !== [] && microtime(true) < $deadline) {
-            foreach ($remaining as $i => $pid) {
-                if ($pid <= 0) {
-                    unset($remaining[$i]);
-                    continue;
-                }
-                if ($this->pollChildConfirmedGone((int) $pid)) {
-                    unset($remaining[$i]);
-                }
-            }
-            if ($remaining !== []) {
-                usleep(50000);
-            }
-        }
-        $sigkilled   = 0;
-        $unkillable  = 0;
-        foreach ($remaining as $pid) {
-            if (!($pid > 0)) {
-                continue;
-            }
-            if (!function_exists('posix_kill')) {
-                $unkillable++;
-                $this->reapFailures[] = (int) $pid;
-                $this->markRace($tag, sprintf('posix_kill unavailable: child pid=%d cannot be escalated', (int) $pid));
-                continue;
-            }
-            @posix_kill($pid, SIGKILL);
-            $killDeadline = microtime(true) + 3.0;
-            $gone = false;
-            while (microtime(true) < $killDeadline) {
-                if ($this->pollChildConfirmedGone((int) $pid)) {
-                    $gone = true;
-                    break;
-                }
-                usleep(50000);
-            }
-            if ($gone) {
-                $sigkilled++;
-            } else {
-                $unkillable++;
-                $this->reapFailures[] = (int) $pid;
-                $this->markRace($tag, sprintf('child pid=%d still alive 3s after SIGKILL', (int) $pid));
-            }
-        }
-        foreach ($files as $file) {
-            @unlink($file);
-        }
-        $this->markRace($tag, sprintf('children_terminated_and_reaped pids=%d sigkilled_after_timeout=%d unkillable=%d', $knownPids, $sigkilled, $unkillable));
-    }
-
-    /**
-     * Bounded, status-checked wait for one forked child (WNOHANG poll),
-     * escalating to SIGKILL after the timeout and polling bounded once more.
-     * Returns true when the child is confirmed reaped (or was already reaped).
-     * Never hangs indefinitely; records un-reapable children in $reapFailures
-     * so tearDown fails loudly.
-     */
-    private function waitForChildExit(int $pid, float $timeoutSec, string $tag): bool
-    {
-        if ($pid <= 0) {
-            return true;
-        }
-        if (!function_exists('pcntl_waitpid')) {
-            return false;
-        }
-        $deadline = microtime(true) + $timeoutSec;
-        while (microtime(true) < $deadline) {
-            if ($this->pollChildConfirmedGone($pid)) {
-                return true;
-            }
-            usleep(20000);
-        }
-        $this->markRace($tag, sprintf('child pid=%d still running after %.1fs; escalating to SIGKILL', $pid, $timeoutSec));
-        if (function_exists('posix_kill')) {
-            @posix_kill($pid, SIGKILL);
-        } else {
-            $this->markRace($tag, sprintf('child pid=%d SIGKILL unavailable (posix_kill missing)', $pid));
-        }
-        $killDeadline = microtime(true) + 3.0;
-        while (microtime(true) < $killDeadline) {
-            if ($this->pollChildConfirmedGone($pid)) {
-                return true;
-            }
-            usleep(50000);
-        }
-        $this->reapFailures[] = (int) $pid;
-        $this->markRace($tag, sprintf('child pid=%d still alive 3s after SIGKILL', (int) $pid));
-        return false;
-    }
-
     /**
      * Emit a single bounded, non-sensitive race marker line for CI forensics:
      * backend selection, the observed InnoDB lock-wait edge, and the child
@@ -1108,6 +799,32 @@ final class HoldCapacityTwoConnectionTest extends WP_UnitTestCase
             }
         }
         return $parts === [] ? '(none)' : implode(' ', $parts);
+    }
+
+    /**
+     * Terminate and close every worker still registered for this test, then
+     * delete every coordination file. Safe on any exit path. A worker that
+     * refuses to stop inside the bounded terminate() window is recorded in
+     * $reapFailures so tearDown fails LOUDLY and refuses the schema DROP —
+     * an unconfirmed worker can never slip past the drop.
+     *
+     * @param list<ExternalRaceWorker> $workers
+     * @param array<int, string> $files
+     */
+    private function reapWorkers(array $workers, array $files, string $tag): void
+    {
+        foreach ($workers as $worker) {
+            $pid = $worker->pid();
+            $worker->terminate();
+            if ($worker->isRunning()) {
+                $this->reapFailures[] = $pid;
+                $this->blockDisposableSchemaDrop('external race worker pid ' . $pid . ' unconfirmed stopped; schema retained');
+                $this->markRace($tag, 'worker pid=' . $pid . ' still running after bounded SIGTERM/SIGKILL; schema drop REFUSED (fail-closed)');
+            }
+        }
+        foreach ($files as $file) {
+            @unlink($file);
+        }
     }
 
     /** InnoDB lock-wait edge with a known worker connection id. */

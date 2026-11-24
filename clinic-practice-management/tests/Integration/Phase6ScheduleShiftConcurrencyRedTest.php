@@ -4,20 +4,10 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
-use ClinicCore\Application\Booking\ScheduleService;
-use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
-use ClinicCore\Domain\Booking\BookingException;
-use ClinicCore\Infrastructure\Audit\AuditLogger;
-use ClinicCore\Infrastructure\Db\CpmsDb;
-use ClinicCore\Infrastructure\Logging\OpLogger;
-use ClinicCore\Infrastructure\Queue\JobQueue;
-use ClinicCore\Infrastructure\Repository\LocationRepository;
-use ClinicCore\Infrastructure\Repository\MembershipRepository;
-use ClinicCore\Infrastructure\Repository\ScheduleRepository;
-use ClinicCore\Tests\Support\ForkChildExit;
+use ClinicCore\Tests\Support\ExternalRaceWorker;
 use WP_UnitTestCase;
 
 /**
@@ -52,18 +42,19 @@ use WP_UnitTestCase;
  *      both succeed (the fix must not over-serialize distinct windows).
  *
  * HOW CONCURRENCY IS PRODUCED (real, not simulated):
- *   - pcntl_fork: each contender is a REAL independent process with its own
- *     fresh wpdb connection (the established ConcurrencyTest /
- *     SlotCapacityOneHundredWayTest / VisitConcurrencyTest pattern).
- *   - Each child runs the REAL production entry point (ScheduleService::
+ *   - External proc_open workers (fork-race-wp-worker.php): each contender is
+ *     a REAL independent process holding NO descriptor inherited from this
+ *     harness process, with its own wpdb connection (the pattern used by
+ *     ConcurrencyTest / SlotCapacityOneHundredWayTest / VisitConcurrencyTest).
+ *   - Each worker runs the REAL production entry point (ScheduleService::
  *     create / ScheduleService::update) with the same dependency wiring as
  *     App::scheduleService(), on its own connection — not a raw SQL mirror.
- *   - Synchronization barrier: all children open their connection, then block
+ *   - Synchronization barrier: all workers open their connection, then block
  *     until a shared absolute time (same host clock, microsecond-scale
  *     alignment) before firing the product call — a deterministic race
  *     start, not "hope they overlap".
- *   - Children write their outcome (ok / stable error / fatal) to a temp
- *     file and exit; the parent aggregates outcomes and then reads the
+ *   - Workers write their outcome (ok / stable error / fatal) to a temp
+ *     file and exit 0; the parent aggregates outcomes and then reads the
  *     FINAL committed DB state with a FRESH connection (the WP Test Suite
  *     parent connection holds a stale REPEATABLE-READ snapshot).
  *
@@ -108,9 +99,6 @@ final class Phase6ScheduleShiftConcurrencyRedTest extends WP_UnitTestCase
     protected function setUp(): void
     {
         parent::setUp();
-        if (!function_exists('pcntl_fork')) {
-            $this->markTestSkipped('pcntl not available (CI Linux has it)');
-        }
         App::migrations()->migrate();
         App::resetScope();
         ScopeContext::clear();
@@ -368,13 +356,13 @@ final class Phase6ScheduleShiftConcurrencyRedTest extends WP_UnitTestCase
     }
 
     // ==================================================================
-    // Worker orchestration (pcntl_fork + independent wpdb per child +
-    // absolute-time barrier — the established repo concurrency pattern).
+    // Worker orchestration (external proc_open workers + absolute-time
+    // barrier — the established repo concurrency pattern).
     // ==================================================================
 
     /**
-     * Fork one child per worker spec; children align on a shared absolute
-     * time and then fire their REAL product call on their own connection.
+     * Launch one external worker per worker spec; workers align on a shared
+     * absolute time and then fire their REAL product call on their own connection.
      *
      * @param list<array{kind: string, day?: int, start: string, end: string, id?: int}> $workers
      *
@@ -383,30 +371,28 @@ final class Phase6ScheduleShiftConcurrencyRedTest extends WP_UnitTestCase
     private function runWorkers(array $workers): array
     {
         $fireAt  = microtime(true) + self::BARRIER_SEC;
-        $pids    = [];
         $files   = [];
         $crashed = [];
+        $script  = dirname(__DIR__) . '/bin/fork-race-wp-worker.php';
+        $launched = [];
 
         foreach ($workers as $i => $worker) {
             $files[$i] = sys_get_temp_dir() . '/cpms-sched-conc-' . $this->fileTag . '-' . $i . '.json';
-            $pid = pcntl_fork();
-            if ($pid === -1) {
-                $this->fail('pcntl_fork failed');
-            }
-            if ($pid === 0) {
-                /*
-                 * Child: an escaped exception would make the copied PHPUnit
-                 * CONTINUE and re-run the whole suite inside the child.
-                 * childWorker() therefore ALWAYS ends via the fork-child lifetime guard.
-                 */
-                $this->childWorker($fireAt, $files[$i], $worker);
-            }
-            $pids[$i] = $pid;
+            @unlink($files[$i]);
+            $launched[$i] = ExternalRaceWorker::launch($script, [
+                'mode' => 'schedule_worker',
+                'clinic_id' => $this->clinicId,
+                'professional_user_id' => $this->professionalUserId,
+                'clinician_id' => $this->clinicianId,
+                'location_id' => $this->locationId,
+                'fire_at' => $fireAt,
+                'spec' => $worker,
+                'outcome' => $files[$i],
+            ]);
         }
 
-        foreach ($pids as $i => $pid) {
-            pcntl_waitpid($pid, $status);
-            if (!ForkChildExit::childTerminatedCleanly($status)) {
+        foreach ($launched as $i => $proc) {
+            if ($proc->waitForExit(30.0) !== 0) {
                 $crashed[] = $i;
             }
         }
@@ -426,110 +412,6 @@ final class Phase6ScheduleShiftConcurrencyRedTest extends WP_UnitTestCase
         }
 
         return $outcomes;
-    }
-
-    /**
-     * Child body: fresh connection -> scope -> real service -> barrier ->
-     * one production mutation inside a REAL transaction boundary ->
-     * outcome file -> fork-child lifetime-guard termination. NEVER returns.
-     *
-     * @param array{kind: string, day?: int, start: string, end: string, id?: int} $worker
-     */
-    private function childWorker(float $fireAt, string $file, array $worker): void
-    {
-        $wdb = null;
-        try {
-            global $wpdb;
-            $wdb = new \wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
-            $wdb->query('SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-            if (!method_exists($wdb, 'set_prefix')) {
-                ForkChildExit::terminate(9);
-            }
-            $wdb->set_prefix($wpdb->prefix);
-            $wpdb = $wdb;
-            remove_all_filters('query');
-            $wdb->has_connected = false;
-            $wdb->init_charset();
-            $wdb->check_connection();
-
-            // The trusted Clinic is the server-side EXPLICIT scope (the same
-            // primitive the REST boundary sets) — never a payload value.
-            ScopeContext::set(ClinicScope::forClinic($this->clinicId));
-
-            // Production wiring, on the child's own connection.
-            $cpms    = new CpmsDb($wdb);
-            $op      = new OpLogger($cpms);
-            $service = new ScheduleService(
-                $cpms,
-                new ScheduleRepository($cpms),
-                new MembershipRepository($cpms),
-                new LocationRepository($cpms),
-                new JobQueue($cpms, $op),
-                new AuditLogger($cpms, $op),
-                $op
-            );
-
-            // Barrier: all children open their connection first, then fire
-            // the product call at the same absolute instant.
-            while (microtime(true) < $fireAt) {
-                usleep(250);
-            }
-
-            $outcome = ['result' => 'unknown'];
-            try {
-                if (($worker['kind'] ?? '') === 'create') {
-                    $view = $service->create($this->professionalUserId, [
-                        'clinician_id' => $this->clinicianId,
-                        'location_id'  => $this->locationId,
-                        'day_of_week'  => $worker['day'],
-                        'start_time'   => $worker['start'],
-                        'end_time'     => $worker['end'],
-                    ]);
-                    $outcome = ['result' => 'ok', 'id' => (int) ($view['id'] ?? 0), 'kind' => 'create'];
-                } else {
-                    $view = $service->update($this->professionalUserId, $worker['id'], [
-                        'start_time' => $worker['start'],
-                        'end_time'   => $worker['end'],
-                    ]);
-                    $outcome = ['result' => 'ok', 'id' => (int) ($view['id'] ?? 0), 'kind' => 'update'];
-                }
-            } catch (BookingException $e) {
-                $outcome = [
-                    'result' => 'error',
-                    'code'   => $e->errorCode,
-                    'http'   => $e->httpStatus,
-                    'errors' => (array) ($e->data['errors'] ?? []),
-                ];
-            } catch (\Throwable $e) {
-                // In unpatched code without concurrency serialization, concurrent
-                // inserts hitting MySQL unique key u_sched_slot result in insert_id 0,
-                // causing scheduleView([]) undefined array key notice/warning.
-                // Record this unhandled failure as a defect outcome rather than harness fatal.
-                $msg = $e->getMessage();
-                if (str_contains($msg, 'Undefined array key') || str_contains($msg, 'Duplicate entry')) {
-                    $outcome = [
-                        'result' => 'defect_raw_db_collision',
-                        'detail' => get_class($e) . ': ' . $msg,
-                    ];
-                } else {
-                    // A raw PHP/SQL failure here is itself a contract violation
-                    // (no stable product error) — recorded, not swallowed.
-                    $outcome = ['result' => 'fatal', 'detail' => get_class($e) . ': ' . $msg];
-                }
-            }
-            file_put_contents($file, json_encode($outcome, JSON_UNESCAPED_UNICODE));
-        } catch (\Throwable $e) {
-            // Connection/setup/bootstrap failure in the child: still leave a
-            // readable outcome (infrastructure evidence, not a silent pass).
-            @file_put_contents(
-                $file,
-                json_encode(['result' => 'fatal', 'detail' => get_class($e) . ': ' . $e->getMessage()], JSON_UNESCAPED_UNICODE)
-            );
-        }
-        if ($wdb instanceof \wpdb) {
-            @$wdb->close();
-        }
-        ForkChildExit::terminate(0);
     }
 
     // ==================================================================

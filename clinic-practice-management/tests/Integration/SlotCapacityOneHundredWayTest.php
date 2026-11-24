@@ -5,9 +5,7 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
-use ClinicCore\Infrastructure\Db\CpmsDb;
-use ClinicCore\Infrastructure\Repository\SlotRepository;
-use ClinicCore\Tests\Support\ForkChildExit;
+use ClinicCore\Tests\Support\ExternalRaceWorker;
 use WP_UnitTestCase;
 
 /**
@@ -19,10 +17,10 @@ use WP_UnitTestCase;
  * موفقیت = دقیقاً ۱ برنده (و برای ظرفیت ۳ = دقیقاً ۳) — بدون Overbooking.
  *
  * نکات فنی:
- *  - pcntl_fork + mysqli مستقل در هر child (الگوی VisitConcurrencyTest F4).
+ *  - External proc_open workers (fork-race-wp-worker.php, atomic_book): هیچ descriptorی از این حلقه به ارث نمی‌رود؛ هر worker مسیر واقعی atomicBook را روی اتصال خودش اجرا می‌کند و با exit ۰ بیرون می‌آید.
  *  - Fixture COMMIT می‌شود تا children ببینند؛ Cleanup دستی (ROLLBACK تست
  *    بعد از COMMIT بی‌اثر است).
- *  - در این sandbox (بدون MySQL/pcntl) اجرا نمی‌شود — CI اجرا می‌کند.
+ *  - در صورت نبود proc_open در محیط اجرا نمی‌شود — CI اجرا می‌کند.
  */
 final class SlotCapacityOneHundredWayTest extends WP_UnitTestCase
 {
@@ -32,9 +30,6 @@ final class SlotCapacityOneHundredWayTest extends WP_UnitTestCase
     protected function setUp(): void
     {
         parent::setUp();
-        if (!function_exists('pcntl_fork')) {
-            $this->markTestSkipped('pcntl not available');
-        }
         App::migrations()->migrate();
     }
 
@@ -97,28 +92,28 @@ final class SlotCapacityOneHundredWayTest extends WP_UnitTestCase
 
     private function runOneHundredContenders(): int
     {
+        // External proc_open workers: no descriptor inherited from this
+        // harness process, so a graceful exit(0) in a worker cannot run
+        // mysqlnd on the shared session. Exit 0 = clean job done
+        // ('won'|'lost' outcome file carries the race result).
+        $script = dirname(__DIR__) . '/bin/fork-race-wp-worker.php';
         $children = [];
         $outcome_files = [];
         $tag = bin2hex(random_bytes(8));
         for ($i = 0; $i < 100; $i++) {
             $outcome_files[$i] = sys_get_temp_dir() . '/cpms-slotcap-' . $tag . '-' . $i . '.out';
-            $pid = pcntl_fork();
-            if ($pid === -1) {
-                $this->fail('pcntl_fork failed');
-            }
-            if ($pid === 0) {
-                // ===== child: اتصال مستقل + مسیر واقعی تولید =====
-                usleep(random_int(0, 3000)); // پخش تلاش اتصال (محدودیت max_connections)
-                $won = $this->childAtomicBook();
-                @file_put_contents($outcome_files[$i], $won ? 'won' : 'lost');
-                ForkChildExit::terminate(0);
-            }
-            $children[$i] = $pid;
+            @unlink($outcome_files[$i]);
+            $children[$i] = ExternalRaceWorker::launch($script, [
+                'mode' => 'atomic_book',
+                'slot_id' => $this->slotId,
+                'outcome' => $outcome_files[$i],
+            ]);
         }
 
         $winners = 0;
-        foreach ($children as $i => $pid) {
-            pcntl_waitpid($pid, $status);
+        foreach ($children as $i => $worker) {
+            $code = $worker->waitForExit(45.0);
+            self::assertSame(0, $code, 'external slot-cap worker ' . $i . ' must exit with status 0 (task ' . $tag . ')');
             $raw = @file_get_contents($outcome_files[$i]);
             @unlink($outcome_files[$i]);
             if ($raw === 'won') {
@@ -127,20 +122,6 @@ final class SlotCapacityOneHundredWayTest extends WP_UnitTestCase
         }
 
         return $winners;
-    }
-
-    private function childAtomicBook(): bool
-    {
-        try {
-            $w = new \wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
-            global $wpdb;
-            $w->set_prefix($wpdb->prefix);
-            $cpms = new CpmsDb($w);
-
-            return (new SlotRepository($cpms))->atomicBook($this->slotId);
-        } catch (\Throwable) {
-            ForkChildExit::terminate(3);
-        }
     }
 
     private function readBookedCount(): int

@@ -6,34 +6,23 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Application\Booking\BookingService;
 use ClinicCore\Application\Booking\ScheduleService;
-use ClinicCore\Application\Notifications\SmsService;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Domain\Booking\BookingWindow;
-use ClinicCore\Domain\Licensing\LicenseDecision;
-use ClinicCore\Domain\Licensing\LicenseGate;
-use ClinicCore\Infrastructure\Audit\AuditLogger;
-use ClinicCore\Infrastructure\Db\CpmsDb;
-use ClinicCore\Infrastructure\Logging\OpLogger;
-use ClinicCore\Infrastructure\Queue\JobQueue;
 use ClinicCore\Infrastructure\Repository\AppointmentRepository;
 use ClinicCore\Infrastructure\Repository\LocationRepository;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Infrastructure\Repository\ScheduleRepository;
 use ClinicCore\Infrastructure\Repository\SlotRepository;
-use ClinicCore\Infrastructure\Security\Idempotency;
-use ClinicCore\Infrastructure\Sms\CredentialVault;
-use ClinicCore\Infrastructure\Sms\SmsProviderRegistry;
 use ClinicCore\Settings\Settings;
-use ClinicCore\Settings\SettingsFactory;
 use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use DateTimeImmutable;
 use DateTimeZone;
 use WP_REST_Request;
-use ClinicCore\Tests\Support\ForkChildExit;
+use ClinicCore\Tests\Support\ExternalRaceWorker;
 use WP_UnitTestCase;
 
 /**
@@ -83,7 +72,6 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
     private const RACE_LOCATION_WAIT_TIMEOUT_SECONDS = 10;
     private const RACE_WRITER_COMMAND_TIMEOUT_SECONDS = 30;
     private const RACE_GRACEFUL_REAP_TIMEOUT_SECONDS = 5;
-    private const RACE_TERMINATION_REAP_TIMEOUT_SECONDS = 2;
 
     private int $orgId = 0;
     private int $clinicId = 0;
@@ -91,7 +79,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
     // fixtures). The purge in tearDown() must then commit its DELETEs too, or
     // the harness ROLLBACK at parent::tearDown() resurrects the committed Clinic
     // rows for every later suite in the shared database (same failure class as
-    // the documented CustomRoleLifecycleTest cascade; fork-children no longer
+    // the documented CustomRoleLifecycleTest cascade; race workers no longer
     // drop the parent session, so the outer ROLLBACK really rolls back now).
     private bool $fixtureCommitted = false;
     private int $locTehran = 0;
@@ -663,16 +651,10 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
     public function testStaffCreateLocksLocationBeforeFinalTimezoneValidation(): void
     {
         if (
-            !function_exists('pcntl_fork')
-            || !function_exists('posix_kill')
-            || !defined('SIGTERM')
-            || !defined('SIGKILL')
-            || !defined('PCNTL_EINTR')
-            || !defined('PCNTL_ECHILD')
-            || !function_exists('stream_socket_pair')
+            !function_exists('proc_open')
             || !class_exists('mysqli')
         ) {
-            self::markTestSkipped('pcntl/posix signals, stream_socket_pair, and mysqli are required for the independent-session race proof.');
+            self::markTestSkipped('proc_open and mysqli are required for the independent-session race proof.');
         }
 
         global $wpdb;
@@ -720,74 +702,51 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
         ];
         self::assertIsArray($before['patient']);
 
-        // Make fixture writes visible to all independent sessions before fork.
+        // External workers inherit no descriptor of this process, so a graceful
+        // exit cannot tear down the harness's shared session. The writer is a
+        // raw mysqli lock holder; the booking actor runs the real BookingService.
         $wpdb->query('COMMIT'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         $this->fixtureCommitted = true;
-        $prefix = $wpdb->prefix;
-        $writerPipes = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
-        $bookingPipes = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
-        if ($writerPipes === false || $bookingPipes === false) {
-            self::markTestSkipped('Cannot create independent-process synchronization pipes.');
-        }
-        [$writerParent, $writerChild] = $writerPipes;
-        [$bookingParent, $bookingChild] = $bookingPipes;
-        $writerPid = null;
-        $bookingPid = null;
+        $script = dirname(__DIR__) . '/bin/fork-race-wp-worker.php';
+        $writer = null;
+        $booking = null;
         $writerReleased = false;
-        $writerStatus = null;
-        $bookingStatus = null;
         $observer = null;
 
         try {
-            $writerFork = pcntl_fork();
-            if ($writerFork === 0) {
-                fclose($writerParent);
-                fclose($bookingParent);
-                fclose($bookingChild);
-                $this->locationTimezoneWriterChild($writerChild, $this->locNewYork);
-                ForkChildExit::terminate(2);
-            }
-            if ($writerFork < 1) {
-                self::fail('pcntl_fork failed for the independent Location writer');
-            }
-            $writerPid = $writerFork;
-            self::closeSynchronizationPipe($writerChild);
+            $writer = ExternalRaceWorker::launch($script, [
+                'mode' => 'timezone_writer',
+                'location_id' => $this->locNewYork,
+                'lock_wait_timeout_sec' => 5,
+                'command_timeout_sec' => self::RACE_WRITER_COMMAND_TIMEOUT_SECONDS,
+            ]);
 
-            $writerMessage = $this->readSynchronizationLine($writerParent, self::RACE_CONNECTION_TIMEOUT_SECONDS);
+            $writerMessage = $writer->readLineWait((float) self::RACE_CONNECTION_TIMEOUT_SECONDS);
             self::assertIsString($writerMessage, 'writer must report its held Location lock before booking starts');
             self::assertMatchesRegularExpression('/^writer_locked:[1-9][0-9]*$/', $writerMessage);
             $writerConnectionId = (int) substr($writerMessage, strlen('writer_locked:'));
 
-            $bookingFork = pcntl_fork();
-            if ($bookingFork === 0) {
-                fclose($bookingParent);
-                fclose($writerParent);
-                $this->staffBookingChild(
-                    $bookingChild,
-                    $prefix,
-                    $this->clinicId,
-                    $staffUserId,
-                    $patientId,
-                    $this->clinicianHold,
-                    $date,
-                    $time,
-                    $slotId
-                );
-                ForkChildExit::terminate(2);
-            }
-            if ($bookingFork < 1) {
-                self::fail('pcntl_fork failed for the independent BookingService actor');
-            }
-            $bookingPid = $bookingFork;
-            self::closeSynchronizationPipe($bookingChild);
+            $booking = ExternalRaceWorker::launch($script, [
+                'mode' => 'staff_booking_actor',
+                'clinic_id' => $this->clinicId,
+                'staff_user_id' => $staffUserId,
+                'patient_id' => $patientId,
+                'clinician_id' => $this->clinicianHold,
+                'date' => $date,
+                'time' => $time,
+                'slot_id' => $slotId,
+            ]);
 
-            $bookingMessage = $this->readSynchronizationLine($bookingParent, self::RACE_CONNECTION_TIMEOUT_SECONDS);
+            $bookingMessage = $booking->readLineWait((float) self::RACE_CONNECTION_TIMEOUT_SECONDS);
             self::assertIsString($bookingMessage, 'booking actor must report its own fresh DB connection before product execution');
             self::assertMatchesRegularExpression('/^booking_connected:[1-9][0-9]*$/', $bookingMessage);
             $bookingConnectionId = (int) substr($bookingMessage, strlen('booking_connected:'));
             self::assertNotSame($writerConnectionId, $bookingConnectionId, 'writer and BookingService actor must use distinct DB sessions');
-            self::assertNotSame(getmypid(), $writerPid, 'writer must be a distinct process');
-            self::assertNotSame(getmypid(), $bookingPid, 'booking actor must be a distinct process');
+            $writerPid = $writer->pid();
+            $bookingPid = $booking->pid();
+            if ($writerPid > 0 && $bookingPid > 0) {
+                self::assertNotSame($writerPid, $bookingPid, 'writer and booking actor must be distinct processes');
+            }
 
             $observer = $this->freshMysqli();
             // This bounded state poll is the synchronization oracle: a matching
@@ -821,10 +780,10 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
 
             // Commit is deliberately impossible before both required facts above
             // are observed. No sleep participates in correctness.
-            self::assertSame(7, fwrite($writerParent, "commit\n"), 'parent must release the writer only after the observed contention');
+            self::assertGreaterThan(0, $writer->writeCommand('commit'), 'parent must release the writer only after the observed contention');
             $writerReleased = true;
 
-            $bookingOutcomeLine = $this->readSynchronizationLine($bookingParent, self::RACE_CONNECTION_TIMEOUT_SECONDS);
+            $bookingOutcomeLine = $booking->readLineWait((float) self::RACE_CONNECTION_TIMEOUT_SECONDS);
             self::assertIsString($bookingOutcomeLine, 'booking actor must finish after writer commit');
             $bookingOutcome = json_decode($bookingOutcomeLine, true);
             self::assertIsArray($bookingOutcome, 'booking actor must return structured outcome evidence');
@@ -833,12 +792,10 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
             self::assertSame($bookingConnectionId, (int) ($bookingOutcome['connection_id'] ?? 0), 'outcome must come from the announced fresh BookingService session');
             self::assertTrue((bool) ($bookingOutcome['own_wpdb_connected'] ?? false), 'BookingService actor must own its wpdb connection');
 
-            $writerStatus = $this->waitForChildExit($writerPid, self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS);
-            $bookingStatus = $this->waitForChildExit($bookingPid, self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS);
-            self::assertIsInt($writerStatus, 'writer must exit within the bounded cleanup window');
-            self::assertIsInt($bookingStatus, 'booking actor must exit within the bounded cleanup window');
-            self::assertTrue(ForkChildExit::childTerminatedCleanly($writerStatus), 'writer must commit its intended Location timezone update');
-            self::assertTrue(ForkChildExit::childTerminatedCleanly($bookingStatus), 'booking actor must terminate cleanly after the rejection');
+            $writerRc = $writer->waitForExit((float) self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS);
+            $bookingRc = $booking->waitForExit((float) self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS);
+            self::assertSame(0, $writerRc, 'writer must exit with a plain, graceful exit(0) after committing its intended Location timezone update');
+            self::assertSame(0, $bookingRc, 'booking actor must exit with a plain, graceful exit(0) after the rejection');
 
             self::assertSame('America/New_York', $this->locationTimezone($this->locNewYork), 'final validation must consume the writer-committed authoritative timezone');
             self::assertSame($before['appointments'], (int) $wpdb->get_var($wpdb->prepare(
@@ -871,318 +828,21 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
             $this->assertRaceLocksReleased($slotId, $this->locNewYork);
         } finally {
             try {
-                if (!$writerReleased && is_resource($writerParent)) {
-                    @fwrite($writerParent, "rollback\n");
+                if (!$writerReleased && $writer instanceof ExternalRaceWorker) {
+                    $writer->writeCommand('rollback');
                 }
-                $cleanupError = null;
-                try {
-                    $this->reapOrTerminateKnownChild($writerPid, $writerStatus);
-                } catch (\Throwable $e) {
-                    $cleanupError = $e;
+                if ($writer instanceof ExternalRaceWorker) {
+                    $writer->terminate();
                 }
-                try {
-                    $this->reapOrTerminateKnownChild($bookingPid, $bookingStatus);
-                } catch (\Throwable $e) {
-                    $cleanupError ??= $e;
-                }
-                if ($cleanupError instanceof \Throwable) {
-                    throw $cleanupError;
+                if ($booking instanceof ExternalRaceWorker) {
+                    $booking->terminate();
                 }
             } finally {
                 if ($observer instanceof \mysqli) {
                     @$observer->close();
                 }
-                self::closeSynchronizationPipe($writerParent);
-                self::closeSynchronizationPipe($writerChild);
-                self::closeSynchronizationPipe($bookingParent);
-                self::closeSynchronizationPipe($bookingChild);
             }
         }
-    }
-
-    public function testRaceCleanupGuardsPidsAndBoundsTermination(): void
-    {
-        if (!defined('SIGTERM') || !defined('SIGKILL')) {
-            self::markTestSkipped('POSIX signal constants are required for cleanup helper coverage.');
-        }
-
-        $waits = [];
-        $signals = [];
-        $neverWait = static function (int $pid, int $seconds) use (&$waits): int {
-            $waits[] = [$pid, $seconds];
-
-            return 0;
-        };
-        $neverSignal = static function (int $pid, int $signal) use (&$signals): bool {
-            $signals[] = [$pid, $signal];
-
-            return true;
-        };
-        self::assertNull(self::cleanupKnownChild(-1, null, $neverWait, $neverSignal));
-        self::assertNull(self::cleanupKnownChild(0, null, $neverWait, $neverSignal));
-        self::assertNull(self::cleanupKnownChild(null, null, $neverWait, $neverSignal));
-        self::assertSame([], $waits, 'fork failure and invalid PIDs must never reach wait or kill callbacks');
-        self::assertSame([], $signals, 'fork failure and invalid PIDs must never reach wait or kill callbacks');
-
-        $waits = [];
-        $signals = [];
-        $alreadyExited = self::cleanupKnownChild(
-            123,
-            null,
-            static function (int $pid, int $seconds) use (&$waits): int {
-                $waits[] = [$pid, $seconds];
-
-                return 0;
-            },
-            static function (int $pid, int $signal) use (&$signals): bool {
-                $signals[] = [$pid, $signal];
-
-                return true;
-            }
-        );
-        self::assertSame(0, $alreadyExited, 'an already-exited child must be reaped without signalling');
-        self::assertSame([[123, self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS]], $waits);
-        self::assertSame([], $signals);
-
-        $waits = [];
-        $signals = [];
-        $outcomes = [null, null, 0];
-        $terminated = self::cleanupKnownChild(
-            456,
-            null,
-            static function (int $pid, int $seconds) use (&$waits, &$outcomes): int|false|null {
-                $waits[] = [$pid, $seconds];
-
-                return array_shift($outcomes);
-            },
-            static function (int $pid, int $signal) use (&$signals): bool {
-                $signals[] = [$pid, $signal];
-
-                return true;
-            }
-        );
-        self::assertSame(0, $terminated, 'bounded escalation must return the final reap status');
-        self::assertSame([
-            [456, self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS],
-            [456, self::RACE_TERMINATION_REAP_TIMEOUT_SECONDS],
-            [456, self::RACE_TERMINATION_REAP_TIMEOUT_SECONDS],
-        ], $waits, 'timeout escalation must use only the three bounded reap windows');
-        self::assertSame([[456, SIGTERM], [456, SIGKILL]], $signals, 'only the recorded positive child PID may be signalled');
-    }
-
-    public function testRaceWaitRetriesEintrAndDoesNotHideOtherErrors(): void
-    {
-        if (!defined('PCNTL_EINTR') || !defined('PCNTL_ECHILD')) {
-            self::markTestSkipped('PCNTL wait error constants are required for EINTR cleanup coverage.');
-        }
-
-        $clock = 0.0;
-        $waitCalls = 0;
-        $outcomes = [[-1, 0, PCNTL_EINTR], [789, 0, 0]];
-        $reaped = self::waitForChildExitUsing(
-            789,
-            5,
-            static function (int $pid) use (&$waitCalls, &$outcomes): array {
-                ++$waitCalls;
-
-                return array_shift($outcomes);
-            },
-            static function () use (&$clock): float {
-                return $clock;
-            },
-            static function () use (&$clock): void {
-                $clock += 1.0;
-            }
-        );
-        self::assertSame(0, $reaped, 'EINTR must retry rather than falsely reporting the child reaped');
-        self::assertSame(2, $waitCalls, 'EINTR must cause another wait attempt');
-        self::assertSame(1.0, $clock, 'EINTR retry must remain within the original deadline');
-
-        $clock = 0.0;
-        $waits = [];
-        $signals = [];
-        $repeatedEintr = static function (int $pid, int $seconds) use (&$clock, &$waits): int|false|null {
-            $waits[] = [$pid, $seconds];
-
-            return self::waitForChildExitUsing(
-                $pid,
-                $seconds,
-                static fn (int $ignored): array => [-1, 0, PCNTL_EINTR],
-                static function () use (&$clock): float {
-                    return $clock;
-                },
-                static function () use (&$clock): void {
-                    $clock += 1.0;
-                }
-            );
-        };
-        $timedOut = self::cleanupKnownChild(
-            456,
-            null,
-            $repeatedEintr,
-            static function (int $pid, int $signal) use (&$signals): bool {
-                $signals[] = [$pid, $signal];
-
-                return true;
-            }
-        );
-        self::assertNull($timedOut, 'repeated EINTR must reach the bounded timeout path, not false ECHILD success');
-        self::assertSame([
-            [456, self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS],
-            [456, self::RACE_TERMINATION_REAP_TIMEOUT_SECONDS],
-            [456, self::RACE_TERMINATION_REAP_TIMEOUT_SECONDS],
-        ], $waits);
-        self::assertSame([[456, SIGTERM], [456, SIGKILL]], $signals);
-        self::assertSame(9.0, $clock, 'EINTR retries must not reset or extend cleanup deadlines');
-
-        $signals = [];
-        $echild = self::cleanupKnownChild(
-            654,
-            null,
-            static function (int $pid, int $seconds): int|false|null {
-                return self::waitForChildExitUsing(
-                    $pid,
-                    $seconds,
-                    static fn (int $ignored): array => [-1, 0, PCNTL_ECHILD],
-                    static fn (): float => 0.0,
-                    static function (): void {
-                        self::fail('confirmed ECHILD must not poll or signal');
-                    }
-                );
-            },
-            static function (int $pid, int $signal) use (&$signals): bool {
-                $signals[] = [$pid, $signal];
-
-                return true;
-            }
-        );
-        self::assertFalse($echild, 'confirmed ECHILD is not a child reap status');
-        self::assertSame([], $signals, 'confirmed ECHILD must never signal a potentially reused PID');
-
-        $waits = [];
-        $signals = [];
-        $attempt = 0;
-        try {
-            self::cleanupKnownChild(
-                741,
-                null,
-                static function (int $pid, int $seconds) use (&$waits, &$attempt): int|false|null {
-                    $waits[] = [$pid, $seconds];
-                    ++$attempt;
-                    if ($attempt === 1) {
-                        throw new \RuntimeException('first wait error before successful reap');
-                    }
-
-                    return 17;
-                },
-                static function (int $pid, int $signal) use (&$signals): bool {
-                    $signals[] = [$pid, $signal];
-
-                    return true;
-                }
-            );
-            self::fail('the first unexpected wait error must remain visible after a later reap');
-        } catch (\RuntimeException $e) {
-            self::assertSame('first wait error before successful reap', $e->getPrevious()?->getMessage());
-        }
-        self::assertSame([
-            [741, self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS],
-            [741, self::RACE_TERMINATION_REAP_TIMEOUT_SECONDS],
-        ], $waits, 'a confirmed reap must stop the cleanup state machine');
-        self::assertSame([[741, SIGTERM]], $signals, 'a confirmed reap must prevent SIGKILL');
-
-        $waits = [];
-        $signals = [];
-        $attempt = 0;
-        try {
-            self::cleanupKnownChild(
-                852,
-                null,
-                static function (int $pid, int $seconds) use (&$waits, &$attempt): int|false|null {
-                    $waits[] = [$pid, $seconds];
-                    ++$attempt;
-                    if ($attempt === 1) {
-                        throw new \RuntimeException('first wait error before ECHILD');
-                    }
-
-                    return false;
-                },
-                static function (int $pid, int $signal) use (&$signals): bool {
-                    $signals[] = [$pid, $signal];
-
-                    return true;
-                }
-            );
-            self::fail('the first unexpected wait error must remain visible after ECHILD');
-        } catch (\RuntimeException $e) {
-            self::assertSame('first wait error before ECHILD', $e->getPrevious()?->getMessage());
-        }
-        self::assertSame([
-            [852, self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS],
-            [852, self::RACE_TERMINATION_REAP_TIMEOUT_SECONDS],
-        ], $waits, 'confirmed ECHILD must stop the cleanup state machine');
-        self::assertSame([[852, SIGTERM]], $signals, 'confirmed ECHILD must prevent SIGKILL');
-
-        $waits = [];
-        $signals = [];
-        try {
-            self::cleanupKnownChild(
-                987,
-                null,
-                static function (int $pid, int $seconds) use (&$waits): int|false|null {
-                    $waits[] = [$pid, $seconds];
-
-                    return self::waitForChildExitUsing(
-                        $pid,
-                        $seconds,
-                        static fn (int $ignored): array => [-1, 0, 12345],
-                        static fn (): float => 0.0,
-                        static function (): void {
-                            self::fail('unexpected wait errors must not be retried as success');
-                        }
-                    );
-                },
-                static function (int $pid, int $signal) use (&$signals): bool {
-                    $signals[] = [$pid, $signal];
-
-                    return true;
-                }
-            );
-            self::fail('unexpected wait errors must remain visible after bounded escalation');
-        } catch (\RuntimeException $e) {
-            self::assertStringContainsString('Unexpected child wait error', $e->getMessage());
-        }
-        self::assertSame([
-            [987, self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS],
-            [987, self::RACE_TERMINATION_REAP_TIMEOUT_SECONDS],
-            [987, self::RACE_TERMINATION_REAP_TIMEOUT_SECONDS],
-        ], $waits);
-        self::assertSame([[987, SIGTERM], [987, SIGKILL]], $signals, 'unexpected wait errors must not silently pass');
-    }
-
-    public function testRaceSynchronizationFailureClosesAllPipeEnds(): void
-    {
-        if (!function_exists('stream_socket_pair')) {
-            self::markTestSkipped('stream_socket_pair is required for synchronization cleanup coverage.');
-        }
-        $pipes = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
-        if ($pipes === false) {
-            self::markTestSkipped('Cannot create synchronization pipes.');
-        }
-        [$parent, $child] = $pipes;
-        $failureObserved = false;
-        try {
-            throw new \RuntimeException('deterministic synchronization failure');
-        } catch (\RuntimeException) {
-            $failureObserved = true;
-        } finally {
-            self::closeSynchronizationPipe($parent);
-            self::closeSynchronizationPipe($child);
-        }
-
-        self::assertTrue($failureObserved);
-        self::assertFalse(is_resource($parent), 'failure cleanup must close the parent synchronization pipe');
-        self::assertFalse(is_resource($child), 'failure cleanup must close the child synchronization pipe');
     }
 
     // =================================================================
@@ -1354,137 +1014,6 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
         Settings::flushCache();
     }
 
-    private function locationTimezoneWriterChild($pipe, int $locationId): void
-    {
-        global $wpdb;
-        $mysqli = null;
-        try {
-            $mysqli = $this->freshMysqli();
-            $mysqli->query('SET SESSION innodb_lock_wait_timeout = 5'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-            $mysqli->begin_transaction();
-            $locations = App::db()->table('cpms_locations');
-            $locked = $mysqli->query('SELECT id FROM ' . $locations . ' WHERE id = ' . $locationId . ' FOR UPDATE');
-            $updated = $locked !== false && $mysqli->query(
-                "UPDATE {$locations} SET timezone = 'America/New_York' WHERE id = " . $locationId
-            ) !== false;
-            if (!$updated) {
-                @fwrite($pipe, "writer_error\n");
-                $mysqli->rollback();
-                ForkChildExit::terminate(2);
-            }
-            @fwrite($pipe, 'writer_locked:' . $mysqli->thread_id . "\n");
-            // The writer is already locked when this wait starts. Thirty seconds
-            // exceeds the parent booking-connection (5s) and lock-observation
-            // (10s) budgets with 15s bounded headroom for the Slot NOWAIT probe.
-            // This is timeout safety only; the pipe/Performance-Schema state is
-            // still the synchronization oracle.
-            $command = $this->readSynchronizationLine($pipe, self::RACE_WRITER_COMMAND_TIMEOUT_SECONDS);
-            if ($command === 'commit') {
-                $mysqli->commit();
-                ForkChildExit::terminate(0);
-            }
-            $mysqli->rollback();
-            ForkChildExit::terminate(3);
-        } catch (\Throwable $e) {
-            @fwrite($pipe, "writer_error\n");
-            if ($mysqli instanceof \mysqli) {
-                @$mysqli->rollback();
-            }
-            ForkChildExit::terminate(2);
-        } finally {
-            if ($mysqli instanceof \mysqli) {
-                @$mysqli->close();
-            }
-            if (is_resource($pipe)) {
-                fclose($pipe);
-            }
-        }
-    }
-
-    private function staffBookingChild(
-        $pipe,
-        string $prefix,
-        int $clinicId,
-        int $staffUserId,
-        int $patientId,
-        int $clinicianId,
-        string $date,
-        string $time,
-        int $slotId
-    ): void {
-        $wdb = null;
-        try {
-            global $wpdb;
-            $wdb = new \wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
-            $wdb->set_prefix($prefix);
-            $wpdb = $wdb;
-            remove_all_filters('query');
-            $wdb->has_connected = false;
-            $wdb->init_charset();
-            $wdb->check_connection();
-            $connectionId = (int) $wdb->get_var('SELECT CONNECTION_ID()');
-            if ($connectionId <= 0) {
-                throw new \RuntimeException('fresh BookingService wpdb connection was not established');
-            }
-            ScopeContext::set(ClinicScope::forClinic($clinicId));
-            @fwrite($pipe, 'booking_connected:' . $connectionId . "\n");
-
-            $cpms = new CpmsDb($wdb);
-            $op = new OpLogger($cpms);
-            $audit = new AuditLogger($cpms, $op);
-            $factory = new SettingsFactory($cpms, $audit);
-            $sms = new SmsService(
-                $cpms,
-                $factory,
-                new SmsProviderRegistry(),
-                new CredentialVault(),
-                $audit,
-                $op,
-                new JobQueue($cpms, $op),
-                static fn (): int => $clinicId
-            );
-            $service = new BookingService(
-                $cpms,
-                new SlotRepository($cpms),
-                new AppointmentRepository($cpms),
-                new PatientRepository($cpms),
-                $factory,
-                new SchedulingLocationLocalAllowAllLicenseGate(),
-                $audit,
-                $op,
-                new Idempotency($cpms),
-                $sms,
-                null,
-                new MembershipRepository($cpms)
-            );
-
-            try {
-                $service->createByStaff($staffUserId, $patientId, $clinicianId, $date, $time, null, $slotId);
-                $outcome = ['result' => 'unexpected_success'];
-            } catch (BookingException $e) {
-                $outcome = ['result' => 'booking_exception', 'code' => $e->errorCode];
-            }
-            $outcome['connection_id'] = $connectionId;
-            $outcome['own_wpdb_connected'] = true;
-            @fwrite($pipe, json_encode($outcome, JSON_UNESCAPED_UNICODE) . "\n");
-            ForkChildExit::terminate(0);
-        } catch (\Throwable $e) {
-            @fwrite($pipe, json_encode([
-                'result' => 'fatal',
-                'detail' => get_class($e) . ': ' . $e->getMessage(),
-            ], JSON_UNESCAPED_UNICODE) . "\n");
-            ForkChildExit::terminate(2);
-        } finally {
-            ScopeContext::clear();
-            if ($wdb instanceof \wpdb) {
-                @$wdb->close();
-            }
-            if (is_resource($pipe)) {
-                fclose($pipe);
-            }
-        }
-    }
-
     private function freshMysqli(): \mysqli
     {
         global $wpdb;
@@ -1495,18 +1024,6 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
         $mysqli->set_charset('utf8mb4');
 
         return $mysqli;
-    }
-
-    private function readSynchronizationLine($pipe, int $seconds): ?string
-    {
-        stream_set_timeout($pipe, $seconds);
-        $line = fgets($pipe);
-        $meta = stream_get_meta_data($pipe);
-        if ($line === false || !empty($meta['timed_out'])) {
-            return null;
-        }
-
-        return rtrim($line, "\r\n");
     }
 
     private function waitForLocationLockContention(
@@ -1547,158 +1064,6 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
         } while (microtime(true) < $deadline);
 
         return false;
-    }
-
-    private function waitForChildExit(int $pid, int $seconds): int|false|null
-    {
-        return self::waitForChildExitUsing(
-            $pid,
-            $seconds,
-            static function (int $childPid): array {
-                $status = 0;
-                $waited = pcntl_waitpid($childPid, $status, WNOHANG);
-
-                return [$waited, $status, $waited === -1 ? pcntl_get_last_error() : 0];
-            },
-            static fn (): float => microtime(true),
-            static function (): void {
-                usleep(10000);
-            }
-        );
-    }
-
-    /**
-     * A false result means confirmed ECHILD only; null means the original
-     * bounded deadline elapsed. Other wait errors are never cleanup success.
-     *
-     * @param callable(int): array{0: int, 1: int, 2: int} $waitpid
-     * @param callable(): float $clock
-     * @param callable(): void $pause
-     */
-    private static function waitForChildExitUsing(
-        int $pid,
-        int $seconds,
-        callable $waitpid,
-        callable $clock,
-        callable $pause
-    ): int|false|null {
-        if ($pid <= 0 || $seconds <= 0) {
-            return false;
-        }
-        $deadline = $clock() + $seconds;
-        do {
-            [$waited, $status, $error] = $waitpid($pid);
-            if ($waited === $pid) {
-                return $status;
-            }
-            if ($waited === -1) {
-                if ($error === PCNTL_EINTR) {
-                    // Keep the original deadline: interruption is neither a
-                    // reap nor permission to abandon required cleanup.
-                    $pause();
-                    continue;
-                }
-                if ($error === PCNTL_ECHILD) {
-                    // No longer waitable: never signal a potentially reused PID.
-                    return false;
-                }
-                throw new \RuntimeException('pcntl_waitpid failed for a known child: ' . pcntl_strerror($error));
-            }
-            if ($waited !== 0) {
-                throw new \RuntimeException('pcntl_waitpid returned an unexpected value: ' . $waited);
-            }
-            $pause();
-        } while ($clock() < $deadline);
-
-        return null;
-    }
-
-    private function reapOrTerminateKnownChild(?int $pid, int|false|null $status): int|false|null
-    {
-        return self::cleanupKnownChild(
-            $pid,
-            $status,
-            fn (int $childPid, int $seconds): int|false|null => $this->waitForChildExit($childPid, $seconds),
-            static function (int $childPid, int $signal): bool {
-                return function_exists('posix_kill') && @posix_kill($childPid, $signal);
-            }
-        );
-    }
-
-    /**
-     * This deterministic seam makes cleanup safety testable without creating
-     * synthetic fork failures or signalling any runner process.
-     *
-     * @param callable(int, int): (int|false|null) $waitForExit
-     * @param callable(int, int): bool $sendSignal
-     */
-    private static function cleanupKnownChild(
-        ?int $pid,
-        int|false|null $status,
-        callable $waitForExit,
-        callable $sendSignal
-    ): int|false|null {
-        if ($status !== null || $pid === null || $pid <= 0) {
-            return $status;
-        }
-
-        $waitError = null;
-        $status = self::waitForCleanup($pid, self::RACE_GRACEFUL_REAP_TIMEOUT_SECONDS, $waitForExit, $waitError);
-        if ($status !== null) {
-            return self::terminalCleanupResult($status, $waitError);
-        }
-        $sendSignal($pid, SIGTERM);
-
-        $status = self::waitForCleanup($pid, self::RACE_TERMINATION_REAP_TIMEOUT_SECONDS, $waitForExit, $waitError);
-        if ($status !== null) {
-            return self::terminalCleanupResult($status, $waitError);
-        }
-        $sendSignal($pid, SIGKILL);
-
-        $status = self::waitForCleanup($pid, self::RACE_TERMINATION_REAP_TIMEOUT_SECONDS, $waitForExit, $waitError);
-        if ($status !== null) {
-            return self::terminalCleanupResult($status, $waitError);
-        }
-        if ($waitError instanceof \Throwable) {
-            throw new \RuntimeException('Unexpected child wait error during bounded cleanup.', 0, $waitError);
-        }
-
-        return null;
-    }
-
-    private static function terminalCleanupResult(int|false $status, ?\Throwable $waitError): int|false
-    {
-        if ($waitError instanceof \Throwable) {
-            throw new \RuntimeException('Unexpected child wait error during bounded cleanup.', 0, $waitError);
-        }
-
-        return $status;
-    }
-
-    /**
-     * @param callable(int, int): (int|false|null) $waitForExit
-     */
-    private static function waitForCleanup(
-        int $pid,
-        int $seconds,
-        callable $waitForExit,
-        ?\Throwable &$waitError
-    ): int|false|null {
-        try {
-            return $waitForExit($pid, $seconds);
-        } catch (\Throwable $e) {
-            $waitError ??= $e;
-
-            return null;
-        }
-    }
-
-    private static function closeSynchronizationPipe(&$pipe): void
-    {
-        if (is_resource($pipe)) {
-            @fclose($pipe);
-        }
-        $pipe = null;
     }
 
     private function assertRaceLocksReleased(int $slotId, int $locationId): void
@@ -2082,7 +1447,7 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
         }
         $wpdb->query('SET FOREIGN_KEY_CHECKS = 1'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         if ($this->fixtureCommitted) {
-            // The fixture was COMMITted for the forked sessions, so this
+            // The fixture was COMMITted for the independent sessions, so this
             // cleanup's DELETEs sit in a fresh transaction that tearDown's
             // ROLLBACK would undo — resurrecting the Clinic rows. Commit them.
             if ($wpdb->query('COMMIT') === false) { // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
@@ -2097,25 +1462,5 @@ final class SchedulingLocationLocalBoundaryRedTest extends WP_UnitTestCase
         $wpdb->query(
             'DELETE FROM ' . App::db()->table('cpms_jobs') . ' WHERE type IN ("slots.generate","holds.expire")' // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         );
-    }
-}
-
-
-/** Test-only child wiring: license policy is intentionally outside this lock-order regression. */
-final class SchedulingLocationLocalAllowAllLicenseGate implements LicenseGate
-{
-    public function assert(string $operation, array $context = []): LicenseDecision
-    {
-        return LicenseDecision::allow();
-    }
-
-    public function state(): string
-    {
-        return 'active';
-    }
-
-    public function isReadOnly(): bool
-    {
-        return false;
     }
 }

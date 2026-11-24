@@ -4,33 +4,11 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
-use ClinicCore\Application\Authorization\AuthorizationService;
-use ClinicCore\Application\Booking\BookingService;
-use ClinicCore\Application\Location\LocationException;
-use ClinicCore\Application\Location\LocationService;
-use ClinicCore\Application\Notifications\SmsService;
-use ClinicCore\Application\Patients\PatientService;
-use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
-use ClinicCore\Domain\Booking\BookingException;
-use ClinicCore\Domain\Licensing\ActiveLicenseGate;
-use ClinicCore\Infrastructure\Audit\AuditLogger;
-use ClinicCore\Infrastructure\Db\CpmsDb;
-use ClinicCore\Infrastructure\Logging\OpLogger;
-use ClinicCore\Infrastructure\Queue\JobQueue;
-use ClinicCore\Infrastructure\Repository\AppointmentRepository;
-use ClinicCore\Infrastructure\Repository\LocationRepository;
-use ClinicCore\Infrastructure\Repository\MembershipRepository;
-use ClinicCore\Infrastructure\Repository\PatientRepository;
-use ClinicCore\Infrastructure\Repository\SlotRepository;
-use ClinicCore\Infrastructure\Security\Idempotency;
-use ClinicCore\Infrastructure\Sms\CredentialVault;
-use ClinicCore\Infrastructure\Sms\SmsProviderRegistry;
 use ClinicCore\Settings\Settings;
-use ClinicCore\Settings\SettingsFactory;
-use ClinicCore\Tests\Support\ForkChildExit;
+use ClinicCore\Tests\Support\ExternalRaceWorker;
 use WP_UnitTestCase;
 
 /**
@@ -74,7 +52,7 @@ final class LocationDeactivationBookingConcurrencyTest extends WP_UnitTestCase
     protected function setUp(): void
     {
         parent::setUp();
-        self::assertTrue(function_exists('pcntl_fork'), 'precondition: CI must provide pcntl for real independent workers');
+        self::assertTrue(function_exists('proc_open'), 'precondition: CI must provide proc_open for real independent workers');
 
         App::migrations()->migrate();
         App::resetScope();
@@ -282,51 +260,24 @@ final class LocationDeactivationBookingConcurrencyTest extends WP_UnitTestCase
         );
     }
 
-    /**
-     * @return array{booking: BookingService, location: LocationService}
-     */
-    private function services(CpmsDb $db, int $clinicId): array
+    /** @return array<string, mixed> worker payload for the location_deactivation mode */
+    private function workerTask(string $kind, string $readyFile, string $goFile, string $outcomeFile): array
     {
-        $op = new OpLogger($db);
-        $audit = new AuditLogger($db, $op);
-        $settingsFactory = new SettingsFactory($db, $audit);
-        $licenseGate = new ActiveLicenseGate();
-        $jobs = new JobQueue($db, $op);
-        $sms = new SmsService(
-            $db,
-            $settingsFactory,
-            new SmsProviderRegistry(),
-            new CredentialVault(),
-            $audit,
-            $op,
-            $jobs,
-            static fn (): int => $clinicId,
-            $licenseGate
-        );
-        $memberships = new MembershipRepository($db);
-        $booking = new BookingService(
-            $db,
-            new SlotRepository($db),
-            new AppointmentRepository($db),
-            new PatientRepository($db),
-            $settingsFactory,
-            $licenseGate,
-            $audit,
-            $op,
-            new Idempotency($db),
-            $sms,
-            null,
-            $memberships,
-            PatientService::default_identity_activator($db)
-        );
-        $location = new LocationService(
-            $db,
-            new LocationRepository($db),
-            new AuthorizationService($memberships),
-            $audit
-        );
-
-        return ['booking' => $booking, 'location' => $location];
+        return [
+            'mode' => 'location_deactivation',
+            'kind' => $kind,
+            'clinic_id' => $this->clinicId,
+            'manager_user_id' => $this->managerUserId,
+            'secretary_user_id' => $this->secretaryUserId,
+            'patient_id' => $this->patientId,
+            'clinician_id' => $this->clinicianId,
+            'target_location_id' => $this->targetLocationId,
+            'slot_date' => $this->slotDate,
+            'slots' => $this->slots,
+            'ready_file' => $readyFile,
+            'go_file' => $goFile,
+            'outcome_file' => $outcomeFile,
+        ];
     }
 
     /** Run one real product worker on a fresh independent connection. */
@@ -335,26 +286,24 @@ final class LocationDeactivationBookingConcurrencyTest extends WP_UnitTestCase
         $goFile = sys_get_temp_dir() . '/' . $this->fileTag . '-' . $kind . '-go';
         $readyFile = sys_get_temp_dir() . '/' . $this->fileTag . '-' . $kind . '-ready.json';
         $outcomeFile = sys_get_temp_dir() . '/' . $this->fileTag . '-' . $kind . '-outcome.json';
-        $pid = pcntl_fork();
-        if ($pid === -1) {
-            return ['result' => 'fatal', 'detail' => 'pcntl_fork failed'];
-        }
-        if ($pid === 0) {
-            $this->childWorker($kind, $readyFile, $goFile, $outcomeFile);
-        }
+        $worker = ExternalRaceWorker::launch($this->workerScript(), $this->workerTask($kind, $readyFile, $goFile, $outcomeFile));
 
         $spec = [$kind => ['ready' => $readyFile, 'outcome' => $outcomeFile]];
         $ready = $this->waitForWorkersReady($spec);
         file_put_contents($goFile, 'release');
-        pcntl_waitpid($pid, $status);
+        $rc = $worker->waitForExit(15.0);
         $raw = @file_get_contents($outcomeFile);
         $decoded = $raw === false ? null : json_decode($raw, true);
+        $worker->terminate();
         @unlink($readyFile);
         @unlink($outcomeFile);
         @unlink($goFile);
 
-        if ($ready === null || !ForkChildExit::childTerminatedCleanly($status)) {
-            return ['result' => 'fatal', 'detail' => 'worker did not become ready or exit cleanly'];
+        if ($ready === null) {
+            return ['result' => 'fatal', 'detail' => 'worker did not become ready'];
+        }
+        if (0 !== $rc) {
+            return ['result' => 'fatal', 'detail' => 'worker did not exit with status 0 (got ' . $rc . ')'];
         }
 
         return is_array($decoded) ? $decoded : ['result' => 'fatal', 'detail' => 'worker outcome file missing or invalid'];
@@ -381,6 +330,7 @@ final class LocationDeactivationBookingConcurrencyTest extends WP_UnitTestCase
                 'outcome' => sys_get_temp_dir() . '/' . $this->fileTag . '-book-outcome.json',
             ],
         ];
+        /** @var array<string, ExternalRaceWorker> $pids */
         $pids = [];
         $coordinationError = '';
         $lockWaitRows = [];
@@ -411,15 +361,15 @@ final class LocationDeactivationBookingConcurrencyTest extends WP_UnitTestCase
                 $coordinationError = 'coordinator could not lock the fixture Organization -> Clinic prefix';
             } else {
                 foreach ($workerSpecs as $kind => $paths) {
-                    $pid = pcntl_fork();
-                    if ($pid === -1) {
-                        $coordinationError = 'pcntl_fork failed for ' . $kind;
+                    try {
+                        $pids[$kind] = ExternalRaceWorker::launch(
+                            $this->workerScript(),
+                            $this->workerTask($kind, $paths['ready'], $goFile, $paths['outcome'])
+                        );
+                    } catch (\Throwable $e) {
+                        $coordinationError = 'worker launch failed for ' . $kind . ': ' . $e->getMessage();
                         break;
                     }
-                    if ($pid === 0) {
-                        $this->childWorker($kind, $paths['ready'], $goFile, $paths['outcome']);
-                    }
-                    $pids[$kind] = $pid;
                 }
 
                 if (count($pids) === count($workerSpecs)) {
@@ -453,9 +403,11 @@ final class LocationDeactivationBookingConcurrencyTest extends WP_UnitTestCase
         $outcomes = [];
         foreach ($workerSpecs as $kind => $paths) {
             if (isset($pids[$kind])) {
-                pcntl_waitpid($pids[$kind], $status);
-                if (!ForkChildExit::childTerminatedCleanly($status)) {
-                    $outcomes[$kind] = ['result' => 'fatal', 'detail' => 'worker process did not exit cleanly'];
+                $worker = $pids[$kind];
+                $rc = $worker->waitForExit(15.0);
+                $worker->terminate();
+                if (0 !== $rc) {
+                    $outcomes[$kind] = ['result' => 'fatal', 'detail' => 'worker process did not exit with status 0 (got ' . $rc . ')'];
                     continue;
                 }
             }
@@ -480,88 +432,10 @@ final class LocationDeactivationBookingConcurrencyTest extends WP_UnitTestCase
         ];
     }
 
-    /** Worker never returns to the copied PHPUnit runner; it always exits. */
-    private function childWorker(string $kind, string $readyFile, string $goFile, string $outcomeFile): void
+    /** Absolute path of the external race worker script. */
+    private function workerScript(): string
     {
-        try {
-            global $wpdb;
-            $workerDb = new \wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
-            if (!method_exists($workerDb, 'set_prefix')) {
-                throw new \RuntimeException('wpdb::set_prefix is unavailable');
-            }
-            $workerDb->set_prefix($wpdb->prefix);
-            $wpdb = $workerDb;
-            remove_all_filters('query');
-            $workerDb->has_connected = false;
-            $workerDb->init_charset();
-            $workerDb->check_connection();
-            $workerDb->query('SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-            $workerDb->query('SET SESSION innodb_lock_wait_timeout = 30'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-
-            $connectionId = (int) $workerDb->get_var('SELECT CONNECTION_ID()'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-            $db = new CpmsDb($workerDb);
-            ScopeContext::set(ClinicScope::forClinic($this->clinicId));
-            $services = $this->services($db, $this->clinicId);
-            file_put_contents($readyFile, wp_json_encode(['connection_id' => $connectionId]));
-
-            $barrierDeadline = microtime(true) + 20.0;
-            while (!is_file($goFile) && microtime(true) < $barrierDeadline) {
-                usleep(1000);
-            }
-            if (!is_file($goFile)) {
-                throw new \RuntimeException('worker barrier timed out');
-            }
-
-            if ($kind === 'deactivate') {
-                $row = $services['location']->set_active(
-                    $this->managerUserId,
-                    $this->clinicId,
-                    $this->targetLocationId,
-                    false
-                );
-                $outcome = ['result' => 'ok', 'is_active' => (int) ($row['is_active'] ?? -1)];
-            } else {
-                $slotIndex = match ($kind) {
-                    'book_control' => 0,
-                    'book' => 1,
-                    'book_after_deactivation' => 2,
-                    default => throw new \InvalidArgumentException('unknown worker kind'),
-                };
-                $booking = $services['booking']->createByStaff(
-                    $this->secretaryUserId,
-                    $this->patientId,
-                    $this->clinicianId,
-                    $this->slotDate,
-                    $this->slots[$slotIndex]['time'],
-                    $kind === 'book_control' ? 'active-location control' : 'location lifecycle race',
-                    $this->slots[$slotIndex]['id']
-                );
-                $outcome = [
-                    'result' => 'ok',
-                    'appointment_id' => (int) ($booking['appointment_id'] ?? 0),
-                ];
-            }
-            file_put_contents($outcomeFile, wp_json_encode($outcome));
-        } catch (BookingException $e) {
-            file_put_contents($outcomeFile, wp_json_encode([
-                'result' => 'error',
-                'code' => $e->errorCode,
-                'http' => $e->httpStatus,
-            ]));
-        } catch (LocationException $e) {
-            file_put_contents($outcomeFile, wp_json_encode([
-                'result' => 'error',
-                'code' => $e->getErrorCode(),
-                'http' => $e->getHttpStatus(),
-            ]));
-        } catch (\Throwable $e) {
-            file_put_contents($outcomeFile, wp_json_encode([
-                'result' => 'fatal',
-                'class' => get_class($e),
-                'detail' => $e->getMessage(),
-            ]));
-        }
-        ForkChildExit::terminate(0);
+        return dirname(__DIR__) . '/bin/fork-race-wp-worker.php';
     }
 
     /** @param array<string, array{ready: string, outcome: string}> $workerSpecs */

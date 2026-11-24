@@ -1,33 +1,40 @@
 <?php
 
 /**
- * Fork-child lifetime guard — witness coverage for the fork/inherited-socket
- * leak fixed in this branch (TEST-ONLY).
+ * External race worker — witness coverage for the inherited-socket hazard
+ * this branch eliminates (TEST-ONLY).
  *
- * Background: every pcntl_fork() child that ends its execution through PHP's
- * normal shutdown path (plain exit()) destroys the inherited WordPress
- * mysqli handle on the shared session socket; the server then tears the
- * harness's outer transaction down and leaks committed fixture rows into
+ * Background: every pcntl_fork() child that used to end its execution through
+ * PHP's normal shutdown path (plain exit()) destroyed the inherited WordPress
+ * mysqli handle on the shared session socket; the server then tore the
+ * harness's outer transaction down and leaked committed fixture rows into
  * the shared test database (observed in CI run 44992895013: 20 failing tests,
  * including the Phase 9 portal preconditions that expected exactly one seeded
  * Clinic).
  *
- * What these tests pin down:
- *  1. A forked child gets its OWN MySQL session (different CONNECTION_ID())
- *     and, after running the real license-gate read path and ending via the
- *     fork-child lifetime guard, the parent's session is the SAME one it
- *     held before the fork — with the same durable Clinic roster and no
- *     driver error. No destructor or shutdown handler runs in the child.
- *  2. The pre-fix behavior is a live hazard, not a theory: a plain
- *     exit(0) DOES run registered PHP shutdown handlers. The control is
- *     executed in a FRESH, socket-free PHP process via exec(); it never
- *     forks the harness process, because a plain-exit child there would
- *     close the inherited MySQL session and poison every later test in
- *     the same PHPUnit process.
+ * The suite no longer forks. Race actors run as external workers launched
+ * through tests/Support/ExternalRaceWorker (proc_open, descriptor
+ * pinning): the worker never holds a descriptor of the harness process, so
+ * its graceful exit runs the ordinary PHP shutdown path — including mysqlnd's
+ * COM_QUIT on the WORKER's own session — without any way to touch the
+ * parent's session.
  *
- * What these tests deliberately do NOT claim: they do not re-prove server-side
- * socket teardown (no deterministic way to do that inside one PHPUnit
- * process) and they do not change or depend on license allow/deny outcomes.
+ * What these tests pin down:
+ *  1. An external worker opens its OWN MySQL session (different
+ *     CONNECTION_ID()), reports its own durable roster count, and ends with a
+ *     plain exit(0). Its registered shutdown handler DOES run (marker file is
+ *     written) and that is safe: the parent's session is the SAME one it held
+ *     before the worker ran — same CONNECTION_ID(), same durable Clinic roster,
+ *     no driver error.
+ *  2. Plain exit(0) DOES run registered PHP shutdown handlers — the exact
+ *     path the inherited-socket hazard lived on. The control runs in a FRESH,
+ *     socket-free PHP process via exec(). It documents the mechanism without
+ *     touching the database at all.
+ *
+ * What these tests deliberately do NOT claim: they do not re-prove
+ * server-side socket teardown (no deterministic way to do that inside one
+ * PHPUnit process) and they do not change or depend on license allow/deny
+ * outcomes.
  */
 
 declare(strict_types=1);
@@ -35,25 +42,22 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
-use ClinicCore\Domain\Licensing\LicenseGate;
-use ClinicCore\Tests\Support\ForkChildExit;
+use ClinicCore\Tests\Support\ExternalRaceWorker;
 use WP_UnitTestCase;
 
 final class ForkChildLifetimeTest extends WP_UnitTestCase
 {
 	/**
-	 * Child opens its own MySQL session and, after running the real
-	 * license-gate read path and ending via the lifetime guard, the
-	 * parent's session is untouched (same CONNECTION_ID(), same durable
-	 * Clinic roster, no driver error) and no child shutdown handler ran.
+	 * Inverted witness: the external worker opens its OWN MySQL session and,
+	 * after reporting it and registering a shutdown handler, ends with a
+	 * plain exit(0). Its shutdown path runs (marker file is written) and the
+	 * parent's session is untouched: same CONNECTION_ID(), same durable Clinic
+	 * roster, no driver error.
 	 */
-	public function testForkedChildUsesOwnConnectionAndParentSessionSurvivesChildGateCall(): void
+	public function testExternalWorkerUsesOwnConnectionAndParentSessionSurvivesWorkerShutdown(): void
 	{
-		if (!function_exists('pcntl_fork') || !function_exists('pcntl_waitpid')) {
-			self::markTestSkipped('pcntl fork/wait not available.');
-		}
-		if (!function_exists('posix_kill') || !defined('SIGKILL')) {
-			self::markTestSkipped('posix_kill/SIGKILL not available (hard child exit is required).');
+		if (!function_exists('proc_open')) {
+			self::markTestSkipped('proc_open not available.');
 		}
 
 		$before = (int) App::db()->fetchValue('SELECT CONNECTION_ID()', []);
@@ -62,55 +66,23 @@ final class ForkChildLifetimeTest extends WP_UnitTestCase
 		self::assertGreaterThan(0, $clinic_count_before, 'precondition: at least one seeded Clinic exists.');
 
 		$tag = bin2hex(random_bytes(6));
-		$outcome_file = sys_get_temp_dir() . '/cpms-forkchild-' . $tag . '-outcome.json';
-		$marker_file = sys_get_temp_dir() . '/cpms-forkchild-' . $tag . '-marker';
+		$outcome_file = sys_get_temp_dir() . '/cpms-extworker-' . $tag . '-outcome.json';
+		$marker_file = sys_get_temp_dir() . '/cpms-extworker-' . $tag . '-marker';
 		@unlink($outcome_file);
 		@unlink($marker_file);
 
-		$pid = pcntl_fork();
-		if ($pid === -1) {
-			self::fail('pcntl_fork failed.');
-		}
-		if ($pid === 0) {
-			try {
-				// Independent MySQL session — never the inherited socket.
-				$own = new \wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
-				$child_connection_id = 0;
-				if (method_exists($own, 'get_var')) {
-					$child_connection_id = (int) $own->get_var('SELECT CONNECTION_ID()');
-				}
-				// Real license-gate read path, executed from the forked child.
-				// The allow/deny outcome is irrelevant here; what matters is that
-				// the gate executes against the child's memory state and returns.
-				$gate_error = null;
-				try {
-					App::licenseGate()->assert(LicenseGate::OP_SETTINGS_WRITE);
-				} catch (\Throwable $gate) {
-					$gate_error = get_class($gate);
-				}
-				register_shutdown_function(static function () use ($marker_file): void {
-					@file_put_contents($marker_file, 'shutdown-ran');
-				});
-				@file_put_contents(
-					$outcome_file,
-					(string) json_encode(
-						[
-							'connection_id' => $child_connection_id,
-							'gate_error'    => $gate_error,
-						]
-					)
-				);
-			} catch (\Throwable $boot) {
-				@file_put_contents($outcome_file, (string) json_encode(['boot_error' => get_class($boot)]));
-			}
-			ForkChildExit::terminate(0);
-		}
-
-		pcntl_waitpid($pid, $status);
-		self::assertTrue(
-			ForkChildExit::childTerminatedCleanly($status),
-			'the child must end via the fork-child lifetime guard (SIGKILL), not by running its shutdown handlers.'
+		$worker = ExternalRaceWorker::launch(
+			dirname(__DIR__) . '/bin/fork-race-wp-worker.php',
+			[
+				'mode' => 'lifetime_probe',
+				'outcome_file' => $outcome_file,
+				'marker_file' => $marker_file,
+			]
 		);
+		$rc = $worker->waitForExit(15.0);
+		$worker->terminate();
+
+		self::assertSame(0, $rc, 'the external worker must end with a plain, graceful exit(0) — never a signalled or timed-out teardown.');
 
 		$raw = @file_get_contents($outcome_file);
 		@unlink($outcome_file);
@@ -121,19 +93,19 @@ final class ForkChildLifetimeTest extends WP_UnitTestCase
 				$decoded = $json;
 			}
 		}
-		self::assertIsArray($decoded, 'the child must report its outcome before terminating.');
-		self::assertArrayHasKey('connection_id', $decoded, 'the child must hold an independent MySQL session.');
-		self::assertGreaterThan(0, (int) $decoded['connection_id'], 'the child must hold an independent MySQL session.');
-		self::assertNotSame($before, (int) $decoded['connection_id'], 'the child must NOT reuse the parent session.');
-		self::assertFileDoesNotExist($marker_file, 'no child shutdown handler may run (it would tear down the inherited socket).');
+		self::assertIsArray($decoded, 'the worker must report its outcome before exiting.');
+		self::assertArrayHasKey('connection_id', $decoded, 'the worker must hold an independent MySQL session.');
+		self::assertGreaterThan(0, (int) $decoded['connection_id'], 'the worker must hold an independent MySQL session.');
+		self::assertNotSame($before, (int) $decoded['connection_id'], 'the worker must NOT reuse the parent session.');
+
+		self::assertFileExists($marker_file, 'worker shutdown handlers DO run on a graceful exit — safe here because the worker inherited no parent descriptor, so there is no shared session to tear down.');
+		@unlink($marker_file);
 
 		$after = (int) App::db()->fetchValue('SELECT CONNECTION_ID()', []);
 		self::assertSame($before, $after, 'the parent must keep the SAME MySQL session (a teardown + transparent reconnect would change CONNECTION_ID()).');
 		$clinic_count_after = (int) App::db()->fetchValue('SELECT COUNT(*) FROM ' . App::db()->table('cpms_clinics'), []);
-		self::assertSame($clinic_count_before, $clinic_count_after, 'the parent must read the same durable Clinic roster after the child ran.');
-		self::assertSame('', (string) App::db()->wpdb()->last_error, 'the parent must not see a driver-level error after the child ran.');
-
-		@unlink($marker_file);
+		self::assertSame($clinic_count_before, $clinic_count_after, 'the parent must read the same durable Clinic roster after the worker ran.');
+		self::assertSame('', (string) App::db()->wpdb()->last_error, 'the parent must not see a driver-level error after the worker ran.');
 	}
 
 	/**
