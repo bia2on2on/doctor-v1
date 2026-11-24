@@ -10,6 +10,7 @@ use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Notifications\NotificationEvents;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
@@ -371,7 +372,9 @@ final class NotificationService
         $payload = [
             'title' => $rendered['title'],
             'body' => $rendered['body'],
-            'vars' => $vars,
+            // B0-PR3 follow-up: raw vars used to be persisted beside the already
+            // redacted title/body; owner rule forbids a NID in a notification.
+            'vars' => self::redact_vars( $vars ),
         ];
 
         $id = $this->notifications->insert($clinic_id, array_merge($recipient, [
@@ -385,6 +388,20 @@ final class NotificationService
         ]));
 
         return $id;
+    }
+
+    /**
+     * Mask NID-shaped digit runs in stored notification variables (keys too).
+     * @param array<string, string> $vars
+     * @return array<string, string>
+     */
+    private function redact_vars( array $vars ): array {
+        $safe = [];
+        foreach ( $vars as $key => $value ) {
+            $safe[ NationalIdValidator::redact_digits( (string) $key ) ] = NationalIdValidator::redact_digits( (string) $value );
+        }
+
+        return $safe;
     }
 
     /**

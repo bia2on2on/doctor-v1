@@ -10,6 +10,7 @@ use ClinicCore\Domain\Sms\SmsMessageStatus;
 use ClinicCore\Domain\Sms\SmsTemplateException;
 use ClinicCore\Domain\Sms\SmsTemplateRenderer;
 use ClinicCore\Domain\Validators\MobileValidator;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
@@ -269,7 +270,10 @@ final class SmsService
         if ($isOtp && !$useTemplate) {
             $text = str_replace((string) ($vars['otp_code'] ?? ''), '***', $text);
         }
-        $storedVars = ($isOtp || $isTest) ? null : (string) json_encode($vars, JSON_UNESCAPED_UNICODE);
+        // B0-PR3 follow-up: vars_json is a stored copy AND the template-variable
+        // source on a later dispatch; NID-shaped runs are masked before storage.
+        // Ordinary content (names/dates/times) is untouched, so delivery is unchanged.
+        $storedVars = ( $isOtp || $isTest ) ? null : (string) json_encode( $this->redact_vars( $vars ), JSON_UNESCAPED_UNICODE );
 
         // Dedupe (الزام §20): رویدادهای وابسته به Context — بدون ارسال تکراری
         $dedupeKey = null;
@@ -1221,6 +1225,20 @@ final class SmsService
             ' SET ' . implode(', ', $sets) . ", updated_at = %s WHERE id = %d",
             $params
         );
+    }
+
+    /**
+     * Mask NID-shaped digit runs in SMS variables before they are persisted.
+     * @param array<string, string> $vars
+     * @return array<string, string>
+     */
+    private function redact_vars( array $vars ): array {
+        $safe = [];
+        foreach ( $vars as $key => $value ) {
+            $safe[ NationalIdValidator::redact_digits( (string) $key ) ] = NationalIdValidator::redact_digits( (string) $value );
+        }
+
+        return $safe;
     }
 
     /**

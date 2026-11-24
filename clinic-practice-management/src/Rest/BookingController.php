@@ -14,6 +14,7 @@ use ClinicCore\Application\Scope\TrustedClinicEstablisher;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use WP_Error;
 use WP_REST_Request;
@@ -703,7 +704,7 @@ final class BookingController extends RestBase
             return $this->error( $e->apiCode(), $e->httpStatus(), $e->getMessage(), $e->getData() );
         } catch ( \Throwable $e ) {
             // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- operational boundary log without leaking raw exception details to client.
-            error_log( '[CPMS][BookingController] unexpected: ' . get_class( $e ) . ': ' . $e->getMessage() );
+            error_log( '[CPMS][BookingController] unexpected: ' . get_class( $e ) . ': ' . NationalIdValidator::redact_digits( $e->getMessage() ) );
             return $this->error( 'CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور؛ لطفاً دوباره تلاش کنید.' );
         }
     }

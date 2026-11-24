@@ -9,6 +9,7 @@ use ClinicCore\Application\Finance\FinanceService;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Domain\Visits\VisitException;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use WP_Error;
@@ -349,7 +350,7 @@ final class FinanceController extends RestBase
             // Transitionهای واگذار‌شده به VisitService (V11/V12)
             return $this->error($e->errorCode, $e->httpStatus, $e->getMessage(), $e->data);
         } catch (\Throwable $e) {
-            error_log('[CPMS][FinanceController] unexpected: ' . get_class($e) . ': ' . $e->getMessage());
+            error_log('[CPMS][FinanceController] unexpected: ' . get_class($e) . ': ' . NationalIdValidator::redact_digits( $e->getMessage() ));
 
             return $this->error('CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور — لطفاً دوباره تلاش کنید');
         }

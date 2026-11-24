@@ -9,6 +9,7 @@ use ClinicCore\Application\Clinical\ClinicalException;
 use ClinicCore\Application\Clinical\ClinicalService;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Domain\Visits\VisitException;
 use WP_Error;
 use WP_REST_Request;
@@ -390,7 +391,7 @@ final class ClinicalController extends RestBase
             // Transitionهای واگذار‌شده به VisitService (E14/E15)
             return $this->error($e->errorCode, $e->httpStatus, $e->getMessage(), $e->data);
         } catch (\Throwable $e) {
-            error_log('[CPMS][ClinicalController] unexpected: ' . get_class($e) . ': ' . $e->getMessage());
+            error_log('[CPMS][ClinicalController] unexpected: ' . get_class($e) . ': ' . NationalIdValidator::redact_digits( $e->getMessage() ));
 
             return $this->error('CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور — لطفاً دوباره تلاش کنید');
         }

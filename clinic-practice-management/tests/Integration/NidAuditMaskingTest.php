@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Notifications\NotificationEvents;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 /**
@@ -491,5 +493,59 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
         $chain = App::audit()->verifyChain();
         $this->assertArrayHasKey('ok', $chain);
         $this->assertTrue((bool) $chain['ok']);
+    }
+
+    /**
+     * B0-PR3 follow-up — the stored payload copy must not keep a raw NID.
+     *
+     * `insertNotification()` always stored the caller's variables verbatim in
+     * `payload_json.vars` beside the already redacted title/body, so a caller
+     * that passed a national ID produced an at-rest NID in cpms_notifications.
+     * Contract asserted here: (a) no NID digit run survives anywhere in the
+     * stored payload, (b) ordinary variables are still stored unchanged — the
+     * masking is targeted, not a whole-payload wipe.
+     */
+    public function testNotificationPayloadVarsMaskNidWhileOrdinaryVarsRemain(): void
+    {
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+
+        $notifId = App::notificationService()->publishToPatient(
+            1,
+            4242,
+            NotificationEvents::APPT_CONFIRMED,
+            [
+                'patient_name' => 'بیمار ' . $nid,
+                'doctor_name' => 'دکتر تست',
+                'appointment_date' => '1405/06/10',
+                'appointment_time' => '09:30',
+                'clinic_name' => 'مطب تست',
+            ],
+            'nid_mask_notification_payload_test_' . random_int(100000, 999999)
+        );
+
+        self::assertNotNull($notifId);
+        $row = App::db()->fetchRow(
+            'SELECT payload_json FROM ' . App::db()->table('cpms_notifications') . ' WHERE id = %d',
+            [$notifId]
+        );
+        self::assertIsArray($row);
+        $payloadJson = (string) $row['payload_json'];
+
+        // Negative: no NID digit run survives in the stored payload.
+        self::assertStringNotContainsString($nid, $payloadJson);
+        self::assertStringContainsString('[nid-redacted]', $payloadJson);
+
+        // Positive witness: ordinary variables are stored unchanged.
+        $payload = json_decode($payloadJson, true);
+        self::assertIsArray($payload);
+        self::assertArrayHasKey('vars', $payload);
+        self::assertIsArray($payload['vars']);
+        self::assertArrayHasKey('doctor_name', $payload['vars']);
+        self::assertSame('دکتر تست', $payload['vars']['doctor_name']);
+        self::assertArrayHasKey('appointment_date', $payload['vars']);
+        self::assertSame('1405/06/10', $payload['vars']['appointment_date']);
+        self::assertArrayHasKey('body', $payload);
+        self::assertStringContainsString('نوبت شما با', (string) $payload['body']);
+        self::assertStringNotContainsString($nid, (string) $payload['body']);
     }
 }

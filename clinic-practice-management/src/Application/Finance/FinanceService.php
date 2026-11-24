@@ -13,6 +13,7 @@ use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Finance\InvoiceCalc;
 use ClinicCore\Domain\Machine\InvoiceMachine;
 use ClinicCore\Domain\Time\Jalali;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Domain\Visits\VisitException;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
@@ -1222,7 +1223,7 @@ final class FinanceService
         try {
             $this->visitService->applyTransition($actorUserId, $visit, 'settled', [], 'system');
         } catch (VisitException $e) {
-            error_log('[CPMS][Finance] settle skipped: ' . $e->getMessage());
+            error_log('[CPMS][Finance] settle skipped: ' . NationalIdValidator::redact_digits( $e->getMessage() ));
         }
     }
 

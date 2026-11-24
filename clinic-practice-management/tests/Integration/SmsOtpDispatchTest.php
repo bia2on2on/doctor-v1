@@ -8,6 +8,7 @@ use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Sms\SmsEvents;
 use ClinicCore\Domain\Sms\SmsMessageStatus;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\RecordingSmsProvider;
 use WP_UnitTestCase;
 
@@ -247,6 +248,93 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
         self::assertSame((string) $row['message'], $this->recording->textSends[0]['message']);
         self::assertNotNull($row['vars_json']);
         self::assertStringContainsString('بیمار تست', (string) $row['vars_json']);
+    }
+
+    /**
+     * B0-PR3 follow-up — `vars_json` is a stored copy of the caller's
+     * variables (and the template-variable source on a later dispatch). It
+     * used to be persisted verbatim, so a caller passing a national ID left a
+     * raw NID at rest in cpms_sms_messages.
+     *
+     * Contract asserted here: the stored copy masks NID-shaped digit runs
+     * while keeping ordinary values for retries, AND delivery is unchanged —
+     * the provider still receives the legitimate rendered text.
+     */
+    public function testStoredVarsMaskNidWhileDeliveredTextKeepsOrdinaryContent(): void
+    {
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+
+        $result = App::smsService()->sendEvent(
+            self::CLINIC_ID,
+            SmsEvents::APPT_REMINDER,
+            self::MOBILE,
+            [
+                'patient_name' => 'بیمار تست',
+                'doctor_name' => 'دکتر تست',
+                'appointment_date' => '1405/06/10',
+                'appointment_time' => '09:30',
+                'clinic_name' => 'مطب تست',
+                'national_id' => $nid,
+            ],
+            'appointment',
+            $this->uniqueContext(),
+            inline: true
+        );
+        self::assertSame(SmsMessageStatus::SENT, $result['status']);
+
+        $row = $this->fetchRow((int) $result['message_id']);
+        // Stored vars copy: NID masked, ordinary values kept for retries.
+        self::assertNotNull($row['vars_json']);
+        self::assertStringNotContainsString($nid, (string) $row['vars_json']);
+        self::assertStringContainsString('[nid-redacted]', (string) $row['vars_json']);
+        self::assertStringContainsString('بیمار تست', (string) $row['vars_json']);
+        self::assertStringContainsString('1405/06/10', (string) $row['vars_json']);
+
+        // Delivery witness: the provider still receives the legitimate text.
+        self::assertCount(1, $this->recording->textSends);
+        self::assertSame((string) $row['message'], $this->recording->textSends[0]['message']);
+        self::assertStringContainsString('بیمار تست', $this->recording->textSends[0]['message']);
+        self::assertStringContainsString('1405/06/10', $this->recording->textSends[0]['message']);
+        self::assertStringNotContainsString($nid, $this->recording->textSends[0]['message']);
+    }
+
+    /**
+     * B0-PR3 follow-up, template path — the stored `vars_json` is exactly the
+     * variable map handed to a template provider on a later dispatch, so the
+     * masked copy must still carry every ordinary variable while no NID digit
+     * run reaches the provider payload.
+     */
+    public function testTemplateDispatchUsesMaskedStoredVarsButDeliversOrdinaryOnes(): void
+    {
+        App::settings()->set('sms.templates', ['appointment_reminder' => ['template_id' => 'TPL-NID-1', 'updated_at' => gmdate('c')]]);
+        Settings::flushCache();
+
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+        $result = App::smsService()->sendEvent(
+            self::CLINIC_ID,
+            SmsEvents::APPT_REMINDER,
+            self::MOBILE,
+            [
+                'patient_name' => 'بیمار تست',
+                'appointment_date' => '1405/06/10',
+                'appointment_time' => '09:30',
+                'national_id' => $nid,
+            ],
+            'appointment',
+            $this->uniqueContext(),
+            inline: true
+        );
+        self::assertSame(SmsMessageStatus::SENT, $result['status']);
+
+        self::assertSame([], $this->recording->textSends);
+        self::assertCount(1, $this->recording->templateSends);
+        $variables = $this->recording->templateSends[0]['variables'];
+        self::assertIsArray($variables);
+        self::assertArrayHasKey('patient_name', $variables);
+        self::assertSame('بیمار تست', $variables['patient_name']);
+        self::assertArrayHasKey('national_id', $variables);
+        self::assertStringNotContainsString($nid, (string) json_encode($variables));
+        self::assertStringContainsString('[nid-redacted]', (string) json_encode($variables));
     }
 
     // ------------------------------------------------------------------

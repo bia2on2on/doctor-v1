@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Application\Jobs;
 
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 use ClinicCore\Infrastructure\Queue\JobQueue;
@@ -111,12 +112,12 @@ final class JobsDispatcher
                 // می‌شود و Requeue/Backoffِ عمومی نمی‌گیرد؛ سایرِ خطاها مسیرِ
                 // Retry قبلی را دست‌نخورده نگه می‌دارند.
                 if ($e instanceof NonRetryableJobFailure) {
-                    $this->queue->failTerminal((int) $job['id'], $e->getMessage(), $workerId);
+                    $this->queue->failTerminal((int) $job['id'], NationalIdValidator::redact_digits( $e->getMessage() ), $workerId);
 
                     continue;
                 }
 
-                $this->queue->fail((int) $job['id'], $e->getMessage(), $workerId);
+                $this->queue->fail((int) $job['id'], NationalIdValidator::redact_digits( $e->getMessage() ), $workerId);
             }
         }
 
