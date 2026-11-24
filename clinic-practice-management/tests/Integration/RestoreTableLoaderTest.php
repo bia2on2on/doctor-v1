@@ -425,13 +425,13 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
 
         // Every edit below is anchored INSIDE the second patient tuple only: a global replace of
         // `,NULL,` would rewrite unrelated nullable columns in other tables.
-        $tuple = strpos($bad, "('8',2,");
+        $tuple = strpos($bad, "('8','2',");
         self::assertNotSame(false, $tuple, 'the second patient tuple must exist in the dump');
         $null_at = strpos($bad, ',NULL,', (int) $tuple);
         self::assertNotSame(false, $null_at, 'the second patient must have a NULL national ID to fill');
         $filled = substr_replace($bad, ",'" . $nid . "',", (int) $null_at, strlen(',NULL,'));
         self::assertSame(2, substr_count($filled, "'" . $nid . "'"), 'both patients now carry the same national ID');
-        $clinic = substr_replace($filled, "('8',1,", (int) $tuple, strlen("('8',2,"));
+        $clinic = substr_replace($filled, "('8','1',", (int) $tuple, strlen("('8','2',"));
         self::assertSame(2, substr_count($clinic, $nid), 'the rewrite touched only the intended bytes');
         self::assertTrue(file_put_contents($this->dump_file, $clinic) > 0);
 
@@ -504,8 +504,9 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
      * gates that already exist (`load()`'s `digest()` and `open()`'s `assert_same_file()`),
      * and tampers only afterwards. Both path-based digests therefore MATCH, so neither
      * earlier gate can catch this: only the digest of the bytes the inserting pass actually
-     * consumed does, and it refuses before COMMIT. The tamper adds a comment line only, so
-     * the row census and every column set are byte-identical — no other gate fires.
+     * consumed does, and it refuses before COMMIT. The tamper appends a legal comment line
+     * after a terminated statement, so the row census, every column set and the syntax are
+     * unchanged — no other gate can fire.
      */
     public function testRefusesBytesChangedWhileTheInsertingPassReads(): void
     {
@@ -522,6 +523,8 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
 
             /** @var resource|null */
             private $handle = null;
+            private string $bytes = '';
+            private int $pos = 0;
 
             /** @param array<string, mixed> $options */
             public function stream_open(string $path, string $mode, int $options, ?array &$opened_path): bool
@@ -532,14 +535,16 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
                 }
                 $bytes = (string) file_get_contents(self::$path);
                 if (self::$opens >= 2) {
-                    // Change one line's bytes without changing a single row or column.
-                    $cut   = strpos($bytes, "\n", (int) strpos($bytes, 'cpms_patients'));
-                    $bytes = false === $cut ? $bytes : substr($bytes, 0, $cut + 1) . '-- tampered mid-pass' . "\n" . substr($bytes, $cut + 1);
+                    // Append a comment from an otherwise blank prefix, so the change is legal
+                    // to parse and no syntax refusal can pre-empt the digest check.
+                    $bytes .= "-- tampered mid-pass\n";
                     ++self::$tampered;
                 }
+                $this->bytes = $bytes;
                 fwrite($handle, $bytes);
-                rewind($handle);
+                fseek($handle, 0);
                 $this->handle = $handle;
+                $this->pos    = 0;
                 ++self::$opens;
 
                 return true;
@@ -547,12 +552,17 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
 
             public function stream_read(int $count): string
             {
-                return is_resource($this->handle) ? (string) fread($this->handle, $count) : '';
+                // Position-based: php://memory handles ignore a userspace rewind() unless
+                // stream_seek() is implemented, so never rely on the handle's pointer.
+                $chunk = (string) substr($this->bytes, $this->pos, $count);
+                $this->pos += strlen($chunk);
+
+                return $chunk;
             }
 
             public function stream_eof(): bool
             {
-                return !is_resource($this->handle) || feof($this->handle);
+                return $this->pos >= strlen($this->bytes);
             }
 
             /** @return array<string, int> */
@@ -614,6 +624,8 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
 
             /** @var resource|null */
             private $handle = null;
+            private string $bytes = '';
+            private int $pos = 0;
 
             /** @param array<string, mixed> $options */
             public function stream_open(string $path, string $mode, int $options, ?array &$opened_path): bool
@@ -624,14 +636,17 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
                 }
                 $bytes = (string) file_get_contents(self::$path);
                 if (self::$shorten && self::$opens >= 2) {
-                    // Stop after the patients marker: whole statements, then an orderly EOF.
+                    // Cut EXACTLY on a statement terminator: every statement the reader receives
+                    // is complete, so it sees an orderly EOF and no syntax refusal can occur.
                     $marker = strpos($bytes, 'cpms_patients');
-                    $cut    = false === $marker ? false : strpos($bytes, "\n", (int) $marker);
-                    $bytes  = false === $cut ? '' : substr($bytes, 0, $cut + 1);
+                    $cut    = false === $marker ? false : strpos($bytes, ';', strpos($bytes, "\n", (int) $marker));
+                    $bytes  = false === $cut ? '' : substr($bytes, 0, (int) $cut + 1);
                 }
+                $this->bytes = $bytes;
                 fwrite($handle, $bytes);
-                rewind($handle);
+                fseek($handle, 0);
                 $this->handle = $handle;
+                $this->pos    = 0;
                 ++self::$opens;
 
                 return true;
@@ -639,12 +654,17 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
 
             public function stream_read(int $count): string
             {
-                return is_resource($this->handle) ? (string) fread($this->handle, $count) : '';
+                // Position-based: php://memory handles ignore a userspace rewind() unless
+                // stream_seek() is implemented, so never rely on the handle's pointer.
+                $chunk = (string) substr($this->bytes, $this->pos, $count);
+                $this->pos += strlen($chunk);
+
+                return $chunk;
             }
 
             public function stream_eof(): bool
             {
-                return !is_resource($this->handle) || feof($this->handle);
+                return $this->pos >= strlen($this->bytes);
             }
 
             /** @return array<string, int> */

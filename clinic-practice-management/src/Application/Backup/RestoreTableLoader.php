@@ -82,9 +82,9 @@ final class RestoreTableLoader {
         $show_errors     = $this->db->wpdb()->show_errors( false );
         $suppress_errors = $this->db->wpdb()->suppress_errors( true );
         // Diagnostics snapshot: only rows added by THIS load may be touched afterwards.
-        $ez_count        = isset( $GLOBALS['EZSQL_ERROR'] ) && is_array( $GLOBALS['EZSQL_ERROR'] ) ? count( $GLOBALS['EZSQL_ERROR'] ) : 0;
-        $queries_count   = is_array( $this->db->wpdb()->queries ?? null ) ? count( $this->db->wpdb()->queries ) : 0;
-        $failed          = false;
+        $ez_count      = isset( $GLOBALS['EZSQL_ERROR'] ) && is_array( $GLOBALS['EZSQL_ERROR'] ) ? count( $GLOBALS['EZSQL_ERROR'] ) : 0;
+        $queries_count = is_array( $this->db->wpdb()->queries ?? null ) ? count( $this->db->wpdb()->queries ) : 0;
+        $failed        = false;
         try {
             // The plan belongs to specific bytes: a different dump with the same columns must not load.
             if ( ( $plan['digest'] ?? '' ) === '' || $reader->digest() !== $plan['digest'] ) {
