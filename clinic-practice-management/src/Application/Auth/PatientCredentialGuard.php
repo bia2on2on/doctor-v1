@@ -60,7 +60,7 @@ final class PatientCredentialGuard {
         unset( $password );
 
         if ( $user instanceof WP_User ) {
-            if ( $this->has_patient_login_account( (int) $user->ID ) ) {
+            if ( $this->should_block_auth( $user ) ) {
                 return new WP_Error( self::ERROR_CODE, PatientAccess::PROOF_FAILED_MESSAGE );
             }
 
@@ -77,7 +77,7 @@ final class PatientCredentialGuard {
             $candidate = get_user_by( 'email', $clean );
         }
 
-        if ( $candidate instanceof WP_User && $this->has_patient_login_account( (int) $candidate->ID ) ) {
+        if ( $candidate instanceof WP_User && $this->should_block_auth( $candidate ) ) {
             return new WP_Error( self::ERROR_CODE, PatientAccess::PROOF_FAILED_MESSAGE );
         }
 
@@ -93,7 +93,7 @@ final class PatientCredentialGuard {
     public function filter_wp_authenticate_user( mixed $user, string $password ): mixed {
         unset( $password );
 
-        if ( $user instanceof WP_User && $this->has_patient_login_account( (int) $user->ID ) ) {
+        if ( $user instanceof WP_User && $this->should_block_auth( $user ) ) {
             return new WP_Error( self::ERROR_CODE, PatientAccess::PROOF_FAILED_MESSAGE );
         }
 
@@ -144,5 +144,37 @@ final class PatientCredentialGuard {
 
             return false;
         }
+    }
+
+    private function should_block_auth( WP_User $user ): bool {
+        if ( $this->has_patient_login_account( (int) $user->ID ) ) {
+            return true;
+        }
+        if ( ! $this->is_xmlrpc_context() ) {
+            return false;
+        }
+        $roles = (array) ( $user->roles ?? [] );
+
+        return in_array( RolesAndCapabilities::ROLE_PATIENT, $roles, true )
+            && ! in_array( RolesAndCapabilities::ROLE_DOCTOR, $roles, true )
+            && ! in_array( RolesAndCapabilities::ROLE_SECRETARY, $roles, true )
+            && ! in_array( RolesAndCapabilities::ROLE_ACCOUNTANT, $roles, true )
+            && ! in_array( RolesAndCapabilities::ROLE_MANAGER, $roles, true )
+            && ( ! function_exists( 'user_can' ) || ! user_can( $user, 'manage_options' ) );
+    }
+
+    private function is_xmlrpc_context(): bool {
+        if ( defined( 'XMLRPC_REQUEST' ) && XMLRPC_REQUEST ) {
+            return true;
+        }
+
+        // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_debug_backtrace -- Detects direct `wp_xmlrpc_server::login()` calls in tests where `XMLRPC_REQUEST` is undefined.
+        foreach ( debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 12 ) as $frame ) {
+            if ( isset( $frame['class'] ) && 'wp_xmlrpc_server' === $frame['class'] ) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

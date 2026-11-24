@@ -465,6 +465,54 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
             self::assertSame( $beforeUsr->first_name, $afterUsr->first_name );
         }
 
+        // H5 fail-closed witness: exact-SQL lookup failure still blocks enumeration with CLINIC_PATIENT_PROOF_FAILED.
+        global $wpdb;
+        $this->activateSession( $accountOnly );
+        $h5Nonce     = wp_create_nonce( 'wp_rest' );
+        $orgTable    = App::db()->table( 'cpms_organization_memberships' );
+        $exactSql    = 'SELECT id FROM ' . $orgTable . " WHERE wp_user_id = {$accountOnly['user_id']} AND status = 'active' LIMIT 1";
+        $hits        = 0;
+        $seenQueries = 0;
+        $fault       = static function ( mixed $query ) use ( $exactSql, $orgTable, &$hits, &$seenQueries ): mixed {
+            ++$seenQueries;
+            if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                ++$hits;
+                return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+            }
+            return $query;
+        };
+        $prevSuppress = (bool) $wpdb->suppress_errors( true );
+        add_filter( 'query', $fault, 5 );
+        try {
+            $errList     = $this->dispatchRestWithNonce( 'GET', '/wp/v2/users', [], $h5Nonce );
+            $errListHits = $hits;
+            $errListSeen = $seenQueries;
+
+            $hits         = 0;
+            $seenQueries  = 0;
+            $errOther     = $this->dispatchRestWithNonce( 'GET', '/wp/v2/users/' . $this->staffDoctorUser, [], $h5Nonce );
+            $errOtherHits = $hits;
+            $errOtherSeen = $seenQueries;
+        } finally {
+            remove_filter( 'query', $fault, 5 );
+            $wpdb->suppress_errors( $prevSuppress );
+        }
+        self::assertGreaterThan( 0, $errListSeen );
+        self::assertSame( 1, $errListHits );
+        self::assertSame( 403, $errList->get_status() );
+        $errListData = $errList->get_data();
+        self::assertIsArray( $errListData );
+        self::assertArrayHasKey( 'code', $errListData );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $errListData['code'] );
+
+        self::assertGreaterThan( 0, $errOtherSeen );
+        self::assertSame( 1, $errOtherHits );
+        self::assertSame( 403, $errOther->get_status() );
+        $errOtherData = $errOther->get_data();
+        self::assertIsArray( $errOtherData );
+        self::assertArrayHasKey( 'code', $errOtherData );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $errOtherData['code'] );
+
         // Positive control: staff user keeps full /wp/v2/users/me read(edit) + update capability.
         PatientTwoProofTestHelper::acting_as( $this->staffDoctorUser );
         $staffNonce = wp_create_nonce( 'wp_rest' );
@@ -1006,6 +1054,46 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         self::assertIsArray( $postData );
         self::assertArrayHasKey( 'code', $postData );
         self::assertSame( PatientAccess::PROOF_FAILED_CODE, $postData['code'] );
+
+        global $wpdb;
+        $orgTable    = App::db()->table( 'cpms_organization_memberships' );
+        $exactSql    = 'SELECT id FROM ' . $orgTable . " WHERE wp_user_id = {$boundUserId} AND status = 'active' LIMIT 1";
+        $hits        = 0;
+        $seenQueries = 0;
+        $fault       = static function ( mixed $query ) use ( $exactSql, $orgTable, &$hits, &$seenQueries ): mixed {
+            ++$seenQueries;
+            if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                ++$hits;
+                return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+            }
+            return $query;
+        };
+        $prevSuppress = (bool) $wpdb->suppress_errors( true );
+        add_filter( 'query', $fault, 5 );
+        try {
+            $errGet     = $this->dispatchRestWithNonce( 'GET', '/wp/v2/users/me', [], $nonce );
+            $errGetHits = $hits;
+            $errGetSeen = $seenQueries;
+
+            $hits        = 0;
+            $seenQueries = 0;
+            $errPost     = $this->dispatchRestWithNonce( 'POST', '/wp/v2/users/me', [ 'first_name' => 'Tampered' ], $nonce );
+            $errPostHits = $hits;
+            $errPostSeen = $seenQueries;
+        } finally {
+            remove_filter( 'query', $fault, 5 );
+            $wpdb->suppress_errors( $prevSuppress );
+        }
+        self::assertGreaterThan( 0, $errGetSeen );
+        self::assertSame( 1, $errGetHits );
+        self::assertSame( 200, $errGet->get_status() );
+        self::assertGreaterThan( 0, $errPostSeen );
+        self::assertSame( 1, $errPostHits );
+        self::assertSame( 403, $errPost->get_status() );
+        $errPostData = $errPost->get_data();
+        self::assertIsArray( $errPostData );
+        self::assertArrayHasKey( 'code', $errPostData );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $errPostData['code'] );
     }
 
     /**
@@ -1035,5 +1123,238 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         $nonce = wp_create_nonce( 'wp_rest' );
         $resp  = $this->dispatchRestWithNonce( 'POST', '/wp/v2/users/me', [ 'first_name' => 'MixedUpdated' ], $nonce );
         self::assertSame( 200, $resp->get_status() );
+    }
+
+    /**
+     * Item 1 (`N2`) + `guardWpAdmin` mutation coverage: denies `?newuseremail=<hash>` on `admin_init`
+     * across GET and POST for `PATIENT` and `UNKNOWN` before core `user-edit.php:108-120` runs.
+     * LIMITATION: exercises `PatientPortalPage::guardWpAdmin()` (verified hooked on `admin_init`) directly, not HTTP `wp-admin/profile.php`.
+     */
+    public function testPendingNewEmailHashDeniedViaGetAndPostAndOnLookupFailure(): void {
+        global $wpdb;
+
+        self::assertSame( 10, has_action( 'admin_init', [ PatientPortalPage::class, 'guardWpAdmin' ] ) );
+
+        $this->seedOtp( $this->clinicPublic, self::MOBILE_ACCOUNT_ACTIVE, '343434', OtpService::PURPOSE_LOGIN );
+        $accountOnly = $this->verifyOtpWithSession( self::MOBILE_ACCOUNT_ACTIVE, '343434', OtpService::PURPOSE_LOGIN );
+        $this->activateSession( $accountOnly );
+
+        $patBefore = get_userdata( $this->userAccountActive );
+        self::assertInstanceOf( WP_User::class, $patBefore );
+        $origEmail = (string) $patBefore->user_email;
+
+        $hash        = 'audit-email-hash-' . uniqid();
+        $pendingMeta = [
+            'hash'     => $hash,
+            'newemail' => 'hijacked-' . uniqid() . '@evil.test',
+        ];
+        update_user_meta( $this->userAccountActive, '_new_email', $pendingMeta );
+
+        $prevGet     = $_GET;
+        $prevRequest = $_REQUEST;
+        $prevPost    = $_POST;
+        $prevMethod  = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+        $prevPagenow = $GLOBALS['pagenow'] ?? null;
+
+        $getDied     = false;
+        $getMsg      = '';
+        $getRedirect = null;
+        $postDied    = false;
+        $postMsg     = '';
+        $escape      = static function ( $url ) use ( &$getRedirect ): string {
+            $getRedirect = (string) $url;
+            throw new RuntimeException( 'intercepted_wp_redirect' );
+        };
+
+        add_filter( 'wp_redirect', $escape, 1 );
+        try {
+            $GLOBALS['pagenow']        = 'profile.php';
+            $_GET                      = [ 'newuseremail' => $hash ];
+            $_REQUEST                  = $_GET;
+            $_POST                     = [];
+            $_SERVER['REQUEST_METHOD'] = 'GET';
+            try {
+                PatientPortalPage::guardWpAdmin();
+            } catch ( WPDieException $e ) {
+                $getDied = true;
+                $getMsg  = $e->getMessage();
+            } catch ( RuntimeException ) {
+                $getDied = false;
+            }
+
+            $_SERVER['REQUEST_METHOD'] = 'POST';
+            try {
+                PatientPortalPage::guardWpAdmin();
+            } catch ( WPDieException $e ) {
+                $postDied = true;
+                $postMsg  = $e->getMessage();
+            }
+        } finally {
+            remove_filter( 'wp_redirect', $escape, 1 );
+            $_GET                      = $prevGet;
+            $_REQUEST                  = $prevRequest;
+            $_POST                     = $prevPost;
+            $_SERVER['REQUEST_METHOD'] = $prevMethod;
+            if ( null === $prevPagenow ) {
+                unset( $GLOBALS['pagenow'] );
+            } else {
+                $GLOBALS['pagenow'] = $prevPagenow;
+            }
+        }
+
+        self::assertTrue( $getDied );
+        self::assertNull( $getRedirect );
+        self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $getMsg );
+        self::assertTrue( $postDied );
+        self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $postMsg );
+
+        $patAfter = get_userdata( $this->userAccountActive );
+        self::assertInstanceOf( WP_User::class, $patAfter );
+        self::assertSame( $origEmail, (string) $patAfter->user_email );
+        self::assertSame( $pendingMeta, get_user_meta( $this->userAccountActive, '_new_email', true ) );
+
+        // UNKNOWN lookup failure: POST newuseremail still dies 403 AND GET cpms-patient still redirects via guardWpAdmin.
+        $orgTable    = App::db()->table( 'cpms_organization_memberships' );
+        $exactSql    = 'SELECT id FROM ' . $orgTable . " WHERE wp_user_id = {$this->userAccountActive} AND status = 'active' LIMIT 1";
+        $hits        = 0;
+        $seenQueries = 0;
+        $fault       = static function ( mixed $query ) use ( $exactSql, $orgTable, &$hits, &$seenQueries ): mixed {
+            ++$seenQueries;
+            if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                ++$hits;
+                return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+            }
+            return $query;
+        };
+        $prevSuppress = (bool) $wpdb->suppress_errors( true );
+        add_filter( 'query', $fault, 5 );
+        $errPostDied = false;
+        try {
+            $this->activateSession( $accountOnly );
+            $GLOBALS['pagenow']        = 'profile.php';
+            $_GET                      = [ 'newuseremail' => $hash ];
+            $_REQUEST                  = $_GET;
+            $_POST                     = [];
+            $_SERVER['REQUEST_METHOD'] = 'POST';
+            try {
+                PatientPortalPage::guardWpAdmin();
+            } catch ( WPDieException ) {
+                $errPostDied = true;
+            }
+            $errPostHits = $hits;
+            $errPostSeen = $seenQueries;
+
+            $hits        = 0;
+            $seenQueries = 0;
+            $errRedirect = $this->captureGuardWpAdminRedirect( $this->userAccountActive, [ 'page' => 'cpms-patient' ], 'GET' );
+            $errRedirHit = $hits;
+            $errRedirSee = $seenQueries;
+        } finally {
+            remove_filter( 'query', $fault, 5 );
+            $wpdb->suppress_errors( $prevSuppress );
+            $_GET                      = $prevGet;
+            $_REQUEST                  = $prevRequest;
+            $_POST                     = $prevPost;
+            $_SERVER['REQUEST_METHOD'] = $prevMethod;
+            if ( null === $prevPagenow ) {
+                unset( $GLOBALS['pagenow'] );
+            } else {
+                $GLOBALS['pagenow'] = $prevPagenow;
+            }
+        }
+
+        self::assertTrue( $errPostDied );
+        self::assertGreaterThan( 0, $errPostSeen );
+        self::assertSame( 1, $errPostHits );
+        self::assertGreaterThan( 0, $errRedirSee );
+        self::assertSame( 1, $errRedirHit );
+        self::assertSame( PatientPortalShell::portal_url(), $errRedirect );
+
+        $patAfterErr = get_userdata( $this->userAccountActive );
+        self::assertInstanceOf( WP_User::class, $patAfterErr );
+        self::assertSame( $origEmail, (string) $patAfterErr->user_email );
+
+        // Positive control: staff account is not blocked on POST newuseremail.
+        PatientTwoProofTestHelper::acting_as( $this->staffDoctorUser );
+        $staffDied = false;
+        try {
+            $GLOBALS['pagenow']        = 'profile.php';
+            $_GET                      = [ 'newuseremail' => $hash ];
+            $_REQUEST                  = $_GET;
+            $_POST                     = [];
+            $_SERVER['REQUEST_METHOD'] = 'POST';
+            try {
+                PatientPortalPage::guardWpAdmin();
+            } catch ( WPDieException ) {
+                $staffDied = true;
+            }
+        } finally {
+            $_GET                      = $prevGet;
+            $_REQUEST                  = $prevRequest;
+            $_POST                     = $prevPost;
+            $_SERVER['REQUEST_METHOD'] = $prevMethod;
+            if ( null === $prevPagenow ) {
+                unset( $GLOBALS['pagenow'] );
+            } else {
+                $GLOBALS['pagenow'] = $prevPagenow;
+            }
+        }
+        self::assertFalse( $staffDied );
+    }
+
+    /**
+     * Item 2 (`N3`): legacy `ROLE_PATIENT` user with NO `cpms_patient_logins` row and valid WP password
+     * is denied XML-RPC (`wp.editProfile` and `wp.getUsersBlogs`), while staff XML-RPC succeeds.
+     */
+    public function testLegacyPatientWithoutLoginRowDeniedOnXmlRpcEditProfileWhileStaffAllowed(): void {
+        if ( ! class_exists( wp_xmlrpc_server::class ) && defined( 'ABSPATH' ) && defined( 'WPINC' ) ) {
+            $ixrFile    = ABSPATH . WPINC . '/class-IXR.php';
+            $serverFile = ABSPATH . WPINC . '/class-wp-xmlrpc-server.php';
+            if ( file_exists( $ixrFile ) ) {
+                require_once $ixrFile;
+            }
+            if ( file_exists( $serverFile ) ) {
+                require_once $serverFile;
+            }
+        }
+        self::assertTrue( class_exists( wp_xmlrpc_server::class ) );
+
+        $legacyId   = $this->createUser( 'audit_legacy_pat_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+        $legacyUser = get_userdata( $legacyId );
+        $staffUser  = get_userdata( $this->staffDoctorUser );
+        self::assertInstanceOf( WP_User::class, $legacyUser );
+        self::assertInstanceOf( WP_User::class, $staffUser );
+        self::assertSame(
+            0,
+            (int) App::db()->fetchValue( 'SELECT COUNT(*) FROM ' . App::db()->table( 'cpms_patient_logins' ) . ' WHERE wp_user_id = %d', [ $legacyId ] )
+        );
+
+        $prevRemoteAddr = $_SERVER['REMOTE_ADDR'] ?? null;
+        unset( $_SERVER['REMOTE_ADDR'] );
+        try {
+            $patSrv      = new wp_xmlrpc_server();
+            $editDenied  = $patSrv->wp_editProfile( [ 1, $legacyUser->user_login, $this->patientKnownPass, [ 'first_name' => 'TamperedLegacy' ] ] );
+            $blogsDenied = ( new wp_xmlrpc_server() )->wp_getUsersBlogs( [ $legacyUser->user_login, $this->patientKnownPass ] );
+            $staffEdit   = ( new wp_xmlrpc_server() )->wp_editProfile( [ 1, $staffUser->user_login, $this->staffDoctorPass, [ 'first_name' => 'دکتر-xmlrpc' ] ] );
+        } finally {
+            if ( null === $prevRemoteAddr ) {
+                unset( $_SERVER['REMOTE_ADDR'] );
+            } else {
+                $_SERVER['REMOTE_ADDR'] = $prevRemoteAddr;
+            }
+        }
+
+        self::assertInstanceOf( IXR_Error::class, $editDenied );
+        self::assertSame( 403, $editDenied->code );
+        self::assertInstanceOf( IXR_Error::class, $blogsDenied );
+        self::assertSame( 403, $blogsDenied->code );
+        self::assertTrue( $staffEdit );
+
+        $legacyAfter = get_userdata( $legacyId );
+        $staffAfter  = get_userdata( $this->staffDoctorUser );
+        self::assertInstanceOf( WP_User::class, $legacyAfter );
+        self::assertInstanceOf( WP_User::class, $staffAfter );
+        self::assertSame( '', (string) $legacyAfter->first_name );
+        self::assertSame( 'دکتر-xmlrpc', (string) $staffAfter->first_name );
     }
 }
