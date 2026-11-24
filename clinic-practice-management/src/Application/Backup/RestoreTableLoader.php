@@ -30,18 +30,25 @@ final class RestoreTableLoader {
     /**
      * پاس فقط‌خواندنی؛ نسخهٔ schema از ledgerِ خودِ dump.
      *
-     * @return array{source_version: string, tables: list<string>, columns: array<string, list<string>>, order: list<string>}
+     * @return array{source_version: string, tables: list<string>, columns: array<string, list<string>>, rows: array<string, int>, digest: string, order: list<string>}
      */
     public function preflight( RestoreDumpReader $reader, ?string $expected_version = null ): array {
+        $digest      = $reader->digest();
         $dump_tables = $reader->tables();
         $columns     = [];
+        $rows        = [];
         $source      = '';
         foreach ( $reader->inserts() as $batch ) {
             $table = $batch['table'];
+            if ( ! in_array( $table, $dump_tables, true ) ) {
+                throw BackupException::of( 'RESTORE_DUMP_SYNTAX', 'The dump inserts into a table it never declares.' );
+            }
             if ( $this->short_name( $table ) === 'schema_migrations' ) {
                 $source = $this->max_version( $source, $batch );
                 continue;
             }
+            // Census of loaded rows only: the ledger is read, never inserted.
+            $rows[ $table ] = ( $rows[ $table ] ?? 0 ) + count( $batch['rows'] );
             if ( isset( $columns[ $table ] ) && $columns[ $table ] !== $batch['columns'] ) {
                 throw BackupException::of( 'RESTORE_COLUMN_MISMATCH', 'The dump declares two different column sets for one table.' );
             }
@@ -52,13 +59,15 @@ final class RestoreTableLoader {
             'source_version' => $source,
             'tables'         => $dump_tables,
             'columns'        => $columns,
+            'rows'           => $rows,
+            'digest'         => $digest,
             'order'          => $this->assert_target_ready( $dump_tables, $source, $columns, $expected_version ),
         ];
     }
 
     /**
      * بارگذاری در یک تراکنش (پیش‌شرط‌ها دوباره پیش از نخستین نوشتن بررسی می‌شوند).
-     * @param array{source_version: string, tables: list<string>, columns: array<string, list<string>>, order: list<string>} $plan
+     * @param array{source_version: string, tables: list<string>, columns: array<string, list<string>>, rows: array<string, int>, digest: string, order: list<string>} $plan
      * @return array{tables: int, rows: int, bindings_closed: int}
      */
     public function load( array $plan, RestoreDumpReader $reader ): array {
@@ -67,7 +76,15 @@ final class RestoreTableLoader {
         $bindings_closed = 0;
         $strict          = $this->db->is_strict();
         $this->db->setStrict( true );
+        // Value-bearing SQL never reaches display/log: suppression is restored in finally.
+        $show_errors             = $this->db->wpdb()->show_errors( false );
+        $suppress_errors         = $this->db->wpdb()->suppress_errors( true );
+        $errors_before           = $this->error_count();
         try {
+            // The plan belongs to specific bytes: a different dump with the same columns must not load.
+            if ( ( $plan['digest'] ?? '' ) === '' || $reader->digest() !== $plan['digest'] ) {
+                throw BackupException::of( 'RESTORE_DUMP_CHANGED', 'The dump is not the one this plan was built from.' );
+            }
             if ( $this->assert_target_ready( $plan['tables'], $plan['source_version'], $plan['columns'] ) !== $plan['order'] ) {
                 throw BackupException::of( 'RESTORE_FK_ORDER_CHANGED', 'The target foreign-key graph changed after preflight.' );
             }
@@ -89,19 +106,54 @@ final class RestoreTableLoader {
                             $counts[ $table ] = ( $counts[ $table ] ?? 0 ) + count( $batch['rows'] );
                         }
                     }
+                    // Every planned table must deliver exactly the rows preflight counted.
+                    foreach ( $plan['rows'] ?? [] as $table => $expected ) {
+                        if ( ( $counts[ $table ] ?? 0 ) !== $expected ) {
+                            throw BackupException::of( 'RESTORE_LOAD_INCOMPLETE', 'The dump lost rows between preflight and load.' );
+                        }
+                    }
                     $bindings_closed = $this->close_bindings();
                 }
             );
         } catch ( BackupException $error ) {
+            $this->clear_value_residue( $errors_before );
+
             throw $error;
         } catch ( \Throwable $error ) {
-            // Never surface driver text: the barrier/UI boundary owns messaging.
+            $this->clear_value_residue( $errors_before );
+
+            // Never surface driver text: the barrier/UI boundary owns messaging. A failed
+            // transaction control leaves the rows' fate unproven, so no rollback is claimed.
+            if ( str_starts_with( $error->getMessage(), 'transaction ' ) ) {
+                throw BackupException::of( 'RESTORE_LOAD_UNKNOWN_STATE', 'The restore load failed and the transaction state is unknown; reconciliation is required.' );
+            }
+
             throw BackupException::of( 'RESTORE_LOAD_FAILED', 'The restore load failed and was rolled back.' );
         } finally {
             $this->db->setStrict( $strict );
+            $this->db->wpdb()->show_errors( $show_errors );
+            $this->db->wpdb()->suppress_errors( $suppress_errors );
         }
 
         return [ 'tables' => count( $counts ), 'rows' => $rows, 'bindings_closed' => $bindings_closed ];
+    }
+
+    /** تعدادِ فعلیِ ورودی‌های `$EZSQL_ERROR` (برای پاک‌کردنِ فقط ردیف‌های همین بار). */
+    private function error_count(): int {
+        return isset( $GLOBALS['EZSQL_ERROR'] ) && is_array( $GLOBALS['EZSQL_ERROR'] ) ? count( $GLOBALS['EZSQL_ERROR'] ) : 0;
+    }
+
+    /**
+     * ردیف‌های `$EZSQL_ERROR` که همین بار افزوده است (کوئریِ مقداردار) و آخرین کوئری/خطا پاک می‌شوند.
+     *
+     * @param int $keep ورودی‌های پیش از این بار
+     */
+    private function clear_value_residue( int $keep ): void {
+        if ( isset( $GLOBALS['EZSQL_ERROR'] ) && is_array( $GLOBALS['EZSQL_ERROR'] ) ) {
+            $GLOBALS['EZSQL_ERROR'] = array_slice( $GLOBALS['EZSQL_ERROR'], 0, $keep );
+        }
+        $this->db->wpdb()->last_query = '';
+        $this->db->wpdb()->last_error = '';
     }
 
     /** @param list<array<string, string|null>> $rows */

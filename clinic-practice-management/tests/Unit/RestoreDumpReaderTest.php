@@ -210,6 +210,125 @@ final class RestoreDumpReaderTest extends TestCase
         self::assertSame('RESTORE_DUMP_UNREADABLE', $failure, 'an unreadable stream refuses instead of ending the dump');
     }
 
+    /** RB-36: an unterminated comment longer than the read bound refuses; the next line is never parsed. */
+    public function testRefusesOverLongCommentInsteadOfParsingTheNextLine(): void
+    {
+        $long = '-- ' . str_repeat('x', 200);
+        // Line 2 looks exactly like a loadable batch; it must never be reached.
+        $sql = "-- ---- table: cpms_patients ----\n" . $long . "\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n";
+        self::assertTrue(file_put_contents($this->file, $sql) > 0);
+
+        $failure = null;
+        $batches = [];
+        try {
+            $batches = iterator_to_array((new RestoreDumpReader($this->file, 64))->inserts(), false);
+        } catch (BackupException $exception) {
+            $failure = $exception->getErrorCode();
+        }
+        self::assertSame('RESTORE_DUMP_SIZE_EXCEEDED', $failure, 'an over-long comment is refused, not cleared');
+        self::assertSame([], $batches, 'the INSERT after the over-long comment is never parsed');
+
+        // Positive witness under the SAME bound: the same shape with a short comment loads.
+        $short = "-- ---- table: cpms_patients ----\n-- ok\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n";
+        self::assertTrue(file_put_contents($this->file, $short) > 0);
+        $loaded = iterator_to_array((new RestoreDumpReader($this->file, 64))->inserts(), false);
+        self::assertCount(1, $loaded);
+        self::assertSame('cpms_patients', $loaded[0]['table']);
+    }
+
+    /** RB-37: the digest is the content fingerprint the plan is bound to. */
+    public function testDigestChangesWithTheBytesAndSurvivesReReads(): void
+    {
+        self::assertTrue(file_put_contents($this->file, "-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n") > 0);
+        $first = (new RestoreDumpReader($this->file))->digest();
+        self::assertSame(64, strlen($first), 'a hex SHA-256 digest');
+        self::assertSame($first, (new RestoreDumpReader($this->file))->digest(), 'the same bytes give the same digest');
+
+        self::assertTrue(file_put_contents($this->file, "-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1),(2);\n") > 0);
+        self::assertNotSame($first, (new RestoreDumpReader($this->file))->digest(), 'different bytes give a different digest');
+    }
+
+    /** RB-44: a mid-dump read failure reaches the loop through the PUBLIC api, not by reflection. */
+    public function testRefusesMidDumpReadFailureThroughPublicApi(): void
+    {
+        $source = static function (string $bytes, bool $fail_after_data) {
+            $handle = fopen('php://memory', 'w+b');
+            if (false === $handle) {
+                throw new \RuntimeException('cannot open the in-memory buffer');
+            }
+            fwrite($handle, $bytes);
+            rewind($handle);
+
+            return new class ($handle, $fail_after_data) {
+                /** @var resource */
+                private $handle;
+                private bool $fail_after_data;
+                private bool $served = false;
+
+                /** @param resource $handle */
+                public function __construct($handle, bool $fail_after_data)
+                {
+                    $this->handle          = $handle;
+                    $this->fail_after_data = $fail_after_data;
+                }
+
+                /** @param array<string, mixed> $options */
+                public function stream_open(string $path, string $mode, int $options, ?array &$opened_path): bool
+                {
+                    return true;
+                }
+
+                public function stream_read(int $count): string
+                {
+                    // A broken stream: the first read works, every later read fails ('' with feof() false).
+                    if ($this->fail_after_data && $this->served) {
+                        return '';
+                    }
+                    $this->served = true;
+
+                    return (string) fread($this->handle, $count);
+                }
+
+                public function stream_eof(): bool
+                {
+                    return false; // never reports EOF, so the reader cannot mistake failure for the end
+                }
+
+                /** @return array<string, int> */
+                public function url_stat(string $path, int $flags): array
+                {
+                    return ['size' => 1, 'mode' => 0100644, 'mtime' => 0, 'atime' => 0, 'ctime' => 0];
+                }
+
+                public function stream_close(): void
+                {
+                    fclose($this->handle);
+                }
+            };
+        };
+
+        $read = static function (string $bytes, bool $fail) use ($source): array {
+            $wrapper = get_class($source($bytes, $fail));
+            self::assertTrue(stream_wrapper_register('cpmsbroken', $wrapper));
+            try {
+                return (new RestoreDumpReader('cpmsbroken://dump.sql'))->tables();
+            } finally {
+                stream_wrapper_unregister('cpmsbroken');
+            }
+        };
+
+        // Positive witness first: the same wrapper shape serves a whole dump when nothing fails.
+        self::assertSame(['cpms_patients'], $read("-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n", false));
+
+        $failure = null;
+        try {
+            $read("-- ---- table: cpms_patients ----\n", true);
+        } catch (BackupException $exception) {
+            $failure = $exception->getErrorCode();
+        }
+        self::assertSame('RESTORE_DUMP_UNREADABLE', $failure, 'the public api refuses a stream that fails without EOF');
+    }
+
     /** RB-28: a dump truncated mid-statement refuses instead of being read as a clean end. */
     public function testRefusesTruncatedDumpInsteadOfReadingItAsEof(): void
     {

@@ -330,6 +330,282 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         self::assertSame([], $writes, 'preflight writes nothing');
     }
 
+    /** RB-38: a value-bearing failed insert leaves no NID in the exception, wpdb, EZSQL_ERROR or the log. */
+    public function testFailedInsertLeavesNoNationalIdInDiagnostics(): void
+    {
+        $db     = App::db();
+        $ledger = $db->table('schema_migrations');
+        $nid    = '1234567890';
+        $log    = sys_get_temp_dir() . '/cpms-nid-log-' . bin2hex(random_bytes(6)) . '.log';
+
+        // Replace the seeded National ID BEFORE preflight, so the plan belongs to these bytes.
+        $dump = (string) file_get_contents($this->dump_file);
+        $bad  = str_replace("'0012345678'", "'" . $nid . "'", $dump);
+        self::assertNotSame($dump, $bad, 'the fixture must actually contain the seeded National ID');
+        self::assertTrue(file_put_contents($this->dump_file, $bad) > 0);
+
+        $version = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
+        $loader  = new RestoreTableLoader($db);
+        $plan    = $loader->preflight(new RestoreDumpReader($this->dump_file), $version);
+
+        $writes = 0;
+        $filter = static function (string $statement) use (&$writes): string {
+            if (preg_match('/\AINSERT INTO `([A-Za-z0-9_]+)`/', $statement, $match) === 1) {
+                ++$writes;
+                if (str_ends_with($match[1], 'cpms_patients')) {
+                    return 'INSERT INTO `' . $match[1] . '` (`no_such_column`) VALUES (1)';
+                }
+            }
+            return $statement;
+        };
+
+        $errors_before   = isset($GLOBALS['EZSQL_ERROR']) && is_array($GLOBALS['EZSQL_ERROR']) ? count($GLOBALS['EZSQL_ERROR']) : 0;
+        $show_before     = $db->wpdb()->show_errors();
+        $suppress_before = $db->wpdb()->suppress_errors();
+        $message         = '';
+        $code            = '';
+        $ini             = (string) ini_get('error_log');
+        add_filter('query', $filter);
+        try {
+            ini_set('error_log', $log);
+            $loader->load($plan, new RestoreDumpReader($this->dump_file));
+        } catch (BackupException $exception) {
+            $code    = $exception->getErrorCode();
+            $message = $exception->getMessage();
+        } finally {
+            remove_filter('query', $filter);
+            ini_set('error_log', $ini);
+        }
+
+        $ezsql  = isset($GLOBALS['EZSQL_ERROR']) && is_array($GLOBALS['EZSQL_ERROR']) ? $GLOBALS['EZSQL_ERROR'] : [];
+        $logged = is_file($log) ? (string) file_get_contents($log) : '';
+        if (is_file($log)) {
+            unlink($log);
+        }
+
+        self::assertGreaterThan(0, $writes, 'the spy must see the INSERTs');
+        self::assertSame('RESTORE_LOAD_FAILED', $code);
+        self::assertSame('The restore load failed and was rolled back.', $message, 'the message is a constant, never driver text');
+        self::assertStringNotContainsString($nid, $message, 'the exception message carries no value');
+        self::assertStringNotContainsString($nid, (string) $db->wpdb()->last_query, 'last_query no longer holds the value-bearing SQL');
+        self::assertStringNotContainsString($nid, (string) $db->wpdb()->last_error, 'last_error is cleared');
+        self::assertSame($errors_before, count($ezsql), 'the EZSQL_ERROR rows this load added are removed');
+        foreach ($ezsql as $entry) {
+            self::assertArrayHasKey('query', $entry);
+            self::assertStringNotContainsString($nid, (string) $entry['query'], 'no retained query carries the value');
+        }
+        self::assertStringNotContainsString($nid, $logged, 'the error log carries no value');
+        foreach (['cpms_clinics', 'cpms_organizations', 'cpms_patients', 'cpms_patient_logins'] as $short) {
+            self::assertSame(0, (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$db->table($short)]), $short . ' holds no rows');
+        }
+        self::assertSame($show_before, $db->wpdb()->show_errors(), 'the previous show_errors setting is restored');
+        self::assertSame($suppress_before, $db->wpdb()->suppress_errors(), 'the previous suppress_errors setting is restored');
+    }
+
+    /** RB-39: a plan built from one dump refuses a different, stable dump with zero writes. */
+    public function testRefusesPlanAppliedToADifferentDump(): void
+    {
+        $db      = App::db();
+        $ledger  = $db->table('schema_migrations');
+        $version = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
+        $loader  = new RestoreTableLoader($db);
+        $plan    = $loader->preflight(new RestoreDumpReader($this->dump_file), $version);
+
+        // A different but perfectly valid dump: one extra Organization row.
+        $other  = $this->dump_file . '.other';
+        $dump   = (string) file_get_contents($this->dump_file);
+        $marker = "-- ---- table: " . $db->table('cpms_organizations') . " ----\n";
+        self::assertStringContainsString($marker, $dump, 'the dump must carry the marker this test relies on');
+        $rewritten = str_replace(
+            $marker,
+            $marker . "INSERT INTO `" . $db->table('cpms_organizations') . "` (`id`,`name`,`slug`,`status`,`created_at`,`updated_at`) VALUES ('9','Org C','org-c','active','2026-01-01 00:00:00.000','2026-01-01 00:00:00.000');\n",
+            $dump
+        );
+        self::assertNotSame($dump, $rewritten);
+        self::assertTrue(file_put_contents($other, $rewritten) > 0);
+
+        $writes = [];
+        $filter = static function (string $statement) use (&$writes): string {
+            if (preg_match('/\A\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|TRUNCATE|RENAME)\b/i', $statement) === 1) {
+                $writes[] = $statement;
+            }
+            return $statement;
+        };
+        $failure = null;
+        add_filter('query', $filter);
+        try {
+            $loader->load($plan, new RestoreDumpReader($other));
+        } catch (BackupException $exception) {
+            $failure = $exception->getErrorCode();
+        } finally {
+            remove_filter('query', $filter);
+            if (is_file($other)) {
+                unlink($other);
+            }
+        }
+
+        self::assertSame('RESTORE_DUMP_CHANGED', $failure, 'the plan is bound to the bytes it was built from');
+        self::assertSame([], $writes, 'a mismatched dump performs zero writes');
+        self::assertSame(0, (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$db->table('cpms_organizations')]), 'nothing was loaded');
+    }
+
+    /** RB-40: a dump that loses planned rows after preflight is refused by the digest, zero rows. */
+    public function testRefusesWhenTheDumpLosesRowsAfterPreflight(): void
+    {
+        $db      = App::db();
+        $ledger  = $db->table('schema_migrations');
+        $version = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
+        $loader  = new RestoreTableLoader($db);
+        $plan    = $loader->preflight(new RestoreDumpReader($this->dump_file), $version);
+
+        // The dumper writes one tuple per line joined by ",\n": deleting one whole tuple shrinks the census.
+        $dump  = (string) file_get_contents($this->dump_file);
+        $lines = explode("\n", $dump);
+        $keep  = [];
+        $lost  = 0;
+        foreach ($lines as $line) {
+            if (0 === $lost && str_starts_with($line, "('8',")) {
+                ++$lost;
+                $keep[count($keep) - 1] = rtrim($keep[count($keep) - 1], ',');
+                continue;
+            }
+            $keep[] = $line;
+        }
+        self::assertSame(1, $lost, 'exactly one planned patient tuple must be removable');
+        $shrunk = implode("\n", $keep);
+        self::assertNotSame($dump, $shrunk, 'the fixture must actually shrink by one planned row');
+        self::assertTrue(file_put_contents($this->dump_file, $shrunk) > 0);
+
+        $writes = [];
+        $filter = static function (string $statement) use (&$writes): string {
+            if (preg_match('/\A\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|TRUNCATE|RENAME)\b/i', $statement) === 1) {
+                $writes[] = $statement;
+            }
+            return $statement;
+        };
+        $failure = null;
+        add_filter('query', $filter);
+        try {
+            $loader->load($plan, new RestoreDumpReader($this->dump_file));
+        } catch (BackupException $exception) {
+            $failure = $exception->getErrorCode();
+        } finally {
+            remove_filter('query', $filter);
+        }
+
+        self::assertSame('RESTORE_DUMP_CHANGED', $failure, 'shrunk bytes are not the bytes the plan was built from');
+        self::assertSame([], $writes, 'the refusal happens before the first write');
+        foreach (['cpms_clinics', 'cpms_organizations', 'cpms_patients', 'cpms_patient_logins'] as $short) {
+            self::assertSame(0, (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$db->table($short)]), $short . ' holds no rows');
+        }
+    }
+
+    /** RB-41: an INSERT for a table the dump never declares is refused as a syntax fault. */
+    public function testRefusesInsertForATableTheDumpNeverDeclares(): void
+    {
+        $db      = App::db();
+        $ledger  = $db->table('schema_migrations');
+        $version = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
+
+        $dump = (string) file_get_contents($this->dump_file);
+        $tail = "\nINSERT INTO `" . $db->table('cpms_services') . "` (`id`) VALUES ('1');\n";
+        self::assertTrue(file_put_contents($this->dump_file, $dump . $tail) > 0);
+
+        $writes = [];
+        $filter = static function (string $statement) use (&$writes): string {
+            if (preg_match('/\A\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|TRUNCATE|RENAME)\b/i', $statement) === 1) {
+                $writes[] = $statement;
+            }
+            return $statement;
+        };
+        $failure = null;
+        add_filter('query', $filter);
+        try {
+            (new RestoreTableLoader($db))->preflight(new RestoreDumpReader($this->dump_file), $version);
+        } catch (BackupException $exception) {
+            $failure = $exception->getErrorCode();
+        } finally {
+            remove_filter('query', $filter);
+        }
+
+        self::assertSame('RESTORE_DUMP_SYNTAX', $failure, 'an undeclared table insert is refused, never silently ignored');
+        self::assertSame([], $writes, 'the refusal happens before any write');
+    }
+
+    /** RB-42: a plan whose census overstates the dump is rolled back, never committed short. */
+    public function testRollsBackWhenTheLoadedCensusIsShort(): void
+    {
+        $db       = App::db();
+        $ledger   = $db->table('schema_migrations');
+        $version  = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
+        $patients = $db->table('cpms_patients');
+        $loader   = new RestoreTableLoader($db);
+        $plan     = $loader->preflight(new RestoreDumpReader($this->dump_file), $version);
+
+        self::assertArrayHasKey($patients, $plan['rows'], 'preflight must census the patient table');
+        ++$plan['rows'][$patients];
+
+        $failure = null;
+        try {
+            $loader->load($plan, new RestoreDumpReader($this->dump_file));
+        } catch (BackupException $exception) {
+            $failure = $exception->getErrorCode();
+        }
+
+        self::assertSame('RESTORE_LOAD_INCOMPLETE', $failure, 'a short census refuses instead of committing');
+        foreach (['cpms_clinics', 'cpms_organizations', 'cpms_patients', 'cpms_patient_logins'] as $short) {
+            self::assertSame(0, (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$db->table($short)]), $short . ' is rolled back to zero rows');
+        }
+    }
+
+    /** RB-43: a failed transaction control reports an UNKNOWN state, and the retry is refused as non-empty. */
+    public function testReportsUnknownStateWhenRollbackFailsAndRefusesARetry(): void
+    {
+        $db      = App::db();
+        $ledger  = $db->table('schema_migrations');
+        $version = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
+        $logins  = $db->table('cpms_patient_logins');
+        $loader  = new RestoreTableLoader($db);
+        $plan    = $loader->preflight(new RestoreDumpReader($this->dump_file), $version);
+
+        $rollbacks = 0;
+        $filter    = static function (string $statement) use (&$rollbacks): string {
+            if ('/*cpms*/ ROLLBACK' === $statement) {
+                ++$rollbacks;
+                return '/*cpms*/ ROLLBACK TO SAVEPOINT cpms_no_such_savepoint';
+            }
+            return $statement;
+        };
+
+        $failure = null;
+        $message = '';
+        add_filter('query', $filter);
+        try {
+            $loader->load($plan, new RestoreDumpReader($this->dump_file));
+        } catch (BackupException $exception) {
+            $failure = $exception->getErrorCode();
+            $message = $exception->getMessage();
+        } finally {
+            remove_filter('query', $filter);
+        }
+
+        self::assertSame(1, $rollbacks, 'the failing ROLLBACK is issued exactly once');
+        self::assertSame('RESTORE_LOAD_UNKNOWN_STATE', $failure, 'a failed rollback is never reported as a completed rollback');
+        self::assertSame('The restore load failed and the transaction state is unknown; reconciliation is required.', $message, 'the message states the state is unknown');
+        self::assertStringNotContainsString('was rolled back', $message, 'the message claims no rollback it cannot prove');
+
+        // The rows the failed rollback left behind make the emptiness check refuse a retry.
+        $rows  = (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$logins]);
+        $retry = null;
+        try {
+            (new RestoreTableLoader($db))->preflight(new RestoreDumpReader($this->dump_file), $version);
+        } catch (BackupException $exception) {
+            $retry = $exception->getErrorCode();
+        }
+        self::assertGreaterThan(0, $rows, 'the unknown-state load leaves rows behind');
+        self::assertSame('RESTORE_TARGET_NOT_EMPTY', $retry, 'a retry after an unknown state is refused by the emptiness check');
+    }
+
     /** RB-21: schema-version mismatches are refused on both sides, with zero writes. */
     public function testRefusesSchemaVersionMismatchWithZeroWrites(): void {
         $db      = App::db();

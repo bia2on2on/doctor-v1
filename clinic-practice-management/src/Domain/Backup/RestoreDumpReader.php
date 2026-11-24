@@ -19,10 +19,11 @@ final class RestoreDumpReader {
     private const MARKER_PATTERN      = '/\A-- ---- table: ([A-Za-z0-9_]+) ----\z/';
     private const IGNORED_PREFIXES    = [ 'CREATE', 'DROP', 'ALTER', 'TRUNCATE', 'RENAME', 'SET', 'LOCK', 'UNLOCK', 'USE', 'START', 'BEGIN', 'COMMIT', 'ROLLBACK' ];
 
-    private string $quote        = '';
-    private bool $pending_escape = false;
-    private int $scanned         = 0;
-    private string $fingerprint  = '';
+    private string $quote         = '';
+    private bool $pending_escape  = false;
+    private int $scanned          = 0;
+    private bool $line_truncated  = false;
+    private string $fingerprint   = '';
 
     public function __construct( private readonly string $path, private readonly int $max_statement_bytes = self::MAX_STATEMENT_BYTES ) {
     }
@@ -86,12 +87,23 @@ final class RestoreDumpReader {
      * @param resource $handle
      */
     private function read_line( $handle ): ?string {
-        $line = fgets( $handle, $this->max_statement_bytes + 1 );
+        $line                 = fgets( $handle, $this->max_statement_bytes + 1 );
+        $this->line_truncated = false === $line ? false : strlen( $line ) === $this->max_statement_bytes && ! str_ends_with( $line, "\n" );
         if ( false === $line && ! feof( $handle ) ) {
             throw BackupException::of( 'RESTORE_DUMP_UNREADABLE', 'The restore dump could not be read to the end.' );
         }
 
         return false === $line ? null : $line;
+    }
+
+    /** اثرانگشتِ فقط‌خواندنیِ محتوا (همان SHA-256 مسیرِ assert_same_file) — پیش از نخستین پاس. */
+    public function digest(): string {
+        $current = hash_file( 'sha256', $this->path );
+        if ( false === $current ) {
+            throw BackupException::of( 'RESTORE_DUMP_UNREADABLE', 'The restore dump is not readable.' );
+        }
+
+        return $current;
     }
 
     private function assert_same_file(): void {
@@ -110,6 +122,7 @@ final class RestoreDumpReader {
         $this->quote          = '';
         $this->pending_escape = false;
         $this->scanned        = 0;
+        $this->line_truncated = false;
         if ( ! is_file( $this->path ) || ! is_readable( $this->path ) ) {
             throw BackupException::of( 'RESTORE_DUMP_UNREADABLE', 'The restore dump is not readable.' );
         }
@@ -158,6 +171,10 @@ final class RestoreDumpReader {
                 $statements[] = substr( $buffer, $index, $end - $index - 1 );
             }
             if ( 'comment_eof' === $kind ) {
+                // A line cut by the read bound is not an EOF comment: refuse instead of clearing it.
+                if ( $this->line_truncated ) {
+                    throw BackupException::of( 'RESTORE_DUMP_SIZE_EXCEEDED', 'A dump comment exceeds the bounded reader size.' );
+                }
                 $statements[] = substr( $buffer, $index );
                 $buffer       = '';
                 $to_eof       = $end;
