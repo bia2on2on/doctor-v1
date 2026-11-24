@@ -351,7 +351,6 @@ final class SmsService
             } finally {
                 $this->live_text = null;
             }
-
         } else {
             $this->jobs->enqueue('sms.send', ['message_id' => $messageId], priority: $priority, maxAttempts: $maxAttempts);
         }
@@ -379,6 +378,7 @@ final class SmsService
      *
      * @param array<string, string>|null $live_vars متغیرهای زنده (OTP — کد هرگز ذخیره نمی‌شود)
      */
+    // phpcs:disable WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy public method name; renaming it is a cross-file API change outside this scope.
     public function dispatchMessage( int $message_id, ?array $live_vars = null ): void
     {
         $row = $this->fetchMessage( $message_id );
