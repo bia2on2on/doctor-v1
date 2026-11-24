@@ -248,88 +248,114 @@ final class RestoreDumpReaderTest extends TestCase
         self::assertNotSame($first, (new RestoreDumpReader($this->file))->digest(), 'different bytes give a different digest');
     }
 
-    /** RB-44: a mid-dump read failure reaches the loop through the PUBLIC api, not by reflection. */
+    /**
+     * RB-44: a mid-dump read failure is refused, proven through the PUBLIC api.
+     *
+     * PHP instantiates the wrapper class itself (no constructor arguments are possible), so the
+     * shared configuration is static — but every fopen() gets its own buffer and its own failure
+     * state. The fingerprint pass is the first open and always succeeds; only a later open may
+     * fail, so a refusal here can never be a digest failure wearing a read-failure mask.
+     */
     public function testRefusesMidDumpReadFailureThroughPublicApi(): void
     {
-        // PHP instantiates the wrapper class itself, so the state has to be static.
         $wrapper = get_class(new class () {
+            public static string $bytes     = '';
+            public static bool $fail_reads  = false;
+            public static int $opens        = 0;
+            public static int $failures     = 0;
+            public static int $serve        = 0;
+
             /** @var resource|null */
-            public static $handle = null;
-            public static bool $fail_after_data = false;
-            public static bool $served          = false;
+            private $handle = null;
+            private bool $broken = false;
+            private bool $served = false;
 
             /** @param array<string, mixed> $options */
             public function stream_open(string $path, string $mode, int $options, ?array &$opened_path): bool
             {
+                $handle = fopen('php://memory', 'w+b');
+                if (false === $handle) {
+                    return false;
+                }
+                fwrite($handle, self::$bytes);
+                rewind($handle);
+                $this->handle = $handle;
+                $this->broken = self::$fail_reads && self::$opens >= 1;
+                ++self::$opens;
+
                 return true;
             }
 
-            public function stream_read(int $count): string
+            /** @return string|false */
+            public function stream_read(int $count)
             {
-                // A broken stream: the first read works, every later read fails ('' while feof() stays false).
-                if (self::$fail_after_data && self::$served) {
-                    return '';
+                // `false` is a read error; '' would be indistinguishable from "no data yet".
+                if ($this->broken) {
+                    if ($this->served) {
+                        ++self::$failures;
+                        return false;
+                    }
+                    // Serve only $serve bytes, so the failure lands with bytes still unread.
+                    $this->served = true;
+                    return substr(self::$bytes, 0, self::$serve);
                 }
-                self::$served = true;
 
-                return (string) fread(self::$handle, $count);
+                return is_resource($this->handle) ? (string) fread($this->handle, $count) : false;
             }
 
             public function stream_eof(): bool
             {
-                // A healthy stream reports real EOF; the broken one never does, so its failure
-                // cannot be mistaken for the end of the dump.
-                return self::$fail_after_data ? false : feof(self::$handle);
+                // The broken stream never claims EOF, so its failure cannot pass as the dump's end.
+                return !$this->broken && is_resource($this->handle) && feof($this->handle);
             }
 
             /** @return array<string, int> */
             public function url_stat(string $path, int $flags): array
             {
-                return ['size' => 1, 'mode' => 0100644, 'mtime' => 0, 'atime' => 0, 'ctime' => 0];
+                return ['size' => strlen(self::$bytes), 'mode' => 0100644, 'mtime' => 0, 'atime' => 0, 'ctime' => 0];
             }
 
             public function stream_close(): void
             {
+                if (is_resource($this->handle)) {
+                    fclose($this->handle);
+                }
             }
         });
 
-        $read = static function (string $bytes, bool $fail) use ($wrapper): array {
-            $handle = fopen('php://memory', 'w+b');
-            if (false === $handle) {
-                throw new \RuntimeException('cannot open the in-memory buffer');
-            }
-            fwrite($handle, $bytes);
-            rewind($handle);
-            $wrapper::$handle          = $handle;
-            $wrapper::$fail_after_data = $fail;
-            $wrapper::$served          = false;
+        $first  = "-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n";
+        $dump   = $first . "INSERT INTO `cpms_patients` (`id`) VALUES (2);\n";
+        // The broken pass stops after the first whole statement: the failure is genuinely mid-dump.
+        $served = $first;
+        self::assertLessThan(strlen($dump), strlen($served), 'the broken pass leaves bytes unread');
+        $read = static function (bool $fail) use ($wrapper, $dump, $served): array {
+            $wrapper::$bytes      = $dump;
+            $wrapper::$fail_reads = $fail;
+            $wrapper::$opens      = 0;
+            $wrapper::$failures   = 0;
+            $wrapper::$serve      = strlen($served);
             self::assertTrue(stream_wrapper_register('cpmsbroken', $wrapper));
             try {
                 return (new RestoreDumpReader('cpmsbroken://dump.sql'))->tables();
             } finally {
                 stream_wrapper_unregister('cpmsbroken');
-                $wrapper::$handle = null;
-                fclose($handle);
             }
         };
 
-        // Positive witness first: the same wrapper serves a whole dump when nothing fails.
-        self::assertSame(
-            ['cpms_patients'],
-            $read("-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n", false),
-            'the wrapper path works when the stream does not fail'
-        );
+        // Positive witness: the same wrapper serves the whole dump when nothing fails.
+        self::assertSame(['cpms_patients'], $read(false), 'the wrapper path works when the stream does not fail');
 
-        // The broken stream serves a whole valid statement first, then fails: the refusal is mid-dump.
+        // The broken pass serves its first chunk, then fails instead of reporting EOF.
         $failure = null;
         $seen    = [];
         try {
-            $seen = $read("-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n", true);
+            $seen = $read(true);
         } catch (BackupException $exception) {
             $failure = $exception->getErrorCode();
         }
+        self::assertGreaterThan(0, $wrapper::$failures, 'the wrapper really failed a read, so the refusal is caused by it');
         self::assertSame([], $seen, 'no table list is returned from a dump that could not be read to the end');
-        self::assertSame('RESTORE_DUMP_UNREADABLE', $failure, 'the public api refuses a stream that fails without EOF');
+        self::assertSame('RESTORE_DUMP_UNREADABLE', $failure, 'the public api refuses a stream that fails mid-dump');
     }
 
     /** RB-28: a dump truncated mid-statement refuses instead of being read as a clean end. */
