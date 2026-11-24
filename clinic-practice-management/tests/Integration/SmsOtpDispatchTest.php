@@ -751,21 +751,31 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
             self::assertSame($sentBeforeFault, count($this->recording->textSends), 'the faulted dispatch never reached the provider');
         } finally {
             App::replaceExplicitScope($previous);
-            $this->recording->failNextRetryable = false;
         }
 
         // (3) Durable proof the exception path really got as far as the binding:
-        // the row was inserted (:328-344) before the faulted update, so it
-        // exists and its stored copy is the MASKED text — the live text never
-        // reaches the row.
+        // the row was inserted (:328-344) before the faulted SENDING update
+        // (:457-463), so it exists in its pre-send state. Its `message` column
+        // legitimately holds the staff text (masking applies to vars_json, not
+        // to this column), so the honest assertions are about STATE: the send
+        // was never attempted and nothing reached the provider.
         $failedId = $this->storedMessageIdFor('0912' . sprintf('%07d', 8_100_002));
         self::assertGreaterThan(0, $failedId, 'the exception-path call inserted its row before the fault');
         $failedRow = $this->fetchRow($failedId);
-        self::assertStringNotContainsString($markerThrow, (string) $failedRow['message'], 'the stored copy never keeps the live text');
+        // The row is INSERTED as SENDING with attempts = 0 (:336-337); reaching
+        // the provider requires the faulted :457-463 update, which is the only
+        // statement that raises `attempts`. So attempts = 0 proves the call died
+        // exactly where intended — before the send — and it stays true whether
+        // or not the failed status write lands.
+        self::assertSame(0, (int) $failedRow['attempts'], 'the faulted SENDING update never committed, so the provider was never called');
         self::assertNotSame(SmsMessageStatus::SENT, (string) $failedRow['status'], 'a faulted dispatch never reports the row as sent');
+        $failedDeliveries = 0;
         foreach ($this->recording->textSends as $send) {
-            self::assertStringNotContainsString($markerThrow, (string) $send['message'], 'the faulted text was never delivered');
+            if (str_contains((string) $send['message'], $markerThrow)) {
+                $failedDeliveries++;
+            }
         }
+        self::assertSame(0, $failedDeliveries, 'the faulted text was never delivered');
     }
 
     /**

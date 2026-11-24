@@ -244,7 +244,7 @@ final class OtpQuotaConsumptionTest extends WP_UnitTestCase
     public function testFourRealRequestsInFourSpellingsChargeOneDerivedBucket(): void
     {
         $local = '09125556677';
-        $forms = ['09125556677', '9125556677', '+989125556677', '0098912556677'];
+        $forms = ['09125556677', '9125556677', '+989125556677', '00989125556677'];
 
         // Four issuances need headroom above the default daily cap of 3, or the
         // 4th request would be refused instead of counted. The caps are pinned
