@@ -290,6 +290,46 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         self::assertSame([], $writes, 'the not-prepared refusal performs zero writes');
     }
 
+    /** RB-35: the engine rows are matched case-insensitively in BOTH columns. */
+    public function testEngineLookupMatchesEitherServerLetterCase(): void
+    {
+        $db      = App::db();
+        $ledger  = $db->table('schema_migrations');
+        $version = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
+        $writes  = [];
+        $reads   = [];
+        $engine  = '/\ASELECT TABLE_NAME AS table_name, ENGINE AS engine FROM information_schema\.TABLES WHERE TABLE_SCHEMA = DATABASE\(\) AND TABLE_NAME IN \(/';
+        // MySQL 8 information_schema answers in upper case; MariaDB 11.4 in lower case.
+        $filter  = static function (string $statement) use (&$writes, &$reads, $engine): string {
+            if (preg_match('/\A\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|TRUNCATE|RENAME)\b/i', $statement) === 1) {
+                $writes[] = $statement;
+            }
+            if (preg_match($engine, $statement) === 1) {
+                $reads[] = $statement;
+                preg_match_all("/'([^']+)'/", $statement, $names);
+                $faked = [];
+                foreach ($names[1] as $name) {
+                    $faked[] = "SELECT '" . strtoupper($name) . "' AS TABLE_NAME, 'InnoDB' AS ENGINE";
+                }
+                return implode(' UNION ALL ', $faked);
+            }
+            return $statement;
+        };
+        $failure = null;
+        add_filter('query', $filter);
+        try {
+            (new RestoreTableLoader($db))->preflight(new RestoreDumpReader($this->dump_file), $version);
+        } catch (BackupException $exception) {
+            $failure = $exception->getErrorCode();
+        } finally {
+            remove_filter('query', $filter);
+        }
+
+        self::assertSame(1, count($reads), 'the engine lookup is seen exactly once');
+        self::assertNull($failure, 'upper-case TABLE_NAME/ENGINE columns still prove InnoDB');
+        self::assertSame([], $writes, 'preflight writes nothing');
+    }
+
     /** RB-21: schema-version mismatches are refused on both sides, with zero writes. */
     public function testRefusesSchemaVersionMismatchWithZeroWrites(): void {
         $db      = App::db();

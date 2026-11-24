@@ -139,6 +139,77 @@ final class RestoreDumpReaderTest extends TestCase
         self::assertNull($error, 'an EOF comment is not an error and must not loop');
     }
 
+    /** RB-32: the dash-form EOF comment without a newline ends the read instead of rewinding. */
+    public function testTerminatesOnDashEofCommentWithoutNewline(): void
+    {
+        $sql = "-- ---- table: cpms_patients ----\n-- eof comment";
+        self::assertTrue(file_put_contents($this->file, $sql) > 0);
+        $error   = null;
+        $tables  = [];
+        $batches = 0;
+        try {
+            $reader  = new RestoreDumpReader($this->file);
+            $tables  = $reader->tables();
+            $batches = count(iterator_to_array($reader->inserts(), false));
+        } catch (BackupException $exception) {
+            $error = $exception->getErrorCode();
+        }
+        self::assertSame(['cpms_patients'], $tables, 'the marker before the dash-form EOF comment survives');
+        self::assertSame(0, $batches, 'a comment-only tail yields no batch');
+        self::assertNull($error, 'a dash-form EOF comment is not an error');
+    }
+
+    /** RB-33: an empty dump is a legal zero-table, zero-row read, not a failure. */
+    public function testEmptyDumpYieldsNothingInsteadOfFailing(): void
+    {
+        self::assertSame(0, file_put_contents($this->file, ''), 'the fixture is a zero-byte dump');
+        $reader = new RestoreDumpReader($this->file);
+        self::assertSame([], $reader->tables(), 'an empty dump declares no table');
+        self::assertSame([], iterator_to_array($reader->inserts(), false), 'an empty dump yields no batch');
+        // Positive witness at the same instant: a marker-only dump is still read.
+        self::assertTrue(file_put_contents($this->file, "-- ---- table: cpms_patients ----\n") > 0);
+        self::assertSame(['cpms_patients'], (new RestoreDumpReader($this->file))->tables());
+    }
+
+    /** RB-34: fgets()=false with feof()=false is a read error, never a clean end of dump. */
+    public function testRefusesReadErrorThatIsNotEof(): void
+    {
+        $sink    = sys_get_temp_dir() . '/cpms-reader-sink-' . bin2hex(random_bytes(6)) . '.sql';
+        $line    = null;
+        $failure = null;
+        self::assertTrue(file_put_contents($this->file, "SET NAMES utf8mb4;\n") > 0);
+        // Small bound (the helper's fgets buffer is bound + 1), so the test allocates 65 bytes.
+        $reader = new RestoreDumpReader($this->file, 64);
+        $method = new \ReflectionMethod(RestoreDumpReader::class, 'read_line');
+        $method->setAccessible(true);
+
+        $readable = fopen($this->file, 'rb');
+        self::assertIsResource($readable);
+        // Write-only handle on its own file: fgets() fails with EBADF while the stream is not at EOF.
+        $write_only = fopen($sink, 'wb');
+        self::assertIsResource($write_only);
+
+        $previous = set_error_handler(static fn (): bool => true);
+        try {
+            $line = $method->invoke($reader, $readable);
+            try {
+                $method->invoke($reader, $write_only);
+            } catch (BackupException $exception) {
+                $failure = $exception->getErrorCode();
+            }
+        } finally {
+            set_error_handler($previous);
+            fclose($readable);
+            fclose($write_only);
+            if (is_file($sink)) {
+                unlink($sink);
+            }
+        }
+
+        self::assertSame("SET NAMES utf8mb4;\n", $line, 'the helper returns a real line unchanged');
+        self::assertSame('RESTORE_DUMP_UNREADABLE', $failure, 'an unreadable stream refuses instead of ending the dump');
+    }
+
     /** RB-28: a dump truncated mid-statement refuses instead of being read as a clean end. */
     public function testRefusesTruncatedDumpInsteadOfReadingItAsEof(): void
     {

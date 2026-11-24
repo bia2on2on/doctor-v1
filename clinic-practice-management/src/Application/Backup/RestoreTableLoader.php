@@ -220,12 +220,17 @@ final class RestoreTableLoader {
      * @param list<array<string, mixed>> $rows
      */
     private function verify_engines( array $tables, array $rows ): void {
-        $engines = array_column( $rows, 'engine', 'table_name' );
+        $engines = [];
+        foreach ( $rows as $row ) {
+            // Table-name letter case follows the server (lower_case_table_names), the engine does not.
+            $engines[ strtolower( (string) $row['table_name'] ) ] = $row['engine'] ?? null;
+        }
         foreach ( $tables as $table ) {
-            if ( ! array_key_exists( $table, $engines ) ) {
+            $key = strtolower( $table );
+            if ( ! array_key_exists( $key, $engines ) ) {
                 throw BackupException::of( 'RESTORE_TARGET_NOT_PREPARED', 'A table the load writes is missing from the target schema.' );
             }
-            if ( ! is_string( $engines[ $table ] ) || 0 !== strcasecmp( $engines[ $table ], 'InnoDB' ) ) {
+            if ( ! is_string( $engines[ $key ] ) || 0 !== strcasecmp( $engines[ $key ], 'InnoDB' ) ) {
                 throw BackupException::of( 'RESTORE_ENGINE_UNSUPPORTED', 'Only InnoDB targets can be restored atomically.' );
             }
         }

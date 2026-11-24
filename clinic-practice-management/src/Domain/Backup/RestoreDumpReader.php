@@ -57,11 +57,8 @@ final class RestoreDumpReader {
         $buffer = '';
         try {
             while ( true ) {
-                $line = fgets( $handle, $this->max_statement_bytes + 1 );
-                if ( false === $line ) {
-                    if ( ! feof( $handle ) ) {
-                        throw BackupException::of( 'RESTORE_DUMP_UNREADABLE', 'The restore dump could not be read to the end.' );
-                    }
+                $line = $this->read_line( $handle );
+                if ( null === $line ) {
                     break;
                 }
                 $buffer .= $line;
@@ -81,6 +78,20 @@ final class RestoreDumpReader {
         } finally {
             fclose( $handle );
         }
+    }
+
+    /**
+     * یک خط با سقفِ مجاز؛ falseِ fgets با feof=false خطای خواندن است، نه پایان فایل.
+     *
+     * @param resource $handle
+     */
+    private function read_line( $handle ): ?string {
+        $line = fgets( $handle, $this->max_statement_bytes + 1 );
+        if ( false === $line && ! feof( $handle ) ) {
+            throw BackupException::of( 'RESTORE_DUMP_UNREADABLE', 'The restore dump could not be read to the end.' );
+        }
+
+        return false === $line ? null : $line;
     }
 
     private function assert_same_file(): void {
