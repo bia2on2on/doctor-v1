@@ -521,4 +521,145 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
         self::assertSame($this->previous_suppress, (bool) $this->wpdb->suppress_errors, 'T2: suppress_errors restored');
         self::assertSame($this->previous_show, (bool) $this->wpdb->show_errors, 'T2: show_errors restored');
     }
+
+    // ------------------------------------------------------- ROUND 2 additions
+
+    /** R2a — a hyphen-separated NID is detected and redacted on a failed lookup. */
+    public function testSeparatedNidLookupFailureLeavesNoNid(): void
+    {
+        $nid      = '049-937-0899';
+        $sql      = 'SELECT id FROM ' . $this->db->table('cpms_patients') . ' WHERE clinic_id = %d AND national_id = %s LIMIT 1';
+        $expected = $this->db->prepare($sql, [$this->clinic_id, $nid]);
+        $this->faultOn($expected, $this->failingSelectSql($nid));
+
+        try {
+            $row = (new PatientRepository($this->db))->find_by_national_id($this->clinic_id, $nid);
+        } finally {
+            $this->removeFault();
+        }
+
+        self::assertSame(1, $this->fault_hits, 'R2a: one exact-SQL match');
+        self::assertNull($row);
+        $this->assertNoNidInDiagnostics($nid);
+    }
+
+    /** R2a — the same separated NID alongside a mobile on a failed insert. */
+    public function testSeparatedNidWithMobileInsertFailureLeavesNoNid(): void
+    {
+        $nid      = '049 937 0899';
+        $data     = $this->newPatientData($nid);
+        $expected = $this->expectedInsertSql($this->db->table('cpms_patients'), $data);
+        $this->faultOn($expected, $this->failingSelectSql($nid));
+
+        try {
+            $ok = $this->db->insert('cpms_patients', $data);
+        } finally {
+            $this->removeFault();
+        }
+
+        self::assertSame(1, $this->fault_hits, 'R2a: one exact-SQL match');
+        self::assertFalse($ok);
+        self::assertMatchesRegularExpression('/^0912[0-9]{8}$/', (string) $data['mobile']);
+        $this->assertNoNidInDiagnostics($nid);
+    }
+
+    /** R2b — exactly one value-free log line is written for a failed guarded call. */
+    public function testFailedGuardedCallWritesOneValueFreeLogLine(): void
+    {
+        $path     = (string) tempnam(sys_get_temp_dir(), 'cpms-nid-r2-log-');
+        $previous = (string) ini_get('error_log');
+        ini_set('error_log', $path);
+
+        $nid            = '049.937.0899';
+        $digits         = '0499370899';
+        $data           = $this->newPatientData($nid);
+        $data['mobile'] = '09123456789';
+        $mobile         = (string) $data['mobile'];
+        $expected       = $this->expectedInsertSql($this->db->table('cpms_patients'), $data);
+        $this->faultOn($expected, $this->failingSelectSql($nid));
+
+        try {
+            $this->db->insert('cpms_patients', $data);
+        } finally {
+            $this->removeFault();
+            ini_set('error_log', $previous);
+        }
+
+        $lines = array_values(array_filter(
+            explode("\n", (string) @file_get_contents($path)),
+            static fn (string $line): bool => str_contains($line, '[cpms-nid-db]')
+        ));
+
+        $all = (string) @file_get_contents($path);
+        self::assertSame(1, $this->fault_hits, 'R2b: one exact-SQL match');
+        self::assertCount(1, $lines, 'R2b: exactly one redacted diagnostic line');
+        self::assertStringNotContainsString($nid, $all, 'R2b: no separated NID anywhere in the log');
+        self::assertStringNotContainsString($digits, $all, 'R2b: no bare NID anywhere in the log');
+        self::assertStringNotContainsString($mobile, $all, 'R2b: no mobile anywhere in the log');
+        $line = (string) $lines[0];
+        self::assertStringNotContainsString($nid, $line, 'R2b: no separated NID');
+        self::assertStringNotContainsString($digits, $line, 'R2b: no bare NID');
+        self::assertStringNotContainsString($mobile, $line, 'R2b: no mobile digits');
+        @unlink($path);
+    }
+
+    /** R2c — show_errors=true survives a guarded failure; teardown restores its original value. */
+    public function testShowErrorsTrueSurvivesGuardedFailure(): void
+    {
+        $this->wpdb->show_errors(true);
+        self::assertTrue((bool) $this->wpdb->show_errors, 'R2c: precondition');
+
+        $nid      = '049/937/0899';
+        $sql      = 'SELECT id FROM ' . $this->db->table('cpms_patients') . ' WHERE clinic_id = %d AND national_id = %s LIMIT 1';
+        $expected = $this->db->prepare($sql, [$this->clinic_id, $nid]);
+        $this->faultOn($expected, $this->failingSelectSql($nid));
+
+        try {
+            $this->db->fetchRow($sql, [$this->clinic_id, $nid]);
+        } finally {
+            $this->removeFault();
+        }
+
+        self::assertSame(1, $this->fault_hits, 'R2c: one exact-SQL match');
+        self::assertTrue((bool) $this->wpdb->show_errors, 'R2c: show_errors after guarded failure');
+    }
+
+    /** R2d — strict mode: a second exact-SQL injection also counts once. */
+    public function testStrictModeSecondInjectionFinalHitCount(): void
+    {
+        $nid         = self::NID_A;
+        $sql         = 'SELECT id FROM ' . $this->db->table('cpms_patients') . ' WHERE clinic_id = %d AND national_id = %s LIMIT 1';
+        $expected    = $this->db->prepare($sql, [$this->clinic_id, $nid]);
+        $replacement = $this->failingSelectSql($nid);
+        $hits        = 0;
+        $fault       = static function (string $query) use ($expected, $replacement, &$hits): string {
+            if ($query !== $expected) {
+                return $query;
+            }
+            ++$hits;
+
+            return $replacement;
+        };
+
+        add_filter('query', $fault, 5);
+        $this->db->setStrict(true);
+        $thrown = [];
+        try {
+            for ($attempt = 0; $attempt < 2; ++$attempt) {
+                try {
+                    $this->db->fetchRow($sql, [$this->clinic_id, $nid]);
+                } catch (Throwable $error) {
+                    $thrown[] = $error;
+                }
+            }
+        } finally {
+            $this->db->setStrict(false);
+            remove_filter('query', $fault, 5);
+        }
+
+        self::assertSame(2, $hits, 'R2d: both exact-SQL injections matched once each');
+        self::assertCount(2, $thrown, 'R2d: both strict calls threw');
+        self::assertSame('Database error (national ID redacted).', (string) $thrown[0]->getMessage());
+        self::assertSame('Database error (national ID redacted).', (string) $thrown[1]->getMessage());
+    }
 }

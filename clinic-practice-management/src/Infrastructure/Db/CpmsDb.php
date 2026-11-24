@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 namespace ClinicCore\Infrastructure\Db;
 
-use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Infrastructure\Profiling\RequestProfiler;
 use RuntimeException;
+use Throwable;
 use wpdb;
 
 /**
@@ -46,6 +46,12 @@ final class CpmsDb
      * the driver message (which can embed the duplicate key value).
      */
     private const NID_SAFE_ERROR = 'Database error (national ID redacted).';
+
+    /**
+     * One NID-shaped token: ten or more digits joined only by the separators
+     * the product validator accepts (hyphen, space, dot, slash, ZWNJ).
+     */
+    private const NID_TOKEN_PATTERN = '/[0-9۰-۹٠-٩](?:[0-9۰-۹٠-٩]|[-\/.\x{200C} ])*[0-9۰-۹٠-٩]/u';
 
     /**
      * Depth of active NID-diagnostic guards on this connection.
@@ -118,20 +124,55 @@ final class CpmsDb
             $this->wpdb->show_errors = false;
         }
         ++$this->nid_guard_depth;
+        $failed = false;
         try {
             return $operation();
+        } catch ( Throwable $error ) {
+            $failed = true;
+            throw $error;
         } finally {
             --$this->nid_guard_depth;
-            $this->scrub_nid_diagnostics( $state );
-            if ( 0 === $this->nid_guard_depth ) {
-                if ( $has_suppress ) {
-                    $this->wpdb->suppress_errors( (bool) $state['suppress'] );
+            try {
+                $new_error = is_array( $EZSQL_ERROR ) && count( $EZSQL_ERROR ) > (int) $state['ez_count'];
+                if ( 0 === $this->nid_guard_depth && ( $failed || $new_error ) ) {
+                    $this->log_redacted_nid_failure( $state );
                 }
-                if ( $has_show ) {
-                    $this->wpdb->show_errors = (bool) $state['show'];
+                $this->scrub_nid_diagnostics( $state );
+            } finally {
+                if ( 0 === $this->nid_guard_depth ) {
+                    if ( $has_suppress ) {
+                        $this->wpdb->suppress_errors( (bool) $state['suppress'] );
+                    }
+                    if ( $has_show ) {
+                        $this->wpdb->show_errors = (bool) $state['show'];
+                    }
                 }
             }
         }
+    }
+
+    /**
+     * Emit ONE line for a FAILED guarded call, in the spirit of
+     * wpdb::print_error(): caller, query and error, each already redacted by
+     * the same rule as the guard. Nothing is logged for a successful call.
+     *
+     * @param array<string, mixed> $state Guard baseline.
+     */
+    private function log_redacted_nid_failure( array $state ): void {
+        $query  = property_exists( $this->wpdb, 'last_query' ) ? (string) $this->wpdb->last_query : '';
+        $error  = property_exists( $this->wpdb, 'last_error' ) ? (string) $this->wpdb->last_error : '';
+        $caller = property_exists( $this->wpdb, 'func_call' ) ? (string) $this->wpdb->func_call : '';
+        $parts  = [];
+
+        foreach ( [ 'caller' => $caller, 'query' => $query, 'error' => $error ] as $label => $text ) {
+            if ( '' === $text ) {
+                continue;
+            }
+            $clean   = $this->redact_nid( $text, $state['values'] );
+            $parts[] = $label . '=' . str_replace( [ "\r", "\n" ], ' ', $clean );
+        }
+
+        error_log( '[cpms-nid-db] failed guarded query ' . implode( ' ', $parts ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- one redacted line replaces wpdb's value-bearing log.
     }
 
     /**
@@ -147,7 +188,7 @@ final class CpmsDb
                 }
                 continue;
             }
-            if ( is_string( $value ) && NationalIdValidator::redact_digits( $value ) !== $value ) {
+            if ( is_string( $value ) && $this->redact_nid_text( $value ) !== $value ) {
                 return true;
             }
         }
@@ -167,12 +208,29 @@ final class CpmsDb
                 $text = $this->redact_nid( $text, $value );
                 continue;
             }
-            if ( is_string( $value ) && $value !== '' && NationalIdValidator::redact_digits( $value ) !== $value ) {
+            if ( is_string( $value ) && $value !== '' && $this->redact_nid_text( $value ) !== $value ) {
                 $text = str_replace( $value, '[nid-redacted]', $text );
             }
         }
 
-        return NationalIdValidator::redact_digits( $text );
+        return $this->redact_nid_text( $text );
+    }
+
+    /**
+     * Replace only NID-shaped tokens: digits with the separator forms the
+     * validator can accept, or ten or more raw ASCII digits. Used by both the
+     * guard trigger and the diagnostic redactor so they cannot disagree.
+     */
+    private function redact_nid_text( string $text ): string {
+        return preg_replace_callback(
+            self::NID_TOKEN_PATTERN,
+            static function ( array $match ): string {
+                return preg_match_all( '/[0-9۰-۹٠-٩]/u', $match[0] ) >= 10
+                    ? '[nid-redacted]'
+                    : $match[0];
+            },
+            $text
+        ) ?? $text;
     }
 
     /**
