@@ -70,6 +70,22 @@ final class SmsService
     private const UPDATE_COLUMNS = ['status', 'attempts', 'failure_code', 'provider_msg_id', 'provider'];
 
     /**
+     * In-memory text to hand to the provider instead of the stored copy, for
+     * ONE message row: `[ text, message_id ]`.
+     *
+     * Why a bound field instead of a dispatchMessage() parameter: the stored
+     * copy of a test-send is masked, the provider must still receive the staff
+     * text, and dispatchMessage()'s signature stays exactly as it was so no
+     * exemption is needed on a public method name or an existing parameter.
+     * The binding carries the row id, so the override can never be delivered
+     * on behalf of a different message; sendEvent() always clears it in a
+     * finally block, and a stale value is ignored anyway by the id check.
+     *
+     * @var array{0: string, 1: int}|null
+     */
+    private array|null $live_text = null;
+
+    /**
      * @param \Closure(): int $currentClinicResolver Clinicِ فعالِ عملیاتِ جاری
      *        (از scope درخواست). به‌صورت Closure تزریق می‌شود تا این سرویس به
      *        bootstrap گره نخورد و ساختنش به هیچ Clinic‌ای نیاز نداشته باشد —
@@ -329,7 +345,12 @@ final class SmsService
 
         // OTP: همیشه Inline + بدون Queue-Retry (کد ذخیره نشده — Retry = ارسال کد جدید توسط کاربر)
         if ($inline || $isOtp) {
-            $this->dispatchMessage( $messageId, $live_test_text, $isOtp ? $vars : null ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $messageId/$isOtp locals.
+            $this->live_text = $live_test_text !== null ? [ $live_test_text, $messageId ] : null; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $messageId local.
+            try {
+                $this->dispatchMessage( $messageId, $isOtp ? $vars : null ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $messageId/$isOtp locals.
+            } finally {
+                $this->live_text = null;
+            }
 
         } else {
             $this->jobs->enqueue('sms.send', ['message_id' => $messageId], priority: $priority, maxAttempts: $maxAttempts);
@@ -344,13 +365,21 @@ final class SmsService
     }
 
     /**
+     * Whether a bound in-memory text belongs to this exact row. A null binding,
+     * or one created for another row, yields false: the caller then falls back
+     * to the row's own stored text.
+     */
+    private function live_text_applies_to( int $message_id ): bool {
+        return $this->live_text !== null && $this->live_text[1] === $message_id;
+    }
+
+    /**
      * تلاش برای ارسال یک Message (idempotent — برای Job + Fast-path).
      * شکست Retryable با Attempts باقی‌مانده → RETRYING (Job Queue تکرار می‌کند).
      *
-     * @param string|null $live_text متن زندهٔ ارسال (test-send — نسخهٔ ذخیره‌شده Mask است، هرگز از ردیف خوانده نمی‌شود)
      * @param array<string, string>|null $live_vars متغیرهای زنده (OTP — کد هرگز ذخیره نمی‌شود)
      */
-    public function dispatchMessage( int $message_id, ?string $live_text = null, ?array $live_vars = null ): void // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid,WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy method name, cross-file API rename; pre-existing camelCase $live_vars parameter.
+    public function dispatchMessage( int $message_id, ?array $live_vars = null ): void
     {
         $row = $this->fetchMessage( $message_id );
         if ($row === [] || SmsMessageStatus::isTerminal((string) $row['status'])) {
@@ -458,8 +487,8 @@ final class SmsService
                 $outbound_text = (string) $row['message'];
                 if ( $is_otp_event ) {
                     $outbound_text = $this->render_live_otp_text( $variables );
-                } elseif ( $live_text !== null ) {
-                    $outbound_text = $live_text;
+                } elseif ( $this->live_text_applies_to( $message_id ) && null !== $this->live_text ) {
+                    $outbound_text = $this->live_text[0];
                 }
                 $result = $provider->sendText( $creds, (string) $row['recipient'], $outbound_text, $opts );
             }

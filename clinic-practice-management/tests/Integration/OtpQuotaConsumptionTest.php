@@ -6,7 +6,10 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Application\Auth\OtpException;
 use ClinicCore\Application\Auth\OtpService;
+use ClinicCore\Application\Auth\PatientNidHmac;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Validators\MobileValidator;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Settings\Settings;
 use WP_UnitTestCase;
 
@@ -15,7 +18,10 @@ use WP_UnitTestCase;
  *
  * قرارداد:
  *   - درخواستی که با Cooldown یا Lockout رد می‌شود هیچ‌کدام از شمارنده‌های
- *     `otp-day:` / `otp-hour:` را مصرف نمی‌کند.
+ *     `otp-day:` / `otp-hour:` را مصرف نمی‌کند. (این‌ها نامِ منطقیِ سطل‌اند؛ از
+ *     B0-PR3 کلیدِ ذخیره‌شده `prefix:HMAC` است و هیچ رقم موبایل/کد ملی در
+ *     `window_key` نمی‌ماند — به تست‌های `testOtpRateLimitKeysNeverStoreRawDigits...`
+ *     و `testQuotaHelpersReadServerDerivedKeysNotRawMobileKeys` مراجعه کنید.)
  *   - درخواستی که واقعاً Challenge صادر می‌کند دقیقاً یکی به هر دو اضافه می‌کند.
  *   - سقف دقیق است: بعد از max صدورِ موفق، درخواست بعدی رد می‌شود و شمارنده
  *     از max بالاتر نمی‌رود (نه max+1).
@@ -64,14 +70,28 @@ final class OtpQuotaConsumptionTest extends WP_UnitTestCase
         );
     }
 
+    /**
+     * Row key for the day/hour bucket of one mobile. Derived from the SAME production
+     * secret carrier the service uses (PatientNidHmac over the HMAC secret), so
+     * these reads follow the real key instead of restating its shape. Before
+     * the key was hashed this was 'otp-day:' . $mobile.
+     */
+    private function bucketKey(string $prefix, string $mobile): string
+    {
+        $normalized = MobileValidator::normalize($mobile);
+        $this->assertNotNull($normalized, 'precondition: the fixture mobile normalizes');
+
+        return (new PatientNidHmac())->mobile_rate_limit_key_with_domain($prefix, 'otp', $normalized);
+    }
+
     private function dayHits(string $mobile): int
     {
-        return $this->counter('otp-day:' . $mobile, self::DAY);
+        return $this->counter($this->bucketKey('otp-day', $mobile), self::DAY);
     }
 
     private function hourHits(string $mobile): int
     {
-        return $this->counter('otp-hour:' . $mobile, self::HOUR);
+        return $this->counter($this->bucketKey('otp-hour', $mobile), self::HOUR);
     }
 
     private function latestChallengeId(string $mobile): int
@@ -100,6 +120,166 @@ final class OtpQuotaConsumptionTest extends WP_UnitTestCase
                 OtpService::PURPOSE_LOGIN
             )
         );
+    }
+
+    /**
+     * (g) A national ID shaped like a mobile must never be stored as a
+     * rate-limit key. MobileValidator accepts a 10-digit input starting with 9
+     * (:33-35), so OtpService::request() would otherwise keep the raw digits in
+     * cpms_rate_limits.window_key for the day/hour/guard/ip buckets.
+     *
+     * Asserted on stored state, three ways:
+     *  - the intended derivation IS in use (the server-derived key rows exist);
+     *  - the raw digits appear in no column of any RateLimiter write for it;
+     *  - the witness of the intended prefix ('otp-day:') is present, so a
+     *    pass cannot come from having written nothing at all.
+     */
+    public function testOtpRateLimitKeysNeverStoreRawDigitsOfAMobileShapedNationalId(): void
+    {
+        $nid = $this->mobileShapedChecksumValidNid();
+        $normalized = MobileValidator::normalize($nid);
+        $this->assertSame($nid, $normalized, 'precondition: the fixture is accepted as a mobile unchanged');
+
+        $this->issue($nid);
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'cpms_rate_limits';
+
+        // (a) intended derivation in use: the exact HMAC rows exist.
+        $dayKey = $this->bucketKey('otp-day', $nid);
+        $guardKey = $this->bucketKey('otp-send-guard', $nid);
+        $this->assertSame(1, $this->dayHits($nid), 'the issued challenge charged the HMAC day bucket');
+        $this->assertSame(1, $this->hourHits($nid), 'the issued challenge charged the HMAC hour bucket');
+        $this->assertStringStartsWith('otp-day:', $dayKey, 'witness: the intended bucket prefix survives');
+        $this->assertGreaterThan(0, (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table} WHERE window_key = %s", // phpcs:ignore WordPress.DB.PreparedSQL
+            $guardKey
+        )), 'the per-mobile guard row is keyed by the same derivation');
+
+        // (b) no stored key of any bucket this call wrote carries the raw digits.
+        $keys = $wpdb->get_col("SELECT window_key FROM {$table}"); // phpcs:ignore WordPress.DB.PreparedSQL
+        $this->assertNotEmpty($keys, 'the call must have written at least one bucket');
+        $offenders = [];
+        foreach ((array) $keys as $key) {
+            if (str_contains((string) $key, $nid) || str_contains((string) $key, substr($nid, 1))) {
+                $offenders[] = (string) $key;
+            }
+        }
+        $this->assertSame([], $offenders, 'no rate-limit key may embed the raw NID (or its 9-digit tail)');
+        $this->assertStringNotContainsString($nid, (string) json_encode($keys), 'raw digits must not appear in any stored key');
+        $this->assertSame(0, $this->rateRowsContaining($nid), 'raw digits must not appear in ANY column of cpms_rate_limits');
+    }
+
+    /**
+     * (g2) The existing daily throttle still trips at the SAME attempt number as
+     * before, through the real service on a fixed bucket: with the documented
+     * default cap of 3, the 4th issuance is denied with CLINIC_OTP_DAILY_LIMIT
+     * and the counter never exceeds 3. Cooldown is switched off the way
+     * OtpFlowTest.php:418 does, so the counts are the bucket's own.
+     */
+    public function testExistingDailyThrottleTripsAtTheSameAttemptNumber(): void
+    {
+        $mobile = '09122223344';
+        $dailyMax = (int) Settings::DEFAULTS['otp.daily_max'];
+        $this->assertSame(3, $dailyMax, 'guard: the default daily cap this test pins is 3');
+
+        App::settings()->set('otp.cooldown_sec', 0);
+        Settings::flushCache();
+
+        for ($issued = 1; $issued <= $dailyMax; $issued++) {
+            $this->issue($mobile);
+            $this->assertSame($issued, $this->dayHits($mobile), 'attempt ' . $issued . ' of 3 is allowed and counted once');
+        }
+
+        $denied = $this->expectApiCode('CLINIC_OTP_DAILY_LIMIT', fn () => $this->issue($mobile));
+        $data = $denied->getData();
+        $this->assertFalse((bool) $data['allowed'], 'the 4th attempt is denied at the same attempt number as before');
+        $this->assertSame(0, (int) $data['remaining']);
+        $this->assertSame($dailyMax, $this->dayHits($mobile), 'a denied attempt must not push the counter past the cap');
+        $this->assertSame($dailyMax, $this->challengeCount($mobile), 'a denied attempt must not create a challenge');
+    }
+
+    /**
+     * (h) The same number in every accepted spelling shares one bucket, and two
+     * different numbers do not. Shaped on the day counter so the assertion is
+     * about the derived key, not about the OTP policy.
+     */
+    public function testSameMobileInAnyFormatSharesOneBucketAndDifferentMobilesDoNot(): void
+    {
+        $local = '09123334455';
+        $forms = ['09123334455', '9123334455', '+989123334455', '00989123334455'];
+        foreach ($forms as $form) {
+            $normalized = MobileValidator::normalize($form);
+            $this->assertSame($local, $normalized, 'precondition: ' . $form . ' normalizes to the local form');
+            App::rate()->hit($this->bucketKey('otp-day', $form), 10, self::DAY);
+        }
+
+        // One bucket, four hits: every spelling landed on the same derived key.
+        $this->assertSame(4, $this->dayHits($local), 'every accepted spelling must share one bucket');
+
+        // A different number is a different bucket even with the same length/prefix.
+        $other = '09123334456';
+        $this->assertSame(0, $this->dayHits($other), 'a different number must not share the bucket');
+        App::rate()->hit($this->bucketKey('otp-day', $other), 10, self::DAY);
+        $this->assertSame(1, $this->dayHits($other));
+        $this->assertSame(4, $this->dayHits($local), 'charging another number must not touch this bucket');
+    }
+
+    /**
+     * (i) Regression guard for the helpers above: they must read the keys the
+     * SERVER writes, not a private copy of the derivation. A charge added only
+     * with the key the helper itself derives is visible to dayHits() by construction, so the
+     * meaningful assertion is the reverse direction: a charge the real request
+     * path makes is visible to the helper (covered above), and a raw-key charge
+     * is NOT visible to it. If the helpers were reading raw keys, this would fail.
+     */
+    public function testQuotaHelpersReadServerDerivedKeysNotRawMobileKeys(): void
+    {
+        $mobile = '09124445566';
+        App::rate()->hit('otp-day:' . $mobile, 10, self::DAY);
+
+        $this->assertSame(0, $this->dayHits($mobile), 'a raw-key legacy bucket must not be read as the quota of this mobile');
+
+        $this->issue($mobile);
+
+        $this->assertSame(1, $this->dayHits($mobile), 'the real issuance charge is what the helper sees');
+        $this->assertSame(1, $this->hourHits($mobile));
+    }
+
+    /**
+     * (j) A checksum-valid national ID that MobileValidator accepts as a mobile:
+     * 10 digits starting with 9 (MobileValidator.php:33-35 -> '0' . digits).
+     */
+    private function mobileShapedChecksumValidNid(): string
+    {
+        // Fixed value, documented: 10 ASCII digits starting with 9, so
+        // MobileValidator treats it as 09...; the last digit is the national-ID
+        // check digit computed from the first nine.
+        $base = '912345678';
+        $sum = 0;
+        for ($i = 0; $i < 9; $i++) {
+            $sum += (int) $base[$i] * (10 - $i);
+        }
+        $rem = $sum % 11;
+        $candidate = $base . (string) ($rem < 2 ? $rem : 11 - $rem);
+
+        $this->assertTrue(NationalIdValidator::isValid($candidate), 'precondition: the fixture passes the national-ID check');
+        $this->assertSame('0' . $candidate, MobileValidator::normalize($candidate), 'precondition: the fixture is a mobile-shaped NID');
+
+        return $candidate;
+    }
+
+    /** Counts cpms_rate_limits rows whose ANY column contains the needle. */
+    private function rateRowsContaining(string $needle): int
+    {
+        global $wpdb;
+        $table = $wpdb->prefix . 'cpms_rate_limits';
+        $total = 0;
+        foreach ((array) $wpdb->get_results("SELECT * FROM {$table}", ARRAY_A) as $row) { // phpcs:ignore WordPress.DB.PreparedSQL
+            $total += str_contains((string) json_encode($row), $needle) ? 1 : 0;
+        }
+
+        return $total;
     }
 
     /**

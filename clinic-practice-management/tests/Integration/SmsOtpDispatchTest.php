@@ -499,9 +499,68 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
         self::assertStringNotContainsString($nid, (string) json_encode($row, JSON_UNESCAPED_UNICODE));
         self::assertSame(0, $this->queueRowsContaining($nid), 'no queue payload may carry the test text');
 
-        // (4) the provider still gets exactly the staff text (unchanged delivery).
+        // (4) the provider still gets exactly the staff text. PENDING OWNER
+        // DECISION: whether delivery itself should be masked is an open product
+        // question (reported), so this assertion pins the CURRENT behaviour only
+        // and must be revisited if the owner chooses to mask delivery too.
         self::assertCount(1, $this->recording->textSends);
         self::assertSame($typed, (string) $this->recording->textSends[0]['message'], 'delivered text is a product decision and is unchanged by this fix');
+    }
+
+    /**
+     * Task D (b) - the live override is bound to ONE row and cleared afterwards.
+     * The binding is private, so this pins the observable contract: after
+     * sendEvent() returns, a later dispatch of a DIFFERENT row must deliver that
+     * row's own stored text and never the bound staff text. Dropping the
+     * finally-clear in SmsService::sendEvent() (or making
+     * live_text_applies_to() always true) would let the staff text leak onto the
+     * next dispatched row and fail the assertions below.
+     */
+    public function testLiveTextOverrideIsBoundToOneRowAndNeverLeaksToAnother(): void
+    {
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+        $typed = 'تست ارسال؛ کد ملی ' . $nid . ' را بررسی کنید';
+
+        // A second message sent inline (the established successful non-OTP
+        // path), then put back into a non-terminal state so it can be
+        // dispatched once more AFTER the test-send.
+        $other = App::smsService()->sendEvent(
+            self::CLINIC_ID,
+            SmsEvents::APPT_REMINDER,
+            self::MOBILE,
+            [
+                'patient_name' => 'بیمار تست',
+                'doctor_name' => 'دکتر تست',
+                'appointment_date' => '1405/06/10',
+                'appointment_time' => '09:30',
+            ],
+            'appointment',
+            $this->uniqueContext(),
+            inline: true
+        );
+        self::assertSame(SmsMessageStatus::SENT, $other['status'], 'precondition: the other row sent inline');
+        $otherId = (int) $other['message_id'];
+        $otherStored = (string) $this->fetchRow($otherId)['message'];
+
+        $before = count($this->recording->textSends);
+        $previous = ScopeContext::tryGet();
+        try {
+            App::replaceExplicitScope(ClinicScope::forClinic(self::CLINIC_ID));
+            App::smsService()->testSend('0912' . sprintf('%07d', 7_000_001), $typed, 1);
+            // Re-drive the OTHER row after the test-send finished.
+            App::db()->update('cpms_sms_messages', ['status' => SmsMessageStatus::QUEUED], ['id' => $otherId]);
+            App::smsService()->dispatchMessage($otherId);
+        } finally {
+            App::replaceExplicitScope($previous);
+        }
+
+        $sent = array_slice($this->recording->textSends, $before);
+        self::assertCount(2, $sent, 'both messages must reach the provider');
+        self::assertSame($typed, (string) $sent[0]['message'], 'the test-send delivers its own live text verbatim');
+        $deliveredOther = (string) $sent[1]['message'];
+        self::assertSame($otherStored, $deliveredOther, 'the later row delivers exactly its own stored text');
+        self::assertStringNotContainsString($typed, $deliveredOther, 'the later row must never receive the bound staff text');
+        self::assertStringContainsString('بیمار تست', $deliveredOther, 'witness: the later row really rendered its own content');
     }
 
     /**
