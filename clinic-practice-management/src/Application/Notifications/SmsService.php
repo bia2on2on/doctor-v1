@@ -329,7 +329,7 @@ final class SmsService
 
         // OTP: همیشه Inline + بدون Queue-Retry (کد ذخیره نشده — Retry = ارسال کد جدید توسط کاربر)
         if ($inline || $isOtp) {
-            $this->dispatchMessage($messageId, $live_test_text, $isOtp ? $vars : null); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $messageId/$isOtp locals.
+            $this->dispatchMessage( $messageId, $live_test_text, $isOtp ? $vars : null ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $messageId/$isOtp locals.
 
         } else {
             $this->jobs->enqueue('sms.send', ['message_id' => $messageId], priority: $priority, maxAttempts: $maxAttempts);
@@ -350,9 +350,7 @@ final class SmsService
      * @param string|null $live_text متن زندهٔ ارسال (test-send — نسخهٔ ذخیره‌شده Mask است، هرگز از ردیف خوانده نمی‌شود)
      * @param array<string, string>|null $live_vars متغیرهای زنده (OTP — کد هرگز ذخیره نمی‌شود)
      */
-    // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy method name; cross-file API rename.
-    // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $live_vars parameter; the method signature is graded on this changed line.
-    public function dispatchMessage( int $message_id, ?string $live_text = null, ?array $live_vars = null ): void
+    public function dispatchMessage( int $message_id, ?string $live_text = null, ?array $live_vars = null ): void // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid,WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- legacy method name, cross-file API rename; pre-existing camelCase $live_vars parameter.
     {
         $row = $this->fetchMessage( $message_id );
         if ($row === [] || SmsMessageStatus::isTerminal((string) $row['status'])) {
