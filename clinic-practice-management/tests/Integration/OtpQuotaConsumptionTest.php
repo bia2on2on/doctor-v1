@@ -27,10 +27,11 @@ use WP_UnitTestCase;
  *     از max بالاتر نمی‌رود (نه max+1).
  *   - شمارندهٔ `otp-ip:` دست‌نخورده و مستقل از این تغییر است.
  *
- * هیچ‌کدام از تست‌ها `otp.cooldown_sec` را صفر نمی‌کنند: Cooldown واقعی (۶۰
- * ثانیه) فعال می‌ماند و برای عبور از آن، `created_at` آخرین Challenge به عقب
+ * تست‌های Cooldown/Lockout `otp.cooldown_sec` را صفر نمی‌کنند: Cooldown واقعی
+ * (۶۰ ثانیه) فعال می‌ماند و برای عبور از آن، `created_at` آخرین Challenge به عقب
  * برده می‌شود (همان روشی که probeهای مرزیِ production-race-proof استفاده
- * می‌کنند).
+ * می‌کنند). دو تست (h2) و (i2) عمداً استثنا هستند و Cooldown را صفر می‌کنند،
+ * چون موضوعشان سطلِ مشترک و ردیفِ legacy است، نه رفتار Cooldown.
  */
 final class OtpQuotaConsumptionTest extends WP_UnitTestCase
 {
@@ -264,8 +265,10 @@ final class OtpQuotaConsumptionTest extends WP_UnitTestCase
             $this->assertSame($index + 1, $this->hourHits($local), 'real request #' . ($index + 1) . ' charged the shared hour bucket');
         }
 
-        // Exactly one HMAC key set for this number: the two mobile-bearing
-        // buckets plus the send-guard row, all carrying the derived prefix.
+        // The production path charged the DERIVED keys of this number (day and
+        // hour at 4 each, plus a guard row), and no row of cpms_rate_limits
+        // contains the raw digits. This is not a count of every bucket row in
+        // the table: `rateRowsContaining()` only scans for raw digits.
         $dayKey = $this->bucketKey('otp-day', $local);
         $hourKey = $this->bucketKey('otp-hour', $local);
         $guardKey = $this->bucketKey('otp-send-guard', $local);
@@ -360,7 +363,10 @@ final class OtpQuotaConsumptionTest extends WP_UnitTestCase
         return $candidate;
     }
 
-    /** Counts cpms_rate_limits rows whose ANY column contains the needle. */
+    /**
+     * Counts cpms_rate_limits rows whose ANY column contains the needle (a
+     * raw-digit scan — it does NOT enumerate or count bucket rows by prefix).
+     */
     private function rateRowsContaining(string $needle): int
     {
         global $wpdb;
