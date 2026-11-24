@@ -548,7 +548,10 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
     {
         $nid      = '049 937 0899';
         $data     = $this->newPatientData($nid);
-        $expected = $this->expectedInsertSql($this->db->table('cpms_patients'), $data);
+        $expected = $this->captureExactSql(
+            $nid,
+            fn () => $this->db->insert('cpms_patients', $data)
+        );
         $this->faultOn($expected, $this->failingSelectSql($nid));
 
         try {
@@ -575,7 +578,10 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
         $data           = $this->newPatientData($nid);
         $data['mobile'] = '09123456789';
         $mobile         = (string) $data['mobile'];
-        $expected       = $this->expectedInsertSql($this->db->table('cpms_patients'), $data);
+        $expected       = $this->captureExactSql(
+            $nid,
+            fn () => $this->db->insert('cpms_patients', $data)
+        );
         $this->faultOn($expected, $this->failingSelectSql($nid));
 
         try {

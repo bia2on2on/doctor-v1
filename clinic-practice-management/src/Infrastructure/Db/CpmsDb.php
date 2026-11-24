@@ -224,10 +224,10 @@ final class CpmsDb
     private function redact_nid_text( string $text ): string {
         return preg_replace_callback(
             self::NID_TOKEN_PATTERN,
-            static function ( array $match ): string {
-                return preg_match_all( '/[0-9۰-۹٠-٩]/u', $match[0] ) >= 10
+            static function ( array $token ): string {
+                return preg_match_all( '/[0-9۰-۹٠-٩]/u', $token[0] ) >= 10
                     ? '[nid-redacted]'
-                    : $match[0];
+                    : $token[0];
             },
             $text
         ) ?? $text;
