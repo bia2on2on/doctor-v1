@@ -580,13 +580,15 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
 
         $rollbacks = 0;
         $filter    = static function (string $statement) use (&$rollbacks, $logins): string {
-            // The load must actually fail for the rollback path to be reached at all.
-            if (str_starts_with($statement, 'UPDATE `' . $logins . '` SET state = \'closed\'')) {
+            // The load must actually fail for the rollback path to be reached at all; the
+            // binding-close UPDATE is the only write the loader issues after the inserts.
+            if (str_contains($statement, '`' . $logins . '`') && str_contains($statement, 'SET state = \'closed\'')) {
                 return 'UPDATE `' . $logins . '` SET cpms_no_such_column = 1';
             }
-            // The integration bootstrap (priority 20) has already rewritten the marked
-            // transaction into a savepoint: an undo reaches us as ROLLBACK TO SAVEPOINT.
-            if (preg_match('/\AROLLBACK TO SAVEPOINT /', $statement) === 1) {
+            // This filter runs at priority 10, before the bootstrap's priority-20 savepoint
+            // rewrite, so the undo still carries its cpms marker; the rewritten shape is
+            // matched too, so the count cannot silently depend on that ordering.
+            if ('/*cpms*/ ROLLBACK' === $statement || preg_match('/\AROLLBACK TO SAVEPOINT /', $statement) === 1) {
                 ++$rollbacks;
                 return 'ROLLBACK TO SAVEPOINT cpms_no_such_savepoint';
             }
