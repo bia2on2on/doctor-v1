@@ -547,5 +547,25 @@ final class NidAuditMaskingTest extends WP_UnitTestCase
         self::assertArrayHasKey('body', $payload);
         self::assertStringContainsString('نوبت شما با', (string) $payload['body']);
         self::assertStringNotContainsString($nid, (string) $payload['body']);
+
+        // F1 closure: the assertion above is vacuous on its own. The fixture puts
+        // the NID in `patient_name`, and the APPT_CONFIRMED body template
+        // (NotificationEvents.php:47-52) renders only doctor_name,
+        // appointment_date and appointment_time - never patient_name - so the body
+        // would exclude the NID even if body redaction were removed. The lines
+        // below exercise the fields the template really substitutes.
+        self::assertArrayHasKey('patient_name', $payload['vars']);
+        self::assertSame('بیمار [nid-redacted]', $payload['vars']['patient_name']);
+        self::assertArrayHasKey('appointment_time', $payload['vars']);
+        self::assertSame('09:30', $payload['vars']['appointment_time']);
+        // Positive control: a variable the body really renders, carrying the NID.
+        $rendered = NotificationEvents::render(
+            NotificationEvents::APPT_CONFIRMED,
+            ['doctor_name' => 'دکتر ' . $nid, 'appointment_date' => '1405/06/10', 'appointment_time' => '09:30']
+        );
+        self::assertArrayHasKey('body', $rendered);
+        self::assertStringContainsString('[nid-redacted]', (string) $rendered['body']);
+        self::assertStringNotContainsString($nid, (string) $rendered['body']);
+        self::assertStringContainsString('1405/06/10', (string) $rendered['body']);
     }
 }

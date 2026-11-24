@@ -342,6 +342,44 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
         self::assertSame('1405/06/10', $variables['appointment_date']);
     }
 
+    /**
+     * F2 closure - :302 above is vacuous alone: there the NID lives only in
+     * `national_id`, which APPT_REMINDER (SmsEvents.php:58-63) never renders.
+     * Here the NID sits in `patient_name`, which it does render, so
+     * SmsTemplateRenderer.php:62 (redact_digits) is the line under test.
+     */
+    public function testRenderedTextMasksNidPlacedInAVariableTheTemplateRenders(): void
+    {
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+
+        $result = App::smsService()->sendEvent(
+            self::CLINIC_ID,
+            SmsEvents::APPT_REMINDER,
+            self::MOBILE,
+            [
+                'patient_name' => 'بیمار ' . $nid,
+                'doctor_name' => 'دکتر تست',
+                'appointment_date' => '1405/06/10',
+                'appointment_time' => '09:30',
+            ],
+            'appointment',
+            $this->uniqueContext(),
+            inline: true
+        );
+        self::assertSame(SmsMessageStatus::SENT, $result['status']);
+
+        self::assertCount(1, $this->recording->textSends);
+        $delivered = (string) $this->recording->textSends[0]['message'];
+        // (a) the redaction marker reaches the delivered text, because the
+        // rendered variable really carried the digits.
+        self::assertStringContainsString('[nid-redacted]', $delivered);
+        // (b) the raw NID never does.
+        self::assertStringNotContainsString($nid, $delivered);
+        // (c) positive witness: ordinary rendered values survive unmasked.
+        self::assertStringContainsString('دکتر تست', $delivered);
+        self::assertStringContainsString('1405/06/10', $delivered);
+    }
+
     // ------------------------------------------------------------------
 
     /**
