@@ -222,8 +222,9 @@ final class RestoreTableLoader {
     private function verify_engines( array $tables, array $rows ): void {
         $engines = [];
         foreach ( $rows as $row ) {
-            // Table-name letter case follows the server (lower_case_table_names), the engine does not.
-            $engines[ strtolower( (string) $row['table_name'] ) ] = $row['engine'] ?? null;
+            // Fold the row's own keys: a server may answer TABLE_NAME/ENGINE whatever the alias case.
+            $folded = array_change_key_case( $row, CASE_LOWER );
+            $engines[ strtolower( (string) ( $folded['table_name'] ?? '' ) ) ] = $folded['engine'] ?? null;
         }
         foreach ( $tables as $table ) {
             $key = strtolower( $table );
