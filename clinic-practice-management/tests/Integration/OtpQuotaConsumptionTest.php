@@ -126,7 +126,10 @@ final class OtpQuotaConsumptionTest extends WP_UnitTestCase
      * (g) A national ID shaped like a mobile must never be stored as a
      * rate-limit key. MobileValidator accepts a 10-digit input starting with 9
      * (:33-35), so OtpService::request() would otherwise keep the raw digits in
-     * cpms_rate_limits.window_key for the day/hour/guard/ip buckets.
+     * cpms_rate_limits.window_key for the day/hour/guard buckets. The ip
+     * buckets are out of scope: their key comes from ClientIp::resolve(), so
+     * no request-supplied identity text can reach them (and OtpService.php
+     * :191-196 defers any IP-bucket keying to the owner's open decision Q6).
      *
      * Asserted on stored state, three ways:
      *  - the intended derivation IS in use (the server-derived key rows exist);
