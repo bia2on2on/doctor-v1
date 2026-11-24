@@ -700,10 +700,9 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
             self::assertSame(0, (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$db->table($short)]), $short . ' is rolled back');
         }
 
-        // Healthy control on the same wrapper with shortening off.
-        $wrapper::$shorten = false;
-        $wrapper::$opens   = 0;
-        $result            = $loader->load($plan, new RestoreDumpReader('cpmsshort://dump.sql'));
+        // Healthy control on the SAME fixture, read through the real file: the only variable
+        // between the two loads is the shortened byte stream.
+        $result = $loader->load($plan, new RestoreDumpReader($this->dump_file));
         self::assertSame(['tables' => $this->loaded_tables, 'rows' => $this->loaded_rows, 'bindings_closed' => 2], $result);
     }
 
