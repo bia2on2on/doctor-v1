@@ -548,14 +548,14 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
     {
         $nid      = '049 937 0899';
         $data     = $this->newPatientData($nid);
-        $expected = $this->captureExactSql(
-            $nid,
-            fn () => $this->db->insert('cpms_patients', $data)
-        );
+        $columns  = '`' . implode('`, `', array_keys($data)) . '`';
+        $sql      = 'INSERT INTO `' . $this->db->table('cpms_patients') . '` (' . $columns . ') VALUES ('
+            . implode(', ', array_fill(0, count($data), '%s')) . ')';
+        $expected = $this->db->prepare($sql, array_values($data));
         $this->faultOn($expected, $this->failingSelectSql($nid));
 
         try {
-            $ok = $this->db->insert('cpms_patients', $data);
+            $ok = $this->db->query($sql, array_values($data));
         } finally {
             $this->removeFault();
         }
@@ -578,14 +578,14 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
         $data           = $this->newPatientData($nid);
         $data['mobile'] = '09123456789';
         $mobile         = (string) $data['mobile'];
-        $expected       = $this->captureExactSql(
-            $nid,
-            fn () => $this->db->insert('cpms_patients', $data)
-        );
+        $columns        = '`' . implode('`, `', array_keys($data)) . '`';
+        $sql            = 'INSERT INTO `' . $this->db->table('cpms_patients') . '` (' . $columns . ') VALUES ('
+            . implode(', ', array_fill(0, count($data), '%s')) . ')';
+        $expected       = $this->db->prepare($sql, array_values($data));
         $this->faultOn($expected, $this->failingSelectSql($nid));
 
         try {
-            $this->db->insert('cpms_patients', $data);
+            $this->db->query($sql, array_values($data));
         } finally {
             $this->removeFault();
             ini_set('error_log', $previous);
