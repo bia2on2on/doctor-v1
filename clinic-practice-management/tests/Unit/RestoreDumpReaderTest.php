@@ -100,4 +100,83 @@ final class RestoreDumpReaderTest extends TestCase
         }
         self::assertSame('RESTORE_DUMP_UNSUPPORTED_STATEMENT', $inline);
     }
+
+    /** RB-26: a single statement above the bound refuses BEFORE it is yielded. */
+    public function testRefusesStatementAboveTheBoundBeforeYieldingIt(): void
+    {
+        $filler = str_repeat('a', 64);
+        self::assertTrue(file_put_contents($this->file, "-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`note`) VALUES ('" . $filler . "');\n") > 0);
+        $size = null;
+        try {
+            iterator_to_array((new RestoreDumpReader($this->file, 40))->inserts(), false);
+        } catch (BackupException $exception) {
+            $size = $exception->getErrorCode();
+        }
+        self::assertSame('RESTORE_DUMP_SIZE_EXCEEDED', $size);
+
+        // Positive witness under the SAME fixture: a bound above the real size reads it.
+        $reader = new RestoreDumpReader($this->file, 4096);
+        self::assertSame(['cpms_patients'], $reader->tables());
+        $batches = iterator_to_array($reader->inserts(), false);
+        self::assertCount(1, $batches);
+        self::assertSame($filler, $batches[0]['rows'][0]['note']);
+    }
+
+    /** RB-27: an EOF comment without a trailing newline terminates instead of rewinding. */
+    public function testTerminatesOnEofCommentWithoutNewline(): void
+    {
+        self::assertTrue(file_put_contents($this->file, "-- ---- table: cpms_patients ----\n#no trailing newline") > 0);
+        $error  = null;
+        $tables = [];
+        try {
+            $tables = (new RestoreDumpReader($this->file))->tables();
+        } catch (BackupException $exception) {
+            $error = $exception->getErrorCode();
+        } catch (\Throwable $throwable) {
+            $error = get_class($throwable);
+        }
+        self::assertSame(['cpms_patients'], $tables, 'the marker before the unterminated comment survives');
+        self::assertNull($error, 'an EOF comment is not an error and must not loop');
+    }
+
+    /** RB-28: a dump truncated mid-statement refuses instead of being read as a clean end. */
+    public function testRefusesTruncatedDumpInsteadOfReadingItAsEof(): void
+    {
+        self::assertTrue(file_put_contents($this->file, "-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`note`) VALUES ('unterminated") > 0);
+        $truncated = null;
+        try {
+            iterator_to_array((new RestoreDumpReader($this->file))->inserts(), false);
+        } catch (BackupException $exception) {
+            $truncated = $exception->getErrorCode();
+        }
+        self::assertSame('RESTORE_DUMP_SYNTAX', $truncated, 'a truncated final statement is refused, never completed');
+
+        // Positive witness under the SAME fixture: closing the literal makes it readable.
+        self::assertTrue(file_put_contents($this->file, "-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`note`) VALUES ('closed');\n") > 0);
+        $batches = iterator_to_array((new RestoreDumpReader($this->file))->inserts(), false);
+        self::assertCount(1, $batches);
+        self::assertSame('closed', $batches[0]['rows'][0]['note']);
+    }
+
+    /** RB-29: a dump that changes between passes refuses instead of committing a partial read. */
+    public function testRefusesDumpChangedBetweenPasses(): void
+    {
+        self::assertTrue(file_put_contents($this->file, "-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n") > 0);
+        $reader = new RestoreDumpReader($this->file);
+        self::assertSame(['cpms_patients'], $reader->tables());
+        self::assertTrue(file_put_contents($this->file, "-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1),(2);\n") > 0);
+        $changed = null;
+        try {
+            iterator_to_array($reader->inserts(), false);
+        } catch (BackupException $exception) {
+            $changed = $exception->getErrorCode();
+        }
+        self::assertSame('RESTORE_DUMP_CHANGED', $changed);
+        // Positive witness: a fresh reader over the same (now stable) bytes succeeds.
+        $rows = 0;
+        foreach ((new RestoreDumpReader($this->file))->inserts() as $batch) {
+            $rows += count($batch['rows']);
+        }
+        self::assertSame(2, $rows);
+    }
 }

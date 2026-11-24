@@ -211,6 +211,48 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         self::assertSame(0, (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$db->table('cpms_clinics')]), 'nothing was loaded');
     }
 
+    /** RB-30: a non-InnoDB table the load writes is refused before the first write. */
+    public function testRefusesNonTransactionalEngineWithZeroWrites(): void {
+        $db      = App::db();
+        $ledger  = $db->table('schema_migrations');
+        $version = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
+        $engine_sql = 'SELECT TABLE_NAME AS table_name, ENGINE AS engine FROM information_schema.TABLES';
+        $writes     = [];
+        $reads      = [];
+        $engine     = '/\ASELECT TABLE_NAME AS table_name, ENGINE AS engine FROM information_schema\.TABLES WHERE TABLE_SCHEMA = DATABASE\(\) AND TABLE_NAME IN \(/';
+        $filter     = static function (string $statement) use (&$writes, &$reads, $engine): string {
+            if (preg_match('/\A\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|TRUNCATE|RENAME)\b/i', $statement) === 1) {
+                $writes[] = $statement;
+            }
+            if (preg_match($engine, $statement) === 1) {
+                $reads[] = $statement;
+                return 'SELECT \'x\' AS table_name, \'MyISAM\' AS engine';
+            }
+            return $statement;
+        };
+        $failure = null;
+        add_filter('query', $filter);
+        try {
+            (new RestoreTableLoader($db))->preflight(new RestoreDumpReader($this->dump_file), $version);
+        } catch (BackupException $exception) {
+            $failure = $exception->getErrorCode();
+        } finally {
+            remove_filter('query', $filter);
+        }
+
+        self::assertSame(1, count($reads), 'the engine lookup is seen exactly once');
+        self::assertStringContainsString($engine_sql, $reads[0]);
+        self::assertSame('RESTORE_ENGINE_UNSUPPORTED', $failure);
+        self::assertSame([], $writes, 'an engine refusal performs zero writes');
+
+        // Positive witness under the SAME fixture and spy: the real engines load.
+        $loader = new RestoreTableLoader($db);
+        $plan   = $loader->preflight(new RestoreDumpReader($this->dump_file), $version);
+        $result = $loader->load($plan, new RestoreDumpReader($this->dump_file));
+        self::assertSame(['tables' => $this->loaded_tables, 'rows' => $this->loaded_rows, 'bindings_closed' => 2], $result);
+        self::assertSame(2, (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$db->table('cpms_clinics')]));
+    }
+
     /** RB-21: schema-version mismatches are refused on both sides, with zero writes. */
     public function testRefusesSchemaVersionMismatchWithZeroWrites(): void {
         $db      = App::db();

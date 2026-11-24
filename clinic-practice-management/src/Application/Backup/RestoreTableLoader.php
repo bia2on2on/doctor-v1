@@ -191,7 +191,44 @@ final class RestoreTableLoader {
             }
         }
 
+        $this->assert_engines_transactional( $loadable );
+
         return $this->foreign_key_order( $loadable );
+    }
+
+    /**
+     * هر جدولی که load() در آن می‌نویسد باید InnoDB باشد؛ در غیر این صورت rollback
+     * ناقص می‌شود و «صفر ردیف» دروغ است (nontransactional-tables).
+     *
+     * @param list<string> $loadable
+     */
+    private function assert_engines_transactional( array $loadable ): void {
+        $tables   = $loadable;
+        $tables[] = $this->db->table( 'patient_logins' );
+        $rows     = $this->db->fetch_all_strict(
+            'SELECT TABLE_NAME AS table_name, ENGINE AS engine FROM information_schema.TABLES'
+            . ' WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (' . implode( ',', array_fill( 0, count( $tables ), '%s' ) ) . ')',
+            $tables
+        );
+        $this->verify_engines( $tables, $rows );
+    }
+
+    /**
+     * غایب = Refuse؛ هر موتور جز InnoDB (بی‌توجه به بزرگی/کوچکی حروف) = Refuse.
+     *
+     * @param list<string>               $tables
+     * @param list<array<string, mixed>> $rows
+     */
+    private function verify_engines( array $tables, array $rows ): void {
+        $engines = array_column( $rows, 'engine', 'table_name' );
+        foreach ( $tables as $table ) {
+            if ( ! array_key_exists( $table, $engines ) ) {
+                throw BackupException::of( 'RESTORE_TARGET_NOT_PREPARED', 'A table the load writes is missing from the target schema.' );
+            }
+            if ( ! is_string( $engines[ $table ] ) || 0 !== strcasecmp( $engines[ $table ], 'InnoDB' ) ) {
+                throw BackupException::of( 'RESTORE_ENGINE_UNSUPPORTED', 'Only InnoDB targets can be restored atomically.' );
+            }
+        }
     }
 
     /** @return list<string> ستون‌های واقعی یک جدول هدف. */

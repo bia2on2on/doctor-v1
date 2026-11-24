@@ -22,8 +22,9 @@ final class RestoreDumpReader {
     private string $quote        = '';
     private bool $pending_escape = false;
     private int $scanned         = 0;
+    private string $fingerprint  = '';
 
-    public function __construct( private readonly string $path ) {
+    public function __construct( private readonly string $path, private readonly int $max_statement_bytes = self::MAX_STATEMENT_BYTES ) {
     }
 
     /** @return list<string> نام جدول‌های اعلام‌شده (شامل جدول‌های بدون ردیف). */
@@ -56,15 +57,21 @@ final class RestoreDumpReader {
         $buffer = '';
         try {
             while ( true ) {
-                $line = fgets( $handle );
+                $line = fgets( $handle, $this->max_statement_bytes + 1 );
                 if ( false === $line ) {
+                    if ( ! feof( $handle ) ) {
+                        throw BackupException::of( 'RESTORE_DUMP_UNREADABLE', 'The restore dump could not be read to the end.' );
+                    }
                     break;
                 }
                 $buffer .= $line;
                 foreach ( $this->take_statements( $buffer ) as $statement ) {
+                    if ( strlen( $statement ) > $this->max_statement_bytes ) {
+                        throw BackupException::of( 'RESTORE_DUMP_SIZE_EXCEEDED', 'A dump statement exceeds the bounded reader size.' );
+                    }
                     yield $statement;
                 }
-                if ( strlen( $buffer ) > self::MAX_STATEMENT_BYTES ) {
+                if ( strlen( $buffer ) > $this->max_statement_bytes ) {
                     throw BackupException::of( 'RESTORE_DUMP_SIZE_EXCEEDED', 'A dump statement exceeds the bounded reader size.' );
                 }
             }
@@ -76,6 +83,17 @@ final class RestoreDumpReader {
         }
     }
 
+    private function assert_same_file(): void {
+        $current = hash_file( 'sha256', $this->path );
+        if ( false === $current ) {
+            throw BackupException::of( 'RESTORE_DUMP_UNREADABLE', 'The restore dump is not readable.' );
+        }
+        if ( '' !== $this->fingerprint && $current !== $this->fingerprint ) {
+            throw BackupException::of( 'RESTORE_DUMP_CHANGED', 'The dump changed between read passes.' );
+        }
+        $this->fingerprint = $current;
+    }
+
     /** @return resource */
     private function open() {
         $this->quote          = '';
@@ -84,6 +102,7 @@ final class RestoreDumpReader {
         if ( ! is_file( $this->path ) || ! is_readable( $this->path ) ) {
             throw BackupException::of( 'RESTORE_DUMP_UNREADABLE', 'The restore dump is not readable.' );
         }
+        $this->assert_same_file();
         $handle = @fopen( $this->path, 'rb' );
         if ( false === $handle ) {
             throw BackupException::of( 'RESTORE_DUMP_UNREADABLE', 'The restore dump is not readable.' );
@@ -158,7 +177,7 @@ final class RestoreDumpReader {
         }
         $newline = strpos( $buffer, "\n", $index );
 
-        return null === $newline ? [ 'none', $index ] : [ 'comment', $newline + 1 ];
+        return false === $newline ? [ 'none', $index ] : [ 'comment', $newline + 1 ];
     }
 
     private function prefix_is_blank( string $buffer, int $index ): bool {
