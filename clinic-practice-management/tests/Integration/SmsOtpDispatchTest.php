@@ -658,10 +658,16 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
      * slot. Depends on nothing but the clear: it passes whether or not the
      * row-id check exists.
      *
-     * Mutation note (INFERENCE — no PHP in this sandbox): delete
-     * `$this->live_text = null;` in the finally at SmsService.php:352 and this
-     * method fails on the assertNull below, because the slot keeps the
-     * `[ text, message_id ]` pair after the send returned.
+     * Scope and slot are both restored in OUTER finally blocks (the mechanism
+     * the combined test used at its :686-688 / :752-754), so a failing
+     * assertion or an unexpected throw cannot leak either into the next test.
+     *
+     * Mutation note (INFERENCE — no PHP in this sandbox), for this test run
+     * ALONE: delete `$this->live_text = null;` in the finally at
+     * SmsService.php:352 and this method fails on the assertNull below,
+     * because the slot keeps the `[ text, message_id ]` pair after the send
+     * returned. Run in a combined run it is also independent of any later
+     * test, because the slot cleanup below runs either way.
      */
     public function testLiveTextSlotIsClearedAfterASuccessfulInlineDispatch(): void
     {
@@ -673,26 +679,32 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
         // written by the call under test.
         self::assertNull($slot->getValue($service), 'precondition: the live-text slot is empty before the call');
 
-        $before = count($this->recording->textSends);
-        // The normal path must NOT throw; if it does, the failure belongs to
-        // this call, so it propagates after the scope is restored.
+        // setUp() installs a fresh RecordingSmsProvider, so the WHOLE list can be
+        // asserted — the same mechanism the combined test relied on when it
+        // asserted count() over the whole list (c46e6c66 :693). Asserted rather
+        // than assumed, so a leaked provider can never make the count below pass.
+        self::assertSame(0, count($this->recording->textSends), 'precondition: a fresh recording list, as setUp() installs');
+
         $ok = [];
         $previous = ScopeContext::tryGet();
         try {
             App::replaceExplicitScope(ClinicScope::forClinic(self::CLINIC_ID));
             $ok = $service->testSend('0912' . sprintf('%07d', 8_100_001), 'marker ' . $marker, 1);
-        } finally {
-            App::replaceExplicitScope($previous);
-        }
 
-        self::assertSame(SmsMessageStatus::SENT, $ok['status'], 'precondition: the normal path really dispatched inline');
-        $sent = array_slice($this->recording->textSends, $before);
-        self::assertCount(1, $sent, 'the normal path delivered exactly once');
-        self::assertStringContainsString($marker, (string) $sent[0]['message'], 'witness: the normal path delivered its bound text');
-        self::assertNull(
-            $slot->getValue($service),
-            'after a NORMAL inline dispatch the slot must be empty — otherwise the staff text stays bound for the next row'
-        );
+            self::assertSame(SmsMessageStatus::SENT, $ok['status'], 'precondition: the normal path really dispatched inline');
+            self::assertSame(1, count($this->recording->textSends), 'the normal path delivered exactly once (whole list)');
+            self::assertStringContainsString($marker, (string) $this->recording->textSends[0]['message'], 'witness: the normal path delivered its bound text');
+            self::assertNull(
+                $slot->getValue($service),
+                'after a NORMAL inline dispatch the slot must be empty — otherwise the staff text stays bound for the next row'
+            );
+        } finally {
+            // Restore the scope even when an assertion above failed or the call
+            // threw; then clear the slot so no stale binding can reach the next
+            // test (the assertions have already run by this point).
+            App::replaceExplicitScope($previous);
+            $slot->setValue($service, null);
+        }
     }
 
     /**
@@ -709,10 +721,17 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
      * throws a RuntimeException (CpmsDb.php:64-69) that leaves sendEvent()
      * through the finally at :351-353.
      *
-     * Mutation note (INFERENCE — no PHP in this sandbox): delete
-     * `$this->live_text = null;` in the finally at SmsService.php:352 and this
-     * method fails on the assertNull below; it is independent of the row-id
-     * check, because a non-null slot fails on its own.
+     * That failure also escapes BEFORE dispatchMessage()'s own restoring
+     * finally at :566-570 (which is inside the try that starts at :465, while
+     * the scope is bound at :448), so the Clinic scope is left CHANGED by the
+     * failed call. The outer finally therefore restores it explicitly.
+     *
+     * Mutation note (INFERENCE — no PHP in this sandbox), for this test run
+     * ALONE: delete `$this->live_text = null;` in the finally at
+     * SmsService.php:352 and this method fails on the assertNull below; it is
+     * independent of the row-id check, because a non-null slot fails on its
+     * own. Run in a combined run it is also independent of any later test,
+     * because the slot cleanup below runs either way.
      */
     public function testLiveTextSlotIsClearedWhenAnInlineDispatchEscapes(): void
     {
@@ -722,9 +741,17 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
 
         self::assertNull($slot->getValue($service), 'precondition: the live-text slot is empty before the call');
 
-        // The statement is matched EXACTLY: anchored \A..\z, the real table
-        // (with $wpdb->prefix), the exact SET list with literal values, and
-        // THIS test's row id. No "contains" on the table token, no prefix-only
+        // Highest durable id BEFORE the call: row identity is then checked
+        // independently of the mutable last-insert id below.
+        $highestBefore = (int) App::db()->fetchValue(
+            'SELECT COALESCE(MAX(id), 0) FROM ' . App::db()->table('cpms_sms_messages')
+        );
+
+        // The statement-SHAPE match. Anchored \A..\z, the real table (with
+        // $wpdb->prefix), the exact SET list in order, and THIS row's id.
+        // `attempts` and the fraction digits are matched BY PATTERN ('\d+',
+        // '\.\d{3}'), so this is a complete statement shape, not one frozen
+        // literal string. No "contains" on the table token, no prefix-only
         // match.
         //
         // Shape produced by SmsService::updateMessage() (:1265-1269) and rendered
@@ -739,31 +766,34 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
         // backticks, unlike wpdb::insert's "INSERT INTO `table`"
         // (class-wpdb.php:2613).
         //
-        // The id is read at UPDATE time on purpose: the 'query' filter runs
-        // BEFORE execution (class-wpdb.php:2230) and insert_id is only assigned
-        // after the insert executes (:2315), so at this point it already holds
-        // the row this call inserted. A filter at priority 5 sees unescaped
-        // text, because wpdb registers remove_placeholder_escape at priority 0
-        // (:2427-2428).
+        // The candidate id for the shape is read at UPDATE time on purpose: the
+        // 'query' filter runs BEFORE execution (class-wpdb.php:2230) and
+        // insert_id is only assigned after the insert executes (:2315), so at
+        // this point it holds the row this call inserted. That value is a HINT
+        // only; the durable proof is the one-new-row check below. A filter at
+        // priority 5 sees unescaped text, because wpdb registers
+        // remove_placeholder_escape at priority 0 (:2427-2428).
         $table = App::db()->table('cpms_sms_messages');
         $faultHits = 0;
+        $matchedId = 0;
         $absentTable = 'cpms_r5_absent_' . random_int(1000000, 9999999);
-        $fault = static function ($query) use ($table, $absentTable, &$faultHits) {
-            $rowId = App::db()->wpdb_last_insert_id();
-            if ($rowId <= 0) {
+        $fault = static function ($query) use ($table, $absentTable, &$faultHits, &$matchedId) {
+            $candidate = App::db()->wpdb_last_insert_id();
+            if ($candidate <= 0) {
                 return $query;
             }
 
             $pattern = '/\AUPDATE ' . preg_quote($table, '/')
                 . ' SET `status` = \'SENDING\', `attempts` = \'\d+\', '
                 . 'updated_at = \'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\' '
-                . 'WHERE id = ' . $rowId . '\z/';
+                . 'WHERE id = ' . $candidate . '\z/';
 
             if (preg_match($pattern, (string) $query) !== 1) {
                 return $query;
             }
 
             $faultHits++;
+            $matchedId = $candidate;
 
             // Same statement, ONE token changed: the table name. The real table
             // name appears nowhere in the rewritten text.
@@ -782,7 +812,9 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
         App::db()->setStrict(true);
         add_filter('query', $fault, 5);
         $threw = null;
+        $previous = ScopeContext::tryGet();
         try {
+            App::replaceExplicitScope(ClinicScope::forClinic(self::CLINIC_ID));
             $service->testSend('0912' . sprintf('%07d', 8_100_002), 'marker ' . $marker, 1);
         } catch (\Throwable $error) {
             $threw = $error;
@@ -790,6 +822,7 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
             remove_filter('query', $fault, 5);
             App::db()->setStrict($wasStrict);
             $wpdb->suppress_errors($suppressed);
+            App::replaceExplicitScope($previous);
         }
 
         self::assertSame(1, $faultHits, 'the fault must fire exactly once, on the one SENDING update of this row');
@@ -798,15 +831,33 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
             $slot->getValue($service),
             'after a THROWING inline dispatch the slot must still be empty — the finally is what clears it'
         );
-        self::assertSame($sentBeforeFault, count($this->recording->textSends), 'the faulted dispatch never reached the provider');
+        // Unconditional, over the WHOLE recording list: a count, not a loop that
+        // could run zero times. The slice assertion stays as well, so a send
+        // appended by this call is caught even if it lacked the marker.
+        $sent = array_slice($this->recording->textSends, $sentBeforeFault);
+        self::assertSame(0, count($sent), 'the faulted dispatch never reached the provider');
+        $markerDeliveries = 0;
         foreach ($this->recording->textSends as $send) {
-            self::assertStringNotContainsString($marker, (string) $send['message'], 'the faulted text was never delivered');
+            if (str_contains((string) $send['message'], $marker)) {
+                $markerDeliveries++;
+            }
         }
+        self::assertSame(0, $markerDeliveries, 'no recorded send anywhere in the list may carry the faulted text');
 
-        // Persisted-state evidence, and only that. `attempts` stays 0 and the
-        // provider count stays unchanged TOGETHER; `attempts === 0` alone does
-        // NOT prove no UPDATE was attempted — the rewritten UPDATE IS attempted,
-        // against a table that does not exist, and fails.
+        // Row identity, independent of the mutable last-insert id: exactly one
+        // new row exists, and it is the row the filter matched.
+        $newRows = App::db()->fetchAll(
+            'SELECT id FROM ' . $table . ' WHERE id > %d ORDER BY id ASC',
+            [$highestBefore]
+        );
+        self::assertSame(1, count($newRows), 'the call must insert exactly one new row');
+        $newId = (int) $newRows[0]['id'];
+        self::assertSame($newId, $matchedId, 'the id the statement-shape filter matched is the row this call inserted');
+
+        // Persisted-state evidence. `attempts` stays 0 and the provider count
+        // stays unchanged TOGETHER; `attempts === 0` alone does NOT prove no
+        // UPDATE was attempted — the rewritten UPDATE IS attempted, against a
+        // table that does not exist, and fails.
         //
         // What the stored `message` column holds depends on which path wrote the
         // row, and this is a test-send row:
@@ -816,11 +867,13 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
         //    digits (NationalIdValidator.php:124-128), so a short marker survives;
         //  - a non-template OTP row: the code becomes `***` (SmsService.php:286-288);
         //  - an ordinary business event: the rendered text is stored unmasked.
-        $failedId = $this->storedMessageIdFor('0912' . sprintf('%07d', 8_100_002));
-        self::assertGreaterThan(0, $failedId, 'the exception-path call inserted its row before the fault');
-        $failedRow = $this->fetchRow($failedId);
+        $failedRow = $this->fetchRow($newId);
         self::assertSame(0, (int) $failedRow['attempts'], 'with the provider count unchanged, persisted state shows no send was recorded');
         self::assertNotSame(SmsMessageStatus::SENT, (string) $failedRow['status'], 'a faulted dispatch never reports the row as sent');
+
+        // The slot cleanup, after all assertions, so a failing assertion above
+        // cannot leave a populated slot behind for the next test.
+        $slot->setValue($service, null);
     }
 
     /**

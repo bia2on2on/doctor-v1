@@ -236,10 +236,11 @@ final class OtpQuotaConsumptionTest extends WP_UnitTestCase
      * OtpService::request() — one per accepted spelling of the same number —
      * with the cooldown switched off the way OtpFlowTest.php:418 does, and then
      * asserts on the real cpms_rate_limits table:
-     *  - exactly ONE day/hour counter pair was charged (4 hits each), i.e. all
-     *    four spellings shared one bucket in production;
-     *  - the stored mobile-bearing keys are exactly the derived ones — no raw
-     *    digits in any rate-limit key.
+     *  - the DERIVED day and hour keys each reached exactly 4 hits, i.e. all
+     *    four spellings shared one bucket in the production path;
+     *  - no row of cpms_rate_limits contains the raw digits. This is not a count
+     *    of every bucket row in the table: `rateRowsContaining()` only scans for
+     *    raw digits, and the guard row is checked for existence, not counted.
      * The ip bucket is deliberately excluded: it is IP-keyed and out of scope.
      */
     public function testFourRealRequestsInFourSpellingsChargeOneDerivedBucket(): void
