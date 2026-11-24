@@ -404,6 +404,21 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
             self::assertSame( 403, $ownIdPost->get_status(), 'POST /wp/v2/users/{own_id} must fail closed.' );
             self::assertSame( PatientAccess::PROOF_FAILED_CODE, $ownIdPost->get_data()['code'] ?? null );
 
+            foreach ( [ 'PUT', 'PATCH' ] as $ownWriteMethod ) {
+                $ownIdWrite = $this->dispatchRestWithNonce(
+                    $ownWriteMethod,
+                    '/wp/v2/users/' . $session['user_id'],
+                    [
+                        'first_name' => 'TamperedOwnId',
+                        'email'      => 'tampered-id-' . uniqid() . '@evil.test',
+                        'password'   => 'TamperedPass123!',
+                    ],
+                    $nonce
+                );
+                self::assertSame( 403, $ownIdWrite->get_status(), $ownWriteMethod . ' /wp/v2/users/{own_id} must fail closed.' );
+                self::assertSame( PatientAccess::PROOF_FAILED_CODE, $ownIdWrite->get_data()['code'] ?? null );
+            }
+
             foreach ( [ '/wp/v2/users/me/application-passwords', '/wp/v2/users/' . $session['user_id'] . '/application-passwords' ] as $appPassRoute ) {
                 $appPassList = $this->dispatchRestWithNonce( 'GET', $appPassRoute, [], $nonce );
                 self::assertSame( 403, $appPassList->get_status(), 'GET ' . $appPassRoute . ' must fail closed.' );
@@ -464,23 +479,57 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         // 2) Generic guardWpAdmin POST contract stays non-interfering while profile.php personal_options_update is blocked (403).
         self::assertNull( $this->captureGuardWpAdminRedirect( $this->userAccountActive, [ 'page' => 'index' ], 'POST' ) );
 
-        $hookDied = false;
-        try {
-            do_action( 'personal_options_update', $this->userAccountActive );
-        } catch ( WPDieException ) {
-            $hookDied = true;
-        }
-        self::assertTrue( $hookDied, 'personal_options_update hook must fail closed for pure patient.' );
+        $patUser   = get_userdata( $this->userAccountActive );
+        $staffUser = get_userdata( $this->staffDoctorUser );
+        self::assertInstanceOf( WP_User::class, $patUser );
+        self::assertInstanceOf( WP_User::class, $staffUser );
+        $staffEmailBefore = (string) $staffUser->user_email;
 
-        // Positive control: staff user is not blocked on personal_options_update.
-        PatientTwoProofTestHelper::acting_as( $this->staffDoctorUser );
-        $staffHookDied = false;
+        $capturedMail  = [];
+        $mailFilter    = static function ( array $atts ) use ( &$capturedMail ): array {
+            $capturedMail[] = $atts;
+            return $atts;
+        };
+        $preMailFilter = static function ( mixed $pre ): mixed {
+            unset( $pre );
+            return false;
+        };
+
+        $prevPost = $_POST;
+        add_filter( 'wp_mail', $mailFilter, 1 );
+        add_filter( 'pre_wp_mail', $preMailFilter, 1, 1 );
         try {
-            do_action( 'personal_options_update', $this->staffDoctorUser );
-        } catch ( WPDieException ) {
-            $staffHookDied = true;
+            $this->activateSession( $accountOnly );
+            $_POST['email'] = (string) $patUser->user_email;
+            $hookDied       = false;
+            try {
+                do_action( 'personal_options_update', $this->userAccountActive );
+            } catch ( WPDieException ) {
+                $hookDied = true;
+            }
+            self::assertTrue( $hookDied, 'personal_options_update hook must fail closed for pure patient.' );
+
+            // Positive control: staff user is not blocked on personal_options_update and triggers no side effect.
+            PatientTwoProofTestHelper::acting_as( $this->staffDoctorUser );
+            $_POST['email'] = $staffEmailBefore;
+            $staffHookDied  = false;
+            try {
+                do_action( 'personal_options_update', $this->staffDoctorUser );
+            } catch ( WPDieException ) {
+                $staffHookDied = true;
+            }
+            self::assertFalse( $staffHookDied, 'Positive control: personal_options_update must not block staff accounts.' );
+        } finally {
+            remove_filter( 'wp_mail', $mailFilter, 1 );
+            remove_filter( 'pre_wp_mail', $preMailFilter, 1 );
+            $_POST = $prevPost;
         }
-        self::assertFalse( $staffHookDied, 'Positive control: personal_options_update must not block staff accounts.' );
+
+        $staffUserAfter = get_userdata( $this->staffDoctorUser );
+        self::assertInstanceOf( WP_User::class, $staffUserAfter );
+        self::assertSame( $staffEmailBefore, (string) $staffUserAfter->user_email );
+        self::assertSame( '', (string) get_user_meta( $this->staffDoctorUser, '_new_email', true ) );
+        self::assertSame( [], $capturedMail );
 
         // 3) admin-post handlers: PortalLogin denies account-only/pending patient; FinanceDelegationPage denies non-admin.
         self::assertFalse( PortalLogin::is_authorized( $this->userAccountActive, 'staff' ) );
