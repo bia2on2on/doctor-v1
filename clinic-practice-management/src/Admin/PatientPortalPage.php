@@ -221,10 +221,11 @@ final class PatientPortalPage
         if (wp_doing_ajax() || (defined('REST_REQUEST') && REST_REQUEST) || wp_doing_cron()) {
             return;
         }
-        if ( isset( $_GET['newuseremail'] ) && is_user_logged_in() && 'NOT_PATIENT' !== self::guard_actor_state( wp_get_current_user() ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Fail-closed deny before WordPress core executes its un-nonced email confirmation hash on any HTTP method.
+        if ( ( isset( $_GET['newuseremail'] ) || isset( $_GET['dismiss'] ) ) && is_user_logged_in() && 'NOT_PATIENT' !== self::guard_actor_state( wp_get_current_user() ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Fail-closed deny before WordPress core executes its email confirmation hash or pending-email dismiss handler on any HTTP method.
             wp_die( esc_html( PatientAccess::PROOF_FAILED_MESSAGE ), '', [ 'response' => 403 ] );
         }
-        if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
+        $request_method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_text_field( wp_unslash( (string) $_SERVER['REQUEST_METHOD'] ) ) ) : 'GET';
+        if ( 'GET' !== $request_method ) {
             return;
         }
         if ( ! is_user_logged_in() || 'NOT_PATIENT' === self::guard_actor_state( wp_get_current_user() ) ) {
