@@ -274,6 +274,17 @@ final class SmsService
         // source on a later dispatch; NID-shaped runs are masked, content is not.
         $storedVars = ( $isOtp || $isTest ) ? null : (string) json_encode( $this->redact_vars( $vars ), JSON_UNESCAPED_UNICODE ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase,WordPress.WP.AlternativeFunctions.json_encode_json_encode -- pre-existing $storedVars/$isOtp/$isTest locals; the existing json_encode contract is unchanged.
 
+        // Test-send free text is staff-typed: a NID may be pasted into it, so the
+        // stored copy is masked exactly like every other persisted text. The text
+        // handed to the provider is NOT changed (product decision, owner question):
+        // dispatchMessage() receives it as a live override, the same transient
+        // mechanism an OTP code uses, and never reads it back from the row.
+        $live_test_text = null;
+        if ( $isTest ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $isTest local.
+            $live_test_text = $text;
+            $text           = NationalIdValidator::redact_digits( $text );
+        }
+
         // Dedupe (الزام §20): رویدادهای وابسته به Context — بدون ارسال تکراری
         $dedupeKey = null;
         if ($contextType !== null && $contextId !== null) {
@@ -318,7 +329,8 @@ final class SmsService
 
         // OTP: همیشه Inline + بدون Queue-Retry (کد ذخیره نشده — Retry = ارسال کد جدید توسط کاربر)
         if ($inline || $isOtp) {
-            $this->dispatchMessage($messageId, $isOtp ? $vars : null);
+            $this->dispatchMessage($messageId, $live_test_text, $isOtp ? $vars : null); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $messageId/$isOtp locals.
+
         } else {
             $this->jobs->enqueue('sms.send', ['message_id' => $messageId], priority: $priority, maxAttempts: $maxAttempts);
         }
@@ -335,10 +347,12 @@ final class SmsService
      * تلاش برای ارسال یک Message (idempotent — برای Job + Fast-path).
      * شکست Retryable با Attempts باقی‌مانده → RETRYING (Job Queue تکرار می‌کند).
      *
+     * @param string|null $live_text متن زندهٔ ارسال (test-send — نسخهٔ ذخیره‌شده Mask است، هرگز از ردیف خوانده نمی‌شود)
      * @param array<string, string>|null $live_vars متغیرهای زنده (OTP — کد هرگز ذخیره نمی‌شود)
      */
     // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy method name; cross-file API rename.
-    public function dispatchMessage( int $message_id, ?array $live_vars = null ): void
+    // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $live_vars parameter; the method signature is graded on this changed line.
+    public function dispatchMessage( int $message_id, ?string $live_text = null, ?array $live_vars = null ): void
     {
         $row = $this->fetchMessage( $message_id );
         if ($row === [] || SmsMessageStatus::isTerminal((string) $row['status'])) {
@@ -446,6 +460,8 @@ final class SmsService
                 $outbound_text = (string) $row['message'];
                 if ( $is_otp_event ) {
                     $outbound_text = $this->render_live_otp_text( $variables );
+                } elseif ( $live_text !== null ) {
+                    $outbound_text = $live_text;
                 }
                 $result = $provider->sendText( $creds, (string) $row['recipient'], $outbound_text, $opts );
             }

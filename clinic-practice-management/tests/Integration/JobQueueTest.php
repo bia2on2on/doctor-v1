@@ -8,6 +8,7 @@ use ClinicCore\Application\Jobs\JobPayloadInvalidException;
 use ClinicCore\Application\Jobs\JobsDispatcher;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Validators\NationalIdValidator;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use WP_UnitTestCase;
 
 /**
@@ -328,6 +329,33 @@ final class JobQueueTest extends WP_UnitTestCase
         self::assertSame('queued', (string) $row['status']);
     }
 
+    /** Same masking with a checksum-valid NID, not just a 10-digit string. */
+    public function testDispatcherRetryableFailureMasksChecksumValidNidInPersistedLastError(): void
+    {
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+        self::assertTrue(NationalIdValidator::isValid($nid), 'precondition: the helper returns a checksum-valid NID');
+        $purged = $this->purgeClaimableJobs();
+        self::assertSame(0, $purged, 'precondition: no earlier test left a claimable job that tick(1) could take instead');
+        $dispatcher = new JobsDispatcher($this->queue, App::op(), true);
+        $dispatcher->register('test.nid_retryable_valid', static function (array $payload) use ($nid): void {
+            throw new \RuntimeException('اعتبارسنجی ناموفق؛ کد ملی ' . $nid . ' رد شد');
+        });
+
+        $jobId = $this->queue->enqueue('test.nid_retryable_valid', [], null, 99, 3);
+        $dispatcher->tick(1);
+
+        $row = $this->dbRow($jobId);
+        self::assertArrayHasKey('last_error', $row, 'the durable row must expose last_error');
+        self::assertNotNull($row['last_error'], 'the retryable failure must persist last_error');
+        $stored = (string) $row['last_error'];
+
+        self::assertStringNotContainsString($nid, $stored);
+        self::assertStringContainsString('[nid-redacted]', $stored);
+        self::assertStringContainsString('اعتبارسنجی ناموفق', $stored);
+        self::assertStringContainsString('رد شد', $stored);
+        self::assertSame('queued', (string) $row['status']);
+    }
+
     /** The same stored-column contract on the terminal path, :115. */
     public function testDispatcherTerminalFailureMasksNidInPersistedLastError(): void
     {
@@ -356,22 +384,57 @@ final class JobQueueTest extends WP_UnitTestCase
         self::assertSame('1', (string) $row['attempts']);
     }
 
+    /** Terminal path with a checksum-valid NID. */
+    public function testDispatcherTerminalFailureMasksChecksumValidNidInPersistedLastError(): void
+    {
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+        self::assertTrue(NationalIdValidator::isValid($nid), 'precondition: the helper returns a checksum-valid NID');
+        $purged = $this->purgeClaimableJobs();
+        self::assertSame(0, $purged, 'precondition: no earlier test left a claimable job that tick(1) could take instead');
+        $dispatcher = new JobsDispatcher($this->queue, App::op(), true);
+        $dispatcher->register('test.nid_terminal_valid', static function (array $payload) use ($nid): void {
+            throw new JobPayloadInvalidException('JOB_PAYLOAD_INVALID', 'payload نامعتبر برای کد ملی ' . $nid . ' است', ['nid' => $nid]);
+        });
+
+        $jobId = $this->queue->enqueue('test.nid_terminal_valid', [], null, 99, 3);
+        $dispatcher->tick(1);
+
+        $row = $this->dbRow($jobId);
+        self::assertArrayHasKey('last_error', $row, 'the durable row must expose last_error');
+        self::assertNotNull($row['last_error'], 'the terminal failure must persist last_error');
+        $stored = (string) $row['last_error'];
+
+        self::assertStringNotContainsString($nid, $stored);
+        self::assertStringContainsString('[nid-redacted]', $stored);
+        self::assertStringContainsString('payload نامعتبر', $stored);
+        self::assertStringContainsString('است', $stored);
+        self::assertSame('failed', (string) $row['status']);
+        self::assertSame('1', (string) $row['attempts']);
+    }
+
     /**
-     * claim() takes the highest-priority claimable row and this class never
-     * purges, so an earlier test's job could be claimed instead. The count is
-     * returned ONCE (no callback) and asserted by the caller; the test
-     * transaction rolls the delete back.
+     * claim() takes the highest-priority claimable row (ORDER BY priority DESC,
+     * id ASC, JobQueue.php:87-89) and this class never purges, so an earlier
+     * test's queued row could be claimed by tick(1). The scope is the tightest
+     * that is still correct: a scoped row has the same status and run_after
+     * predicate as claim() (JobQueue.php:86), so only rows that cannot be
+     * claimed at all are left alone. The driver returns int|false, so false is
+     * asserted before the count is used, and the count is returned ONCE (no
+     * callback); the test transaction rolls back.
      */
     private function purgeClaimableJobs(): int
     {
         global $wpdb;
 
-        return (int) $wpdb->query(
+        $deleted = $wpdb->query(
             $wpdb->prepare(
                 'DELETE FROM ' . $wpdb->prefix . 'cpms_jobs WHERE status = %s AND run_after <= %s', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
                 'queued',
                 App::db()->nowUtcSql()
             )
         );
+        self::assertNotFalse($deleted, 'the isolation DELETE must not fail');
+
+        return (int) $deleted;
     }
 }

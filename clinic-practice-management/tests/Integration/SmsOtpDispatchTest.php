@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Scope\ClinicScope;
+use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Sms\SmsEvents;
 use ClinicCore\Domain\Sms\SmsMessageStatus;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Settings\Settings;
 use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\RecordingSmsProvider;
@@ -447,6 +450,61 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
     }
 
     /**
+     * Item 1 (independent reader BLOCKER) - a privileged test-send carries STAFF
+     * free text, so a NID can be pasted into `cpms_sms_messages.message`.
+     * VERIFIED before the fix: SmsService.php:253-254 put the override text into
+     * $text untouched and :305 persisted it raw. The contract pinned here: the
+     * PERSISTED copy is masked exactly like every other stored text, while the
+     * text handed to the provider is deliberately NOT changed (open product
+     * question for the owner, not a regression): the service passes it to
+     * dispatchMessage() as a live in-memory override (the same transient
+     * mechanism an OTP code uses), so the provider still receives the raw text
+     * and the row never does.
+     */
+    public function testTestSendMasksNidInPersistedMessageButDeliversStaffTextUnchanged(): void
+    {
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+        self::assertTrue(NationalIdValidator::isValid($nid), 'precondition: the helper returns a checksum-valid NID');
+        // Unique per run: the lookup below keys on the recipient, and a rerun in
+        // the same process must never see an earlier row.
+        $mobile = '0912' . sprintf('%07d', (int) (microtime(true) * 1000) % 10000000);
+        $typed = 'تست ارسال؛ کد ملی ' . $nid . ' را بررسی کنید';
+
+        // testSend() resolves the Clinic from the live operation scope, so bind
+        // it explicitly and restore whatever was there before (try/finally), the
+        // same way the other integration suites do via App::replaceExplicitScope.
+        $lastId = $this->storedMessageIdFor($mobile);
+        $previous = ScopeContext::tryGet();
+        try {
+            App::replaceExplicitScope(ClinicScope::forClinic(self::CLINIC_ID));
+            $result = App::smsService()->testSend($mobile, $typed, 1);
+        } finally {
+            App::replaceExplicitScope($previous);
+        }
+        self::assertSame(SmsMessageStatus::SENT, $result['status']);
+
+        // (1) the real stored row: the raw NID is absent and the marker is there.
+        $messageId = $this->storedMessageIdFor($mobile);
+        self::assertGreaterThan($lastId, $messageId, 'precondition: the call inserted exactly the new row we read');
+        $row = $this->fetchRow($messageId);
+        $stored = (string) $row['message'];
+        self::assertStringNotContainsString($nid, $stored, 'the persisted test-send text must not keep the raw NID');
+        self::assertStringContainsString('[nid-redacted]', $stored, 'the persisted copy must carry the redaction marker');
+        // (2) positive witness: ordinary words of the same fixture survive.
+        self::assertStringContainsString('تست ارسال', $stored);
+        self::assertStringContainsString('را بررسی کنید', $stored);
+        self::assertSame('test', (string) $row['event']);
+
+        // (3) no other persisted column of that row keeps the digits.
+        self::assertStringNotContainsString($nid, (string) json_encode($row, JSON_UNESCAPED_UNICODE));
+        self::assertSame(0, $this->queueRowsContaining($nid), 'no queue payload may carry the test text');
+
+        // (4) the provider still gets exactly the staff text (unchanged delivery).
+        self::assertCount(1, $this->recording->textSends);
+        self::assertSame($typed, (string) $this->recording->textSends[0]['message'], 'delivered text is a product decision and is unchanged by this fix');
+    }
+
+    /**
      * @return array<string, mixed>
      */
     private function fetchRow(int $messageId): array
@@ -465,6 +523,20 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
         return (int) App::db()->fetchValue(
             'SELECT COUNT(*) FROM ' . App::db()->table('cpms_jobs') . ' WHERE payload_json LIKE %s',
             ['%' . $needle . '%']
+        );
+    }
+
+    /**
+     * Highest durable message id for a recipient (0 when the recipient has no
+     * row yet). Reading it before and after the call proves the row asserted on
+     * is the row that call inserted — from the real table, not from an
+     * in-memory return value.
+     */
+    private function storedMessageIdFor(string $recipient): int
+    {
+        return (int) App::db()->fetchValue(
+            'SELECT MAX(id) FROM ' . App::db()->table('cpms_sms_messages') . ' WHERE recipient = %s',
+            [$recipient]
         );
     }
 
