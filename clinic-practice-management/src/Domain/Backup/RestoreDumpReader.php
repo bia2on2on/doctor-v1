@@ -122,6 +122,7 @@ final class RestoreDumpReader {
         $statements = [];
         $start      = 0;
         $length     = strlen( $buffer );
+        $to_eof     = 0;
         for ( $index = $this->scanned; $index < $length; ++$index ) {
             if ( '' !== $this->quote ) {
                 if ( $this->pending_escape ) {
@@ -145,8 +146,19 @@ final class RestoreDumpReader {
             if ( 'comment' === $kind ) {
                 $statements[] = substr( $buffer, $index, $end - $index - 1 );
             }
+            if ( 'comment_eof' === $kind ) {
+                $statements[] = substr( $buffer, $index );
+                $buffer       = '';
+                $to_eof       = $end;
+                break;
+            }
             $start = $end;
             $index = $end - 1;
+        }
+        if ( 0 !== $to_eof ) {
+            $this->scanned = 0;
+
+            return array_values( array_filter( array_map( 'trim', $statements ), static fn ( string $sql ): bool => '' !== $sql ) );
         }
 
         // Every byte was classified, so the next pass resumes at the remainder
@@ -177,7 +189,7 @@ final class RestoreDumpReader {
         }
         $newline = strpos( $buffer, "\n", $index );
 
-        return false === $newline ? [ 'none', $index ] : [ 'comment', $newline + 1 ];
+        return false === $newline ? [ 'comment_eof', strlen( $buffer ) ] : [ 'comment', $newline + 1 ];
     }
 
     private function prefix_is_blank( string $buffer, int $index ): bool {

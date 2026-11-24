@@ -106,13 +106,13 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         $logins  = $db->table('cpms_patient_logins');
         $hash    = (string) get_userdata($this->user_id)->user_pass;
 
-        $ddl     = [];
-        $order   = [];
-        $updates = 0;
-        $seen    = 0;
+        $ddl            = [];
+        $order          = [];
+        $updates        = 0;
+        $seen           = 0;
         $insert_pattern = '/\AINSERT INTO `([A-Za-z0-9_]+)` \(/';
         $update_pattern = '/\AUPDATE `' . preg_quote($logins, '/') . '` SET state = \'closed\', live_key = NULL, account_key = CASE WHEN kind = \'account\' THEN wp_user_id ELSE NULL END\z/';
-        $filter = static function (string $statement) use (&$ddl, &$order, &$updates, &$seen, $insert_pattern, $update_pattern): string {
+        $filter         = static function (string $statement) use (&$ddl, &$order, &$updates, &$seen, $insert_pattern, $update_pattern): string {
             ++$seen;
             if (preg_match('/\A\s*(CREATE|DROP|ALTER|TRUNCATE|RENAME)\b/i', $statement) === 1) {
                 $ddl[] = $statement;
@@ -213,10 +213,9 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
 
     /** RB-30: a non-InnoDB table the load writes is refused before the first write. */
     public function testRefusesNonTransactionalEngineWithZeroWrites(): void {
-        $db      = App::db();
-        $ledger  = $db->table('schema_migrations');
-        $version = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
-        $engine_sql = 'SELECT TABLE_NAME AS table_name, ENGINE AS engine FROM information_schema.TABLES';
+        $db         = App::db();
+        $ledger     = $db->table('schema_migrations');
+        $version    = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
         $writes     = [];
         $reads      = [];
         $engine     = '/\ASELECT TABLE_NAME AS table_name, ENGINE AS engine FROM information_schema\.TABLES WHERE TABLE_SCHEMA = DATABASE\(\) AND TABLE_NAME IN \(/';
@@ -241,7 +240,7 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         }
 
         self::assertSame(1, count($reads), 'the engine lookup is seen exactly once');
-        self::assertStringContainsString($engine_sql, $reads[0]);
+        self::assertStringContainsString('SELECT TABLE_NAME AS table_name, ENGINE AS engine FROM information_schema.TABLES', $reads[0]);
         self::assertSame('RESTORE_ENGINE_UNSUPPORTED', $failure);
         self::assertSame([], $writes, 'an engine refusal performs zero writes');
 
