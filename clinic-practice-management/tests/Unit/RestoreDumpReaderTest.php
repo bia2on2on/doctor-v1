@@ -398,4 +398,22 @@ final class RestoreDumpReaderTest extends TestCase
         }
         self::assertSame(2, $rows);
     }
+
+    /** RB-48: the streamed pass digest equals a hash of the exact bytes the dump contains. */
+    public function testPassDigestEqualsTheConsumedBytes(): void
+    {
+        $dump = "-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n";
+        self::assertTrue(file_put_contents($this->file, $dump) > 0);
+
+        $reader = new RestoreDumpReader($this->file);
+        self::assertNull($reader->last_pass_digest(), 'no pass has completed yet');
+        self::assertSame(['cpms_patients'], $reader->tables());
+        self::assertSame(hash('sha256', $dump), $reader->last_pass_digest(), 'the digest covers exactly the bytes read');
+
+        // A different dump yields a different digest: the value tracks the bytes, not the path.
+        self::assertTrue(file_put_contents($this->file, $dump . "-- trailing comment\n") > 0);
+        $second = new RestoreDumpReader($this->file);
+        self::assertSame(['cpms_patients'], $second->tables());
+        self::assertNotSame($reader->last_pass_digest(), $second->last_pass_digest(), 'changed bytes change the digest');
+    }
 }

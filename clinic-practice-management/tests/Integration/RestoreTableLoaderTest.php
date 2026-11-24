@@ -407,6 +407,275 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         self::assertSame($suppress_before, $db->wpdb()->suppress_errors, 'the previous suppress_errors setting is restored');
     }
 
+    /** RB-45: a REAL duplicate-key failure leaves no national ID in any wpdb diagnostic carrier. */
+    public function testRealDuplicateKeyFailureLeavesNoNationalIdInCarriers(): void
+    {
+        $db     = App::db();
+        $ledger = $db->table('schema_migrations');
+        $nid    = '1234567890';
+        $log    = sys_get_temp_dir() . '/cpms-nid-real-' . bin2hex(random_bytes(6)) . '.log';
+
+        // Move the second patient into clinic 1 and give it the SAME national ID: the real
+        // `u_pat_nid (clinic_id, national_id)` key (migration 0001:83) then refuses the INSERT.
+        $dump = (string) file_get_contents($this->dump_file);
+        $bad  = str_replace("('8',2,", "('8',1,", $dump);
+        self::assertNotSame($dump, $bad, 'the fixture must contain the second patient tuple');
+        $bad = str_replace("'0012345678'", "'" . $nid . "'", $bad);
+        self::assertStringContainsString($nid, $bad, 'the duplicate national ID is in the dump');
+        self::assertTrue(file_put_contents($this->dump_file, $bad) > 0);
+
+        // SAVEQUERIES is a constant: it cannot be toggled once defined, so report which it is.
+        $savequeries = defined('SAVEQUERIES') && SAVEQUERIES;
+        $wpdb        = $db->wpdb();
+        if ($savequeries) {
+            $wpdb->queries = is_array($wpdb->queries) ? $wpdb->queries : [];
+        }
+
+        $version = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
+        $loader  = new RestoreTableLoader($db);
+        $plan    = $loader->preflight(new RestoreDumpReader($this->dump_file), $version);
+
+        $ez_before      = isset($GLOBALS['EZSQL_ERROR']) && is_array($GLOBALS['EZSQL_ERROR']) ? count($GLOBALS['EZSQL_ERROR']) : 0;
+        $queries_before = is_array($wpdb->queries) ? count($wpdb->queries) : 0;
+        $ini            = (string) ini_get('error_log');
+        $code           = '';
+        $message        = '';
+        try {
+            ini_set('error_log', $log);
+            $loader->load($plan, new RestoreDumpReader($this->dump_file));
+        } catch (BackupException $exception) {
+            $code    = $exception->getErrorCode();
+            $message = $exception->getMessage();
+        } finally {
+            ini_set('error_log', $ini);
+        }
+
+        $ezsql       = isset($GLOBALS['EZSQL_ERROR']) && is_array($GLOBALS['EZSQL_ERROR']) ? $GLOBALS['EZSQL_ERROR'] : [];
+        $new_ez      = array_slice($ezsql, $ez_before);
+        $new_queries = is_array($wpdb->queries) ? array_slice($wpdb->queries, $queries_before) : [];
+        $logged      = is_file($log) ? (string) file_get_contents($log) : '';
+        if (is_file($log)) {
+            unlink($log);
+        }
+
+        self::assertSame('RESTORE_LOAD_FAILED', $code, 'a real duplicate key fails the load');
+        self::assertSame('The restore load failed and was rolled back.', $message, 'the message stays a constant');
+        // Positive witness: the real driver error WAS produced and recorded by core.
+        self::assertGreaterThan($ez_before, count($ezsql), 'core recorded the real duplicate-key failure');
+        self::assertNotEmpty($new_ez, 'the load added at least one EZSQL_ERROR row');
+        foreach ($new_ez as $entry) {
+            self::assertArrayHasKey('query', $entry);
+            self::assertArrayHasKey('error_str', $entry);
+            self::assertStringNotContainsString($nid, (string) $entry['query'], 'no diagnostic query carries the value');
+            self::assertStringNotContainsString($nid, (string) $entry['error_str'], 'no driver message carries the value');
+            self::assertDoesNotMatchRegularExpression('/\d{10}/', (string) $entry['query'], 'no 10-digit run survives in query');
+            self::assertDoesNotMatchRegularExpression('/\d{10}/', (string) $entry['error_str'], 'no 10-digit run survives in error_str');
+        }
+        self::assertStringNotContainsString($nid, (string) $wpdb->last_query, 'last_query is scrubbed');
+        self::assertStringNotContainsString($nid, (string) $wpdb->last_error, 'last_error is scrubbed');
+        self::assertStringNotContainsString($nid, (string) $wpdb->func_call, 'func_call is cleared');
+        self::assertStringNotContainsString($nid, $message, 'the exception message carries no value');
+        self::assertStringNotContainsString($nid, $logged, 'the error log carries no value');
+        if ($savequeries) {
+            foreach ($new_queries as $entry) {
+                self::assertStringNotContainsString($nid, (string) $entry[0], 'no SAVEQUERIES row carries the value');
+            }
+        }
+        foreach (['cpms_clinics', 'cpms_organizations', 'cpms_patients', 'cpms_patient_logins'] as $short) {
+            self::assertSame(0, (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$db->table($short)]), $short . ' holds no rows');
+        }
+    }
+
+    /**
+     * RB-46: bytes that change mid-pass are caught by the STREAMED digest.
+     *
+     * The wrapper serves the real bytes to the first two opens, which are exactly the two
+     * gates that already exist (`load()`'s `digest()` and `open()`'s `assert_same_file()`),
+     * and tampers only afterwards. Both path-based digests therefore MATCH, so neither
+     * earlier gate can catch this: only the digest of the bytes the inserting pass actually
+     * consumed does, and it refuses before COMMIT. The tamper adds a comment line only, so
+     * the row census and every column set are byte-identical — no other gate fires.
+     */
+    public function testRefusesBytesChangedWhileTheInsertingPassReads(): void
+    {
+        $db      = App::db();
+        $ledger  = $db->table('schema_migrations');
+        $version = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
+        $loader  = new RestoreTableLoader($db);
+        $plan    = $loader->preflight(new RestoreDumpReader($this->dump_file), $version);
+
+        $wrapper = get_class(new class () {
+            public static string $path  = '';
+            public static int $opens    = 0;
+            public static int $tampered = 0;
+
+            /** @var resource|null */
+            private $handle = null;
+
+            /** @param array<string, mixed> $options */
+            public function stream_open(string $path, string $mode, int $options, ?array &$opened_path): bool
+            {
+                $handle = fopen('php://memory', 'w+b');
+                if (false === $handle) {
+                    return false;
+                }
+                $bytes = (string) file_get_contents(self::$path);
+                if (self::$opens >= 2) {
+                    // Change one line's bytes without changing a single row or column.
+                    $cut   = strpos($bytes, "\n", (int) strpos($bytes, 'cpms_patients'));
+                    $bytes = false === $cut ? $bytes : substr($bytes, 0, $cut + 1) . '-- tampered mid-pass' . "\n" . substr($bytes, $cut + 1);
+                    ++self::$tampered;
+                }
+                fwrite($handle, $bytes);
+                rewind($handle);
+                $this->handle = $handle;
+                ++self::$opens;
+
+                return true;
+            }
+
+            public function stream_read(int $count): string
+            {
+                return is_resource($this->handle) ? (string) fread($this->handle, $count) : '';
+            }
+
+            public function stream_eof(): bool
+            {
+                return !is_resource($this->handle) || feof($this->handle);
+            }
+
+            /** @return array<string, int> */
+            public function url_stat(string $path, int $flags): array
+            {
+                return ['size' => (int) filesize(self::$path), 'mode' => 0100644, 'mtime' => 0, 'atime' => 0, 'ctime' => 0];
+            }
+
+            public function stream_close(): void
+            {
+                if (is_resource($this->handle)) {
+                    fclose($this->handle);
+                }
+            }
+        });
+
+        $wrapper::$path     = $this->dump_file;
+        $wrapper::$opens    = 0;
+        $wrapper::$tampered = 0;
+        $failure            = null;
+        self::assertTrue(stream_wrapper_register('cpmsmidread', $wrapper));
+        try {
+            $loader->load($plan, new RestoreDumpReader('cpmsmidread://dump.sql'));
+        } catch (BackupException $exception) {
+            $failure = $exception->getErrorCode();
+        } finally {
+            stream_wrapper_unregister('cpmsmidread');
+        }
+
+        self::assertGreaterThan(0, $wrapper::$tampered, 'the wrapper really served changed bytes');
+        self::assertSame('RESTORE_DUMP_CHANGED', $failure, 'the streamed digest refuses a mid-pass change');
+        foreach (['cpms_clinics', 'cpms_organizations', 'cpms_patients', 'cpms_patient_logins'] as $short) {
+            self::assertSame(0, (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$db->table($short)]), $short . ' is rolled back');
+        }
+
+        // Positive control: the untouched file loads and the same digest gate passes.
+        $result = $loader->load($plan, new RestoreDumpReader($this->dump_file));
+        self::assertSame(['tables' => $this->loaded_tables, 'rows' => $this->loaded_rows, 'bindings_closed' => 2], $result);
+    }
+
+    /**
+     * RB-47: a short read that reports a clean EOF is refused by the digest, not trusted.
+     *
+     * `fgets()` returns false and `feof()` is true, so the reader sees an orderly end; the
+     * bytes it consumed are simply fewer than the plan's, which the streamed digest catches.
+     */
+    public function testRefusesShortReadThatLooksLikeCleanEof(): void
+    {
+        $db      = App::db();
+        $ledger  = $db->table('schema_migrations');
+        $version = (string) $db->fetchValue('SELECT MAX(version) FROM %i', [$ledger]);
+        $loader  = new RestoreTableLoader($db);
+        $plan    = $loader->preflight(new RestoreDumpReader($this->dump_file), $version);
+
+        $wrapper = get_class(new class () {
+            public static string $path  = '';
+            public static int $opens    = 0;
+            public static bool $shorten = false;
+
+            /** @var resource|null */
+            private $handle = null;
+
+            /** @param array<string, mixed> $options */
+            public function stream_open(string $path, string $mode, int $options, ?array &$opened_path): bool
+            {
+                $handle = fopen('php://memory', 'w+b');
+                if (false === $handle) {
+                    return false;
+                }
+                $bytes = (string) file_get_contents(self::$path);
+                if (self::$shorten && self::$opens >= 2) {
+                    // Stop after the patients marker: whole statements, then an orderly EOF.
+                    $marker = strpos($bytes, 'cpms_patients');
+                    $cut    = false === $marker ? false : strpos($bytes, "\n", (int) $marker);
+                    $bytes  = false === $cut ? '' : substr($bytes, 0, $cut + 1);
+                }
+                fwrite($handle, $bytes);
+                rewind($handle);
+                $this->handle = $handle;
+                ++self::$opens;
+
+                return true;
+            }
+
+            public function stream_read(int $count): string
+            {
+                return is_resource($this->handle) ? (string) fread($this->handle, $count) : '';
+            }
+
+            public function stream_eof(): bool
+            {
+                return !is_resource($this->handle) || feof($this->handle);
+            }
+
+            /** @return array<string, int> */
+            public function url_stat(string $path, int $flags): array
+            {
+                return ['size' => (int) filesize(self::$path), 'mode' => 0100644, 'mtime' => 0, 'atime' => 0, 'ctime' => 0];
+            }
+
+            public function stream_close(): void
+            {
+                if (is_resource($this->handle)) {
+                    fclose($this->handle);
+                }
+            }
+        });
+
+        $wrapper::$path    = $this->dump_file;
+        $wrapper::$opens   = 0;
+        $wrapper::$shorten = true;
+        $failure           = null;
+        self::assertTrue(stream_wrapper_register('cpmsshort', $wrapper));
+        try {
+            $loader->load($plan, new RestoreDumpReader('cpmsshort://dump.sql'));
+        } catch (BackupException $exception) {
+            $failure = $exception->getErrorCode();
+        } finally {
+            stream_wrapper_unregister('cpmsshort');
+        }
+
+        self::assertSame('RESTORE_DUMP_CHANGED', $failure, 'an orderly short read is still a different dump');
+        self::assertStringNotContainsString('UNREADABLE', (string) $failure, 'the shortened read is not reported as an I/O error');
+        foreach (['cpms_clinics', 'cpms_organizations', 'cpms_patients', 'cpms_patient_logins'] as $short) {
+            self::assertSame(0, (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$db->table($short)]), $short . ' is rolled back');
+        }
+
+        // Healthy control on the same wrapper with shortening off.
+        $wrapper::$shorten = false;
+        $wrapper::$opens   = 0;
+        $result            = $loader->load($plan, new RestoreDumpReader('cpmsshort://dump.sql'));
+        self::assertSame(['tables' => $this->loaded_tables, 'rows' => $this->loaded_rows, 'bindings_closed' => 2], $result);
+    }
+
     /** RB-39: a plan built from one dump refuses a different, stable dump with zero writes. */
     public function testRefusesPlanAppliedToADifferentDump(): void
     {
@@ -579,10 +848,13 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         $plan    = $loader->preflight(new RestoreDumpReader($this->dump_file), $version);
 
         $rollbacks = 0;
-        $filter    = static function (string $statement) use (&$rollbacks, $logins): string {
-            // The load must actually fail for the rollback path to be reached at all; the
-            // binding-close UPDATE is the only write the loader issues after the inserts.
-            if (str_contains($statement, '`' . $logins . '`') && str_contains($statement, 'SET state = \'closed\'')) {
+        $injected  = 0;
+        // The exact statement the loader issues, anchored: one injection, counted once below.
+        $close     = 'UPDATE `' . $logins . '` SET state = \'closed\', live_key = NULL, account_key = CASE WHEN kind = \'account\' THEN wp_user_id ELSE NULL END';
+        $filter    = static function (string $statement) use (&$rollbacks, &$injected, $close, $logins): string {
+            // The load must actually fail for the rollback path to be reached at all.
+            if ($close === $statement) {
+                ++$injected;
                 return 'UPDATE `' . $logins . '` SET cpms_no_such_column = 1';
             }
             // This filter runs at priority 10, before the bootstrap's priority-20 savepoint
@@ -607,12 +879,15 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
             remove_filter('query', $filter);
         }
 
+        self::assertSame(1, $injected, 'the injected UPDATE fault is issued exactly once');
         self::assertSame(1, $rollbacks, 'the failing ROLLBACK is issued exactly once');
         self::assertSame('RESTORE_LOAD_UNKNOWN_STATE', $failure, 'a failed rollback is never reported as a completed rollback');
         self::assertSame('The restore load failed and the transaction state is unknown; reconciliation is required.', $message, 'the message states the state is unknown');
         self::assertStringNotContainsString('was rolled back', $message, 'the message claims no rollback it cannot prove');
 
-        // The rows the failed rollback left behind make the emptiness check refuse a retry.
+        // The injected failed rollback leaves rows visible in this test's still-open outer
+        // transaction; the subsequent emptiness check rejects a retry on this connection. This
+        // does not prove production durability or a retry from a fresh connection.
         $rows  = (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$logins]);
         $retry = null;
         self::assertGreaterThan(0, $rows, 'the unknown-state load leaves rows behind, so a retry must be refused');
@@ -703,15 +978,19 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         $loader  = new RestoreTableLoader($db);
         $plan    = $loader->preflight(new RestoreDumpReader($this->dump_file), $version);
 
-        $ddl    = [];
-        $seen   = 0;
-        $strict = $db->is_strict();
-        $filter = static function (string $statement) use (&$ddl, &$seen, $logins): string {
+        $ddl      = [];
+        $seen     = 0;
+        $injected = 0;
+        $strict   = $db->is_strict();
+        $close    = 'UPDATE `' . $logins . '` SET state = \'closed\', live_key = NULL, account_key = CASE WHEN kind = \'account\' THEN wp_user_id ELSE NULL END';
+        $filter   = static function (string $statement) use (&$ddl, &$seen, &$injected, $logins, $close): string {
             ++$seen;
             if (preg_match('/\A\s*(CREATE|DROP|ALTER|TRUNCATE|RENAME)\b/i', $statement) === 1) {
                 $ddl[] = $statement;
             }
-            if (str_starts_with($statement, 'UPDATE `' . $logins . '` SET state = \'closed\'')) {
+            // Exact anchored match: the fault is injected once and its hit count is asserted outside.
+            if ($close === $statement) {
+                ++$injected;
                 return 'UPDATE `' . $logins . '` SET cpms_no_such_column = 1';
             }
             return $statement;
@@ -729,6 +1008,7 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         }
 
         self::assertGreaterThan(3, $seen, 'the spy must see the load queries');
+        self::assertSame(1, $injected, 'the injected UPDATE fault is issued exactly once');
         self::assertSame([], $ddl, 'a failing load still issues no DDL');
         self::assertSame('RESTORE_LOAD_FAILED', $failure);
         foreach (['cpms_clinics', 'cpms_organizations', 'cpms_patients', 'cpms_patient_logins'] as $short) {

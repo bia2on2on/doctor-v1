@@ -81,6 +81,10 @@ final class RestoreTableLoader {
         // Value-bearing SQL never reaches display/log: suppression is restored in finally.
         $show_errors     = $this->db->wpdb()->show_errors( false );
         $suppress_errors = $this->db->wpdb()->suppress_errors( true );
+        // Diagnostics snapshot: only rows added by THIS load may be touched afterwards.
+        $ez_count      = isset( $GLOBALS['EZSQL_ERROR'] ) && is_array( $GLOBALS['EZSQL_ERROR'] ) ? count( $GLOBALS['EZSQL_ERROR'] ) : 0;
+        $queries_count = is_array( $this->db->wpdb()->queries ?? null ) ? count( $this->db->wpdb()->queries ) : 0;
+        $failed        = false;
         try {
             // The plan belongs to specific bytes: a different dump with the same columns must not load.
             if ( ( $plan['digest'] ?? '' ) === '' || $reader->digest() !== $plan['digest'] ) {
@@ -107,6 +111,9 @@ final class RestoreTableLoader {
                             $counts[ $table ] = ( $counts[ $table ] ?? 0 ) + count( $batch['rows'] );
                         }
                     }
+                    // The bytes this pass consumed must be the bytes the plan was built from:
+                    // checked BEFORE the transaction commits, so a mismatch rolls back.
+                    $this->assert_pass_digest( $reader, $plan );
                     // Every planned table must deliver exactly the rows preflight counted.
                     foreach ( $plan['rows'] ?? [] as $table => $expected ) {
                         if ( ( $counts[ $table ] ?? 0 ) !== $expected ) {
@@ -117,10 +124,12 @@ final class RestoreTableLoader {
                 }
             );
         } catch ( BackupException $error ) {
+            $failed = true;
             $this->clear_last_query();
 
             throw $error;
         } catch ( \Throwable $error ) {
+            $failed = true;
             $this->clear_last_query();
 
             // Never surface driver text: the barrier/UI boundary owns messaging. A failed
@@ -131,9 +140,13 @@ final class RestoreTableLoader {
 
             throw BackupException::of( 'RESTORE_LOAD_FAILED', 'The restore load failed and was rolled back.' );
         } finally {
-            $this->db->setStrict( $strict );
-            $this->db->wpdb()->show_errors( $show_errors );
-            $this->db->wpdb()->suppress_errors( $suppress_errors );
+            try {
+                $this->scrub_diagnostics( $ez_count, $queries_count, $failed );
+            } finally {
+                $this->db->setStrict( $strict );
+                $this->db->wpdb()->show_errors( $show_errors );
+                $this->db->wpdb()->suppress_errors( $suppress_errors );
+            }
         }
 
         return [ 'tables' => count( $counts ), 'rows' => $rows, 'bindings_closed' => $bindings_closed ];
@@ -143,6 +156,50 @@ final class RestoreTableLoader {
     private function clear_last_query(): void {
         $this->db->wpdb()->last_query = '';
         $this->db->wpdb()->last_error = '';
+    }
+
+    /**
+     * پاسِ اخیرِ خواننده باید همان بایت‌های plan باشد (پیش از COMMIT).
+     *
+     * If no pass ran, the dump declared no INSERT at all, so this load read no dump bytes and
+     * the path digest checked at the start of `load()` is the only evidence there is; falling
+     * back to it cannot hide a changed value because no value was written.
+     */
+    private function assert_pass_digest( RestoreDumpReader $reader, array $plan ): void {
+        $streamed = $reader->last_pass_digest() ?? $reader->digest();
+        if ( $streamed !== $plan['digest'] ) {
+            throw BackupException::of( 'RESTORE_DUMP_CHANGED', 'The dump changed while it was being read.' );
+        }
+    }
+
+    /**
+     * پاک‌سازیِ تشخیص‌های افزودهٔ همین بارگذاری. ردیف‌های قدیمی دست‌نخورده می‌مانند و
+     * ردیف‌های تازه حذف نمی‌شوند بلکه درجا بی‌اثر می‌شوند (ledger آزمون به آن تکیه دارد).
+     */
+    private function scrub_diagnostics( int $ez_count, int $queries_count, bool $failed ): void {
+        $marker = '[restore statement redacted]';
+        $wpdb   = $this->db->wpdb();
+        if ( isset( $GLOBALS['EZSQL_ERROR'] ) && is_array( $GLOBALS['EZSQL_ERROR'] ) ) {
+            $total = count( $GLOBALS['EZSQL_ERROR'] );
+            for ( $index = $ez_count; $index < $total; ++$index ) {
+                if ( ! is_array( $GLOBALS['EZSQL_ERROR'][ $index ] ) ) {
+                    continue;
+                }
+                foreach ( [ 'query', 'error_str' ] as $key ) {
+                    if ( isset( $GLOBALS['EZSQL_ERROR'][ $index ][ $key ] ) ) {
+                        $GLOBALS['EZSQL_ERROR'][ $index ][ $key ] = $marker; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited -- redacts one core diagnostic row in place; the global is never replaced.
+                    }
+                }
+            }
+        }
+        if ( $failed ) {
+            $wpdb->last_query = $marker;
+            $wpdb->last_error = $marker;
+        }
+        $wpdb->func_call = '';
+        if ( is_array( $wpdb->queries ?? null ) ) {
+            array_splice( $wpdb->queries, $queries_count );
+        }
     }
 
     /** @param list<array<string, string|null>> $rows */

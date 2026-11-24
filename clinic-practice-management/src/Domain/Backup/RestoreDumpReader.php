@@ -23,6 +23,7 @@ final class RestoreDumpReader {
     private bool $pending_escape = false;
     private int $scanned         = 0;
     private string $fingerprint  = '';
+    private ?string $pass_digest = null;
 
     public function __construct( private readonly string $path, private readonly int $max_statement_bytes = self::MAX_STATEMENT_BYTES ) {
     }
@@ -55,6 +56,8 @@ final class RestoreDumpReader {
     private function statements(): Generator {
         $handle = $this->open();
         $buffer = '';
+        $ctx    = hash_init( 'sha256' );
+        $this->pass_digest = null;
         try {
             while ( true ) {
                 $truncated = false;
@@ -62,6 +65,9 @@ final class RestoreDumpReader {
                 if ( null === $line ) {
                     break;
                 }
+                // Hash the bytes actually consumed from THIS handle: a file swapped after a
+                // path-based hash, or a short read that looks like EOF, cannot go unnoticed.
+                hash_update( $ctx, $line );
                 $buffer .= $line;
                 foreach ( $this->take_statements( $buffer, $truncated ) as $statement ) {
                     if ( strlen( $statement ) > $this->max_statement_bytes ) {
@@ -76,9 +82,15 @@ final class RestoreDumpReader {
             if ( '' !== trim( $buffer ) ) {
                 throw BackupException::of( 'RESTORE_DUMP_SYNTAX', 'The dump ends inside an unterminated statement.' );
             }
+            $this->pass_digest = hash_final( $ctx );
         } finally {
             fclose( $handle );
         }
+    }
+
+    /** اثرانگشتِ بایت‌های مصرف‌شده در پاسِ کامل‌شدهٔ اخیر (null تا پاس کامل نشود). */
+    public function last_pass_digest(): ?string {
+        return $this->pass_digest;
     }
 
     /**
