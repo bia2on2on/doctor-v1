@@ -2209,6 +2209,347 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         }
     }
 
+    /**
+     * Round 4 Mission A: proves `patient+subscriber` is also blocked server-side on
+     * `edit_user_profile_update` (closing the non-`IS_PROFILE_PAGE` user-edit hook via the
+     * shared `PatientAccess::patient_target_state()` predicate), REST `PUT`/`PATCH /wp/v2/users/me`,
+     * and `retrieve_password()` (lost-password request), leaving stored email, password hash, and
+     * activation key untouched.
+     *
+     * INFERENCE (revert-to-fail):
+     * - Reverting `add_action( 'edit_user_profile_update', ... )` at `PatientPortalPage.php:90`
+     *   lets `do_action( 'edit_user_profile_update', $subPatId )` succeed without dying 403.
+     */
+    public function testPatientPlusSubscriberBlockedOnEditUserProfileUpdateRestPutPatchAndRetrievePassword(): void {
+        self::assertSame( 1, has_action( 'personal_options_update', [ PatientPortalPage::class, 'guard_wp_admin_profile_hooks' ] ) );
+        self::assertSame( 1, has_action( 'edit_user_profile_update', [ PatientPortalPage::class, 'guard_wp_admin_profile_hooks' ] ) );
+
+        $subPatId   = $this->createUser( 'r4_patsub_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+        $subPatUser = get_userdata( $subPatId );
+        self::assertInstanceOf( WP_User::class, $subPatUser );
+        $subPatUser->add_role( 'subscriber' );
+
+        $origEmail = (string) $subPatUser->user_email;
+        $origHash  = (string) $subPatUser->user_pass;
+
+        PatientTwoProofTestHelper::acting_as( $subPatId );
+
+        $prevPost       = $_POST;
+        $prevRequest    = $_REQUEST;
+        $prevMethod     = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+        $prevPagenow    = $GLOBALS['pagenow'] ?? null;
+        $preMail        = static fn (): bool => true;
+        add_filter( 'pre_wp_mail', $preMail, 1 );
+        try {
+            // 1) edit_user_profile_update (`wp-admin/user-edit.php:158`) blocked server-side.
+            $GLOBALS['pagenow']        = 'user-edit.php';
+            $_SERVER['REQUEST_METHOD'] = 'POST';
+            $_POST                     = [
+                'user_id'  => (string) $subPatId,
+                'nickname' => 'PatSubAttempt',
+                'email'    => 'blocked-patsub@clinic.test',
+                'pass1'    => 'BlockedPass123!',
+                'pass2'    => 'BlockedPass123!',
+            ];
+            $_REQUEST                  = $_POST;
+            $editHookDied              = false;
+            $editHookMsg               = '';
+            try {
+                do_action( 'edit_user_profile_update', $subPatId );
+            } catch ( WPDieException $e ) {
+                $editHookDied = true;
+                $editHookMsg  = $e->getMessage();
+            }
+
+            // 2) REST PUT & PATCH /wp/v2/users/me blocked with 403.
+            $_POST     = [];
+            $_REQUEST  = [];
+            $nonce     = wp_create_nonce( 'wp_rest' );
+            $putResp   = $this->dispatchRestWithNonce(
+                'PUT',
+                '/wp/v2/users/me',
+                [
+                    'email'      => 'blocked-put@clinic.test',
+                    'password'   => 'BlockedPut123!',
+                    'first_name' => 'BlockedPut',
+                ],
+                $nonce
+            );
+            $patchResp = $this->dispatchRestWithNonce(
+                'PATCH',
+                '/wp/v2/users/me',
+                [
+                    'email'      => 'blocked-patch@clinic.test',
+                    'password'   => 'BlockedPatch123!',
+                    'first_name' => 'BlockedPatch',
+                ],
+                $nonce
+            );
+
+            // 3) Lost-password request via retrieve_password() blocked (`no_password_reset`).
+            $retrieveRes = retrieve_password( $subPatUser->user_login );
+        } finally {
+            remove_filter( 'pre_wp_mail', $preMail, 1 );
+            $_POST                     = $prevPost;
+            $_REQUEST                  = $prevRequest;
+            $_SERVER['REQUEST_METHOD'] = $prevMethod;
+            if ( null === $prevPagenow ) {
+                unset( $GLOBALS['pagenow'] );
+            } else {
+                $GLOBALS['pagenow'] = $prevPagenow;
+            }
+        }
+
+        self::assertTrue( $editHookDied );
+        self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $editHookMsg );
+        self::assertSame( 403, $putResp->get_status() );
+        $putData = $putResp->get_data();
+        self::assertIsArray( $putData );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $putData['code'] );
+        self::assertSame( 403, $patchResp->get_status() );
+        $patchData = $patchResp->get_data();
+        self::assertIsArray( $patchData );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $patchData['code'] );
+        self::assertInstanceOf( WP_Error::class, $retrieveRes );
+        self::assertSame( 'no_password_reset', $retrieveRes->get_error_code() );
+
+        $after = get_userdata( $subPatId );
+        self::assertInstanceOf( WP_User::class, $after );
+        self::assertSame( $origEmail, (string) $after->user_email );
+        self::assertSame( $origHash, (string) $after->user_pass );
+        self::assertSame( '', (string) $after->first_name );
+        self::assertSame( '', (string) $after->user_activation_key );
+    }
+
+    /**
+     * Round 4 Mission B(1): proves full lost-password request (`retrieve_password`), key validation
+     * (`check_password_reset_key` + `validate_password_reset`), and password reset (`reset_password`)
+     * succeed for administrator, doctor, secretary, and a clinic-scoped custom-role staff user, and
+     * asserts that the stored `user_pass` hash actually changes and verifies the new password.
+     */
+    public function testLostPasswordRequestKeyAndResetSucceedAndChangeHashForAdminAndStaffRoles(): void {
+        $adminId = $this->createUser( 'r4_lp_admin_' . uniqid(), 'OldPassAdmin123!', 'administrator' );
+        $docId   = $this->createUser( 'r4_lp_doc_' . uniqid(), 'OldPassDoc123!', RolesAndCapabilities::ROLE_DOCTOR );
+        $secId   = $this->createUser( 'r4_lp_sec_' . uniqid(), 'OldPassSec123!', RolesAndCapabilities::ROLE_SECRETARY );
+        cpms_test_seed_membership( $docId, $this->clinicPublic, RolesAndCapabilities::ROLE_DOCTOR );
+        cpms_test_seed_membership( $secId, $this->clinicPublic, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $customStaffId = $this->createUser( 'r4_lp_cust_' . uniqid(), 'OldPassCust123!', 'subscriber' );
+        $customRoleKey = 'cx_r4_staff_' . substr( uniqid(), -6 );
+        $this->insertActiveCustomRoleDef( $this->clinicPublic, $customRoleKey, [ RolesAndCapabilities::QUEUE_READ ] );
+        App::membership_service()->create_membership( $this->clinicPublic, $customStaffId, $customRoleKey );
+
+        $targets = [
+            'administrator' => [ 'uid' => $adminId, 'old' => 'OldPassAdmin123!', 'new' => 'NewResetAdmin456!' ],
+            'doctor'        => [ 'uid' => $docId, 'old' => 'OldPassDoc123!', 'new' => 'NewResetDoc456!' ],
+            'secretary'     => [ 'uid' => $secId, 'old' => 'OldPassSec123!', 'new' => 'NewResetSec456!' ],
+            'custom_staff'  => [ 'uid' => $customStaffId, 'old' => 'OldPassCust123!', 'new' => 'NewResetCust456!' ],
+        ];
+
+        $prevRemoteAddr = $_SERVER['REMOTE_ADDR'] ?? null;
+        $_SERVER['REMOTE_ADDR'] = '127.0.0.1';
+        $preMail        = static fn (): bool => true;
+        add_filter( 'pre_wp_mail', $preMail, 1 );
+        try {
+            foreach ( $targets as $label => $cfg ) {
+                $uid  = (int) $cfg['uid'];
+                $user = get_userdata( $uid );
+                self::assertInstanceOf( WP_User::class, $user, $label );
+                $origHash = (string) $user->user_pass;
+
+                $capturedKey = '';
+                $keyHook     = static function ( string $userLogin, string $key ) use ( $user, &$capturedKey ): void {
+                    if ( $userLogin === $user->user_login ) {
+                        $capturedKey = $key;
+                    }
+                };
+                add_action( 'retrieve_password_key', $keyHook, 10, 2 );
+                try {
+                    $retrieveRes = retrieve_password( $user->user_login );
+                } finally {
+                    remove_action( 'retrieve_password_key', $keyHook, 10 );
+                }
+
+                self::assertTrue( $retrieveRes, $label );
+                self::assertNotSame( '', $capturedKey, $label );
+
+                $checked = check_password_reset_key( $capturedKey, $user->user_login );
+                self::assertInstanceOf( WP_User::class, $checked, $label );
+
+                $errors = new WP_Error();
+                do_action( 'validate_password_reset', $errors, $checked );
+                self::assertFalse( $errors->has_errors(), $label );
+
+                reset_password( $checked, (string) $cfg['new'] );
+
+                $after = get_userdata( $uid );
+                self::assertInstanceOf( WP_User::class, $after, $label );
+                self::assertNotSame( $origHash, (string) $after->user_pass, $label );
+                self::assertTrue( wp_check_password( (string) $cfg['new'], (string) $after->user_pass, $uid ), $label );
+                self::assertFalse( wp_check_password( (string) $cfg['old'], (string) $after->user_pass, $uid ), $label );
+            }
+        } finally {
+            remove_filter( 'pre_wp_mail', $preMail, 1 );
+            if ( null === $prevRemoteAddr ) {
+                unset( $_SERVER['REMOTE_ADDR'] );
+            } else {
+                $_SERVER['REMOTE_ADDR'] = $prevRemoteAddr;
+            }
+        }
+    }
+
+    /**
+     * Round 4 Mission B(2), B(3), B(4): proves (2) an administrator editing another user's email
+     * and role via `user-edit.php` POST (`edit_user_profile_update` + `edit_user()`) still works,
+     * (3) staff changing their own email and password via `profile.php` (`personal_options_update` +
+     * `edit_user()`) still works, and (4) administrator-side management of staff accounts (both
+     * `user-edit.php` POST and REST `/wp/v2/users/{id}`) is undisrupted.
+     */
+    public function testAdministratorCanEditOtherUsersAndManageStaffAccountsViaUserEditPostAndProfile(): void {
+        if ( ! function_exists( 'edit_user' ) && defined( 'ABSPATH' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/user.php';
+        }
+        self::assertTrue( function_exists( 'edit_user' ) );
+
+        $adminId       = $this->createUser( 'r4_adm_' . uniqid(), 'AdminPass123!', 'administrator' );
+        $targetStaffId = $this->createUser( 'r4_mstaff_' . uniqid(), 'StaffOldPass123!', RolesAndCapabilities::ROLE_SECRETARY );
+        $membershipId  = cpms_test_seed_membership( $targetStaffId, $this->clinicPublic, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $subPatId   = $this->createUser( 'r4_mpatsub_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+        $subPatUser = get_userdata( $subPatId );
+        self::assertInstanceOf( WP_User::class, $subPatUser );
+        $subPatUser->add_role( 'subscriber' );
+
+        $selfDocId   = $this->createUser( 'r4_selfdoc_' . uniqid(), 'DocOldPass123!', RolesAndCapabilities::ROLE_DOCTOR );
+        cpms_test_seed_membership( $selfDocId, $this->clinicPublic, RolesAndCapabilities::ROLE_DOCTOR );
+
+        $staffBefore = get_userdata( $targetStaffId );
+        $docBefore   = get_userdata( $selfDocId );
+        self::assertInstanceOf( WP_User::class, $staffBefore );
+        self::assertInstanceOf( WP_User::class, $docBefore );
+        $staffOldHash = (string) $staffBefore->user_pass;
+        $docOldHash   = (string) $docBefore->user_pass;
+
+        $newStaffEmail = 'managed-staff-' . uniqid() . '@clinic.test';
+        $newStaffPass  = 'ManagedStaffPass456!';
+        $restStaffMail = 'managed-staff-rest-' . uniqid() . '@clinic.test';
+        $newPatEmail   = 'admin-edited-patsub-' . uniqid() . '@clinic.test';
+        $newDocEmail   = 'self-doc-' . uniqid() . '@clinic.test';
+        $newDocPass    = 'SelfDocNewPass456!';
+
+        $prevGet     = $_GET;
+        $prevPost    = $_POST;
+        $prevRequest = $_REQUEST;
+        $prevMethod  = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+        $prevPagenow = $GLOBALS['pagenow'] ?? null;
+        $preMail     = static fn (): bool => true;
+        add_filter( 'pre_wp_mail', $preMail, 1 );
+        try {
+            // (2) & (4): Administrator edits another staff user's email, password, and role via user-edit.php POST.
+            PatientTwoProofTestHelper::acting_as( $adminId );
+            $GLOBALS['pagenow']        = 'user-edit.php';
+            $_SERVER['REQUEST_METHOD'] = 'POST';
+            $_POST                     = [
+                'user_id'  => (string) $targetStaffId,
+                'nickname' => 'ManagedStaffNick',
+                'email'    => $newStaffEmail,
+                'role'     => RolesAndCapabilities::ROLE_DOCTOR,
+                'pass1'    => $newStaffPass,
+                'pass2'    => $newStaffPass,
+            ];
+            $_REQUEST                  = $_POST;
+            PatientPortalPage::guardWpAdmin();
+            do_action( 'edit_user_profile_update', $targetStaffId );
+            $staffEditRes = edit_user( $targetStaffId );
+
+            self::assertSame( $targetStaffId, $staffEditRes );
+            $staffAfterEdit = get_userdata( $targetStaffId );
+            self::assertInstanceOf( WP_User::class, $staffAfterEdit );
+            self::assertSame( $newStaffEmail, (string) $staffAfterEdit->user_email );
+            self::assertNotSame( $staffOldHash, (string) $staffAfterEdit->user_pass );
+            self::assertTrue( wp_check_password( $newStaffPass, (string) $staffAfterEdit->user_pass, $targetStaffId ) );
+            self::assertContains( RolesAndCapabilities::ROLE_DOCTOR, (array) $staffAfterEdit->roles );
+
+            // (4) Administrator updates clinic membership role & edits staff user via REST /wp/v2/users/{id}.
+            App::membership_service()->set_role_key( $membershipId, RolesAndCapabilities::ROLE_DOCTOR );
+            $updatedMembership = App::membership_service()->membership_for( $this->clinicPublic, $targetStaffId );
+            self::assertIsArray( $updatedMembership );
+            self::assertSame( RolesAndCapabilities::ROLE_DOCTOR, (string) $updatedMembership['role_key'] );
+
+            $_POST    = [];
+            $_REQUEST = [];
+            $nonce    = wp_create_nonce( 'wp_rest' );
+            $restAdm  = $this->dispatchRestWithNonce( 'POST', '/wp/v2/users/' . $targetStaffId, [ 'email' => $restStaffMail ], $nonce );
+            self::assertSame( 200, $restAdm->get_status() );
+            $staffAfterRest = get_userdata( $targetStaffId );
+            self::assertInstanceOf( WP_User::class, $staffAfterRest );
+            self::assertSame( $restStaffMail, (string) $staffAfterRest->user_email );
+
+            // (2) Administrator editing a patient+subscriber account via user-edit.php POST also still works (`guard_wp_admin_profile_hooks` checks acting admin, not target).
+            $_POST    = [
+                'user_id'  => (string) $subPatId,
+                'nickname' => 'AdminEditedPatSub',
+                'email'    => $newPatEmail,
+                'role'     => 'subscriber',
+            ];
+            $_REQUEST = $_POST;
+            do_action( 'edit_user_profile_update', $subPatId );
+            $patEditRes = edit_user( $subPatId );
+            self::assertSame( $subPatId, $patEditRes );
+            $patAfterAdmin = get_userdata( $subPatId );
+            self::assertInstanceOf( WP_User::class, $patAfterAdmin );
+            self::assertSame( $newPatEmail, (string) $patAfterAdmin->user_email );
+            self::assertSame( [ 'subscriber' ], array_values( (array) $patAfterAdmin->roles ) );
+
+            // (3) Staff changing own email and password via profile.php (`personal_options_update` + `edit_user()`).
+            PatientTwoProofTestHelper::acting_as( $selfDocId );
+            $GLOBALS['pagenow']        = 'profile.php';
+            $_SERVER['REQUEST_METHOD'] = 'POST';
+            $_POST                     = [
+                'user_id'  => (string) $selfDocId,
+                'nickname' => 'SelfDocNick',
+                'email'    => $newDocEmail,
+                'pass1'    => $newDocPass,
+                'pass2'    => $newDocPass,
+            ];
+            $_REQUEST                  = $_POST;
+            PatientPortalPage::guardWpAdmin();
+            do_action( 'personal_options_update', $selfDocId );
+            $docEditRes = edit_user( $selfDocId );
+            self::assertSame( $selfDocId, $docEditRes );
+
+            $pendingDocEmail = get_user_meta( $selfDocId, '_new_email', true );
+            if ( is_array( $pendingDocEmail ) && isset( $pendingDocEmail['hash'] ) ) {
+                self::assertSame( $newDocEmail, (string) $pendingDocEmail['newemail'] );
+                $_SERVER['REQUEST_METHOD'] = 'GET';
+                $_GET                      = [ 'newuseremail' => (string) $pendingDocEmail['hash'] ];
+                $_REQUEST                  = $_GET;
+                $docConfirmRedirect        = $this->captureGuardWpAdminRedirect( $selfDocId, $_GET, 'GET' );
+                self::assertNull( $docConfirmRedirect );
+                wp_update_user( [ 'ID' => $selfDocId, 'user_email' => $newDocEmail ] );
+                delete_user_meta( $selfDocId, '_new_email' );
+            }
+
+            $docAfter = get_userdata( $selfDocId );
+            self::assertInstanceOf( WP_User::class, $docAfter );
+            self::assertSame( $newDocEmail, (string) $docAfter->user_email );
+            self::assertNotSame( $docOldHash, (string) $docAfter->user_pass );
+            self::assertTrue( wp_check_password( $newDocPass, (string) $docAfter->user_pass, $selfDocId ) );
+            self::assertFalse( wp_check_password( 'DocOldPass123!', (string) $docAfter->user_pass, $selfDocId ) );
+        } finally {
+            remove_filter( 'pre_wp_mail', $preMail, 1 );
+            $_GET                      = $prevGet;
+            $_POST                     = $prevPost;
+            $_REQUEST                  = $prevRequest;
+            $_SERVER['REQUEST_METHOD'] = $prevMethod;
+            if ( null === $prevPagenow ) {
+                unset( $GLOBALS['pagenow'] );
+            } else {
+                $GLOBALS['pagenow'] = $prevPagenow;
+            }
+        }
+    }
+
     /** @param list<string> $capabilities */
     private function insertActiveCustomRoleDef( int $clinicId, string $roleKey, array $capabilities ): void {
         global $wpdb;

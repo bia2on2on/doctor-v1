@@ -87,6 +87,7 @@ final class PatientPortalPage
         add_action('admin_menu', [self::class, 'menu']);
         add_action('admin_init', [self::class, 'guardWpAdmin']);
         add_action( 'personal_options_update', [ self::class, 'guard_wp_admin_profile_hooks' ], 1 );
+        add_action( 'edit_user_profile_update', [ self::class, 'guard_wp_admin_profile_hooks' ], 1 );
         add_filter( 'rest_pre_dispatch', [ self::class, 'guard_wp_users_rest' ], 10, 3 );
         add_action( 'admin_enqueue_scripts', [self::class, 'enqueue_assets'] );
     }
@@ -263,7 +264,7 @@ final class PatientPortalPage
     }
 
     /**
-     * Fail-closed block on wp-admin own-profile update (`personal_options_update`) for pure patients.
+     * Fail-closed block on wp-admin profile updates (`personal_options_update`, `edit_user_profile_update`) for patient targets.
      */
     public static function guard_wp_admin_profile_hooks(): void {
         if ( ! is_user_logged_in() || 'NOT_PATIENT' === App::patient_access()->patient_target_state( wp_get_current_user() ) ) {
