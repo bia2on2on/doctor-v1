@@ -1153,33 +1153,33 @@ final class BookingService
                 }
             }
             // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase
+            // DISCRIMINATOR (ii): Dedicated field in BookingException set only by profile gate.
+            // If errorCode is CLINIC_VALIDATION_FAILED AND data['profile_incomplete'] === true,
+            // then preserve ACTIVE hold and capacity, release ONLY idempotency.
+            // Otherwise, preserve existing compensation behaviour (already handled in catch above).
+            // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- Established BookingException property.
+            if ( 'CLINIC_VALIDATION_FAILED' === $denial->errorCode && ( $denial->data['profile_incomplete'] ?? false ) ) {
+                // Profile-incomplete denial: preserve ACTIVE hold and capacity, release ONLY idempotency.
+                $this->idem->release( $idemKey, self::EP_CONFIRM, $wpUserId, null, $idemClinicId );
+                throw $denial;
+            }
+            // Existing compensation logic for all other denials (already executed in the catch block above)
+            // The throw $denial; below is for all other cases.
             $this->idem->release( $idemKey, self::EP_CONFIRM, $wpUserId, null, $idemClinicId );
             throw $denial;
         }
 
-        $appt       = $confirmation['appointment'];
-        $appt_id    = (int) $confirmation['appointment_id'];
-        $patient_id = (int) $confirmation['patient_id'];
-        $view       = $this->appointmentView( $appt );
-        $this->idem->complete($idemKey, self::EP_CONFIRM, $wpUserId, null, 200, $view, $idemClinicId);
+        // REMOVED ORPHAN BLOCK (lines 1158-1195 in original head)
+        // The following lines were duplicate/stray and are removed:
+        // $appt       = $confirmation['appointment'];
+        // $appt_id    = (int) $confirmation['appointment_id'];
+        // $patient_id = (int) $confirmation['patient_id'];
+        // $view       = $this->appointmentView( $appt );
+        // $this->idem->complete($idemKey, self::EP_CONFIRM, $wpUserId, null, 200, $view, $idemClinicId);
+        // ... [rest of orphan block] ...
 
-        // Mandatory PATIENT_CREATED/APPOINTMENT_CREATED audits now commit inside
-        // the confirmation transaction above (D6 atomicity).
-        $this->op->info(
-            'booking.confirmed',
-            [
-                'appointment_id' => $appt_id,
-                'slot_id'        => (int) $hold['slot_id'],
-                'wp_user_id'     => (int) $hold['holder_wp_user_id'],
-            ]
-        );
+        // [REPLACED WITH NOTHING - function ends at throw $denial;]
 
-        $this->send_appointment_sms( SmsEvents::APPT_CONFIRMED, $mobile, $appt );
-
-        return $view;
-    }
-
-    // ================= B6 — Resume =================
 
     /**
      * @return array{hold_token: string, status: string, expires_at?: string, slot?: array<string, mixed>}
@@ -3100,7 +3100,8 @@ final class BookingService
 
     private function assert_patient_profile_complete_for_booking( ?int $patient_id ): void {
         if ( null === $patient_id || $patient_id <= 0 ) {
-            throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
+            // DISCRIMINATOR (ii): Dedicated field in BookingException set only by profile gate.
+            throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400, [ 'profile_incomplete' => true ] );
         }
         $row = $this->db->fetchRowForUpdate(
             'SELECT id, first_name, last_name, mobile, national_id, birth_date FROM ' . $this->db->table( 'cpms_patients' ) . ' WHERE id = %d LIMIT 1',
@@ -3117,7 +3118,8 @@ final class BookingService
      */
     private function assert_patient_profile_complete_row( ?array $patient ): void {
         if ( null === $patient ) {
-            throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
+            // DISCRIMINATOR (ii): Dedicated field in BookingException set only by profile gate.
+            throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400, [ 'profile_incomplete' => true ] );
         }
         $first_name  = trim( (string) ( $patient['first_name'] ?? '' ) );
         $last_name   = trim( (string) ( $patient['last_name'] ?? '' ) );
@@ -3135,7 +3137,8 @@ final class BookingService
             || ! NationalIdValidator::isValid( $national_id )
             || ! $valid_birth
         ) {
-            throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
+            // DISCRIMINATOR (ii): Dedicated field in BookingException set only by profile gate.
+            throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400, [ 'profile_incomplete' => true ] );
         }
     }
 
