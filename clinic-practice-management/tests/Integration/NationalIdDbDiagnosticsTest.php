@@ -41,6 +41,8 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
     private string $previous_error_log;
     private bool $previous_suppress;
     private bool $previous_show;
+    private bool $original_suppress;
+    private bool $original_show;
     private ?Closure $fault = null;
     private int $fault_hits = 0;
 
@@ -60,17 +62,19 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
         ini_set('error_log', $this->error_log_path);
 
         // Exercise restoration from a state where output is NOT suppressed.
-        $this->previous_suppress = (bool) $this->wpdb->suppress_errors;
-        $this->previous_show     = (bool) $this->wpdb->show_errors;
+        $this->original_suppress = (bool) $this->wpdb->suppress_errors;
+        $this->original_show     = (bool) $this->wpdb->show_errors;
         $this->wpdb->suppress_errors(false);
         $this->wpdb->show_errors(false);
+        $this->previous_suppress = (bool) $this->wpdb->suppress_errors;
+        $this->previous_show     = (bool) $this->wpdb->show_errors;
     }
 
     protected function tearDown(): void
     {
         $this->removeFault();
-        $this->wpdb->suppress_errors($this->previous_suppress);
-        $this->wpdb->show_errors($this->previous_show);
+        $this->wpdb->suppress_errors($this->original_suppress);
+        $this->wpdb->show_errors($this->original_show);
         ini_set('error_log', $this->previous_error_log);
         @unlink($this->error_log_path);
         parent::tearDown();
@@ -186,7 +190,10 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
     /** Flow 5 — staff/clinical patient search (PatientRepository.php:372-391). */
     public function testFlow5PatientSearchFailureLeavesNoNid(): void
     {
-        $expected = $this->expectedSearchSql(self::NID_A, 20);
+        $expected = $this->captureExactSql(
+            self::NID_A,
+            fn () => (new PatientRepository($this->db))->search($this->clinic_id, self::NID_A, 20)
+        );
         $this->faultOn($expected, $this->failingSelectSql(self::NID_A));
 
         try {
@@ -210,7 +217,10 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
         cpms_test_seed_membership($secretary, $this->clinic_id, 'cpms_secretary');
         wp_set_current_user($secretary);
 
-        $expected = $this->expectedSearchSql(self::NID_C, 25);
+        $expected = $this->captureExactSql(
+            self::NID_C,
+            fn () => (new PatientRepository($this->db))->search($this->clinic_id, self::NID_C, 25)
+        );
         $this->faultOn($expected, $this->failingSelectSql(self::NID_C));
         try {
             $request  = new WP_REST_Request('POST', '/clinic/v1/patients/search');
@@ -260,7 +270,8 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
         $data = $this->newPatientData(self::NID_A);
 
         $ok = $this->db->insert('cpms_patients', $data);
-        $errno = (int) $this->wpdb->errno;
+        $dbh   = $this->wpdb->dbh;
+        $errno = $dbh instanceof \mysqli ? mysqli_errno($dbh) : 0;
 
         self::assertFalse($ok, 'the real unique index rejects the duplicate');
         self::assertSame(1062, $errno, 'a real driver duplicate-key failure occurred');
@@ -382,20 +393,26 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
         return (string) $this->wpdb->prepare("INSERT INTO `$table` ($fields) VALUES ($formats)", array_values($data));
     }
 
-    private function expectedSearchSql(string $nid, int $limit): string
+    /** Capture the exact interpolated SQL of a harmless NID-bearing read. */
+    private function captureExactSql(string $nid, callable $operation): string
     {
-        $like    = '%' . $this->db->esc_like($nid) . '%';
-        $where   = 'first_name LIKE %s OR last_name LIKE %s OR mobile LIKE %s OR mrn LIKE %s OR national_id = %s';
-        $sql     = 'SELECT id, mrn, first_name, last_name, mobile, national_id, birth_date, gender, status'
-            . "\n             FROM " . $this->db->table('cpms_patients')
-            . "\n             WHERE clinic_id = %d AND status = %s AND (" . $where . ')'
-            . "\n             ORDER BY last_name, first_name"
-            . "\n             LIMIT " . (int) $limit;
+        $captured = null;
+        $capture  = function (string $query) use ($nid, &$captured): string {
+            if ($captured === null && str_contains($query, $nid)) {
+                $captured = $query;
+            }
 
-        return (string) $this->db->prepare(
-            $sql,
-            array_merge([$this->clinic_id, 'active'], [$like, $like, $like, $like, $nid])
-        );
+            return $query;
+        };
+        add_filter('query', $capture, 5);
+        try {
+            $operation();
+        } finally {
+            remove_filter('query', $capture, 5);
+        }
+        self::assertIsString($captured, 'the exact NID-bearing SQL was captured');
+
+        return (string) $captured;
     }
 
     private function failingSelectSql(string $nid): string
