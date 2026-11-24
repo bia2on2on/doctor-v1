@@ -79,6 +79,50 @@ final class ForkChildGracefulExitProbeTest extends WP_UnitTestCase
         ];
         $json = json_encode($payload, JSON_UNESCAPED_SLASHES);
 
-        self::fail('GRACEFUL-EXIT PROBE (CI diagnostic, red on purpose): ' . (string) $json);
+        // Connection-diagnostics channel: PHPUnit's own assertion messages are
+        // deliberately NOT published by CI; the bounded CPMS_CONN_DIAG lines
+        // are (they land in the log and are projected into the PR via the
+        // evidence comment). Only the allow-listed vocabulary is emitted.
+        $result = is_array($payload['result']) ? $payload['result'] : [];
+        self::emitConnDiag($result['scenario_a'] ?? null, 101);
+        self::emitConnDiag($result['scenario_c_sigkill'] ?? null, 102);
+        self::emitConnDiag($result['scenario_b_exit'] ?? null, 103);
+        self::fail('GRACEFUL-EXIT PROBE (CI diagnostic, red on purpose): facts are projected through CPMS_CONN_DIAG records (counts 101/102/103) in this run\'s integration evidence.');
+    }
+
+    /** @param array<string, mixed>|null $scenario */
+    private static function emitConnDiag(?array $scenario, int $tag): void
+    {
+        $out = ['count' => $tag];
+        if (is_array($scenario)) {
+            if (isset($scenario['survived']) && is_bool($scenario['survived'])) {
+                $out['ready'] = $scenario['survived'];
+            } elseif (isset($scenario['select_after']) && is_bool($scenario['select_after'])) {
+                $out['ready'] = $scenario['select_after'];
+            }
+            $errno = null;
+            if (isset($scenario['dbh_errno']) && is_int($scenario['dbh_errno'])) {
+                $errno = $scenario['dbh_errno'];
+            } elseif (isset($scenario['errno_after']) && is_int($scenario['errno_after'])) {
+                $errno = $scenario['errno_after'];
+            }
+            if ($errno !== null && $errno >= 0 && $errno < 1000000000000) {
+                $out['mysql_errno'] = $errno;
+                $out['last_error_present'] = $errno !== 0;
+            } elseif (isset($scenario['last_error']) && is_string($scenario['last_error'])) {
+                $out['last_error_present'] = $scenario['last_error'] !== '';
+            }
+            $threadId = null;
+            if (isset($scenario['id_after']) && is_int($scenario['id_after'])) {
+                $threadId = $scenario['id_after'];
+            } elseif (isset($scenario['id_before']) && is_int($scenario['id_before'])) {
+                $threadId = $scenario['id_before'];
+            }
+            if ($threadId !== null && $threadId >= 0 && $threadId < 1000000000000) {
+                $out['thread_id'] = $threadId;
+            }
+            $out['dbh_is_mysqli'] = true;
+        }
+        fwrite(STDOUT, 'CPMS_CONN_DIAG ' . json_encode($out, JSON_UNESCAPED_SLASHES) . PHP_EOL);
     }
 }

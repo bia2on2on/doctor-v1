@@ -130,12 +130,15 @@ if ($pidC === 0) {
 }
 pcntl_waitpid($pidC, $statusC);
 $midRaw = $GLOBALS['wpdb']->get_var('SELECT CONNECTION_ID()');
+$dbhC = $GLOBALS['wpdb']->dbh ?? null;
 $out['scenario_c_sigkill'] = [
     'wifsignaled' => (bool) pcntl_wifsignaled($statusC),
     'wtermsig' => pcntl_wifsignaled($statusC) ? (int) pcntl_wtermsig($statusC) : null,
     'id_after' => ($midRaw === false || $midRaw === null) ? 0 : (int) $midRaw,
     'last_error' => (string) $GLOBALS['wpdb']->last_error,
     'survived' => ((int) $midRaw === $s0 && $s0 > 0),
+    'dbh_errno' => $dbhC instanceof \mysqli ? (int) mysqli_errno($dbhC) : -1,
+    's0' => $s0,
 ];
 
 // ----------------------------------------------------- scenario B (exit 0)
@@ -145,6 +148,7 @@ if ($pidB === 0) {
 }
 pcntl_waitpid($pidB, $statusB);
 $bRaw = $GLOBALS['wpdb']->get_var('SELECT CONNECTION_ID()');
+$dbhB = $GLOBALS['wpdb']->dbh ?? null;
 $out['scenario_b_exit'] = [
     'wifexited' => (bool) pcntl_wifexited($statusB),
     'wexitstatus' => pcntl_wifexited($statusB) ? (int) pcntl_wexitstatus($statusB) : null,
@@ -152,6 +156,8 @@ $out['scenario_b_exit'] = [
     'id_after' => ($bRaw === false || $bRaw === null) ? 0 : (int) $bRaw,
     'last_error' => (string) $GLOBALS['wpdb']->last_error,
     'survived' => ((int) $bRaw === $s0 && $s0 > 0),
+    'dbh_errno' => $dbhB instanceof \mysqli ? (int) mysqli_errno($dbhB) : -1,
+    's0' => $s0,
 ];
 
 echo 'CPMS_PROBE_RESULT ' . json_encode($out, JSON_UNESCAPED_SLASHES) . "\n";
