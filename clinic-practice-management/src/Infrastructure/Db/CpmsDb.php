@@ -307,7 +307,7 @@ final class CpmsDb
     /**
      * @return array<string, mixed>|null
      */
-    public function fetchRow( string $sql, array $params = [] ): ?array {
+    public function fetchRow( string $sql, array $params = [] ): ?array { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- established public API; renaming would break callers.
         return $this->without_nid_diagnostics(
             function () use ( $sql, $params ): ?array {
                 return $this->fetch_row_unguarded( $sql, $params );
@@ -328,7 +328,7 @@ final class CpmsDb
     /**
      * @return list<array<string, mixed>>
      */
-    public function fetchAll( string $sql, array $params = [] ): array {
+    public function fetchAll( string $sql, array $params = [] ): array { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- established public API; renaming would break callers.
         return $this->without_nid_diagnostics(
             function () use ( $sql, $params ): array {
                 return $this->fetch_all_unguarded( $sql, $params );
@@ -374,7 +374,7 @@ final class CpmsDb
         return array_map( static fn ( $row ) => (array) $row, $rows );
     }
 
-    public function fetchValue( string $sql, array $params = [] ): mixed {
+    public function fetchValue( string $sql, array $params = [] ): mixed { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- established public API; renaming would break callers.
         return $this->without_nid_diagnostics(
             function () use ( $sql, $params ) {
                 return $this->fetch_value_unguarded( $sql, $params );
