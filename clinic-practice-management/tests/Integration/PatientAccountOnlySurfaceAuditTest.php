@@ -3248,6 +3248,42 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
             $unkAfter = get_userdata( $unkId );
             self::assertInstanceOf( WP_User::class, $unkAfter );
             self::assertSame( $unkHashBefore, (string) $unkAfter->user_pass );
+
+            // UNKNOWN lookup-failure also denies wp_authenticate() and wp_signon() with zero auth cookies.
+            self::assertTrue( wp_check_password( $this->patientKnownPass, $unkHashBefore, $unkId ), 'T6 unknown pre-check' );
+            $unkLoginHits     = 0;
+            $unkLoginFault    = static function ( mixed $query ) use ( $exactSql, $orgTable, &$unkLoginHits ): mixed {
+                if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                    ++$unkLoginHits;
+                    return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+                }
+                return $query;
+            };
+            $unkCookiesIssued = 0;
+            $unkCookieSpy     = static function () use ( &$unkCookiesIssued ): void {
+                ++$unkCookiesIssued;
+            };
+            $prevLoginSuppress = (bool) $wpdb->suppress_errors( true );
+            add_action( 'set_auth_cookie', $unkCookieSpy, 10 );
+            add_action( 'set_logged_in_cookie', $unkCookieSpy, 10 );
+            add_filter( 'send_auth_cookies', $suppressCookie, 10, 1 );
+            add_filter( 'query', $unkLoginFault, 5 );
+            try {
+                $unkAuthRes   = wp_authenticate( $unkUser->user_login, $this->patientKnownPass );
+                $unkSignonRes = wp_signon( [ 'user_login' => $unkUser->user_login, 'user_password' => $this->patientKnownPass, 'remember' => false ], false );
+            } finally {
+                remove_filter( 'query', $unkLoginFault, 5 );
+                $wpdb->suppress_errors( $prevLoginSuppress );
+                remove_filter( 'send_auth_cookies', $suppressCookie, 10 );
+                remove_action( 'set_logged_in_cookie', $unkCookieSpy, 10 );
+                remove_action( 'set_auth_cookie', $unkCookieSpy, 10 );
+            }
+            self::assertGreaterThanOrEqual( 2, $unkLoginHits, 'T6 unknown login exact-SQL fault hits' );
+            self::assertInstanceOf( WP_Error::class, $unkAuthRes, 'T6 unknown wp_authenticate' );
+            self::assertSame( PatientCredentialGuard::ERROR_CODE, $unkAuthRes->get_error_code(), 'T6 unknown wp_authenticate code' );
+            self::assertInstanceOf( WP_Error::class, $unkSignonRes, 'T6 unknown wp_signon' );
+            self::assertSame( PatientCredentialGuard::ERROR_CODE, $unkSignonRes->get_error_code(), 'T6 unknown wp_signon code' );
+            self::assertSame( 0, $unkCookiesIssued, 'T6 unknown zero auth cookies' );
         } finally {
             remove_filter( 'pre_wp_mail', $preMail, 1 );
             if ( null === $prevRemoteAddr ) {
@@ -3649,6 +3685,162 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
             }
             if ( $createdCustomerRole ) {
                 remove_role( 'customer' );
+            }
+        }
+    }
+
+    /**
+     * Round 7 T10 (R6-1 manager decision pin): tests the SAME `ROLE_PATIENT`-only user with a
+     * known WP password across three membership/lookup states:
+     *  1) active capable Clinic-scoped custom-role membership (`NOT_PATIENT` -> `wp_authenticate` & `wp_signon` succeed);
+     *  2) after `MembershipService::suspend_membership()` (`PATIENT` -> denied with guard code/message, zero cookies);
+     *  3) after `MembershipService::reactivate_membership()` with exact-SQL lookup fault (`UNKNOWN` -> fail-closed denied).
+     */
+    public function testRound7T10PatientRoleWithCapableScopedMembershipTransitionsAcrossActiveSuspendedAndUnknownLookup(): void {
+        global $wpdb;
+
+        $knownPass = 'R7T10KnownPass1!';
+        $uid       = $this->createUser( 'r7_t10_patcap_' . uniqid(), $knownPass, RolesAndCapabilities::ROLE_PATIENT );
+        $user      = get_userdata( $uid );
+        self::assertInstanceOf( WP_User::class, $user );
+        $origHash = (string) $user->user_pass;
+        self::assertTrue( wp_check_password( $knownPass, $origHash, $uid ), '[pre-check] known password verifies before state transitions' );
+
+        $roleKey = 'cx_r7_staff_' . substr( uniqid(), -6 );
+        $this->insertActiveCustomRoleDef( $this->clinicPublic, $roleKey, [ RolesAndCapabilities::QUEUE_READ ] );
+        $memberships  = App::membership_service();
+        $membershipId = $memberships->create_membership( $this->clinicPublic, $uid, $roleKey );
+        self::assertGreaterThan( 0, $membershipId );
+
+        $prevRemoteAddr = $_SERVER['REMOTE_ADDR'] ?? null;
+        unset( $_SERVER['REMOTE_ADDR'] );
+        $suppressCookie = static fn (): bool => false;
+
+        try {
+            // State 1: active capable scoped membership -> NOT_PATIENT -> WP password login allowed.
+            self::assertSame( 'NOT_PATIENT', App::patient_access()->patient_target_state( $user ), '[state 1: active_scoped_membership] target state' );
+            $cookies1   = 0;
+            $cookieSpy1 = static function () use ( &$cookies1 ): void {
+                ++$cookies1;
+            };
+            add_action( 'set_auth_cookie', $cookieSpy1, 10 );
+            add_action( 'set_logged_in_cookie', $cookieSpy1, 10 );
+            add_filter( 'send_auth_cookies', $suppressCookie, 10, 1 );
+            try {
+                $auth1       = wp_authenticate( $user->user_login, $knownPass );
+                $signon1     = wp_signon( [ 'user_login' => $user->user_login, 'user_password' => $knownPass, 'remember' => false ], false );
+                $directUser1 = apply_filters( 'wp_authenticate_user', $user, $knownPass );
+            } finally {
+                remove_filter( 'send_auth_cookies', $suppressCookie, 10 );
+                remove_action( 'set_logged_in_cookie', $cookieSpy1, 10 );
+                remove_action( 'set_auth_cookie', $cookieSpy1, 10 );
+                wp_set_current_user( 0 );
+            }
+            self::assertInstanceOf( WP_User::class, $auth1, '[state 1: active_scoped_membership] wp_authenticate returns WP_User' );
+            self::assertSame( $uid, $auth1->ID, '[state 1: active_scoped_membership] wp_authenticate user ID' );
+            self::assertInstanceOf( WP_User::class, $signon1, '[state 1: active_scoped_membership] wp_signon returns WP_User' );
+            self::assertSame( $uid, $signon1->ID, '[state 1: active_scoped_membership] wp_signon user ID' );
+            self::assertInstanceOf( WP_User::class, $directUser1, '[state 1: active_scoped_membership] wp_authenticate_user returns WP_User' );
+            self::assertSame( $uid, $directUser1->ID, '[state 1: active_scoped_membership] wp_authenticate_user user ID' );
+            self::assertGreaterThan( 0, $cookies1, '[state 1: active_scoped_membership] auth cookie action fired' );
+            $after1 = get_userdata( $uid );
+            self::assertInstanceOf( WP_User::class, $after1, '[state 1: active_scoped_membership] stored user present' );
+            self::assertSame( $origHash, (string) $after1->user_pass, '[state 1: active_scoped_membership] user_pass hash unchanged' );
+            self::assertTrue( wp_check_password( $knownPass, (string) $after1->user_pass, $uid ), '[state 1: active_scoped_membership] known password still verifies' );
+
+            // State 2: suspended scoped membership -> pure ROLE_PATIENT -> WP password login denied.
+            $memberships->suspend_membership( $membershipId );
+            $user2 = get_userdata( $uid );
+            self::assertInstanceOf( WP_User::class, $user2, '[state 2: suspended_scoped_membership] user reload' );
+            self::assertSame( 'PATIENT', App::patient_access()->patient_target_state( $user2 ), '[state 2: suspended_scoped_membership] target state' );
+            self::assertFalse( App::patient_access()->is_shared_patient_account( $user2 ), '[state 2: suspended_scoped_membership] not shared account' );
+
+            $cookies2   = 0;
+            $cookieSpy2 = static function () use ( &$cookies2 ): void {
+                ++$cookies2;
+            };
+            add_action( 'set_auth_cookie', $cookieSpy2, 10 );
+            add_action( 'set_logged_in_cookie', $cookieSpy2, 10 );
+            add_filter( 'send_auth_cookies', $suppressCookie, 10, 1 );
+            try {
+                $auth2       = wp_authenticate( $user2->user_login, $knownPass );
+                $signon2     = wp_signon( [ 'user_login' => $user2->user_login, 'user_password' => $knownPass, 'remember' => false ], false );
+                $directUser2 = apply_filters( 'wp_authenticate_user', $user2, $knownPass );
+            } finally {
+                remove_filter( 'send_auth_cookies', $suppressCookie, 10 );
+                remove_action( 'set_logged_in_cookie', $cookieSpy2, 10 );
+                remove_action( 'set_auth_cookie', $cookieSpy2, 10 );
+            }
+            self::assertInstanceOf( WP_Error::class, $auth2, '[state 2: suspended_scoped_membership] wp_authenticate denied' );
+            self::assertSame( PatientCredentialGuard::ERROR_CODE, $auth2->get_error_code(), '[state 2: suspended_scoped_membership] wp_authenticate guard code' );
+            self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $auth2->get_error_message(), '[state 2: suspended_scoped_membership] wp_authenticate guard message' );
+            self::assertInstanceOf( WP_Error::class, $signon2, '[state 2: suspended_scoped_membership] wp_signon denied' );
+            self::assertSame( PatientCredentialGuard::ERROR_CODE, $signon2->get_error_code(), '[state 2: suspended_scoped_membership] wp_signon guard code' );
+            self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $signon2->get_error_message(), '[state 2: suspended_scoped_membership] wp_signon guard message' );
+            self::assertInstanceOf( WP_Error::class, $directUser2, '[state 2: suspended_scoped_membership] wp_authenticate_user denied' );
+            self::assertSame( PatientCredentialGuard::ERROR_CODE, $directUser2->get_error_code(), '[state 2: suspended_scoped_membership] wp_authenticate_user guard code' );
+            self::assertSame( 0, $cookies2, '[state 2: suspended_scoped_membership] zero auth cookies' );
+            $after2 = get_userdata( $uid );
+            self::assertInstanceOf( WP_User::class, $after2, '[state 2: suspended_scoped_membership] stored user present' );
+            self::assertSame( $origHash, (string) $after2->user_pass, '[state 2: suspended_scoped_membership] user_pass hash unchanged' );
+            self::assertTrue( wp_check_password( $knownPass, (string) $after2->user_pass, $uid ), '[state 2: suspended_scoped_membership] known password still verifies' );
+
+            // State 3: reactivated scoped membership with exact-SQL lookup fault -> UNKNOWN fail-closed denied.
+            $memberships->reactivate_membership( $membershipId );
+            $user3 = get_userdata( $uid );
+            self::assertInstanceOf( WP_User::class, $user3, '[state 3: unknown_lookup_failure] user reload' );
+            self::assertSame( 'NOT_PATIENT', App::patient_access()->patient_target_state( $user3 ), '[state 3: unknown_lookup_failure] reactivated state before fault' );
+
+            $orgTable     = App::db()->table( 'cpms_organization_memberships' );
+            $exactSql     = 'SELECT id FROM ' . $orgTable . " WHERE wp_user_id = {$uid} AND status = 'active' LIMIT 1";
+            $hits         = 0;
+            $fault        = static function ( mixed $query ) use ( $exactSql, $orgTable, &$hits ): mixed {
+                if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                    ++$hits;
+                    return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+                }
+                return $query;
+            };
+            $prevSuppress = (bool) $wpdb->suppress_errors( true );
+            $cookies3     = 0;
+            $cookieSpy3   = static function () use ( &$cookies3 ): void {
+                ++$cookies3;
+            };
+            add_action( 'set_auth_cookie', $cookieSpy3, 10 );
+            add_action( 'set_logged_in_cookie', $cookieSpy3, 10 );
+            add_filter( 'send_auth_cookies', $suppressCookie, 10, 1 );
+            add_filter( 'query', $fault, 5 );
+            try {
+                $auth3       = wp_authenticate( $user3->user_login, $knownPass );
+                $signon3     = wp_signon( [ 'user_login' => $user3->user_login, 'user_password' => $knownPass, 'remember' => false ], false );
+                $directUser3 = apply_filters( 'wp_authenticate_user', $user3, $knownPass );
+            } finally {
+                remove_filter( 'query', $fault, 5 );
+                $wpdb->suppress_errors( $prevSuppress );
+                remove_filter( 'send_auth_cookies', $suppressCookie, 10 );
+                remove_action( 'set_logged_in_cookie', $cookieSpy3, 10 );
+                remove_action( 'set_auth_cookie', $cookieSpy3, 10 );
+            }
+
+            self::assertGreaterThanOrEqual( 3, $hits, '[state 3: unknown_lookup_failure] exact-SQL fault hits' );
+            self::assertInstanceOf( WP_Error::class, $auth3, '[state 3: unknown_lookup_failure] wp_authenticate denied' );
+            self::assertSame( PatientCredentialGuard::ERROR_CODE, $auth3->get_error_code(), '[state 3: unknown_lookup_failure] wp_authenticate guard code' );
+            self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $auth3->get_error_message(), '[state 3: unknown_lookup_failure] wp_authenticate guard message' );
+            self::assertInstanceOf( WP_Error::class, $signon3, '[state 3: unknown_lookup_failure] wp_signon denied' );
+            self::assertSame( PatientCredentialGuard::ERROR_CODE, $signon3->get_error_code(), '[state 3: unknown_lookup_failure] wp_signon guard code' );
+            self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $signon3->get_error_message(), '[state 3: unknown_lookup_failure] wp_signon guard message' );
+            self::assertInstanceOf( WP_Error::class, $directUser3, '[state 3: unknown_lookup_failure] wp_authenticate_user denied' );
+            self::assertSame( PatientCredentialGuard::ERROR_CODE, $directUser3->get_error_code(), '[state 3: unknown_lookup_failure] wp_authenticate_user guard code' );
+            self::assertSame( 0, $cookies3, '[state 3: unknown_lookup_failure] zero auth cookies' );
+            $after3 = get_userdata( $uid );
+            self::assertInstanceOf( WP_User::class, $after3, '[state 3: unknown_lookup_failure] stored user present' );
+            self::assertSame( $origHash, (string) $after3->user_pass, '[state 3: unknown_lookup_failure] user_pass hash unchanged' );
+            self::assertTrue( wp_check_password( $knownPass, (string) $after3->user_pass, $uid ), '[state 3: unknown_lookup_failure] known password still verifies' );
+        } finally {
+            if ( null === $prevRemoteAddr ) {
+                unset( $_SERVER['REMOTE_ADDR'] );
+            } else {
+                $_SERVER['REMOTE_ADDR'] = $prevRemoteAddr;
             }
         }
     }

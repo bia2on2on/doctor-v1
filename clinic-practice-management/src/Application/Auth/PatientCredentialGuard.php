@@ -21,9 +21,9 @@ use WP_User;
  * Passwords, and XML-RPC auth, while shared accounts (e.g. `patient+subscriber`,
  * `patient+customer`) retain WP password recovery and non-XML-RPC password login
  * with XML-RPC, Application Passwords, and WooCommerce account email/password
- * edits remaining closed server-side. Non-XML-RPC legacy `wp_authenticate()`
- * fixtures without `cpms_patient_logins` rows remain untouched for harness
- * compatibility.
+ * edits remaining closed server-side. Pure `ROLE_PATIENT`-only users without
+ * staff authority are denied non-XML-RPC WP password authentication regardless
+ * of `cpms_patient_logins` row state; shared and `NOT_PATIENT` keep Round 5 rules.
  */
 final class PatientCredentialGuard {
 
