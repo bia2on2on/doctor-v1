@@ -25,6 +25,7 @@ use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use IXR_Error;
 use RuntimeException;
+use WP_Application_Passwords;
 use WP_Error;
 use WP_REST_Request;
 use WP_REST_Response;
@@ -1639,5 +1640,605 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         $mixedAfter = get_userdata( $mixedId );
         self::assertInstanceOf( WP_User::class, $mixedAfter );
         self::assertSame( 'MixedXmlRpcOk', (string) $mixedAfter->first_name );
+    }
+
+    /**
+     * Round 3 Task D (`N1`, `authorize-application.php`) + Task C (`wp_authenticate_application_password`):
+     * exercises the closest PHPUnit equivalents to `authorize-application.php` (`admin_init` with
+     * `$pagenow = 'authorize-application.php'` and `REQUEST_URI`, `wp_is_application_passwords_available_for_user`,
+     * REST `POST /wp/v2/users/me/application-passwords`, and `wp_authenticate_application_password`) across
+     * OTP patient, legacy patient, `patient+subscriber`, `UNKNOWN` lookup-failure, staff, and mixed accounts.
+     *
+     * INFERENCE (revert-to-fail):
+     * - Reverting `authorize_application_password` check in `PatientPortalPage::guardWpAdmin()` (`:224-228`)
+     *   lets `POST authorize-application.php` reach core `:16-38` without dying 403 on `admin_init`.
+     * - Reverting `PatientCredentialGuard::filter_app_passwords_available()` (`:154-159`) lets
+     *   `authorize-application.php:104` pass to nonce printing (`:240`) and lets `wp_authenticate_application_password` succeed.
+     * - Reverting `PatientPortalPage::guard_wp_users_rest()` (`:258-277`) lets REST `POST /wp/v2/users/me/application-passwords` return 201.
+     */
+    public function testAuthorizeApplicationClosureViaAdminInitAvailabilityAndRestForAllTargets(): void {
+        global $wpdb;
+
+        self::assertSame( 10, has_action( 'admin_init', [ PatientPortalPage::class, 'guardWpAdmin' ] ) );
+
+        $this->seedOtp( $this->clinicPublic, self::MOBILE_ACCOUNT_ACTIVE, '778899', OtpService::PURPOSE_LOGIN );
+        $otpToken = $this->verifyOtpWithSession( self::MOBILE_ACCOUNT_ACTIVE, '778899', OtpService::PURPOSE_LOGIN );
+
+        $legacyId = $this->createUser( 'audit_n1_legacy_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+
+        $subPatId   = $this->createUser( 'audit_n1_sub_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+        $subPatUser = get_userdata( $subPatId );
+        self::assertInstanceOf( WP_User::class, $subPatUser );
+        $subPatUser->add_role( 'subscriber' );
+
+        $unknownId = $this->createUser( 'audit_n1_unk_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+
+        $mixedId   = $this->createUser( 'audit_n1_mix_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+        $mixedUser = get_userdata( $mixedId );
+        self::assertInstanceOf( WP_User::class, $mixedUser );
+        $mixedUser->add_role( RolesAndCapabilities::ROLE_DOCTOR );
+
+        $cases = [
+            'otp_patient'             => [ 'uid' => $this->userAccountActive, 'expect_denied' => true, 'expect_get_redirect' => true, 'fault' => false, 'otp' => $otpToken ],
+            'legacy_patient'          => [ 'uid' => $legacyId, 'expect_denied' => true, 'expect_get_redirect' => true, 'fault' => false, 'otp' => null ],
+            'patient_plus_subscriber' => [ 'uid' => $subPatId, 'expect_denied' => true, 'expect_get_redirect' => false, 'fault' => false, 'otp' => null ],
+            'unknown_lookup_failure'  => [ 'uid' => $unknownId, 'expect_denied' => true, 'expect_get_redirect' => true, 'fault' => true, 'otp' => null ],
+            'staff_doctor'            => [ 'uid' => $this->staffDoctorUser, 'expect_denied' => false, 'expect_get_redirect' => false, 'fault' => false, 'otp' => null ],
+            'mixed_patient_doctor'    => [ 'uid' => $mixedId, 'expect_denied' => false, 'expect_get_redirect' => false, 'fault' => false, 'otp' => null ],
+        ];
+
+        $prevGet        = $_GET;
+        $prevPost       = $_POST;
+        $prevRequest    = $_REQUEST;
+        $prevMethod     = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+        $prevRequestUri = $_SERVER['REQUEST_URI'] ?? null;
+        $prevPagenow    = $GLOBALS['pagenow'] ?? null;
+
+        add_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
+        add_filter( 'application_password_is_api_request', '__return_true', 999 );
+        try {
+            foreach ( $cases as $label => $cfg ) {
+                $uid = (int) $cfg['uid'];
+                if ( null !== $cfg['otp'] ) {
+                    $this->activateSession( (string) $cfg['otp'] );
+                } else {
+                    PatientTwoProofTestHelper::acting_as( $uid );
+                }
+                $userObj = get_userdata( $uid );
+                self::assertInstanceOf( WP_User::class, $userObj, $label );
+
+                $orgTable = App::db()->table( 'cpms_organization_memberships' );
+                $exactSql = 'SELECT id FROM ' . $orgTable . " WHERE wp_user_id = {$uid} AND status = 'active' LIMIT 1";
+                $hits     = 0;
+                $fault    = static function ( mixed $query ) use ( $exactSql, $orgTable, &$hits ): mixed {
+                    if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                        ++$hits;
+                        return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+                    }
+                    return $query;
+                };
+                $prevSuppress = (bool) $wpdb->suppress_errors( true );
+                if ( $cfg['fault'] ) {
+                    add_filter( 'query', $fault, 5 );
+                }
+
+                $getRedirect = null;
+                $postDied    = false;
+                $postMsg     = '';
+                $escape      = static function ( $url ) use ( &$getRedirect ): string {
+                    $getRedirect = (string) $url;
+                    throw new RuntimeException( 'intercepted_wp_redirect' );
+                };
+
+                try {
+                    // 1) GET authorize-application.php via `PatientPortalPage::guardWpAdmin()` (verified hooked at priority 10 on `admin_init`).
+                    $GLOBALS['pagenow']        = 'authorize-application.php';
+                    $_SERVER['REQUEST_URI']    = '/wp-admin/authorize-application.php';
+                    $_SERVER['REQUEST_METHOD'] = 'GET';
+                    $_GET                      = [];
+                    $_POST                     = [];
+                    $_REQUEST                  = [];
+                    add_filter( 'wp_redirect', $escape, 1 );
+                    try {
+                        PatientPortalPage::guardWpAdmin();
+                    } catch ( RuntimeException $e ) {
+                        if ( 'intercepted_wp_redirect' !== $e->getMessage() ) {
+                            throw $e;
+                        }
+                    } finally {
+                        remove_filter( 'wp_redirect', $escape, 1 );
+                    }
+
+                    // 2) POST authorize-application.php (`action=authorize_application_password`) via `PatientPortalPage::guardWpAdmin()`.
+                    $_SERVER['REQUEST_METHOD'] = 'POST';
+                    $_POST                     = [
+                        'action'   => 'authorize_application_password',
+                        'approve'  => '1',
+                        'app_name' => 'AuditApp',
+                    ];
+                    $_REQUEST                  = $_POST;
+                    try {
+                        PatientPortalPage::guardWpAdmin();
+                    } catch ( WPDieException $e ) {
+                        $postDied = true;
+                        $postMsg  = $e->getMessage();
+                    }
+
+                    // 3) WP core :104 availability check (blocks :240 nonce even when GET renders for patient+subscriber).
+                    $appAvailable = wp_is_application_passwords_available_for_user( $userObj );
+
+                    // 4) Real REST POST /wp/v2/users/me/application-passwords (auth-app.js path).
+                    $_POST    = [];
+                    $_REQUEST = [];
+                    $nonce    = wp_create_nonce( 'wp_rest' );
+                    $restResp = $this->dispatchRestWithNonce( 'POST', '/wp/v2/users/me/application-passwords', [ 'name' => 'AuditApp_' . $label ], $nonce );
+                    $stored   = WP_Application_Passwords::get_user_application_passwords( $uid );
+                } finally {
+                    if ( $cfg['fault'] ) {
+                        remove_filter( 'query', $fault, 5 );
+                    }
+                    $wpdb->suppress_errors( $prevSuppress );
+                }
+
+                if ( $cfg['fault'] ) {
+                    self::assertGreaterThanOrEqual( 4, $hits, $label );
+                }
+                if ( $cfg['expect_get_redirect'] ) {
+                    self::assertSame( PatientPortalShell::portal_url(), $getRedirect, $label );
+                } else {
+                    self::assertNull( $getRedirect, $label );
+                }
+
+                if ( $cfg['expect_denied'] ) {
+                    self::assertTrue( $postDied, $label );
+                    self::assertSame( PatientAccess::PROOF_FAILED_MESSAGE, $postMsg, $label );
+                    self::assertFalse( $appAvailable, $label );
+                    self::assertSame( 403, $restResp->get_status(), $label );
+                    $restData = $restResp->get_data();
+                    self::assertIsArray( $restData, $label );
+                    self::assertArrayHasKey( 'code', $restData, $label );
+                    self::assertSame( PatientAccess::PROOF_FAILED_CODE, $restData['code'], $label );
+                    self::assertSame( [], $stored, $label );
+
+                    // 5) Even if an app password row existed directly in usermeta, `wp_authenticate_application_password` rejects it (`user.php:429`).
+                    $seeded = WP_Application_Passwords::create_new_application_password( $uid, [ 'name' => 'DirectSeed_' . $label ] );
+                    self::assertIsArray( $seeded, $label );
+                    self::assertTrue( WP_Application_Passwords::is_in_use(), $label );
+                    if ( $cfg['fault'] ) {
+                        add_filter( 'query', $fault, 5 );
+                    }
+                    try {
+                        $appAuth = wp_authenticate_application_password( null, $userObj->user_login, (string) $seeded[0] );
+                    } finally {
+                        if ( $cfg['fault'] ) {
+                            remove_filter( 'query', $fault, 5 );
+                        }
+                        WP_Application_Passwords::delete_all_application_passwords( $uid );
+                    }
+                    self::assertInstanceOf( WP_Error::class, $appAuth, $label );
+                    self::assertSame( 'application_passwords_disabled_for_user', $appAuth->get_error_code(), $label );
+                } else {
+                    self::assertFalse( $postDied, $label );
+                    self::assertTrue( $appAvailable, $label );
+                    self::assertSame( 201, $restResp->get_status(), $label );
+                    self::assertCount( 1, $stored, $label );
+                    $restData = $restResp->get_data();
+                    self::assertIsArray( $restData, $label );
+                    self::assertArrayHasKey( 'password', $restData, $label );
+                    $appAuth = wp_authenticate_application_password( null, $userObj->user_login, (string) $restData['password'] );
+                    self::assertInstanceOf( WP_User::class, $appAuth, $label );
+                    self::assertSame( $uid, (int) $appAuth->ID, $label );
+                    WP_Application_Passwords::delete_all_application_passwords( $uid );
+                }
+            }
+        } finally {
+            remove_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
+            remove_filter( 'application_password_is_api_request', '__return_true', 999 );
+            $_GET                      = $prevGet;
+            $_POST                     = $prevPost;
+            $_REQUEST                  = $prevRequest;
+            $_SERVER['REQUEST_METHOD'] = $prevMethod;
+            if ( null === $prevRequestUri ) {
+                unset( $_SERVER['REQUEST_URI'] );
+            } else {
+                $_SERVER['REQUEST_URI'] = $prevRequestUri;
+            }
+            if ( null === $prevPagenow ) {
+                unset( $GLOBALS['pagenow'] );
+            } else {
+                $GLOBALS['pagenow'] = $prevPagenow;
+            }
+        }
+    }
+
+    /** @return array<string, array{0: string}> */
+    public static function roleCombinationMatrixProvider(): array {
+        return [
+            'otp_patient'                  => [ 'otp_patient' ],
+            'legacy_patient'               => [ 'legacy_patient' ],
+            'patient_plus_subscriber'      => [ 'patient_plus_subscriber' ],
+            'subscriber_with_login_row'    => [ 'subscriber_with_login_row' ],
+            'patient_empty_custom_role'    => [ 'patient_empty_custom_role' ],
+            'unknown_patient_lookup_fault' => [ 'unknown_patient_lookup_fault' ],
+            'staff_doctor'                 => [ 'staff_doctor' ],
+            'admin_manage_options'         => [ 'admin_manage_options' ],
+            'mixed_patient_plus_doctor'    => [ 'mixed_patient_plus_doctor' ],
+            'patient_active_custom_role'   => [ 'patient_active_custom_role' ],
+            'patient_wp_custom_cap_role'   => [ 'patient_wp_custom_cap_role' ],
+            'staff_doctor_lookup_fault'    => [ 'staff_doctor_lookup_fault' ],
+        ];
+    }
+
+    /**
+     * Round 3 Task B + Task E: tests the single shared predicate `PatientAccess::patient_target_state()`
+     * across every role combination in Task B over all 6 surfaces (`wp-admin` redirect, `personal_options_update`
+     * + `newuseremail` + `dismiss`, `REST /wp/v2/users*`, `XML-RPC wp_editProfile` & `wp_getUsersBlogs`,
+     * WP reset key [`allow_password_reset`, `get_password_reset_key`, `validate_password_reset`, `reset_password`],
+     * and Application Passwords [`wp_is_application_passwords_available_for_user`, REST create]).
+     *
+     * INFERENCE (revert-to-fail):
+     * - Reverting `PatientAccess::patient_target_state()` (`PatientAccess.php:283-325`) or its delegation
+     *   in `PatientPortalPage` (`:207-268`) and `PatientCredentialGuard` (`:108-196`) breaks `patient_plus_subscriber`,
+     *   `subscriber_with_login_row`, `patient_empty_custom_role`, `patient_active_custom_role`, or `unknown_patient_lookup_fault`.
+     * - Reverting `1 !== count(roles)` in `PatientPortalPage::guardWpAdmin()` (`:218`) redirects `patient_plus_subscriber`
+     *   on GET `profile.php`, breaking `WooCommerceAdminAccessProfileTest.php:284`.
+     *
+     * @dataProvider roleCombinationMatrixProvider
+     */
+    public function testSharedPredicateMatrixAcrossRoleCombinationsAndSurfaces( string $caseKey ): void {
+        global $wpdb;
+
+        if ( ! class_exists( wp_xmlrpc_server::class ) && defined( 'ABSPATH' ) && defined( 'WPINC' ) ) {
+            $ixrFile    = ABSPATH . WPINC . '/class-IXR.php';
+            $serverFile = ABSPATH . WPINC . '/class-wp-xmlrpc-server.php';
+            if ( file_exists( $ixrFile ) ) {
+                require_once $ixrFile;
+            }
+            if ( file_exists( $serverFile ) ) {
+                require_once $serverFile;
+            }
+        }
+        self::assertTrue( class_exists( wp_xmlrpc_server::class ) );
+
+        $uid            = 0;
+        $pass           = $this->patientKnownPass;
+        $otpToken       = null;
+        $expectDenied   = true;
+        $expectRedirect = true;
+        $expectState    = 'PATIENT';
+        $injectFault    = false;
+
+        switch ( $caseKey ) {
+            case 'otp_patient':
+                $uid = $this->userAccountActive;
+                $this->seedOtp( $this->clinicPublic, self::MOBILE_ACCOUNT_ACTIVE, '616161', OtpService::PURPOSE_LOGIN );
+                $otpToken = $this->verifyOtpWithSession( self::MOBILE_ACCOUNT_ACTIVE, '616161', OtpService::PURPOSE_LOGIN );
+                break;
+
+            case 'legacy_patient':
+                $uid = $this->createUser( 'mat_legacy_' . uniqid(), $pass, RolesAndCapabilities::ROLE_PATIENT );
+                break;
+
+            case 'patient_plus_subscriber':
+                $uid = $this->createUser( 'mat_patsub_' . uniqid(), $pass, RolesAndCapabilities::ROLE_PATIENT );
+                $u   = get_userdata( $uid );
+                self::assertInstanceOf( WP_User::class, $u );
+                $u->add_role( 'subscriber' );
+                $expectRedirect = false; // WooCommerceAdminAccessProfileTest:284 GET exception preserved.
+                break;
+
+            case 'subscriber_with_login_row':
+                $uid    = $this->createUser( 'mat_sublogin_' . uniqid(), $pass, 'subscriber' );
+                $logins = new PatientLoginRepository( App::db() );
+                $aid    = $logins->insert_pending_account( $uid, '09123334455', 'ساب', 'بیمار' );
+                $logins->activate_account_from_pending( $aid, $uid );
+                break;
+
+            case 'patient_empty_custom_role':
+                $uid = $this->createUser( 'mat_patemp_' . uniqid(), $pass, RolesAndCapabilities::ROLE_PATIENT );
+                $rk  = 'cx_mat_empty_' . substr( uniqid(), -6 );
+                $this->insertActiveCustomRoleDef( $this->clinicPublic, $rk, [] );
+                App::membership_service()->create_membership( $this->clinicPublic, $uid, $rk );
+                break;
+
+            case 'unknown_patient_lookup_fault':
+                $uid         = $this->createUser( 'mat_unk_' . uniqid(), $pass, RolesAndCapabilities::ROLE_PATIENT );
+                $expectState = 'UNKNOWN';
+                $injectFault = true;
+                break;
+
+            case 'staff_doctor':
+                $uid            = $this->staffDoctorUser;
+                $pass           = $this->staffDoctorPass;
+                $expectDenied   = false;
+                $expectRedirect = false;
+                $expectState    = 'NOT_PATIENT';
+                break;
+
+            case 'admin_manage_options':
+                $uid            = $this->createUser( 'mat_admin_' . uniqid(), $pass, 'administrator' );
+                $expectDenied   = false;
+                $expectRedirect = false;
+                $expectState    = 'NOT_PATIENT';
+                break;
+
+            case 'mixed_patient_plus_doctor':
+                $uid = $this->createUser( 'mat_mixed_' . uniqid(), $pass, RolesAndCapabilities::ROLE_PATIENT );
+                $u   = get_userdata( $uid );
+                self::assertInstanceOf( WP_User::class, $u );
+                $u->add_role( RolesAndCapabilities::ROLE_DOCTOR );
+                $expectDenied   = false;
+                $expectRedirect = false;
+                $expectState    = 'NOT_PATIENT';
+                break;
+
+            case 'patient_active_custom_role':
+                $uid = $this->createUser( 'mat_patcap_' . uniqid(), $pass, RolesAndCapabilities::ROLE_PATIENT );
+                $rk  = 'cx_mat_staff_' . substr( uniqid(), -6 );
+                $this->insertActiveCustomRoleDef( $this->clinicPublic, $rk, [ RolesAndCapabilities::QUEUE_READ ] );
+                App::membership_service()->create_membership( $this->clinicPublic, $uid, $rk );
+                $expectDenied   = false;
+                $expectRedirect = false;
+                $expectState    = 'NOT_PATIENT';
+                break;
+
+            case 'patient_wp_custom_cap_role':
+                $wpRoleKey = 'cx_wp_cap_' . substr( uniqid(), -6 );
+                if ( null === get_role( $wpRoleKey ) ) {
+                    add_role( $wpRoleKey, 'Matrix WP Custom Cap', [ 'read' => true, RolesAndCapabilities::APPT_READ => true ] );
+                }
+                $uid = $this->createUser( 'mat_patwp_' . uniqid(), $pass, RolesAndCapabilities::ROLE_PATIENT );
+                $u   = get_userdata( $uid );
+                self::assertInstanceOf( WP_User::class, $u );
+                $u->add_role( $wpRoleKey );
+                $expectDenied   = false;
+                $expectRedirect = false;
+                $expectState    = 'NOT_PATIENT';
+                break;
+
+            case 'staff_doctor_lookup_fault':
+                $uid            = $this->staffDoctorUser;
+                $pass           = $this->staffDoctorPass;
+                $expectDenied   = false;
+                $expectRedirect = false;
+                $expectState    = 'NOT_PATIENT';
+                $injectFault    = true;
+                break;
+        }
+
+        if ( null !== $otpToken ) {
+            $this->activateSession( $otpToken );
+        } else {
+            PatientTwoProofTestHelper::acting_as( $uid );
+        }
+
+        $userObj = get_userdata( $uid );
+        self::assertInstanceOf( WP_User::class, $userObj, $caseKey );
+
+        $origEmail   = (string) $userObj->user_email;
+        $origHash    = (string) $userObj->user_pass;
+        $pendingMeta = [
+            'hash'     => 'mat-hash-' . uniqid(),
+            'newemail' => 'mat-new-' . uniqid() . '@clinic.test',
+        ];
+        update_user_meta( $uid, '_new_email', $pendingMeta );
+
+        $orgTable     = App::db()->table( 'cpms_organization_memberships' );
+        $exactSql     = 'SELECT id FROM ' . $orgTable . " WHERE wp_user_id = {$uid} AND status = 'active' LIMIT 1";
+        $hits         = 0;
+        $seenQueries  = 0;
+        $fault        = static function ( mixed $query ) use ( $exactSql, $orgTable, &$hits, &$seenQueries ): mixed {
+            ++$seenQueries;
+            if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                ++$hits;
+                return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+            }
+            return $query;
+        };
+        $preMail      = static fn ( mixed $null ): bool => true;
+        $prevSuppress = (bool) $wpdb->suppress_errors( true );
+        if ( $injectFault ) {
+            add_filter( 'query', $fault, 5 );
+        }
+        add_filter( 'pre_wp_mail', $preMail, 1, 1 );
+        add_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
+
+        $prevGet        = $_GET;
+        $prevPost       = $_POST;
+        $prevRequest    = $_REQUEST;
+        $prevMethod     = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+        $prevPagenow    = $GLOBALS['pagenow'] ?? null;
+        $prevRemoteAddr = $_SERVER['REMOTE_ADDR'] ?? null;
+        unset( $_SERVER['REMOTE_ADDR'] );
+
+        try {
+            self::assertSame( $expectState, App::patient_access()->patient_target_state( $userObj ), $caseKey );
+
+            // 1) wp-admin GET redirect (profile.php).
+            $GLOBALS['pagenow'] = 'profile.php';
+            $getRedirect        = $this->captureGuardWpAdminRedirect( $uid, [], 'GET' );
+            if ( $expectRedirect ) {
+                self::assertSame( PatientPortalShell::portal_url(), $getRedirect, $caseKey );
+            } else {
+                self::assertNull( $getRedirect, $caseKey );
+            }
+
+            // 2) personal_options_update + POST newuseremail + POST dismiss.
+            $GLOBALS['pagenow']        = 'profile.php';
+            $_SERVER['REQUEST_METHOD'] = 'POST';
+            $_POST                     = [ 'email' => $origEmail ];
+            $profileDied               = false;
+            try {
+                do_action( 'personal_options_update', $uid );
+            } catch ( WPDieException ) {
+                $profileDied = true;
+            }
+
+            $_GET              = [ 'newuseremail' => $pendingMeta['hash'] ];
+            $_REQUEST          = $_GET;
+            $newEmailDied      = false;
+            try {
+                PatientPortalPage::guardWpAdmin();
+            } catch ( WPDieException ) {
+                $newEmailDied = true;
+            }
+
+            $_GET         = [ 'dismiss' => $uid . '_new_email', '_wpnonce' => wp_create_nonce( 'dismiss-' . $uid . '_new_email' ) ];
+            $_REQUEST     = $_GET;
+            $dismissDied  = false;
+            try {
+                PatientPortalPage::guardWpAdmin();
+            } catch ( WPDieException ) {
+                $dismissDied = true;
+            }
+
+            // 3) REST /wp/v2/users/me (GET + POST) and /wp/v2/users (GET).
+            $_GET     = [];
+            $_POST    = [];
+            $_REQUEST = [];
+            $nonce    = wp_create_nonce( 'wp_rest' );
+            $meGet    = $this->dispatchRestWithNonce( 'GET', '/wp/v2/users/me', [], $nonce );
+            $mePost   = $this->dispatchRestWithNonce( 'POST', '/wp/v2/users/me', [ 'first_name' => 'MatRest_' . $caseKey ], $nonce );
+            $listGet  = $this->dispatchRestWithNonce( 'GET', '/wp/v2/users', [], $nonce );
+
+            // 4) XML-RPC wp_editProfile & wp_getUsersBlogs.
+            $xmlEdit  = ( new wp_xmlrpc_server() )->wp_editProfile( [ 1, $userObj->user_login, $pass, [ 'first_name' => 'MatXml_' . $caseKey ] ] );
+            $xmlBlogs = ( new wp_xmlrpc_server() )->wp_getUsersBlogs( [ $userObj->user_login, $pass ] );
+
+            // 5) Reset key + already-valid key validate_password_reset + direct reset_password().
+            $allowReset = apply_filters( 'allow_password_reset', true, $uid );
+            $keyRes     = get_password_reset_key( $userObj );
+            $rawValid   = 'MatResetKey123456';
+            if ( $expectDenied ) {
+                wp_update_user(
+                    [
+                        'ID'                  => $uid,
+                        'user_activation_key' => time() . ':' . wp_fast_hash( $rawValid ),
+                    ]
+                );
+                $checkUser = check_password_reset_key( $rawValid, $userObj->user_login );
+            } else {
+                self::assertIsString( $keyRes, $caseKey );
+                $checkUser = check_password_reset_key( $keyRes, $userObj->user_login );
+            }
+            $resetErrors = new WP_Error();
+            do_action( 'validate_password_reset', $resetErrors, $checkUser );
+            $directResetDied = false;
+            if ( $expectDenied ) {
+                try {
+                    reset_password( $userObj, 'MatNewPass123!' );
+                } catch ( WPDieException ) {
+                    $directResetDied = true;
+                }
+            }
+
+            // 6) Application Passwords availability + REST creation.
+            $appAvail = wp_is_application_passwords_available_for_user( $userObj );
+            $appRest  = $this->dispatchRestWithNonce( 'POST', '/wp/v2/users/me/application-passwords', [ 'name' => 'MatApp_' . $caseKey ], $nonce );
+        } finally {
+            if ( $injectFault ) {
+                remove_filter( 'query', $fault, 5 );
+            }
+            remove_filter( 'pre_wp_mail', $preMail, 1 );
+            remove_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
+            $wpdb->suppress_errors( $prevSuppress );
+            WP_Application_Passwords::delete_all_application_passwords( $uid );
+            $_GET                      = $prevGet;
+            $_POST                     = $prevPost;
+            $_REQUEST                  = $prevRequest;
+            $_SERVER['REQUEST_METHOD'] = $prevMethod;
+            if ( null === $prevPagenow ) {
+                unset( $GLOBALS['pagenow'] );
+            } else {
+                $GLOBALS['pagenow'] = $prevPagenow;
+            }
+            if ( null === $prevRemoteAddr ) {
+                unset( $_SERVER['REMOTE_ADDR'] );
+            } else {
+                $_SERVER['REMOTE_ADDR'] = $prevRemoteAddr;
+            }
+        }
+
+        if ( $injectFault && 'unknown_patient_lookup_fault' === $caseKey ) {
+            self::assertGreaterThanOrEqual( 4, $hits, $caseKey );
+        } elseif ( $injectFault && 'staff_doctor_lookup_fault' === $caseKey ) {
+            self::assertGreaterThan( 0, $seenQueries, $caseKey );
+            self::assertSame( 0, $hits, $caseKey );
+        }
+
+        self::assertSame( 200, $meGet->get_status(), $caseKey );
+
+        $afterUser = get_userdata( $uid );
+        self::assertInstanceOf( WP_User::class, $afterUser, $caseKey );
+
+        if ( $expectDenied ) {
+            self::assertTrue( $profileDied, $caseKey );
+            self::assertTrue( $newEmailDied, $caseKey );
+            self::assertTrue( $dismissDied, $caseKey );
+            self::assertSame( $origEmail, (string) $afterUser->user_email, $caseKey );
+            self::assertSame( $pendingMeta, get_user_meta( $uid, '_new_email', true ), $caseKey );
+            self::assertSame( 403, $mePost->get_status(), $caseKey );
+            self::assertSame( 403, $listGet->get_status(), $caseKey );
+            self::assertInstanceOf( IXR_Error::class, $xmlEdit, $caseKey );
+            self::assertSame( 403, $xmlEdit->code, $caseKey );
+            self::assertInstanceOf( IXR_Error::class, $xmlBlogs, $caseKey );
+            self::assertSame( 403, $xmlBlogs->code, $caseKey );
+            self::assertSame( '', (string) $afterUser->first_name, $caseKey );
+            self::assertFalse( $allowReset, $caseKey );
+            self::assertInstanceOf( WP_Error::class, $keyRes, $caseKey );
+            self::assertSame( 'no_password_reset', $keyRes->get_error_code(), $caseKey );
+            self::assertTrue( $resetErrors->has_errors(), $caseKey );
+            self::assertContains( PatientCredentialGuard::ERROR_CODE, $resetErrors->get_error_codes(), $caseKey );
+            self::assertTrue( $directResetDied, $caseKey );
+            self::assertSame( $origHash, (string) $afterUser->user_pass, $caseKey );
+            self::assertFalse( $appAvail, $caseKey );
+            self::assertSame( 403, $appRest->get_status(), $caseKey );
+        } else {
+            self::assertFalse( $profileDied, $caseKey );
+            self::assertFalse( $newEmailDied, $caseKey );
+            self::assertFalse( $dismissDied, $caseKey );
+            self::assertSame( 200, $mePost->get_status(), $caseKey );
+            self::assertTrue( $xmlEdit, $caseKey );
+            self::assertIsArray( $xmlBlogs, $caseKey );
+            self::assertSame( 'MatXml_' . $caseKey, (string) $afterUser->first_name, $caseKey );
+            self::assertTrue( $allowReset, $caseKey );
+            self::assertIsString( $keyRes, $caseKey );
+            self::assertFalse( $resetErrors->has_errors(), $caseKey );
+            self::assertTrue( $appAvail, $caseKey );
+            self::assertSame( 201, $appRest->get_status(), $caseKey );
+        }
+    }
+
+    /** @param list<string> $capabilities */
+    private function insertActiveCustomRoleDef( int $clinicId, string $roleKey, array $capabilities ): void {
+        global $wpdb;
+        $now    = App::db()->nowUtcSql();
+        $defs   = $wpdb->prefix . 'cpms_custom_role_defs';
+        $defCap = $wpdb->prefix . 'cpms_custom_role_capabilities';
+
+        $wpdb->query(
+            $wpdb->prepare(
+                "INSERT INTO {$defs} (clinic_id, role_key, status, version, created_at, updated_at) VALUES (%d, %s, %s, %d, %s, %s)", // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                $clinicId,
+                $roleKey,
+                'active',
+                1,
+                $now,
+                $now
+            )
+        );
+        $defId = (int) $wpdb->insert_id;
+        self::assertGreaterThan( 0, $defId );
+
+        foreach ( $capabilities as $capability ) {
+            $wpdb->query(
+                $wpdb->prepare(
+                    "INSERT INTO {$defCap} (role_def_id, capability, created_at) VALUES (%d, %s, %s)", // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                    $defId,
+                    $capability,
+                    $now
+                )
+            );
+        }
     }
 }

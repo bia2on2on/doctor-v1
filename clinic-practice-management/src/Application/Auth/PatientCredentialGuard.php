@@ -4,31 +4,33 @@ declare( strict_types=1 );
 
 namespace ClinicCore\Application\Auth;
 
-use ClinicCore\Auth\RolesAndCapabilities;
+use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use RuntimeException;
-use Throwable;
 use WP_Error;
 use WP_User;
 
 /**
  * §4.4 initial-credential guard for OTP-registered / OTP-bound patient accounts.
  *
- * Until a future password-lifecycle release introduces verified method-B
- * credentials, any user with a `cpms_patient_logins` account row (`kind='account'`)
- * must authenticate solely via OTP and must never sign in via WordPress password,
- * reset a password via WP reset keys, or use WordPress Application Passwords.
- *
- * Legacy patient-only `ROLE_PATIENT` WP accounts without staff roles are also
- * blocked on WP password-reset paths, Application Passwords, and XML-RPC auth,
- * while non-XML-RPC legacy `wp_authenticate()` fixtures remain untouched.
+ * Delegates patient-target classification to the single shared predicate
+ * `PatientAccess::patient_target_state()`. Any patient target (`ROLE_PATIENT`
+ * or unclosed `cpms_patient_logins` account row without staff authority, or
+ * `UNKNOWN` on lookup failure) is blocked on WP password resets, Application
+ * Passwords, and XML-RPC auth, while OTP-registered (`cpms_patient_logins`)
+ * accounts are blocked on all WP password auth (`authenticate` / `wp_authenticate_user`).
+ * Non-XML-RPC legacy `wp_authenticate()` fixtures without `cpms_patient_logins`
+ * rows remain untouched for harness compatibility.
  */
 final class PatientCredentialGuard {
 
     public const ERROR_CODE = 'cpms_patient_otp_required';
 
-    public function __construct( private readonly CpmsDb $db ) {
+    public function __construct(
+        private readonly CpmsDb $db,
+        private readonly ?PatientAccess $patient_access = null
+    ) {
     }
 
     public function register_hooks(): void {
@@ -109,20 +111,16 @@ final class PatientCredentialGuard {
     }
 
     /**
-     * Blocks WordPress password reset key generation for patient accounts.
+     * Blocks WordPress password reset key generation for patient targets.
      */
     public function filter_allow_password_reset( bool $allow, int $user_id ): bool {
-        if ( $user_id <= 0 ) {
+        if ( $user_id <= 0 || ! function_exists( 'get_userdata' ) ) {
             return $allow;
         }
-        if ( $this->has_patient_login_account( $user_id ) ) {
+
+        $user = get_userdata( $user_id );
+        if ( $user instanceof WP_User && 'NOT_PATIENT' !== $this->access()->patient_target_state( $user ) ) {
             return false;
-        }
-        if ( function_exists( 'get_userdata' ) ) {
-            $user = get_userdata( $user_id );
-            if ( $user instanceof WP_User && $this->is_patient_only_wp_user( $user ) ) {
-                return false;
-            }
         }
 
         return $allow;
@@ -132,7 +130,7 @@ final class PatientCredentialGuard {
      * Blocks `wp-login.php?action=rp` / `resetpass` even with an already-valid reset key.
      */
     public function action_validate_password_reset( WP_Error $errors, mixed $user ): void {
-        if ( $user instanceof WP_User && $this->is_patient_target( $user ) ) {
+        if ( $user instanceof WP_User && 'NOT_PATIENT' !== $this->access()->patient_target_state( $user ) ) {
             $errors->add( self::ERROR_CODE, PatientAccess::PROOF_FAILED_MESSAGE );
         }
     }
@@ -143,7 +141,7 @@ final class PatientCredentialGuard {
     public function action_password_reset( mixed $user, string $new_pass ): void {
         unset( $new_pass );
 
-        if ( ! $user instanceof WP_User || ! $this->is_patient_target( $user ) ) {
+        if ( ! $user instanceof WP_User || 'NOT_PATIENT' === $this->access()->patient_target_state( $user ) ) {
             return;
         }
 
@@ -155,65 +153,42 @@ final class PatientCredentialGuard {
     }
 
     /**
-     * Blocks WordPress Application Passwords for patient accounts.
+     * Blocks WordPress Application Passwords for patient targets.
      */
     public function filter_app_passwords_available( bool $available, WP_User $user ): bool {
-        if ( $this->is_patient_target( $user ) ) {
+        if ( 'NOT_PATIENT' !== $this->access()->patient_target_state( $user ) ) {
             return false;
         }
 
         return $available;
     }
 
-    private function has_patient_login_account( int $wp_user_id ): bool {
-        if ( $wp_user_id <= 0 ) {
-            return false;
+    private function access(): PatientAccess {
+        if ( null !== $this->patient_access ) {
+            return $this->patient_access;
+        }
+        if ( function_exists( 'get_userdata' ) && class_exists( App::class ) ) {
+            return App::patient_access();
         }
 
-        try {
-            $logins = new PatientLoginRepository( $this->db );
-            if ( ! $logins->table_exists() ) {
-                return false;
-            }
-
-            return null !== $logins->find_account_by_user_id( $wp_user_id );
-        } catch ( Throwable ) {
-            if ( function_exists( 'get_userdata' ) ) {
-                $user = get_userdata( $wp_user_id );
-                if ( $user instanceof WP_User && in_array( RolesAndCapabilities::ROLE_PATIENT, (array) $user->roles, true ) ) {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-    }
-
-    private function is_patient_target( WP_User $user ): bool {
-        return $this->has_patient_login_account( (int) $user->ID )
-            || $this->is_patient_only_wp_user( $user );
-    }
-
-    private function is_patient_only_wp_user( WP_User $user ): bool {
-        $roles = (array) ( $user->roles ?? [] );
-
-        return in_array( RolesAndCapabilities::ROLE_PATIENT, $roles, true )
-            && ! in_array( RolesAndCapabilities::ROLE_DOCTOR, $roles, true )
-            && ! in_array( RolesAndCapabilities::ROLE_SECRETARY, $roles, true )
-            && ! in_array( RolesAndCapabilities::ROLE_ACCOUNTANT, $roles, true )
-            && ! in_array( RolesAndCapabilities::ROLE_MANAGER, $roles, true )
-            && ( ! function_exists( 'user_can' ) || ! user_can( $user, 'manage_options' ) );
+        return new PatientAccess( $this->db, null, logins: new PatientLoginRepository( $this->db ) );
     }
 
     private function should_block_auth( WP_User $user ): bool {
-        if ( $this->has_patient_login_account( (int) $user->ID ) ) {
-            return true;
-        }
-        if ( ! $this->is_xmlrpc_context() ) {
+        $access = $this->access();
+        if ( 'NOT_PATIENT' === $access->patient_target_state( $user ) ) {
             return false;
         }
+        if ( $this->is_xmlrpc_context() ) {
+            return true;
+        }
 
-        return $this->is_patient_only_wp_user( $user );
+        $login_state = $access->has_live_patient_login_account( (int) $user->ID );
+        if ( null === $login_state ) {
+            return true;
+        }
+
+        return $login_state;
     }
 
     private function is_xmlrpc_context(): bool {

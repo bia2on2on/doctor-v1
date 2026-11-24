@@ -131,23 +131,6 @@ final class PatientPortalPage
         return false;
     }
 
-    /** Three-way actor decision (`PATIENT` | `NOT_PATIENT` | `UNKNOWN`) for fail-closed guards. */
-    private static function guard_actor_state( \WP_User $user ): string {
-        $roles = (array) ( $user->roles ?? [] );
-        if ( 1 !== count( $roles ) || ! in_array( RolesAndCapabilities::ROLE_PATIENT, $roles, true ) || user_can( $user, 'manage_options' ) || self::holds_any_cpms_capability( $user ) ) {
-            return 'NOT_PATIENT';
-        }
-        try {
-            $scoped = App::patient_access()->scoped_staff_actor_state( (int) $user->ID );
-        } catch ( \Throwable ) {
-            return 'UNKNOWN';
-        }
-        if ( null === $scoped ) {
-            return 'UNKNOWN';
-        }
-        return $scoped ? 'NOT_PATIENT' : 'PATIENT';
-    }
-
     /**
      * Production pure-patient destination — frontend Patient Portal URL
      * (never under /wp-admin/ as of Phase 9 Slice 3).
@@ -221,14 +204,24 @@ final class PatientPortalPage
         if (wp_doing_ajax() || (defined('REST_REQUEST') && REST_REQUEST) || wp_doing_cron()) {
             return;
         }
-        if ( ( isset( $_GET['newuseremail'] ) || isset( $_GET['dismiss'] ) ) && is_user_logged_in() && 'NOT_PATIENT' !== self::guard_actor_state( wp_get_current_user() ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Fail-closed deny before WordPress core executes its email confirmation hash or pending-email dismiss handler on any HTTP method.
+        $raw_action = isset( $_REQUEST['action'] ) ? sanitize_key( wp_unslash( (string) $_REQUEST['action'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Fail-closed deny on `admin_init` before WordPress core executes `authorize-application.php` (:16-38).
+        if ( ( isset( $_GET['newuseremail'] ) || isset( $_GET['dismiss'] ) || 'authorize_application_password' === $raw_action ) // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Fail-closed deny on `admin_init` before WordPress core executes `newuseremail` (:108-120), `dismiss` (:124-129), or `authorize-application.php` (:16-38) on any HTTP method.
+            && is_user_logged_in()
+            && 'NOT_PATIENT' !== App::patient_access()->patient_target_state( wp_get_current_user() ) ) {
             wp_die( esc_html( PatientAccess::PROOF_FAILED_MESSAGE ), '', [ 'response' => 403 ] );
         }
         $request_method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_text_field( wp_unslash( (string) $_SERVER['REQUEST_METHOD'] ) ) ) : 'GET';
         if ( 'GET' !== $request_method ) {
             return;
         }
-        if ( ! is_user_logged_in() || 'NOT_PATIENT' === self::guard_actor_state( wp_get_current_user() ) ) {
+        if ( ! is_user_logged_in() ) {
+            return;
+        }
+        $current_user = wp_get_current_user();
+        if ( 'NOT_PATIENT' === App::patient_access()->patient_target_state( $current_user ) ) {
+            return;
+        }
+        if ( 1 !== count( (array) ( $current_user->roles ?? [] ) ) ) {
             return;
         }
         wp_safe_redirect(self::pageUrl());
@@ -251,7 +244,7 @@ final class PatientPortalPage
             return $result;
         }
 
-        if ( ! is_user_logged_in() || 'NOT_PATIENT' === self::guard_actor_state( wp_get_current_user() ) ) {
+        if ( ! is_user_logged_in() || 'NOT_PATIENT' === App::patient_access()->patient_target_state( wp_get_current_user() ) ) {
             return $result;
         }
 
@@ -273,7 +266,7 @@ final class PatientPortalPage
      * Fail-closed block on wp-admin own-profile update (`personal_options_update`) for pure patients.
      */
     public static function guard_wp_admin_profile_hooks(): void {
-        if ( ! is_user_logged_in() || 'NOT_PATIENT' === self::guard_actor_state( wp_get_current_user() ) ) {
+        if ( ! is_user_logged_in() || 'NOT_PATIENT' === App::patient_access()->patient_target_state( wp_get_current_user() ) ) {
             return;
         }
 
