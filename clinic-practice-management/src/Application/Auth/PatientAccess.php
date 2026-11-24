@@ -232,6 +232,143 @@ final class PatientAccess {
         return $this->has_scoped_staff_authority( $wp_user_id );
     }
 
+    /** True for verified scoped staff, false for none, null on error or missing dependency. */
+    public function scoped_staff_actor_state( int $wp_user_id ): ?bool {
+        if ( $wp_user_id > 0 && null !== $this->scoped_staff_checker ) {
+            try {
+                return (bool) ( $this->scoped_staff_checker )( $wp_user_id );
+            } catch ( Throwable ) {
+                return null;
+            }
+        }
+        if ( $wp_user_id <= 0 || null === $this->db || null === $this->memberships || null === $this->authorization ) {
+            return null;
+        }
+        $was_strict = $this->db->is_strict();
+        $this->db->setStrict( true );
+        try {
+            $org_sql = 'SELECT id FROM ' . $this->db->table( 'cpms_organization_memberships' ) . " WHERE wp_user_id = %d AND status = 'active' LIMIT 1";
+            if ( [] !== $this->db->fetch_all_strict( $org_sql, [ $wp_user_id ] ) ) {
+                return true;
+            }
+            foreach ( $this->memberships->active_clinic_ids_for_user( $wp_user_id ) as $clinic_id ) {
+                foreach ( RolesAndCapabilities::ALL_CAPS as $capability ) {
+                    if ( $clinic_id <= 0 || $this->authorization->can( $wp_user_id, $clinic_id, $capability ) ) {
+                        return $clinic_id <= 0 ? null : true;
+                    }
+                }
+            }
+            return false;
+        } catch ( Throwable ) {
+            return null;
+        } finally {
+            $this->db->setStrict( $was_strict );
+        }
+    }
+
+    /**
+     * Single shared three-way patient-target predicate (`'PATIENT' | 'NOT_PATIENT' | 'UNKNOWN'`)
+     * for fail-closed credential and mutation guards.
+     *
+     * Staff authority (WP staff roles, `manage_options`, or any CPMS capability via
+     * global WP role or Clinic-scoped membership / `CustomRolePolicy` custom role)
+     * takes precedence and returns `'NOT_PATIENT'` (mixed patient+staff stay open).
+     * Extra non-staff WP roles (e.g. `subscriber` + `cpms_patient`) do not exempt a
+     * patient target on these guards.
+     */
+    public function patient_target_state( WP_User $user ): string {
+        $wp_user_id = (int) $user->ID;
+        if ( $wp_user_id <= 0 ) {
+            return 'NOT_PATIENT';
+        }
+
+        $roles = (array) ( $user->roles ?? [] );
+        if (
+            in_array( RolesAndCapabilities::ROLE_DOCTOR, $roles, true )
+            || in_array( RolesAndCapabilities::ROLE_SECRETARY, $roles, true )
+            || in_array( RolesAndCapabilities::ROLE_ACCOUNTANT, $roles, true )
+            || in_array( RolesAndCapabilities::ROLE_MANAGER, $roles, true )
+        ) {
+            return 'NOT_PATIENT';
+        }
+
+        if ( function_exists( 'user_can' ) ) {
+            if ( user_can( $user, 'manage_options' ) ) {
+                return 'NOT_PATIENT';
+            }
+            foreach ( RolesAndCapabilities::ALL_CAPS as $capability ) {
+                if ( user_can( $user, $capability ) ) {
+                    return 'NOT_PATIENT';
+                }
+            }
+        }
+
+        $is_patient_candidate = in_array( RolesAndCapabilities::ROLE_PATIENT, $roles, true );
+        if ( ! $is_patient_candidate ) {
+            $login_state = $this->has_live_patient_login_account( $wp_user_id );
+            if ( null === $login_state ) {
+                return 'UNKNOWN';
+            }
+            if ( ! $login_state ) {
+                return 'NOT_PATIENT';
+            }
+        }
+
+        $scoped = $this->scoped_staff_actor_state( $wp_user_id );
+        if ( null === $scoped ) {
+            return 'UNKNOWN';
+        }
+
+        return $scoped ? 'NOT_PATIENT' : 'PATIENT';
+    }
+
+    /**
+     * Additive shared-account predicate: returns `true` only when `patient_target_state()`
+     * classifies `$user` as `'PATIENT'` (no staff authority and not `'UNKNOWN'`) AND
+     * `$user` holds at least one WordPress role other than `ROLE_PATIENT` (e.g.
+     * `patient+subscriber`, `patient+customer`, or `subscriber` with a live patient login row).
+     */
+    public function is_shared_patient_account( WP_User $user ): bool {
+        if ( 'PATIENT' !== $this->patient_target_state( $user ) ) {
+            return false;
+        }
+
+        foreach ( (array) ( $user->roles ?? [] ) as $role ) {
+            $role_name = (string) $role;
+            if ( '' !== $role_name && RolesAndCapabilities::ROLE_PATIENT !== $role_name ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Checks whether `$wp_user_id` holds an unclosed `cpms_patient_logins` account row
+     * (`kind = 'account'`, `state != 'closed'`). Returns `null` on DB/wiring failure.
+     */
+    public function has_live_patient_login_account( int $wp_user_id ): ?bool {
+        if ( $wp_user_id <= 0 ) {
+            return false;
+        }
+
+        $logins = $this->logins ?? ( null !== $this->db ? new PatientLoginRepository( $this->db ) : null );
+        if ( null === $logins ) {
+            return null;
+        }
+
+        try {
+            if ( ! $logins->table_exists() ) {
+                return false;
+            }
+            $account = $logins->find_account_by_user_id( $wp_user_id );
+
+            return is_array( $account ) && PatientLoginRepository::STATE_CLOSED !== (string) ( $account['state'] ?? '' );
+        } catch ( Throwable ) {
+            return null;
+        }
+    }
+
     /**
      * Computes the two-factor patient access level (`none` | `booking` | `full`)
      * for `$wp_user_id`, failing closed on any missing proof, inactive account,
