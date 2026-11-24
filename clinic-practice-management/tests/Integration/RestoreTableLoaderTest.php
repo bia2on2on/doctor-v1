@@ -415,14 +415,25 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         $nid    = '1234567890';
         $log    = sys_get_temp_dir() . '/cpms-nid-real-' . bin2hex(random_bytes(6)) . '.log';
 
-        // Move the second patient into clinic 1 and give it the SAME national ID: the real
-        // `u_pat_nid (clinic_id, national_id)` key (migration 0001:83) then refuses the INSERT.
+        // Bring both patients into clinic 1 with the SAME national ID: the real
+        // `u_pat_nid (clinic_id, national_id)` key (migration 0001:83) then refuses the second
+        // INSERT with a genuine duplicate-key error. The seeded second patient has no national
+        // ID at all (NULL), so it has to be given one before the move can collide.
         $dump = (string) file_get_contents($this->dump_file);
-        $bad  = str_replace("('8',2,", "('8',1,", $dump);
-        self::assertNotSame($dump, $bad, 'the fixture must contain the second patient tuple');
-        $bad = str_replace("'0012345678'", "'" . $nid . "'", $bad);
-        self::assertStringContainsString($nid, $bad, 'the duplicate national ID is in the dump');
-        self::assertTrue(file_put_contents($this->dump_file, $bad) > 0);
+        self::assertSame(1, substr_count($dump, "'0012345678'"), 'the seeded national ID appears once');
+        $bad = str_replace("'0012345678'", "'" . $nid . "'", $dump);
+
+        // Every edit below is anchored INSIDE the second patient tuple only: a global replace of
+        // `,NULL,` would rewrite unrelated nullable columns in other tables.
+        $tuple = strpos($bad, "('8',2,");
+        self::assertNotSame(false, $tuple, 'the second patient tuple must exist in the dump');
+        $null_at = strpos($bad, ',NULL,', (int) $tuple);
+        self::assertNotSame(false, $null_at, 'the second patient must have a NULL national ID to fill');
+        $filled = substr_replace($bad, ",'" . $nid . "',", (int) $null_at, strlen(',NULL,'));
+        self::assertSame(2, substr_count($filled, "'" . $nid . "'"), 'both patients now carry the same national ID');
+        $clinic = substr_replace($filled, "('8',1,", (int) $tuple, strlen("('8',2,"));
+        self::assertSame(2, substr_count($clinic, $nid), 'the rewrite touched only the intended bytes');
+        self::assertTrue(file_put_contents($this->dump_file, $clinic) > 0);
 
         // SAVEQUERIES is a constant: it cannot be toggled once defined, so report which it is.
         $savequeries = defined('SAVEQUERIES') && SAVEQUERIES;
