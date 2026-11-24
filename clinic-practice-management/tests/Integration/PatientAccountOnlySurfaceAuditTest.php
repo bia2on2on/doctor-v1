@@ -3092,11 +3092,11 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
                 }
 
                 PatientTwoProofTestHelper::acting_as( $uid );
-
-                $meResp    = $this->dispatchRest( 'GET', '/clinic/v1/patient/me' );
-                $recResp   = $this->dispatchRest( 'GET', '/clinic/v1/patient/my-records' );
-                $apptsResp = $this->dispatchRest( 'GET', '/clinic/v1/appointments/mine' );
-                $filesResp = $this->dispatchRest( 'GET', '/clinic/v1/patients/' . $linkedIds[0] . '/files' );
+                $nonce     = wp_create_nonce( 'wp_rest' );
+                $meResp    = $this->dispatchRestWithNonce( 'GET', '/clinic/v1/patient/me', [], $nonce );
+                $recResp   = $this->dispatchRestWithNonce( 'GET', '/clinic/v1/patient/my-records', [], $nonce );
+                $apptsResp = $this->dispatchRestWithNonce( 'GET', '/clinic/v1/appointments/mine', [], $nonce );
+                $filesResp = $this->dispatchRestWithNonce( 'GET', '/clinic/v1/patients/' . $linkedIds[0] . '/files', [], $nonce );
 
                 foreach ( [ 'me' => $meResp, 'my_records' => $recResp, 'appointments' => $apptsResp, 'files' => $filesResp ] as $routeName => $resp ) {
                     self::assertSame( 403, $resp->get_status(), $label . ':' . $routeName );
