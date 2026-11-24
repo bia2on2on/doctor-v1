@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Infrastructure\Db;
 
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Infrastructure\Profiling\RequestProfiler;
 use RuntimeException;
 use wpdb;
@@ -40,6 +41,19 @@ final class CpmsDb
      */
     private int $rollback_epoch = 0;
 
+    /**
+     * Constant exception text for failures inside an NID guard: never contains
+     * the driver message (which can embed the duplicate key value).
+     */
+    private const NID_SAFE_ERROR = 'Database error (national ID redacted).';
+
+    /**
+     * Depth of active NID-diagnostic guards on this connection.
+     *
+     * @var int
+     */
+    private int $nid_guard_depth = 0;
+
     public function rollback_epoch(): int {
         return $this->rollback_epoch;
     }
@@ -64,7 +78,125 @@ final class CpmsDb
     private function ensureNoSqlError(): void
     {
         if ($this->strict && $this->wpdb->last_error !== '') {
-            throw new RuntimeException('SQL error: ' . $this->wpdb->last_error);
+            throw new RuntimeException(
+                $this->nid_guard_depth > 0 ? self::NID_SAFE_ERROR : 'SQL error: ' . $this->wpdb->last_error
+            );
+        }
+    }
+
+    /**
+     * Run a DB operation carrying an NID-shaped value without publishing that
+     * value through error_log, EZSQL_ERROR, wpdb's last/func_call/queries
+     * diagnostics, or an exception message. Calls with no NID-shaped value are
+     * passed through untouched.
+     *
+     * @template T
+     *
+     * @param callable(): T $operation DB operation to run.
+     * @param array<mixed>  $values    SQL template and bound values to inspect.
+     *
+     * @return T
+     */
+    private function without_nid_diagnostics( callable $operation, array $values ) {
+        if ( ! $this->has_nid_value( $values ) ) {
+            return $operation();
+        }
+
+        global $EZSQL_ERROR;
+
+        $state = [
+            'suppress'      => $this->wpdb->suppress_errors( true ),
+            'show'          => $this->wpdb->show_errors( false ),
+            'ez_count'      => is_array( $EZSQL_ERROR ) ? count( $EZSQL_ERROR ) : 0,
+            'queries_count' => is_array( $this->wpdb->queries ?? null ) ? count( $this->wpdb->queries ) : 0,
+            'values'        => $values,
+        ];
+
+        ++$this->nid_guard_depth;
+        try {
+            return $operation();
+        } finally {
+            --$this->nid_guard_depth;
+            $this->scrub_nid_diagnostics( $state );
+            if ( 0 === $this->nid_guard_depth ) {
+                $this->wpdb->suppress_errors( $state['suppress'] );
+                $this->wpdb->show_errors( $state['show'] );
+            }
+        }
+    }
+
+    /**
+     * Whether any value carries ten or more digits (the NID shape).
+     *
+     * @param array<mixed> $values Values to inspect.
+     */
+    private function has_nid_value( array $values ): bool {
+        foreach ( $values as $value ) {
+            if ( is_array( $value ) ) {
+                if ( $this->has_nid_value( $value ) ) {
+                    return true;
+                }
+                continue;
+            }
+            if ( is_string( $value ) && NationalIdValidator::redact_digits( $value ) !== $value ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Remove the exact candidate values first, then every NID-shaped digit run.
+     *
+     * @param string       $text   Diagnostic text to clean.
+     * @param array<mixed> $values Candidate NID-bearing values.
+     */
+    private function redact_nid( string $text, array $values ): string {
+        foreach ( $values as $value ) {
+            if ( is_array( $value ) ) {
+                $text = $this->redact_nid( $text, $value );
+                continue;
+            }
+            if ( is_string( $value ) && $value !== '' && NationalIdValidator::redact_digits( $value ) !== $value ) {
+                $text = str_replace( $value, '[nid-redacted]', $text );
+            }
+        }
+
+        return NationalIdValidator::redact_digits( $text );
+    }
+
+    /**
+     * Clean only the diagnostics written by the guarded call. The EZSQL_ERROR
+     * row is kept (redacted), not dropped: the test-only SQL failure ledger
+     * reads its last row plus a non-empty last_error at the next query.
+     *
+     * @param array<string, mixed> $state Guard baseline.
+     */
+    private function scrub_nid_diagnostics( array $state ): void {
+        global $EZSQL_ERROR;
+
+        if ( is_array( $EZSQL_ERROR ) ) {
+            $count = count( $EZSQL_ERROR );
+            for ( $i = (int) $state['ez_count']; $i < $count; ++$i ) {
+                if ( ! is_array( $EZSQL_ERROR[ $i ] ) ) {
+                    continue;
+                }
+                foreach ( [ 'query', 'error_str' ] as $key ) {
+                    if ( isset( $EZSQL_ERROR[ $i ][ $key ] ) && is_string( $EZSQL_ERROR[ $i ][ $key ] ) ) {
+                        $EZSQL_ERROR[ $i ][ $key ] = $this->redact_nid( $EZSQL_ERROR[ $i ][ $key ], $state['values'] ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName -- wpdb diagnostic key names are fixed by core.
+                    }
+                }
+            }
+        }
+
+        $this->wpdb->last_query  = $this->redact_nid( (string) $this->wpdb->last_query, $state['values'] );
+        $this->wpdb->last_error  = $this->redact_nid( (string) $this->wpdb->last_error, $state['values'] );
+        $this->wpdb->func_call   = $this->redact_nid( (string) ( $this->wpdb->func_call ?? '' ), $state['values'] );
+        $this->wpdb->last_result = [];
+
+        if ( is_array( $this->wpdb->queries ?? null ) ) {
+            array_splice( $this->wpdb->queries, (int) $state['queries_count'] );
         }
     }
 
@@ -118,6 +250,16 @@ final class CpmsDb
 
     public function query(string $sql, array $params = []): bool
     {
+        return $this->without_nid_diagnostics(
+            function () use ( $sql, $params ): bool {
+                return $this->query_unguarded( $sql, $params );
+            },
+            array_merge( [ $sql ], $params )
+        );
+    }
+
+    private function query_unguarded(string $sql, array $params = []): bool
+    {
         // Phase 17 profiling: observed only when the server-side profiler is armed
         // (one memoized check otherwise); counted even on SQL error, matching
         // `$wpdb->num_queries` semantics.
@@ -136,6 +278,16 @@ final class CpmsDb
      */
     public function execute(string $sql, array $params = []): int
     {
+        return $this->without_nid_diagnostics(
+            function () use ( $sql, $params ): int {
+                return $this->execute_unguarded( $sql, $params );
+            },
+            array_merge( [ $sql ], $params )
+        );
+    }
+
+    private function execute_unguarded(string $sql, array $params = []): int
+    {
         $profile_start = RequestProfiler::query_start();
         $result = $this->wpdb->query($this->prepare($sql, $params)); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         RequestProfiler::query_end( $profile_start );
@@ -149,6 +301,16 @@ final class CpmsDb
      */
     public function fetchRow(string $sql, array $params = []): ?array
     {
+        return $this->without_nid_diagnostics(
+            function () use ( $sql, $params ): ?array {
+                return $this->fetch_row_unguarded( $sql, $params );
+            },
+            array_merge( [ $sql ], $params )
+        );
+    }
+
+    private function fetch_row_unguarded(string $sql, array $params = []): ?array
+    {
         $profile_start = RequestProfiler::query_start();
         $row = $this->wpdb->get_row($this->prepare($sql, $params), ARRAY_A); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         RequestProfiler::query_end( $profile_start );
@@ -161,6 +323,16 @@ final class CpmsDb
      * @return list<array<string, mixed>>
      */
     public function fetchAll(string $sql, array $params = []): array
+    {
+        return $this->without_nid_diagnostics(
+            function () use ( $sql, $params ): array {
+                return $this->fetch_all_unguarded( $sql, $params );
+            },
+            array_merge( [ $sql ], $params )
+        );
+    }
+
+    private function fetch_all_unguarded(string $sql, array $params = []): array
     {
         $profile_start = RequestProfiler::query_start();
         $rows = $this->wpdb->get_results($this->prepare($sql, $params), ARRAY_A); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
@@ -178,6 +350,15 @@ final class CpmsDb
      * @return list<array<string, mixed>>
      */
     public function fetch_all_strict( string $sql, array $params = [] ): array {
+        return $this->without_nid_diagnostics(
+            function () use ( $sql, $params ): array {
+                return $this->fetch_all_strict_unguarded( $sql, $params );
+            },
+            array_merge( [ $sql ], $params )
+        );
+    }
+
+    private function fetch_all_strict_unguarded( string $sql, array $params = [] ): array {
         $profile_start = RequestProfiler::query_start();
         $rows          = $this->wpdb->get_results( $this->prepare( $sql, $params ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         RequestProfiler::query_end( $profile_start );
@@ -191,6 +372,16 @@ final class CpmsDb
 
     public function fetchValue(string $sql, array $params = []): mixed
     {
+        return $this->without_nid_diagnostics(
+            function () use ( $sql, $params ) {
+                return $this->fetch_value_unguarded( $sql, $params );
+            },
+            array_merge( [ $sql ], $params )
+        );
+    }
+
+    private function fetch_value_unguarded(string $sql, array $params = []): mixed
+    {
         $profile_start = RequestProfiler::query_start();
         $value = $this->wpdb->get_var($this->prepare($sql, $params)); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         RequestProfiler::query_end( $profile_start );
@@ -203,6 +394,16 @@ final class CpmsDb
      * @param array<string, mixed> $data
      */
     public function insert(string $table, array $data): bool
+    {
+        return $this->without_nid_diagnostics(
+            function () use ( $table, $data ): bool {
+                return $this->insert_unguarded( $table, $data );
+            },
+            array_merge( [ $table ], array_values( $data ) )
+        );
+    }
+
+    private function insert_unguarded(string $table, array $data): bool
     {
         // wpdb::insert در موفقیت int (تعداد ردیف) و در خطا false برمی‌گرداند —
         // نه bool؛ بدون این نرمال‌سازی هر insert موفق TypeError می‌داد.
@@ -220,6 +421,16 @@ final class CpmsDb
      */
     public function update( string $table, array $data, array $where, bool $throw_on_error = false ): int
     {
+        return $this->without_nid_diagnostics(
+            function () use ( $table, $data, $where, $throw_on_error ): int {
+                return $this->update_unguarded( $table, $data, $where, $throw_on_error );
+            },
+            array_merge( [ $table ], array_values( $data ), array_values( $where ) )
+        );
+    }
+
+    private function update_unguarded( string $table, array $data, array $where, bool $throw_on_error = false ): int
+    {
         $profile_start = RequestProfiler::query_start();
         $result = $this->wpdb->update(
             $this->table($table),
@@ -230,6 +441,9 @@ final class CpmsDb
         );
         RequestProfiler::query_end( $profile_start );
         if ( false === $result && $throw_on_error ) {
+            if ( $this->nid_guard_depth > 0 ) {
+                throw new RuntimeException( self::NID_SAFE_ERROR );
+            }
             $error = '' !== $this->wpdb->last_error ? $this->wpdb->last_error : 'unknown error';
             throw new RuntimeException( 'Database update failed: ' . $error );
         }
@@ -242,6 +456,16 @@ final class CpmsDb
      * @param array<string, mixed> $where
      */
     public function delete(string $table, array $where): int
+    {
+        return $this->without_nid_diagnostics(
+            function () use ( $table, $where ): int {
+                return $this->delete_unguarded( $table, $where );
+            },
+            array_merge( [ $table ], array_values( $where ) )
+        );
+    }
+
+    private function delete_unguarded(string $table, array $where): int
     {
         $profile_start = RequestProfiler::query_start();
         $result = $this->wpdb->delete(
