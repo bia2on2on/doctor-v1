@@ -47,8 +47,10 @@ final class RestoreTableLoader {
                 $source = $this->max_version( $source, $batch );
                 continue;
             }
-            // Census of loaded rows only: the ledger is read, never inserted.
-            $rows[ $table ] = ( $rows[ $table ] ?? 0 ) + count( $batch['rows'] );
+            // Census of loaded rows only: a skipped table is read or seeded, never inserted.
+            if ( ! $this->skipped( $table ) ) {
+                $rows[ $table ] = ( $rows[ $table ] ?? 0 ) + count( $batch['rows'] );
+            }
             if ( isset( $columns[ $table ] ) && $columns[ $table ] !== $batch['columns'] ) {
                 throw BackupException::of( 'RESTORE_COLUMN_MISMATCH', 'The dump declares two different column sets for one table.' );
             }
