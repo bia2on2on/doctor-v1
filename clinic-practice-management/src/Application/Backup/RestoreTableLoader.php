@@ -82,9 +82,9 @@ final class RestoreTableLoader {
         $show_errors     = $this->db->wpdb()->show_errors( false );
         $suppress_errors = $this->db->wpdb()->suppress_errors( true );
         // Diagnostics snapshot: only rows added by THIS load may be touched afterwards.
-        $ez_count      = isset( $GLOBALS['EZSQL_ERROR'] ) && is_array( $GLOBALS['EZSQL_ERROR'] ) ? count( $GLOBALS['EZSQL_ERROR'] ) : 0;
-        $queries_count = is_array( $this->db->wpdb()->queries ?? null ) ? count( $this->db->wpdb()->queries ) : 0;
-        $failed        = false;
+        $ez_count        = isset( $GLOBALS['EZSQL_ERROR'] ) && is_array( $GLOBALS['EZSQL_ERROR'] ) ? count( $GLOBALS['EZSQL_ERROR'] ) : 0;
+        $queries_count   = is_array( $this->db->wpdb()->queries ?? null ) ? count( $this->db->wpdb()->queries ) : 0;
+        $failed          = false;
         try {
             // The plan belongs to specific bytes: a different dump with the same columns must not load.
             if ( ( $plan['digest'] ?? '' ) === '' || $reader->digest() !== $plan['digest'] ) {
@@ -177,17 +177,19 @@ final class RestoreTableLoader {
      * ردیف‌های تازه حذف نمی‌شوند بلکه درجا بی‌اثر می‌شوند (ledger آزمون به آن تکیه دارد).
      */
     private function scrub_diagnostics( int $ez_count, int $queries_count, bool $failed ): void {
+        global $EZSQL_ERROR;
+
         $marker = '[restore statement redacted]';
         $wpdb   = $this->db->wpdb();
-        if ( isset( $GLOBALS['EZSQL_ERROR'] ) && is_array( $GLOBALS['EZSQL_ERROR'] ) ) {
-            $total = count( $GLOBALS['EZSQL_ERROR'] );
+        if ( is_array( $EZSQL_ERROR ) ) {
+            $total = count( $EZSQL_ERROR );
             for ( $index = $ez_count; $index < $total; ++$index ) {
-                if ( ! is_array( $GLOBALS['EZSQL_ERROR'][ $index ] ) ) {
+                if ( ! is_array( $EZSQL_ERROR[ $index ] ) ) {
                     continue;
                 }
                 foreach ( [ 'query', 'error_str' ] as $key ) {
-                    if ( isset( $GLOBALS['EZSQL_ERROR'][ $index ][ $key ] ) ) {
-                        $GLOBALS['EZSQL_ERROR'][ $index ][ $key ] = $marker; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited -- redacts one core diagnostic row in place; the global is never replaced.
+                    if ( isset( $EZSQL_ERROR[ $index ][ $key ] ) ) {
+                        $EZSQL_ERROR[ $index ][ $key ] = $marker; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited -- redacts one core diagnostic row in place; the global itself is never replaced.
                     }
                 }
             }

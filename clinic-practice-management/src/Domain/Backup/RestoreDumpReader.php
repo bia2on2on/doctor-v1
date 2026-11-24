@@ -57,8 +57,8 @@ final class RestoreDumpReader {
         $handle = $this->open();
         $buffer = '';
         $ctx    = hash_init( 'sha256' );
-        $this->pass_digest = null;
         try {
+            $this->pass_digest = null;
             while ( true ) {
                 $truncated = false;
                 $line      = $this->read_line( $handle, $truncated );
