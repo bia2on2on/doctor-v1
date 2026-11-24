@@ -581,11 +581,19 @@ final class BookingService
         }
 
         // N-4: Hold Active موجود همان بیمار/اسلات → Idempotent (بازگردانی همان Token)
-        $existing = $this->db->fetchRow(
-            'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
-            . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s LIMIT 1',
-            [ $wp_user_id, $trusted_clinic_id, (int) $slot['id'], 'active', $this->db->nowUtcSql() ]
-        );
+        if ( null !== $patient_id_to_persist && $patient_id_to_persist > 0 ) {
+            $existing = $this->db->fetchRow(
+                'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
+                . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s AND patient_id = %d LIMIT 1',
+                [ $wp_user_id, $trusted_clinic_id, (int) $slot['id'], 'active', $this->db->nowUtcSql(), $patient_id_to_persist ]
+            );
+        } else {
+            $existing = $this->db->fetchRow(
+                'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
+                . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s AND patient_id IS NULL LIMIT 1',
+                [ $wp_user_id, $trusted_clinic_id, (int) $slot['id'], 'active', $this->db->nowUtcSql() ]
+            );
+        }
         if ($existing !== null) {
             return [
                 'hold_token' => (string) $existing['token'],
@@ -598,12 +606,16 @@ final class BookingService
         $token = self::uuid4();
         $expires_at = ( new \DateTimeImmutable( '+ ' . $ttl . ' seconds', new \DateTimeZone( 'UTC' ) ) )->format( 'Y-m-d H:i:s.000' );
 
+        $logins_table_exists = ( new PatientLoginRepository( $this->db ) )->table_exists();
+
         $has_patient_col = $this->holdsHasPatientIdColumn();
         $wp_user_id      = (int) func_get_arg( 0 );
-        $this->booking_transaction(
+        $reused_hold     = $this->booking_transaction(
             function () use (
                 $slot,
                 $wp_user_id,
+                $trusted_clinic_id,
+                $logins_table_exists,
                 $mobile,
                 $token,
                 $expires_at,
@@ -613,13 +625,29 @@ final class BookingService
                 $settings,
                 $slot_time,
                 $slot_date
-            ): int {
+            ): ?array {
                 // New demand takes Account -> Organization -> Clinic -> Slot -> Location/capacity.
                 // Slot before Location is the established booking order: the
                 // independent staff-create race test requires the Slot lock to be
                 // held while the actor blocks on the Location row, and every other
                 // booking path follows the same order so no ABBA cycle exists.
-                $this->enforce_account_pending_appointment_cap( $wp_user_id, null );
+                $this->enforce_account_pending_appointment_cap( $wp_user_id, null, $logins_table_exists );
+                if ( null !== $patient_id_to_persist && $patient_id_to_persist > 0 ) {
+                    $existing_in_tx = $this->db->fetchRow(
+                        'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
+                        . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s AND patient_id = %d LIMIT 1',
+                        [ $wp_user_id, $trusted_clinic_id, (int) $slot['id'], 'active', $this->db->nowUtcSql(), $patient_id_to_persist ]
+                    );
+                } else {
+                    $existing_in_tx = $this->db->fetchRow(
+                        'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
+                        . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s AND patient_id IS NULL LIMIT 1',
+                        [ $wp_user_id, $trusted_clinic_id, (int) $slot['id'], 'active', $this->db->nowUtcSql() ]
+                    );
+                }
+                if ( null !== $existing_in_tx ) {
+                    return $existing_in_tx;
+                }
                 $this->lock_booking_tenant_prefix( (int) $slot['clinic_id'] );
                 $locked_slot = $this->slots->findForUpdate( (int) $slot['id'] );
                 $this->assert_read_succeeded(
@@ -698,9 +726,17 @@ final class BookingService
                     (int) $slot['clinic_id']
                 );
 
-                return $hold_id;
+                return null;
             }
         );
+
+        if ( null !== $reused_hold ) {
+            return [
+                'hold_token' => (string) $reused_hold['token'],
+                'expires_at' => (string) $reused_hold['expires_at'],
+                'slot'       => $this->slotView( (int) $slot['id'], $slot ),
+            ];
+        }
 
         $hold_id = $this->db->wpdb_last_insert_id();
         $this->op->info('booking.hold', [
@@ -3148,12 +3184,16 @@ final class BookingService
      * across all active proved bindings of the account inside the booking
      * transaction, locking the account row outermost (`FOR UPDATE`).
      */
-    private function enforce_account_pending_appointment_cap( int $wp_user_id, ?int $exclude_appointment_id = null ): void {
+    private function enforce_account_pending_appointment_cap(
+        int $wp_user_id,
+        ?int $exclude_appointment_id = null,
+        ?bool $logins_table_exists = null
+    ): void {
         if ( $wp_user_id <= 0 ) {
             return;
         }
         $logins = new PatientLoginRepository( $this->db );
-        if ( ! $logins->table_exists() ) {
+        if ( ! ( $logins_table_exists ?? $logins->table_exists() ) ) {
             return;
         }
 
