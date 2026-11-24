@@ -197,7 +197,7 @@ final class OtpService
             // هیچ Writerِ محصولی برای otp.ip_hourly_max وجود ندارد؛ فقطِ Seed/
             // تست می‌نویسند تا وقتی که Q6/سطحِ ادمین تصمیم گیرد.
             $ip_hourly_max = self::clamp_ip_hourly_max( $settings->get( 'otp.ip_hourly_max' ) );
-            $byIp = $this->rate->hit( $this->mobile_bucket( 'otp-ip', $ip ), $ip_hourly_max, 3600 );
+            $byIp = $this->rate->hit('otp-ip:' . $ip, $ip_hourly_max, 3600);
             if (!$byIp['allowed']) {
                 throw new OtpException('CLINIC_RATE_LIMITED', 'درخواست‌های شما موقتاً محدود شده است', $byIp);
             }
@@ -407,7 +407,7 @@ final class OtpService
         }
         $purpose = $this->assertPurpose($purpose);
         if ($ip !== null && $ip !== '') {
-            $rl = $this->rate->hit( $this->mobile_bucket( 'otp-verify-ip', $ip ), 20, 3600 );
+            $rl = $this->rate->hit('otp-verify-ip:' . $ip, 20, 3600);
             if (!$rl['allowed']) {
                 throw new OtpException('CLINIC_RATE_LIMITED', 'درخواست‌های شما موقتاً محدود شده است', $rl);
             }

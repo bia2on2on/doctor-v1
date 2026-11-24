@@ -138,7 +138,7 @@ final class OtpQuotaConsumptionTest extends WP_UnitTestCase
     {
         $nid = $this->mobileShapedChecksumValidNid();
         $normalized = MobileValidator::normalize($nid);
-        $this->assertSame($nid, $normalized, 'precondition: the fixture is accepted as a mobile unchanged');
+        $this->assertSame('0' . $nid, $normalized, 'precondition: the 10-digit fixture normalizes to the 09... form');
 
         $this->issue($nid);
 
