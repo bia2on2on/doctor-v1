@@ -19,11 +19,10 @@ final class RestoreDumpReader {
     private const MARKER_PATTERN      = '/\A-- ---- table: ([A-Za-z0-9_]+) ----\z/';
     private const IGNORED_PREFIXES    = [ 'CREATE', 'DROP', 'ALTER', 'TRUNCATE', 'RENAME', 'SET', 'LOCK', 'UNLOCK', 'USE', 'START', 'BEGIN', 'COMMIT', 'ROLLBACK' ];
 
-    private string $quote         = '';
-    private bool $pending_escape  = false;
-    private int $scanned          = 0;
-    private bool $line_truncated  = false;
-    private string $fingerprint   = '';
+    private string $quote        = '';
+    private bool $pending_escape = false;
+    private int $scanned         = 0;
+    private string $fingerprint  = '';
 
     public function __construct( private readonly string $path, private readonly int $max_statement_bytes = self::MAX_STATEMENT_BYTES ) {
     }
@@ -58,12 +57,13 @@ final class RestoreDumpReader {
         $buffer = '';
         try {
             while ( true ) {
-                $line = $this->read_line( $handle );
+                $truncated = false;
+                $line      = $this->read_line( $handle, $truncated );
                 if ( null === $line ) {
                     break;
                 }
                 $buffer .= $line;
-                foreach ( $this->take_statements( $buffer ) as $statement ) {
+                foreach ( $this->take_statements( $buffer, $truncated ) as $statement ) {
                     if ( strlen( $statement ) > $this->max_statement_bytes ) {
                         throw BackupException::of( 'RESTORE_DUMP_SIZE_EXCEEDED', 'A dump statement exceeds the bounded reader size.' );
                     }
@@ -86,9 +86,9 @@ final class RestoreDumpReader {
      *
      * @param resource $handle
      */
-    private function read_line( $handle ): ?string {
-        $line                 = fgets( $handle, $this->max_statement_bytes + 1 );
-        $this->line_truncated = false === $line ? false : strlen( $line ) === $this->max_statement_bytes && ! str_ends_with( $line, "\n" );
+    private function read_line( $handle, bool &$truncated = false ): ?string {
+        $line      = fgets( $handle, $this->max_statement_bytes + 1 );
+        $truncated = false !== $line && strlen( $line ) === $this->max_statement_bytes && ! str_ends_with( $line, "\n" );
         if ( false === $line && ! feof( $handle ) ) {
             throw BackupException::of( 'RESTORE_DUMP_UNREADABLE', 'The restore dump could not be read to the end.' );
         }
@@ -122,7 +122,6 @@ final class RestoreDumpReader {
         $this->quote          = '';
         $this->pending_escape = false;
         $this->scanned        = 0;
-        $this->line_truncated = false;
         if ( ! is_file( $this->path ) || ! is_readable( $this->path ) ) {
             throw BackupException::of( 'RESTORE_DUMP_UNREADABLE', 'The restore dump is not readable.' );
         }
@@ -142,7 +141,7 @@ final class RestoreDumpReader {
      *
      * @return list<string>
      */
-    private function take_statements( string &$buffer ): array {
+    private function take_statements( string &$buffer, bool $truncated = false ): array {
         $statements = [];
         $start      = 0;
         $length     = strlen( $buffer );
@@ -172,7 +171,7 @@ final class RestoreDumpReader {
             }
             if ( 'comment_eof' === $kind ) {
                 // A line cut by the read bound is not an EOF comment: refuse instead of clearing it.
-                if ( $this->line_truncated ) {
+                if ( $truncated ) {
                     throw BackupException::of( 'RESTORE_DUMP_SIZE_EXCEEDED', 'A dump comment exceeds the bounded reader size.' );
                 }
                 $statements[] = substr( $buffer, $index );

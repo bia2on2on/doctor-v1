@@ -77,9 +77,8 @@ final class RestoreTableLoader {
         $strict          = $this->db->is_strict();
         $this->db->setStrict( true );
         // Value-bearing SQL never reaches display/log: suppression is restored in finally.
-        $show_errors             = $this->db->wpdb()->show_errors( false );
-        $suppress_errors         = $this->db->wpdb()->suppress_errors( true );
-        $errors_before           = $this->error_count();
+        $show_errors     = $this->db->wpdb()->show_errors( false );
+        $suppress_errors = $this->db->wpdb()->suppress_errors( true );
         try {
             // The plan belongs to specific bytes: a different dump with the same columns must not load.
             if ( ( $plan['digest'] ?? '' ) === '' || $reader->digest() !== $plan['digest'] ) {
@@ -116,11 +115,11 @@ final class RestoreTableLoader {
                 }
             );
         } catch ( BackupException $error ) {
-            $this->clear_value_residue( $errors_before );
+            $this->clear_last_query();
 
             throw $error;
         } catch ( \Throwable $error ) {
-            $this->clear_value_residue( $errors_before );
+            $this->clear_last_query();
 
             // Never surface driver text: the barrier/UI boundary owns messaging. A failed
             // transaction control leaves the rows' fate unproven, so no rollback is claimed.
@@ -138,20 +137,8 @@ final class RestoreTableLoader {
         return [ 'tables' => count( $counts ), 'rows' => $rows, 'bindings_closed' => $bindings_closed ];
     }
 
-    /** تعدادِ فعلیِ ورودی‌های `$EZSQL_ERROR` (برای پاک‌کردنِ فقط ردیف‌های همین بار). */
-    private function error_count(): int {
-        return isset( $GLOBALS['EZSQL_ERROR'] ) && is_array( $GLOBALS['EZSQL_ERROR'] ) ? count( $GLOBALS['EZSQL_ERROR'] ) : 0;
-    }
-
-    /**
-     * ردیف‌های `$EZSQL_ERROR` که همین بار افزوده است (کوئریِ مقداردار) و آخرین کوئری/خطا پاک می‌شوند.
-     *
-     * @param int $keep ورودی‌های پیش از این بار
-     */
-    private function clear_value_residue( int $keep ): void {
-        if ( isset( $GLOBALS['EZSQL_ERROR'] ) && is_array( $GLOBALS['EZSQL_ERROR'] ) ) {
-            $GLOBALS['EZSQL_ERROR'] = array_slice( $GLOBALS['EZSQL_ERROR'], 0, $keep );
-        }
+    /** آخرین کوئری/خطای wpdb (که می‌تواند مقدارِ ردیف را در خود داشته باشد) پاک می‌شود. */
+    private function clear_last_query(): void {
         $this->db->wpdb()->last_query = '';
         $this->db->wpdb()->last_error = '';
     }

@@ -251,74 +251,72 @@ final class RestoreDumpReaderTest extends TestCase
     /** RB-44: a mid-dump read failure reaches the loop through the PUBLIC api, not by reflection. */
     public function testRefusesMidDumpReadFailureThroughPublicApi(): void
     {
-        $source = static function (string $bytes, bool $fail_after_data) {
+        // PHP instantiates the wrapper class itself, so the state has to be static.
+        $wrapper = get_class(new class () {
+            /** @var resource|null */
+            public static $handle = null;
+            public static bool $fail_after_data = false;
+            public static bool $served          = false;
+
+            /** @param array<string, mixed> $options */
+            public function stream_open(string $path, string $mode, int $options, ?array &$opened_path): bool
+            {
+                return true;
+            }
+
+            public function stream_read(int $count): string
+            {
+                // A broken stream: the first read works, every later read fails ('' while feof() stays false).
+                if (self::$fail_after_data && self::$served) {
+                    return '';
+                }
+                self::$served = true;
+
+                return (string) fread(self::$handle, $count);
+            }
+
+            public function stream_eof(): bool
+            {
+                return false; // never reports EOF, so a failure cannot be mistaken for the end of the dump
+            }
+
+            /** @return array<string, int> */
+            public function url_stat(string $path, int $flags): array
+            {
+                return ['size' => 1, 'mode' => 0100644, 'mtime' => 0, 'atime' => 0, 'ctime' => 0];
+            }
+
+            public function stream_close(): void
+            {
+            }
+        });
+
+        $read = static function (string $bytes, bool $fail) use ($wrapper): array {
             $handle = fopen('php://memory', 'w+b');
             if (false === $handle) {
                 throw new \RuntimeException('cannot open the in-memory buffer');
             }
             fwrite($handle, $bytes);
             rewind($handle);
-
-            return new class ($handle, $fail_after_data) {
-                /** @var resource */
-                private $handle;
-                private bool $fail_after_data;
-                private bool $served = false;
-
-                /** @param resource $handle */
-                public function __construct($handle, bool $fail_after_data)
-                {
-                    $this->handle          = $handle;
-                    $this->fail_after_data = $fail_after_data;
-                }
-
-                /** @param array<string, mixed> $options */
-                public function stream_open(string $path, string $mode, int $options, ?array &$opened_path): bool
-                {
-                    return true;
-                }
-
-                public function stream_read(int $count): string
-                {
-                    // A broken stream: the first read works, every later read fails ('' with feof() false).
-                    if ($this->fail_after_data && $this->served) {
-                        return '';
-                    }
-                    $this->served = true;
-
-                    return (string) fread($this->handle, $count);
-                }
-
-                public function stream_eof(): bool
-                {
-                    return false; // never reports EOF, so the reader cannot mistake failure for the end
-                }
-
-                /** @return array<string, int> */
-                public function url_stat(string $path, int $flags): array
-                {
-                    return ['size' => 1, 'mode' => 0100644, 'mtime' => 0, 'atime' => 0, 'ctime' => 0];
-                }
-
-                public function stream_close(): void
-                {
-                    fclose($this->handle);
-                }
-            };
-        };
-
-        $read = static function (string $bytes, bool $fail) use ($source): array {
-            $wrapper = get_class($source($bytes, $fail));
+            $wrapper::$handle          = $handle;
+            $wrapper::$fail_after_data = $fail;
+            $wrapper::$served          = false;
             self::assertTrue(stream_wrapper_register('cpmsbroken', $wrapper));
             try {
                 return (new RestoreDumpReader('cpmsbroken://dump.sql'))->tables();
             } finally {
                 stream_wrapper_unregister('cpmsbroken');
+                $wrapper::$handle = null;
+                fclose($handle);
             }
         };
 
-        // Positive witness first: the same wrapper shape serves a whole dump when nothing fails.
-        self::assertSame(['cpms_patients'], $read("-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n", false));
+        // Positive witness first: the same wrapper serves a whole dump when nothing fails.
+        self::assertSame(
+            ['cpms_patients'],
+            $read("-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n", false),
+            'the wrapper path works when the stream does not fail'
+        );
 
         $failure = null;
         try {
