@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Admin;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientSessionProofStore;
 use ClinicCore\Application\Clinic\PublicClinicDirectory;
 use ClinicCore\Application\Patients\PatientService;
@@ -85,6 +86,9 @@ final class PatientPortalPage
         add_filter('show_admin_bar', [self::class, 'hideAdminBar'], 20);
         add_action('admin_menu', [self::class, 'menu']);
         add_action('admin_init', [self::class, 'guardWpAdmin']);
+        add_action( 'personal_options_update', [ self::class, 'guard_wp_admin_profile_hooks' ], 1 );
+        add_action( 'edit_user_profile_update', [ self::class, 'guard_wp_admin_profile_hooks' ], 1 );
+        add_filter( 'rest_pre_dispatch', [ self::class, 'guard_wp_users_rest' ], 10, 3 );
         add_action( 'admin_enqueue_scripts', [self::class, 'enqueue_assets'] );
     }
 
@@ -201,14 +205,73 @@ final class PatientPortalPage
         if (wp_doing_ajax() || (defined('REST_REQUEST') && REST_REQUEST) || wp_doing_cron()) {
             return;
         }
-        if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
+        $raw_action = isset( $_REQUEST['action'] ) ? sanitize_key( wp_unslash( (string) $_REQUEST['action'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Fail-closed deny on `admin_init` before WordPress core executes `authorize-application.php` (:16-38).
+        if ( ( isset( $_GET['newuseremail'] ) || isset( $_GET['dismiss'] ) || 'authorize_application_password' === $raw_action ) // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Fail-closed deny on `admin_init` before WordPress core executes `newuseremail` (:108-120), `dismiss` (:124-129), or `authorize-application.php` (:16-38) on any HTTP method.
+            && is_user_logged_in()
+            && 'NOT_PATIENT' !== App::patient_access()->patient_target_state( wp_get_current_user() ) ) {
+            wp_die( esc_html( PatientAccess::PROOF_FAILED_MESSAGE ), '', [ 'response' => 403 ] );
+        }
+        $request_method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_text_field( wp_unslash( (string) $_SERVER['REQUEST_METHOD'] ) ) ) : 'GET';
+        if ( 'GET' !== $request_method ) {
             return;
         }
-        if (!is_user_logged_in() || !self::isPatientOnly(wp_get_current_user())) {
+        if ( ! is_user_logged_in() ) {
+            return;
+        }
+        $current_user = wp_get_current_user();
+        if ( 'NOT_PATIENT' === App::patient_access()->patient_target_state( $current_user ) ) {
+            return;
+        }
+        if ( 1 !== count( (array) ( $current_user->roles ?? [] ) ) ) {
             return;
         }
         wp_safe_redirect(self::pageUrl());
         exit;
+    }
+
+    /**
+     * Fail-closed guard against pure-patient mutation or enumeration on `/wp/v2/users*`.
+     * Preserves read-only `GET /wp/v2/users/me` (`context=view`) for session proof checks.
+     */
+    public static function guard_wp_users_rest( mixed $result, \WP_REST_Server $server, \WP_REST_Request $request ): mixed {
+        unset( $server );
+
+        if ( null !== $result ) {
+            return $result;
+        }
+
+        $route = (string) $request->get_route();
+        if ( 1 !== preg_match( '#^/wp/v2/users(?:/|$)#i', $route ) ) {
+            return $result;
+        }
+
+        if ( ! is_user_logged_in() || 'NOT_PATIENT' === App::patient_access()->patient_target_state( wp_get_current_user() ) ) {
+            return $result;
+        }
+
+        $method      = strtoupper( (string) $request->get_method() );
+        $raw_context = $request->get_param( 'context' );
+        $safe_ctx    = null === $raw_context || ( is_string( $raw_context ) && 'edit' !== strtolower( trim( $raw_context ) ) );
+        if ( '/wp/v2/users/me' === rtrim( strtolower( $route ), '/' ) && in_array( $method, [ 'GET', 'HEAD' ], true ) && $safe_ctx ) {
+            return $result;
+        }
+
+        return new \WP_Error(
+            PatientAccess::PROOF_FAILED_CODE,
+            PatientAccess::PROOF_FAILED_MESSAGE,
+            [ 'status' => 403 ]
+        );
+    }
+
+    /**
+     * Fail-closed block on wp-admin profile updates (`personal_options_update`, `edit_user_profile_update`) for patient targets.
+     */
+    public static function guard_wp_admin_profile_hooks(): void {
+        if ( ! is_user_logged_in() || 'NOT_PATIENT' === App::patient_access()->patient_target_state( wp_get_current_user() ) ) {
+            return;
+        }
+
+        wp_die( esc_html( PatientAccess::PROOF_FAILED_MESSAGE ), '', [ 'response' => 403 ] );
     }
 
     /**
