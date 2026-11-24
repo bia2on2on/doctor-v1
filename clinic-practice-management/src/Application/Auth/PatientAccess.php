@@ -323,6 +323,27 @@ final class PatientAccess {
     }
 
     /**
+     * Additive shared-account predicate: returns `true` only when `patient_target_state()`
+     * classifies `$user` as `'PATIENT'` (no staff authority and not `'UNKNOWN'`) AND
+     * `$user` holds at least one WordPress role other than `ROLE_PATIENT` (e.g.
+     * `patient+subscriber`, `patient+customer`, or `subscriber` with a live patient login row).
+     */
+    public function is_shared_patient_account( WP_User $user ): bool {
+        if ( 'PATIENT' !== $this->patient_target_state( $user ) ) {
+            return false;
+        }
+
+        foreach ( (array) ( $user->roles ?? [] ) as $role ) {
+            $role_name = (string) $role;
+            if ( '' !== $role_name && RolesAndCapabilities::ROLE_PATIENT !== $role_name ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * Checks whether `$wp_user_id` holds an unclosed `cpms_patient_logins` account row
      * (`kind = 'account'`, `state != 'closed'`). Returns `null` on DB/wiring failure.
      */

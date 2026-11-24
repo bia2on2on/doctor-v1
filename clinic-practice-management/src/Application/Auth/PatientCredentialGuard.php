@@ -14,18 +14,21 @@ use WP_User;
 /**
  * §4.4 initial-credential guard for OTP-registered / OTP-bound patient accounts.
  *
- * Delegates patient-target classification to the single shared predicate
- * `PatientAccess::patient_target_state()`. Any patient target (`ROLE_PATIENT`
- * or unclosed `cpms_patient_logins` account row without staff authority, or
- * `UNKNOWN` on lookup failure) is blocked on WP password resets, Application
- * Passwords, and XML-RPC auth, while OTP-registered (`cpms_patient_logins`)
- * accounts are blocked on all WP password auth (`authenticate` / `wp_authenticate_user`).
- * Non-XML-RPC legacy `wp_authenticate()` fixtures without `cpms_patient_logins`
- * rows remain untouched for harness compatibility.
+ * Delegates patient-target classification to `PatientAccess::patient_target_state()`
+ * and `PatientAccess::is_shared_patient_account()`. Pure patient targets (only
+ * `ROLE_PATIENT` and/or live `cpms_patient_logins` without another non-staff role,
+ * or `UNKNOWN` on lookup failure) stay blocked on WP password resets, Application
+ * Passwords, and XML-RPC auth, while shared accounts (e.g. `patient+subscriber`,
+ * `patient+customer`) retain WP password recovery and non-XML-RPC password login
+ * with XML-RPC, Application Passwords, and WooCommerce account email/password
+ * edits remaining closed server-side. Non-XML-RPC legacy `wp_authenticate()`
+ * fixtures without `cpms_patient_logins` rows remain untouched for harness
+ * compatibility.
  */
 final class PatientCredentialGuard {
 
-    public const ERROR_CODE = 'cpms_patient_otp_required';
+    public const ERROR_CODE                    = 'cpms_patient_otp_required';
+    public const ACCOUNT_CHANGE_DENIED_MESSAGE = 'تغییر ایمیل یا گذرواژه از این مسیر مجاز نیست.';
 
     public function __construct(
         private readonly CpmsDb $db,
@@ -55,6 +58,9 @@ final class PatientCredentialGuard {
         }
         if ( ! function_exists( 'has_filter' ) || false === has_filter( 'wp_is_application_passwords_available_for_user', [ $this, 'filter_app_passwords_available' ] ) ) {
             add_filter( 'wp_is_application_passwords_available_for_user', [ $this, 'filter_app_passwords_available' ], 10, 2 );
+        }
+        if ( function_exists( 'add_action' ) && ( ! function_exists( 'has_action' ) || false === has_action( 'woocommerce_save_account_details_errors', [ $this, 'action_wc_save_account_details_errors' ] ) ) ) {
+            add_action( 'woocommerce_save_account_details_errors', [ $this, 'action_wc_save_account_details_errors' ], 10, 2 );
         }
     }
 
@@ -111,7 +117,8 @@ final class PatientCredentialGuard {
     }
 
     /**
-     * Blocks WordPress password reset key generation for patient targets.
+     * Blocks WordPress password reset key generation for pure patient targets and `UNKNOWN`
+     * lookup failures while allowing shared accounts (`patient+subscriber`, `patient+customer`).
      */
     public function filter_allow_password_reset( bool $allow, int $user_id ): bool {
         if ( $user_id <= 0 || ! function_exists( 'get_userdata' ) ) {
@@ -119,7 +126,7 @@ final class PatientCredentialGuard {
         }
 
         $user = get_userdata( $user_id );
-        if ( $user instanceof WP_User && 'NOT_PATIENT' !== $this->access()->patient_target_state( $user ) ) {
+        if ( $user instanceof WP_User && $this->should_block_reset( $user ) ) {
             return false;
         }
 
@@ -127,21 +134,23 @@ final class PatientCredentialGuard {
     }
 
     /**
-     * Blocks `wp-login.php?action=rp` / `resetpass` even with an already-valid reset key.
+     * Blocks `wp-login.php?action=rp` / `resetpass` even with an already-valid reset key
+     * for pure patient targets and `UNKNOWN` lookup failures.
      */
     public function action_validate_password_reset( WP_Error $errors, mixed $user ): void {
-        if ( $user instanceof WP_User && 'NOT_PATIENT' !== $this->access()->patient_target_state( $user ) ) {
+        if ( $user instanceof WP_User && $this->should_block_reset( $user ) ) {
             $errors->add( self::ERROR_CODE, PatientAccess::PROOF_FAILED_MESSAGE );
         }
     }
 
     /**
-     * Defense-in-depth block on `reset_password()` before `wp_set_password()` runs.
+     * Defense-in-depth block on `reset_password()` before `wp_set_password()` runs
+     * for pure patient targets and `UNKNOWN` lookup failures.
      */
     public function action_password_reset( mixed $user, string $new_pass ): void {
         unset( $new_pass );
 
-        if ( ! $user instanceof WP_User || 'NOT_PATIENT' === $this->access()->patient_target_state( $user ) ) {
+        if ( ! $user instanceof WP_User || ! $this->should_block_reset( $user ) ) {
             return;
         }
 
@@ -153,7 +162,50 @@ final class PatientCredentialGuard {
     }
 
     /**
-     * Blocks WordPress Application Passwords for patient targets.
+     * Scoped WooCommerce My-Account edit-account check (`woocommerce_save_account_details_errors`):
+     * blocks email changes or new password submissions for patient targets (including shared
+     * accounts) and `UNKNOWN` lookup failures, while permitting first/last/display name updates
+     * and leaving staff, admins, and non-patient customers unaffected.
+     */
+    public function action_wc_save_account_details_errors( mixed $errors, mixed $user = null ): void {
+        if ( ! $errors instanceof WP_Error || ! function_exists( 'get_userdata' ) ) {
+            return;
+        }
+
+        $target_id = 0;
+        if ( is_object( $user ) && isset( $user->ID ) ) {
+            $target_id = (int) $user->ID;
+        } elseif ( function_exists( 'get_current_user_id' ) ) {
+            $target_id = (int) get_current_user_id();
+        }
+        if ( $target_id <= 0 ) {
+            return;
+        }
+
+        $stored = get_userdata( $target_id );
+        if ( ! $stored instanceof WP_User ) {
+            return;
+        }
+
+        if ( 'NOT_PATIENT' === $this->access()->patient_target_state( $stored ) ) {
+            return;
+        }
+
+        $email_changed = is_object( $user )
+            && isset( $user->user_email )
+            && strtolower( trim( (string) $user->user_email ) ) !== strtolower( trim( (string) $stored->user_email ) );
+
+        $password_submitted = is_object( $user )
+            && isset( $user->user_pass )
+            && '' !== (string) $user->user_pass;
+
+        if ( $email_changed || $password_submitted ) {
+            $errors->add( self::ERROR_CODE, self::ACCOUNT_CHANGE_DENIED_MESSAGE );
+        }
+    }
+
+    /**
+     * Blocks WordPress Application Passwords for patient targets (including shared accounts).
      */
     public function filter_app_passwords_available( bool $available, WP_User $user ): bool {
         if ( 'NOT_PATIENT' !== $this->access()->patient_target_state( $user ) ) {
@@ -174,13 +226,33 @@ final class PatientCredentialGuard {
         return new PatientAccess( $this->db, null, logins: new PatientLoginRepository( $this->db ) );
     }
 
+    private function should_block_reset( WP_User $user ): bool {
+        $access = $this->access();
+        $state  = $access->patient_target_state( $user );
+        if ( 'NOT_PATIENT' === $state ) {
+            return false;
+        }
+        if ( 'UNKNOWN' === $state ) {
+            return true;
+        }
+
+        return ! $access->is_shared_patient_account( $user );
+    }
+
     private function should_block_auth( WP_User $user ): bool {
         $access = $this->access();
-        if ( 'NOT_PATIENT' === $access->patient_target_state( $user ) ) {
+        $state  = $access->patient_target_state( $user );
+        if ( 'NOT_PATIENT' === $state ) {
             return false;
         }
         if ( $this->is_xmlrpc_context() ) {
             return true;
+        }
+        if ( 'UNKNOWN' === $state ) {
+            return true;
+        }
+        if ( $access->is_shared_patient_account( $user ) ) {
+            return false;
         }
 
         $login_state = $access->has_live_patient_login_account( (int) $user->ID );

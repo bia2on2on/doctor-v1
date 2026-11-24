@@ -25,6 +25,7 @@ use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use IXR_Error;
 use RuntimeException;
+use stdClass;
 use WP_Application_Passwords;
 use WP_Error;
 use WP_REST_Request;
@@ -1900,13 +1901,14 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         }
         self::assertTrue( class_exists( wp_xmlrpc_server::class ) );
 
-        $uid            = 0;
-        $pass           = $this->patientKnownPass;
-        $otpToken       = null;
-        $expectDenied   = true;
-        $expectRedirect = true;
-        $expectState    = 'PATIENT';
-        $injectFault    = false;
+        $uid               = 0;
+        $pass              = $this->patientKnownPass;
+        $otpToken          = null;
+        $expectDenied      = true;
+        $expectRedirect    = true;
+        $expectResetOpen   = false;
+        $expectState       = 'PATIENT';
+        $injectFault       = false;
 
         switch ( $caseKey ) {
             case 'otp_patient':
@@ -1924,14 +1926,16 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
                 $u   = get_userdata( $uid );
                 self::assertInstanceOf( WP_User::class, $u );
                 $u->add_role( 'subscriber' );
-                $expectRedirect = false; // WooCommerceAdminAccessProfileTest:284 GET exception preserved.
+                $expectRedirect  = false; // WooCommerceAdminAccessProfileTest:284 GET exception preserved.
+                $expectResetOpen = true;  // OWNER DECISION REVERSAL (PR22 Round 5): shared accounts keep WP password recovery open.
                 break;
 
             case 'subscriber_with_login_row':
-                $uid    = $this->createUser( 'mat_sublogin_' . uniqid(), $pass, 'subscriber' );
-                $logins = new PatientLoginRepository( App::db() );
-                $aid    = $logins->insert_pending_account( $uid, '09123334455', 'ساب', 'بیمار' );
+                $uid             = $this->createUser( 'mat_sublogin_' . uniqid(), $pass, 'subscriber' );
+                $logins          = new PatientLoginRepository( App::db() );
+                $aid             = $logins->insert_pending_account( $uid, '09123334455', 'ساب', 'بیمار' );
                 $logins->activate_account_from_pending( $aid, $uid );
+                $expectResetOpen = true;  // OWNER DECISION REVERSAL (PR22 Round 5): shared accounts keep WP password recovery open.
                 break;
 
             case 'patient_empty_custom_role':
@@ -2109,7 +2113,7 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
             $allowReset = apply_filters( 'allow_password_reset', true, $uid );
             $keyRes     = get_password_reset_key( $userObj );
             $rawValid   = 'MatResetKey123456';
-            if ( $expectDenied ) {
+            if ( $expectDenied && ! $expectResetOpen ) {
                 wp_update_user(
                     [
                         'ID'                  => $uid,
@@ -2184,13 +2188,23 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
             self::assertInstanceOf( IXR_Error::class, $xmlBlogs, $caseKey );
             self::assertSame( 403, $xmlBlogs->code, $caseKey );
             self::assertSame( '', (string) $afterUser->first_name, $caseKey );
-            self::assertFalse( $allowReset, $caseKey );
-            self::assertInstanceOf( WP_Error::class, $keyRes, $caseKey );
-            self::assertSame( 'no_password_reset', $keyRes->get_error_code(), $caseKey );
-            self::assertTrue( $resetErrors->has_errors(), $caseKey );
-            self::assertContains( PatientCredentialGuard::ERROR_CODE, $resetErrors->get_error_codes(), $caseKey );
-            self::assertTrue( $directResetDied, $caseKey );
-            self::assertSame( $origHash, (string) $afterUser->user_pass, $caseKey );
+            if ( $expectResetOpen ) {
+                // OWNER DECISION REVERSAL (PR22 Round 5): shared accounts keep password recovery enabled.
+                self::assertTrue( $allowReset, $caseKey );
+                self::assertIsString( $keyRes, $caseKey );
+                self::assertFalse( $resetErrors->has_errors(), $caseKey );
+                self::assertFalse( $directResetDied, $caseKey );
+                self::assertNotSame( $origHash, (string) $afterUser->user_pass, $caseKey );
+                self::assertTrue( wp_check_password( 'MatNewPass123!', (string) $afterUser->user_pass, $uid ), $caseKey );
+            } else {
+                self::assertFalse( $allowReset, $caseKey );
+                self::assertInstanceOf( WP_Error::class, $keyRes, $caseKey );
+                self::assertSame( 'no_password_reset', $keyRes->get_error_code(), $caseKey );
+                self::assertTrue( $resetErrors->has_errors(), $caseKey );
+                self::assertContains( PatientCredentialGuard::ERROR_CODE, $resetErrors->get_error_codes(), $caseKey );
+                self::assertTrue( $directResetDied, $caseKey );
+                self::assertSame( $origHash, (string) $afterUser->user_pass, $caseKey );
+            }
             self::assertFalse( $appAvail, $caseKey );
             self::assertSame( 403, $appRest->get_status(), $caseKey );
         } else {
@@ -2286,7 +2300,7 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
                 $nonce
             );
 
-            // 3) Lost-password request via retrieve_password() blocked (`no_password_reset`).
+            // 3) OWNER DECISION REVERSAL (PR22 Round 5): shared patient+subscriber keeps lost-password request enabled.
             $retrieveRes = retrieve_password( $subPatUser->user_login );
         } finally {
             remove_filter( 'pre_wp_mail', $preMail, 1 );
@@ -2310,15 +2324,15 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         $patchData = $patchResp->get_data();
         self::assertIsArray( $patchData );
         self::assertSame( PatientAccess::PROOF_FAILED_CODE, $patchData['code'] );
-        self::assertInstanceOf( WP_Error::class, $retrieveRes );
-        self::assertSame( 'no_password_reset', $retrieveRes->get_error_code() );
+        // OWNER DECISION REVERSAL (PR22 Round 5): retrieve_password() now succeeds and issues an activation key.
+        self::assertTrue( $retrieveRes );
 
         $after = get_userdata( $subPatId );
         self::assertInstanceOf( WP_User::class, $after );
         self::assertSame( $origEmail, (string) $after->user_email );
         self::assertSame( $origHash, (string) $after->user_pass );
         self::assertSame( '', (string) $after->first_name );
-        self::assertSame( '', (string) $after->user_activation_key );
+        self::assertNotSame( '', (string) $after->user_activation_key );
     }
 
     /**
@@ -2580,6 +2594,827 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
                     $now
                 )
             );
+        }
+    }
+
+    /**
+     * Round 5 T1: proves `patient+subscriber` completes full WP lost-password flow (`allow_password_reset`,
+     * `retrieve_password`, `check_password_reset_key`, `validate_password_reset`, `reset_password`), changes
+     * stored `user_pass` hash, and keeps Application Passwords closed.
+     */
+    public function testRound5T1PatientPlusSubscriberFullPasswordResetChangesHashAndKeepsAppPasswordsClosed(): void {
+        $origPass = 'R5T1OldPass123!';
+        $newPass  = 'R5T1NewPass456!';
+        $uid      = $this->createUser( 'r5_t1_patsub_' . uniqid(), $origPass, RolesAndCapabilities::ROLE_PATIENT );
+        $user     = get_userdata( $uid );
+        self::assertInstanceOf( WP_User::class, $user );
+        $user->add_role( 'subscriber' );
+
+        $logins    = new PatientLoginRepository( App::db() );
+        $accountId = $logins->insert_pending_account( $uid, '09128880001', 'تی۱', 'مشترک' );
+        $logins->activate_account_from_pending( $accountId, $uid );
+
+        self::assertTrue( App::patient_access()->is_shared_patient_account( $user ) );
+        self::assertSame( 'PATIENT', App::patient_access()->patient_target_state( $user ) );
+
+        $origHash    = (string) $user->user_pass;
+        $capturedKey = '';
+        $keyHook     = static function ( string $userLogin, string $key ) use ( $user, &$capturedKey ): void {
+            if ( $userLogin === $user->user_login ) {
+                $capturedKey = $key;
+            }
+        };
+        $preMail     = static fn (): bool => true;
+
+        add_filter( 'pre_wp_mail', $preMail, 1 );
+        add_action( 'retrieve_password_key', $keyHook, 10, 2 );
+        add_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
+        try {
+            $allowReset  = apply_filters( 'allow_password_reset', true, $uid );
+            $retrieveRes = retrieve_password( $user->user_login );
+            $checked     = '' !== $capturedKey ? check_password_reset_key( $capturedKey, $user->user_login ) : null;
+            $valErrors   = new WP_Error();
+            if ( $checked instanceof WP_User ) {
+                do_action( 'validate_password_reset', $valErrors, $checked );
+            }
+            $resetDied = false;
+            try {
+                reset_password( $user, $newPass );
+            } catch ( WPDieException ) {
+                $resetDied = true;
+            }
+
+            $appAvail = wp_is_application_passwords_available_for_user( $user );
+            PatientTwoProofTestHelper::acting_as( $uid );
+            $nonce   = wp_create_nonce( 'wp_rest' );
+            $appRest = $this->dispatchRestWithNonce( 'POST', '/wp/v2/users/me/application-passwords', [ 'name' => 'R5T1App' ], $nonce );
+        } finally {
+            remove_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
+            remove_action( 'retrieve_password_key', $keyHook, 10 );
+            remove_filter( 'pre_wp_mail', $preMail, 1 );
+        }
+
+        self::assertTrue( $allowReset );
+        self::assertTrue( $retrieveRes );
+        self::assertNotSame( '', $capturedKey );
+        self::assertInstanceOf( WP_User::class, $checked );
+        self::assertFalse( $valErrors->has_errors() );
+        self::assertFalse( $resetDied );
+
+        $after = get_userdata( $uid );
+        self::assertInstanceOf( WP_User::class, $after );
+        self::assertNotSame( $origHash, (string) $after->user_pass );
+        self::assertTrue( wp_check_password( $newPass, (string) $after->user_pass, $uid ) );
+        self::assertFalse( wp_check_password( $origPass, (string) $after->user_pass, $uid ) );
+        self::assertFalse( $appAvail );
+        self::assertSame( 403, $appRest->get_status() );
+    }
+
+    /**
+     * Round 5 T2: proves `patient+customer` (with `'customer'` role created dynamically when absent)
+     * completes full WP lost-password reset and changes stored `user_pass`, while Application Passwords
+     * remains closed.
+     */
+    public function testRound5T2PatientPlusCustomerFullResetAndPasswordLoginWhileKeepingClosures(): void {
+        $createdCustomerRole = false;
+        if ( null === get_role( 'customer' ) ) {
+            add_role( 'customer', 'Customer', [ 'read' => true ] );
+            $createdCustomerRole = true;
+        }
+
+        try {
+            $origPass = 'R5T2OldPass123!';
+            $newPass  = 'R5T2NewPass456!';
+            $uid      = $this->createUser( 'r5_t2_patcust_' . uniqid(), $origPass, RolesAndCapabilities::ROLE_PATIENT );
+            $user     = get_userdata( $uid );
+            self::assertInstanceOf( WP_User::class, $user );
+            $user->add_role( 'customer' );
+
+            self::assertTrue( App::patient_access()->is_shared_patient_account( $user ) );
+            self::assertSame( 'PATIENT', App::patient_access()->patient_target_state( $user ) );
+
+            $origHash    = (string) $user->user_pass;
+            $capturedKey = '';
+            $keyHook     = static function ( string $userLogin, string $key ) use ( $user, &$capturedKey ): void {
+                if ( $userLogin === $user->user_login ) {
+                    $capturedKey = $key;
+                }
+            };
+            $preMail     = static fn (): bool => true;
+
+            add_filter( 'pre_wp_mail', $preMail, 1 );
+            add_action( 'retrieve_password_key', $keyHook, 10, 2 );
+            add_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
+            try {
+                $allowReset  = apply_filters( 'allow_password_reset', true, $uid );
+                $retrieveRes = retrieve_password( $user->user_login );
+                $checked     = '' !== $capturedKey ? check_password_reset_key( $capturedKey, $user->user_login ) : null;
+                $valErrors   = new WP_Error();
+                if ( $checked instanceof WP_User ) {
+                    do_action( 'validate_password_reset', $valErrors, $checked );
+                }
+                reset_password( $user, $newPass );
+                $appAvail = wp_is_application_passwords_available_for_user( $user );
+            } finally {
+                remove_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
+                remove_action( 'retrieve_password_key', $keyHook, 10 );
+                remove_filter( 'pre_wp_mail', $preMail, 1 );
+            }
+
+            self::assertTrue( $allowReset );
+            self::assertTrue( $retrieveRes );
+            self::assertNotSame( '', $capturedKey );
+            self::assertInstanceOf( WP_User::class, $checked );
+            self::assertFalse( $valErrors->has_errors() );
+            self::assertFalse( $appAvail );
+
+            $after = get_userdata( $uid );
+            self::assertInstanceOf( WP_User::class, $after );
+            self::assertNotSame( $origHash, (string) $after->user_pass );
+            self::assertTrue( wp_check_password( $newPass, (string) $after->user_pass, $uid ) );
+        } finally {
+            if ( $createdCustomerRole ) {
+                remove_role( 'customer' );
+            }
+        }
+    }
+
+    /**
+     * Round 5 T3: proves non-XML-RPC WP password login (`wp_authenticate` & `wp_signon`) succeeds for
+     * `patient+subscriber` WITH a live `cpms_patient_logins` row and `patient+customer`, returns generic
+     * WP `incorrect_password` on wrong password, and keeps pure `ROLE_PATIENT`-only with a live login
+     * row and `UNKNOWN` lookup-failure blocked with `cpms_patient_otp_required`.
+     */
+    public function testRound5T3SharedAccountPasswordLoginSucceedsWithLiveLoginRowWhileWrongPasswordAndPureOtpFail(): void {
+        global $wpdb;
+
+        $createdCustomerRole = false;
+        if ( null === get_role( 'customer' ) ) {
+            add_role( 'customer', 'Customer', [ 'read' => true ] );
+            $createdCustomerRole = true;
+        }
+
+        $suppressCookies = static fn (): bool => false;
+        add_filter( 'send_auth_cookies', $suppressCookies, 10, 1 );
+        try {
+            $subPass  = 'R5T3SubPass123!';
+            $custPass = 'R5T3CustPass123!';
+            $subId    = $this->createUser( 'r5_t3_patsub_' . uniqid(), $subPass, RolesAndCapabilities::ROLE_PATIENT );
+            $subUser  = get_userdata( $subId );
+            self::assertInstanceOf( WP_User::class, $subUser );
+            $subUser->add_role( 'subscriber' );
+
+            $logins = new PatientLoginRepository( App::db() );
+            $aid    = $logins->insert_pending_account( $subId, '09128880002', 'تی۳', 'لاگین' );
+            $logins->activate_account_from_pending( $aid, $subId );
+
+            $custId   = $this->createUser( 'r5_t3_patcust_' . uniqid(), $custPass, RolesAndCapabilities::ROLE_PATIENT );
+            $custUser = get_userdata( $custId );
+            self::assertInstanceOf( WP_User::class, $custUser );
+            $custUser->add_role( 'customer' );
+
+            $subAuth    = wp_authenticate( $subUser->user_login, $subPass );
+            $subSignon  = wp_signon( [ 'user_login' => $subUser->user_login, 'user_password' => $subPass, 'remember' => false ], false );
+            $subWrong   = wp_authenticate( $subUser->user_login, 'WrongSubPass999!' );
+            $custAuth   = wp_authenticate( $custUser->user_login, $custPass );
+            $custSignon = wp_signon( [ 'user_login' => $custUser->user_login, 'user_password' => $custPass, 'remember' => false ], false );
+            $custWrong  = wp_authenticate( $custUser->user_login, 'WrongCustPass999!' );
+
+            self::assertInstanceOf( WP_User::class, $subAuth );
+            self::assertSame( $subId, $subAuth->ID );
+            self::assertInstanceOf( WP_User::class, $subSignon );
+            self::assertSame( $subId, $subSignon->ID );
+            self::assertInstanceOf( WP_Error::class, $subWrong );
+            self::assertSame( 'incorrect_password', $subWrong->get_error_code() );
+            self::assertStringNotContainsString( 'بیمار', $subWrong->get_error_message() );
+
+            self::assertInstanceOf( WP_User::class, $custAuth );
+            self::assertSame( $custId, $custAuth->ID );
+            self::assertInstanceOf( WP_User::class, $custSignon );
+            self::assertSame( $custId, $custSignon->ID );
+            self::assertInstanceOf( WP_Error::class, $custWrong );
+            self::assertSame( 'incorrect_password', $custWrong->get_error_code() );
+            self::assertStringNotContainsString( 'بیمار', $custWrong->get_error_message() );
+
+            // Pure OTP patient with live `cpms_patient_logins` row stays blocked on right & wrong password.
+            $otpUser = get_userdata( $this->userAccountActive );
+            self::assertInstanceOf( WP_User::class, $otpUser );
+            $otpRight = wp_authenticate( $otpUser->user_login, $this->patientKnownPass );
+            $otpWrong = wp_authenticate( $otpUser->user_login, 'WrongOtpPass999!' );
+            self::assertInstanceOf( WP_Error::class, $otpRight );
+            self::assertSame( PatientCredentialGuard::ERROR_CODE, $otpRight->get_error_code() );
+            self::assertInstanceOf( WP_Error::class, $otpWrong );
+            self::assertSame( PatientCredentialGuard::ERROR_CODE, $otpWrong->get_error_code() );
+
+            // UNKNOWN lookup-failure stays closed on non-XML-RPC wp_authenticate().
+            $unkId   = $this->createUser( 'r5_t3_unk_' . uniqid(), $subPass, RolesAndCapabilities::ROLE_PATIENT );
+            $unkUser = get_userdata( $unkId );
+            self::assertInstanceOf( WP_User::class, $unkUser );
+            $orgTable = App::db()->table( 'cpms_organization_memberships' );
+            $exactSql = 'SELECT id FROM ' . $orgTable . " WHERE wp_user_id = {$unkId} AND status = 'active' LIMIT 1";
+            $hits     = 0;
+            $fault    = static function ( mixed $query ) use ( $exactSql, $orgTable, &$hits ): mixed {
+                if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                    ++$hits;
+                    return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+                }
+                return $query;
+            };
+            $prevSuppress = (bool) $wpdb->suppress_errors( true );
+            add_filter( 'query', $fault, 5 );
+            try {
+                $unkAuth = wp_authenticate( $unkUser->user_login, $subPass );
+            } finally {
+                remove_filter( 'query', $fault, 5 );
+                $wpdb->suppress_errors( $prevSuppress );
+            }
+            self::assertGreaterThanOrEqual( 1, $hits );
+            self::assertInstanceOf( WP_Error::class, $unkAuth );
+            self::assertSame( PatientCredentialGuard::ERROR_CODE, $unkAuth->get_error_code() );
+        } finally {
+            remove_filter( 'send_auth_cookies', $suppressCookies, 10 );
+            if ( $createdCustomerRole ) {
+                remove_role( 'customer' );
+            }
+        }
+    }
+
+    /**
+     * Round 5 T4: proves all non-recovery closures (XML-RPC, Application Passwords, REST `/wp/v2/users/me`
+     * writes, `profile.php`/`user-edit.php` POST, `newuseremail`, `dismiss`) remain enforced on stored
+     * state for `patient+subscriber` and `patient+customer` even after password reset + WP password login,
+     * while `profile.php` GET remains open without forced portal redirect.
+     */
+    public function testRound5T4AllClosuresHoldOnStoredDataAfterSharedAccountResetAndPasswordLogin(): void {
+        if ( ! class_exists( wp_xmlrpc_server::class ) && defined( 'ABSPATH' ) && defined( 'WPINC' ) ) {
+            $ixrFile    = ABSPATH . WPINC . '/class-IXR.php';
+            $serverFile = ABSPATH . WPINC . '/class-wp-xmlrpc-server.php';
+            if ( file_exists( $ixrFile ) ) {
+                require_once $ixrFile;
+            }
+            if ( file_exists( $serverFile ) ) {
+                require_once $serverFile;
+            }
+        }
+        self::assertTrue( class_exists( wp_xmlrpc_server::class ) );
+
+        $createdCustomerRole = false;
+        if ( null === get_role( 'customer' ) ) {
+            add_role( 'customer', 'Customer', [ 'read' => true ] );
+            $createdCustomerRole = true;
+        }
+
+        $prevGet        = $_GET;
+        $prevPost       = $_POST;
+        $prevRequest    = $_REQUEST;
+        $prevMethod     = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+        $prevPagenow    = $GLOBALS['pagenow'] ?? null;
+        $prevRemoteAddr = $_SERVER['REMOTE_ADDR'] ?? null;
+        $suppress       = static fn (): bool => false;
+        $preMail        = static fn (): bool => true;
+
+        try {
+            foreach ( [ 'subscriber', 'customer' ] as $extraRole ) {
+                $oldPass = 'R5T4OldPass123!';
+                $newPass = 'R5T4NewPass456!';
+                $uid     = $this->createUser( 'r5_t4_' . $extraRole . '_' . uniqid(), $oldPass, RolesAndCapabilities::ROLE_PATIENT );
+                $user    = get_userdata( $uid );
+                self::assertInstanceOf( WP_User::class, $user );
+                $user->add_role( $extraRole );
+                $origEmail = (string) $user->user_email;
+
+                add_filter( 'pre_wp_mail', $preMail, 1 );
+                add_filter( 'send_auth_cookies', $suppress, 10, 1 );
+                add_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
+                try {
+                    reset_password( $user, $newPass );
+                    $signon = wp_signon( [ 'user_login' => $user->user_login, 'user_password' => $newPass, 'remember' => false ], false );
+                    self::assertInstanceOf( WP_User::class, $signon );
+                    $resetHash = (string) $signon->user_pass;
+
+                    PatientTwoProofTestHelper::acting_as( $uid );
+
+                    $pendingMeta = [ 'hash' => 'r5_t4_hash_' . $extraRole, 'newemail' => 'r5t4pending@clinic.test' ];
+                    update_user_meta( $uid, '_new_email', $pendingMeta );
+
+                    // GET profile.php stays unblocked (WooCommerceAdminAccessProfileTest preserved).
+                    $GLOBALS['pagenow']        = 'profile.php';
+                    $_SERVER['REQUEST_METHOD'] = 'GET';
+                    $_GET                      = [];
+                    $_POST                     = [];
+                    $_REQUEST                  = [];
+                    $getRedirect               = $this->captureGuardWpAdminRedirect( $uid, [], 'GET' );
+                    self::assertNull( $getRedirect, $extraRole );
+
+                    // POST profile.php + personal_options_update + edit_user_profile_update + newuseremail + dismiss blocked.
+                    $_SERVER['REQUEST_METHOD'] = 'POST';
+                    $_POST                     = [
+                        'user_id'    => (string) $uid,
+                        'email'      => 'evil-' . $extraRole . '@clinic.test',
+                        'pass1'      => 'EvilPass123!',
+                        'pass2'      => 'EvilPass123!',
+                        'first_name' => 'EvilFirst',
+                    ];
+                    $_REQUEST                  = $_POST;
+                    $profileDied               = false;
+                    try {
+                        do_action( 'personal_options_update', $uid );
+                    } catch ( WPDieException ) {
+                        $profileDied = true;
+                    }
+                    $editDied = false;
+                    try {
+                        do_action( 'edit_user_profile_update', $uid );
+                    } catch ( WPDieException ) {
+                        $editDied = true;
+                    }
+
+                    $GLOBALS['pagenow'] = 'profile.php';
+                    $_GET               = [ 'newuseremail' => $pendingMeta['hash'] ];
+                    $_REQUEST           = $_GET;
+                    $_POST              = [];
+                    $newEmailDied       = false;
+                    try {
+                        PatientPortalPage::guardWpAdmin();
+                    } catch ( WPDieException ) {
+                        $newEmailDied = true;
+                    }
+
+                    $_GET        = [ 'dismiss' => $uid . '_new_email', '_wpnonce' => wp_create_nonce( 'dismiss-' . $uid . '_new_email' ) ];
+                    $_REQUEST    = $_GET;
+                    $dismissDied = false;
+                    try {
+                        PatientPortalPage::guardWpAdmin();
+                    } catch ( WPDieException ) {
+                        $dismissDied = true;
+                    }
+
+                    // REST /wp/v2/users/me writes + Application Passwords blocked.
+                    $_GET     = [];
+                    $_REQUEST = [];
+                    $nonce    = wp_create_nonce( 'wp_rest' );
+                    $restPut  = $this->dispatchRestWithNonce( 'PUT', '/wp/v2/users/me', [ 'email' => 'rest-' . $extraRole . '@clinic.test', 'password' => 'RestEvil123!', 'first_name' => 'RestEvil' ], $nonce );
+                    $appAvail = wp_is_application_passwords_available_for_user( $signon );
+                    $appRest  = $this->dispatchRestWithNonce( 'POST', '/wp/v2/users/me/application-passwords', [ 'name' => 'R5T4App_' . $extraRole ], $nonce );
+
+                    // XML-RPC blocked.
+                    unset( $_SERVER['REMOTE_ADDR'] );
+                    $xmlEdit = ( new wp_xmlrpc_server() )->wp_editProfile( [ 1, $user->user_login, $newPass, [ 'first_name' => 'XmlEvil' ] ] );
+                } finally {
+                    remove_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
+                    remove_filter( 'send_auth_cookies', $suppress, 10 );
+                    remove_filter( 'pre_wp_mail', $preMail, 1 );
+                }
+
+                self::assertTrue( $profileDied, $extraRole );
+                self::assertTrue( $editDied, $extraRole );
+                self::assertTrue( $newEmailDied, $extraRole );
+                self::assertTrue( $dismissDied, $extraRole );
+                self::assertSame( 403, $restPut->get_status(), $extraRole );
+                self::assertFalse( $appAvail, $extraRole );
+                self::assertSame( 403, $appRest->get_status(), $extraRole );
+                self::assertInstanceOf( IXR_Error::class, $xmlEdit, $extraRole );
+                self::assertSame( 403, $xmlEdit->code, $extraRole );
+
+                $after = get_userdata( $uid );
+                self::assertInstanceOf( WP_User::class, $after, $extraRole );
+                self::assertSame( $origEmail, (string) $after->user_email, $extraRole );
+                self::assertSame( $resetHash, (string) $after->user_pass, $extraRole );
+                self::assertSame( '', (string) $after->first_name, $extraRole );
+                self::assertSame( $pendingMeta, get_user_meta( $uid, '_new_email', true ), $extraRole );
+            }
+        } finally {
+            $_GET                      = $prevGet;
+            $_POST                     = $prevPost;
+            $_REQUEST                  = $prevRequest;
+            $_SERVER['REQUEST_METHOD'] = $prevMethod;
+            if ( null === $prevPagenow ) {
+                unset( $GLOBALS['pagenow'] );
+            } else {
+                $GLOBALS['pagenow'] = $prevPagenow;
+            }
+            if ( null === $prevRemoteAddr ) {
+                unset( $_SERVER['REMOTE_ADDR'] );
+            } else {
+                $_SERVER['REMOTE_ADDR'] = $prevRemoteAddr;
+            }
+            if ( $createdCustomerRole ) {
+                remove_role( 'customer' );
+            }
+        }
+    }
+
+    /**
+     * Round 5 T5: proves patient clinical data routes (`/patient/me`, `/patient/my-records`,
+     * `/appointments/mine`, `/patients/{id}/files`) and the public/portal booking chooser stay CLOSED
+     * (403 `CLINIC_PATIENT_PROOF_FAILED` / zero chooser markup or linked PHI) after WP password login
+     * or password reset without SMS OTP + matching national ID proof — for `patient+subscriber`,
+     * `patient+customer`, AND legacy `ROLE_PATIENT` without a login row.
+     */
+    public function testRound5T5PatientDataRoutesAndBookingChooserStayClosedAfterWpPasswordLoginOrReset(): void {
+        $createdCustomerRole = false;
+        if ( null === get_role( 'customer' ) ) {
+            add_role( 'customer', 'Customer', [ 'read' => true ] );
+            $createdCustomerRole = true;
+        }
+
+        $db       = App::db();
+        $now      = $db->nowUtcSql();
+        $suppress = static fn (): bool => false;
+
+        try {
+            $fixtures = [
+                'patient_plus_subscriber' => [ 'roles' => [ RolesAndCapabilities::ROLE_PATIENT, 'subscriber' ], 'with_login_row' => true, 'tag' => '۱' ],
+                'patient_plus_customer'   => [ 'roles' => [ RolesAndCapabilities::ROLE_PATIENT, 'customer' ], 'with_login_row' => false, 'tag' => '۲' ],
+                'legacy_role_patient'     => [ 'roles' => [ RolesAndCapabilities::ROLE_PATIENT ], 'with_login_row' => false, 'tag' => '۳' ],
+            ];
+
+            $seq = 1;
+            foreach ( $fixtures as $label => $cfg ) {
+                $pass = 'R5T5Pass123!';
+                $uid  = $this->createUser( 'r5_t5_' . $label . '_' . uniqid(), $pass, $cfg['roles'][0] );
+                $user = get_userdata( $uid );
+                self::assertInstanceOf( WP_User::class, $user, $label );
+                if ( isset( $cfg['roles'][1] ) ) {
+                    $user->add_role( $cfg['roles'][1] );
+                }
+                if ( $cfg['with_login_row'] ) {
+                    $logins = new PatientLoginRepository( $db );
+                    $aid    = $logins->insert_pending_account( $uid, '0912888001' . $cfg['tag'], 'تی۵', 'بیمار' . $cfg['tag'] );
+                    $logins->activate_account_from_pending( $aid, $uid );
+                }
+
+                // Seed 2 linked active patients in the clinic so booking chooser would render if unguarded.
+                $linkedIds  = [];
+                $firstNames = [ 'فاطمه' . $label, 'زهرا' . $label ];
+                foreach ( $firstNames as $idx => $fname ) {
+                    $num = $seq++;
+                    $db->insert(
+                        'cpms_patients',
+                        [
+                            'clinic_id'   => $this->clinicPublic,
+                            'mrn'         => 'MR-R5T5-' . $num . '-' . uniqid(),
+                            'first_name'  => $fname,
+                            'last_name'   => 'آزمون' . $idx,
+                            'mobile'      => '0913' . str_pad( (string) ( 5000000 + $num ), 7, '0', STR_PAD_LEFT ),
+                            'national_id' => '00' . str_pad( (string) ( 10000000 + $num ), 8, '0', STR_PAD_LEFT ),
+                            'birth_date'  => '1992-01-15',
+                            'status'      => 'active',
+                            'created_at'  => $now,
+                            'updated_at'  => $now,
+                        ]
+                    );
+                    $pid         = $db->wpdb_last_insert_id();
+                    $linkedIds[] = $pid;
+                    $db->insert(
+                        'cpms_patient_user_links',
+                        [
+                            'clinic_id'      => $this->clinicPublic,
+                            'patient_id'     => $pid,
+                            'wp_user_id'     => $uid,
+                            'mobile_at_link' => '09128880099',
+                            'is_primary'     => 0 === $idx ? 1 : 0,
+                            'linked_at'      => $now,
+                        ]
+                    );
+                }
+
+                add_filter( 'send_auth_cookies', $suppress, 10, 1 );
+                try {
+                    if ( 'legacy_role_patient' !== $label ) {
+                        reset_password( $user, 'R5T5ResetPass123!' );
+                        $pass = 'R5T5ResetPass123!';
+                    }
+                    $signon = wp_signon( [ 'user_login' => $user->user_login, 'user_password' => $pass, 'remember' => false ], false );
+                    self::assertInstanceOf( WP_User::class, $signon, $label );
+                } finally {
+                    remove_filter( 'send_auth_cookies', $suppress, 10 );
+                }
+
+                PatientTwoProofTestHelper::acting_as( $uid );
+
+                $meResp    = $this->dispatchRest( 'GET', '/clinic/v1/patient/me' );
+                $recResp   = $this->dispatchRest( 'GET', '/clinic/v1/patient/my-records' );
+                $apptsResp = $this->dispatchRest( 'GET', '/clinic/v1/appointments/mine' );
+                $filesResp = $this->dispatchRest( 'GET', '/clinic/v1/patients/' . $linkedIds[0] . '/files' );
+
+                foreach ( [ 'me' => $meResp, 'my_records' => $recResp, 'appointments' => $apptsResp, 'files' => $filesResp ] as $routeName => $resp ) {
+                    self::assertSame( 403, $resp->get_status(), $label . ':' . $routeName );
+                    $rdata = $resp->get_data();
+                    self::assertIsArray( $rdata, $label . ':' . $routeName );
+                    self::assertSame( PatientAccess::PROOF_FAILED_CODE, $rdata['code'], $label . ':' . $routeName );
+                }
+
+                $publicHtml = PublicBookingShortcode::render( [ 'clinic_id' => $this->clinicPublic ] );
+                $portalHtml = PublicBookingShortcode::render_for_patient_portal( $this->clinicPublic );
+                foreach ( [ $publicHtml, $portalHtml ] as $html ) {
+                    self::assertStringNotContainsString( 'data-role="patient-chooser"', $html, $label );
+                    self::assertStringNotContainsString( $firstNames[0], $html, $label );
+                    self::assertStringNotContainsString( $firstNames[1], $html, $label );
+                }
+            }
+        } finally {
+            if ( $createdCustomerRole ) {
+                remove_role( 'customer' );
+            }
+        }
+    }
+
+    /**
+     * Round 5 T6: proves pure `ROLE_PATIENT`-only accounts (both OTP-registered with `cpms_patient_logins`
+     * row and legacy without row) and `UNKNOWN` lookup failures stay CLOSED on password reset.
+     */
+    public function testRound5T6PureRolePatientOnlyAndUnknownLookupFailureStayClosedOnResetAndLogin(): void {
+        global $wpdb;
+
+        $legacyId   = $this->createUser( 'r5_t6_legacy_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+        $legacyUser = get_userdata( $legacyId );
+        $otpUser    = get_userdata( $this->userAccountActive );
+        $unkId      = $this->createUser( 'r5_t6_unk_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+        $unkUser    = get_userdata( $unkId );
+        self::assertInstanceOf( WP_User::class, $legacyUser );
+        self::assertInstanceOf( WP_User::class, $otpUser );
+        self::assertInstanceOf( WP_User::class, $unkUser );
+
+        self::assertFalse( App::patient_access()->is_shared_patient_account( $legacyUser ) );
+        self::assertFalse( App::patient_access()->is_shared_patient_account( $otpUser ) );
+
+        $preMail = static fn (): bool => true;
+        add_filter( 'pre_wp_mail', $preMail, 1 );
+        try {
+            foreach ( [ 'otp_patient' => $otpUser, 'legacy_patient' => $legacyUser ] as $label => $u ) {
+                $origHash = (string) $u->user_pass;
+                self::assertFalse( apply_filters( 'allow_password_reset', true, (int) $u->ID ), $label );
+                $ret = retrieve_password( $u->user_login );
+                self::assertInstanceOf( WP_Error::class, $ret, $label );
+                self::assertSame( 'no_password_reset', $ret->get_error_code(), $label );
+                $keyErr = get_password_reset_key( $u );
+                self::assertInstanceOf( WP_Error::class, $keyErr, $label );
+                self::assertSame( 'no_password_reset', $keyErr->get_error_code(), $label );
+
+                $rawKey = 'R5T6RawKey123456';
+                wp_update_user( [ 'ID' => $u->ID, 'user_activation_key' => time() . ':' . wp_fast_hash( $rawKey ) ] );
+                $checked = check_password_reset_key( $rawKey, $u->user_login );
+                self::assertInstanceOf( WP_User::class, $checked, $label );
+                $valErr = new WP_Error();
+                do_action( 'validate_password_reset', $valErr, $checked );
+                self::assertContains( PatientCredentialGuard::ERROR_CODE, $valErr->get_error_codes(), $label );
+
+                $died = false;
+                try {
+                    reset_password( $u, 'R5T6AttemptPass!' );
+                } catch ( WPDieException ) {
+                    $died = true;
+                }
+                self::assertTrue( $died, $label );
+                $after = get_userdata( $u->ID );
+                self::assertInstanceOf( WP_User::class, $after, $label );
+                self::assertSame( $origHash, (string) $after->user_pass, $label );
+            }
+
+            // UNKNOWN lookup-failure on shared-role candidate stays fail-closed on reset.
+            $unkUser->add_role( 'subscriber' );
+            $unkHashBefore = (string) $unkUser->user_pass;
+            $orgTable      = App::db()->table( 'cpms_organization_memberships' );
+            $exactSql      = 'SELECT id FROM ' . $orgTable . " WHERE wp_user_id = {$unkId} AND status = 'active' LIMIT 1";
+            $hits          = 0;
+            $fault         = static function ( mixed $query ) use ( $exactSql, $orgTable, &$hits ): mixed {
+                if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                    ++$hits;
+                    return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+                }
+                return $query;
+            };
+            $prevSuppress = (bool) $wpdb->suppress_errors( true );
+            add_filter( 'query', $fault, 5 );
+            $unkDied = false;
+            try {
+                $unkAllow = apply_filters( 'allow_password_reset', true, $unkId );
+                $unkRet   = retrieve_password( $unkUser->user_login );
+                try {
+                    reset_password( $unkUser, 'R5T6UnkPass!' );
+                } catch ( WPDieException ) {
+                    $unkDied = true;
+                }
+            } finally {
+                remove_filter( 'query', $fault, 5 );
+                $wpdb->suppress_errors( $prevSuppress );
+            }
+            self::assertGreaterThanOrEqual( 3, $hits );
+            self::assertFalse( $unkAllow );
+            self::assertInstanceOf( WP_Error::class, $unkRet );
+            self::assertSame( 'no_password_reset', $unkRet->get_error_code() );
+            self::assertTrue( $unkDied );
+            $unkAfter = get_userdata( $unkId );
+            self::assertInstanceOf( WP_User::class, $unkAfter );
+            self::assertSame( $unkHashBefore, (string) $unkAfter->user_pass );
+        } finally {
+            remove_filter( 'pre_wp_mail', $preMail, 1 );
+        }
+    }
+
+    /**
+     * Round 5 T7 (INFERENCE for real WooCommerce): exercises `woocommerce_save_account_details_errors`
+     * via `do_action_ref_array()` + `WP_Error`: blocks email change or new password for shared accounts
+     * (`patient+subscriber`, `patient+customer`) and `UNKNOWN`, permits name-only edits, and leaves
+     * staff, admins, and non-patient customers unaffected.
+     */
+    public function testRound5T7WooCommerceEditAccountHookBlocksEmailAndPasswordButAllowsNameOnlyAndControls(): void {
+        global $wpdb;
+
+        $createdCustomerRole = false;
+        if ( null === get_role( 'customer' ) ) {
+            add_role( 'customer', 'Customer', [ 'read' => true ] );
+            $createdCustomerRole = true;
+        }
+
+        try {
+            $patSubId = $this->createUser( 'r5_t7_patsub_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+            $patSub   = get_userdata( $patSubId );
+            self::assertInstanceOf( WP_User::class, $patSub );
+            $patSub->add_role( 'subscriber' );
+
+            $patCustId = $this->createUser( 'r5_t7_patcust_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+            $patCust   = get_userdata( $patCustId );
+            self::assertInstanceOf( WP_User::class, $patCust );
+            $patCust->add_role( 'customer' );
+
+            $adminId   = $this->createUser( 'r5_t7_admin_' . uniqid(), $this->patientKnownPass, 'administrator' );
+            $adminUser = get_userdata( $adminId );
+            $custId    = $this->createUser( 'r5_t7_cust_' . uniqid(), $this->patientKnownPass, 'customer' );
+            $custUser  = get_userdata( $custId );
+            $staffUser = get_userdata( $this->staffDoctorUser );
+            self::assertInstanceOf( WP_User::class, $adminUser );
+            self::assertInstanceOf( WP_User::class, $custUser );
+            self::assertInstanceOf( WP_User::class, $staffUser );
+
+            foreach ( [ 'patient_plus_subscriber' => $patSub, 'patient_plus_customer' => $patCust ] as $label => $u ) {
+                // 1) Email change blocked with non-revealing constant error.
+                $errEmail               = new WP_Error();
+                $payloadEmail           = new stdClass();
+                $payloadEmail->ID       = $u->ID;
+                $payloadEmail->user_email = 'changed-' . $label . '@clinic.test';
+                do_action_ref_array( 'woocommerce_save_account_details_errors', [ &$errEmail, &$payloadEmail ] );
+                self::assertTrue( $errEmail->has_errors(), $label . ':email' );
+                self::assertContains( PatientCredentialGuard::ERROR_CODE, $errEmail->get_error_codes(), $label . ':email' );
+                self::assertSame( PatientCredentialGuard::ACCOUNT_CHANGE_DENIED_MESSAGE, $errEmail->get_error_message( PatientCredentialGuard::ERROR_CODE ), $label . ':email' );
+                self::assertStringNotContainsString( 'بیمار', $errEmail->get_error_message( PatientCredentialGuard::ERROR_CODE ) );
+
+                // 2) New password blocked.
+                $errPass               = new WP_Error();
+                $payloadPass           = new stdClass();
+                $payloadPass->ID       = $u->ID;
+                $payloadPass->user_email = $u->user_email;
+                $payloadPass->user_pass  = 'WcNewPass123!';
+                do_action_ref_array( 'woocommerce_save_account_details_errors', [ &$errPass, &$payloadPass ] );
+                self::assertTrue( $errPass->has_errors(), $label . ':password' );
+                self::assertContains( PatientCredentialGuard::ERROR_CODE, $errPass->get_error_codes(), $label . ':password' );
+
+                // 3) First/last/display name only (same email, empty/unset password) allowed.
+                $errName                 = new WP_Error();
+                $payloadName             = new stdClass();
+                $payloadName->ID         = $u->ID;
+                $payloadName->user_email = $u->user_email;
+                $payloadName->first_name = 'نام';
+                $payloadName->last_name  = 'جدید';
+                $payloadName->display_name = 'نام جدید';
+                do_action_ref_array( 'woocommerce_save_account_details_errors', [ &$errName, &$payloadName ] );
+                self::assertFalse( $errName->has_errors(), $label . ':name_only' );
+            }
+
+            // 4) UNKNOWN lookup-failure fails closed on email/password change.
+            $orgTable = App::db()->table( 'cpms_organization_memberships' );
+            $exactSql = 'SELECT id FROM ' . $orgTable . " WHERE wp_user_id = {$patSubId} AND status = 'active' LIMIT 1";
+            $hits     = 0;
+            $fault    = static function ( mixed $query ) use ( $exactSql, $orgTable, &$hits ): mixed {
+                if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                    ++$hits;
+                    return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+                }
+                return $query;
+            };
+            $prevSuppress = (bool) $wpdb->suppress_errors( true );
+            add_filter( 'query', $fault, 5 );
+            $errUnk               = new WP_Error();
+            $payloadUnk           = new stdClass();
+            $payloadUnk->ID       = $patSubId;
+            $payloadUnk->user_email = 'unk-wc@clinic.test';
+            try {
+                do_action_ref_array( 'woocommerce_save_account_details_errors', [ &$errUnk, &$payloadUnk ] );
+            } finally {
+                remove_filter( 'query', $fault, 5 );
+                $wpdb->suppress_errors( $prevSuppress );
+            }
+            self::assertSame( 1, $hits );
+            self::assertTrue( $errUnk->has_errors() );
+
+            // 5) Controls: staff, administrator, and non-patient customer unaffected even on email+password change.
+            foreach ( [ 'staff_doctor' => $staffUser, 'admin' => $adminUser, 'non_patient_customer' => $custUser ] as $ctrlLabel => $ctrlUser ) {
+                $errCtrl               = new WP_Error();
+                $payloadCtrl           = new stdClass();
+                $payloadCtrl->ID       = $ctrlUser->ID;
+                $payloadCtrl->user_email = 'ok-' . $ctrlLabel . '@clinic.test';
+                $payloadCtrl->user_pass  = 'CtrlNewPass123!';
+                do_action_ref_array( 'woocommerce_save_account_details_errors', [ &$errCtrl, &$payloadCtrl ] );
+                self::assertFalse( $errCtrl->has_errors(), $ctrlLabel );
+            }
+        } finally {
+            if ( $createdCustomerRole ) {
+                remove_role( 'customer' );
+            }
+        }
+    }
+
+    /**
+     * Round 5 T8: positive control proving `administrator`, `doctor`, and mixed `ROLE_PATIENT + ROLE_DOCTOR`
+     * remain unaffected across password reset, WP password login, XML-RPC, Application Passwords, and
+     * WooCommerce edit-account hook.
+     */
+    public function testRound5T8StaffAdminAndMixedAccountsRemainUnaffectedAcrossAllRound5Surfaces(): void {
+        if ( ! class_exists( wp_xmlrpc_server::class ) && defined( 'ABSPATH' ) && defined( 'WPINC' ) ) {
+            $ixrFile    = ABSPATH . WPINC . '/class-IXR.php';
+            $serverFile = ABSPATH . WPINC . '/class-wp-xmlrpc-server.php';
+            if ( file_exists( $ixrFile ) ) {
+                require_once $ixrFile;
+            }
+            if ( file_exists( $serverFile ) ) {
+                require_once $serverFile;
+            }
+        }
+        self::assertTrue( class_exists( wp_xmlrpc_server::class ) );
+
+        $adminId = $this->createUser( 'r5_t8_admin_' . uniqid(), 'R5T8AdminOld1!', 'administrator' );
+        $mixedId = $this->createUser( 'r5_t8_mixed_' . uniqid(), 'R5T8MixedOld1!', RolesAndCapabilities::ROLE_PATIENT );
+        $mixed   = get_userdata( $mixedId );
+        self::assertInstanceOf( WP_User::class, $mixed );
+        $mixed->add_role( RolesAndCapabilities::ROLE_DOCTOR );
+
+        $controls = [
+            'admin'        => [ 'uid' => $adminId, 'new_pass' => 'R5T8AdminNew2!' ],
+            'staff_doctor' => [ 'uid' => $this->staffDoctorUser, 'new_pass' => 'R5T8DocNew2!' ],
+            'mixed_doctor' => [ 'uid' => $mixedId, 'new_pass' => 'R5T8MixedNew2!' ],
+        ];
+
+        $prevRemoteAddr = $_SERVER['REMOTE_ADDR'] ?? null;
+        $preMail        = static fn (): bool => true;
+        $suppress       = static fn (): bool => false;
+
+        try {
+            foreach ( $controls as $label => $cfg ) {
+                $uid  = (int) $cfg['uid'];
+                $user = get_userdata( $uid );
+                self::assertInstanceOf( WP_User::class, $user, $label );
+                self::assertFalse( App::patient_access()->is_shared_patient_account( $user ), $label );
+                self::assertSame( 'NOT_PATIENT', App::patient_access()->patient_target_state( $user ), $label );
+
+                $capturedKey = '';
+                $keyHook     = static function ( string $userLogin, string $key ) use ( $user, &$capturedKey ): void {
+                    if ( $userLogin === $user->user_login ) {
+                        $capturedKey = $key;
+                    }
+                };
+                add_filter( 'pre_wp_mail', $preMail, 1 );
+                add_action( 'retrieve_password_key', $keyHook, 10, 2 );
+                add_filter( 'send_auth_cookies', $suppress, 10, 1 );
+                add_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
+                try {
+                    self::assertTrue( apply_filters( 'allow_password_reset', true, $uid ), $label );
+                    self::assertTrue( retrieve_password( $user->user_login ), $label );
+                    $checked = check_password_reset_key( $capturedKey, $user->user_login );
+                    self::assertInstanceOf( WP_User::class, $checked, $label );
+                    $valErr = new WP_Error();
+                    do_action( 'validate_password_reset', $valErr, $checked );
+                    self::assertFalse( $valErr->has_errors(), $label );
+                    reset_password( $user, $cfg['new_pass'] );
+
+                    $signon = wp_signon( [ 'user_login' => $user->user_login, 'user_password' => $cfg['new_pass'], 'remember' => false ], false );
+                    self::assertInstanceOf( WP_User::class, $signon, $label );
+                    self::assertTrue( wp_is_application_passwords_available_for_user( $signon ), $label );
+
+                    unset( $_SERVER['REMOTE_ADDR'] );
+                    $xmlEdit = ( new wp_xmlrpc_server() )->wp_editProfile( [ 1, $user->user_login, $cfg['new_pass'], [ 'first_name' => 'CtrlOk_' . $label ] ] );
+                    self::assertTrue( $xmlEdit, $label );
+
+                    $wcErr              = new WP_Error();
+                    $wcPayload          = new stdClass();
+                    $wcPayload->ID      = $uid;
+                    $wcPayload->user_email = 'ctrl-' . $label . '@clinic.test';
+                    $wcPayload->user_pass  = 'CtrlWcPass1!';
+                    do_action_ref_array( 'woocommerce_save_account_details_errors', [ &$wcErr, &$wcPayload ] );
+                    self::assertFalse( $wcErr->has_errors(), $label );
+                } finally {
+                    remove_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
+                    remove_filter( 'send_auth_cookies', $suppress, 10 );
+                    remove_action( 'retrieve_password_key', $keyHook, 10 );
+                    remove_filter( 'pre_wp_mail', $preMail, 1 );
+                }
+            }
+        } finally {
+            if ( null === $prevRemoteAddr ) {
+                unset( $_SERVER['REMOTE_ADDR'] );
+            } else {
+                $_SERVER['REMOTE_ADDR'] = $prevRemoteAddr;
+            }
         }
     }
 }
