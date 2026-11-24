@@ -147,7 +147,7 @@ final class HandwritingController extends RestBase
         } catch (HandwritingException $e) {
             return $this->error($e->errorCode, $e->httpStatus, $e->getMessage(), $e->data);
         } catch (\Throwable $e) {
-            error_log('[CPMS][HandwritingController] unexpected: ' . get_class($e) . ': ' . NationalIdValidator::redact_digits( $e->getMessage() ));
+            error_log( '[CPMS][HandwritingController] unexpected: ' . get_class( $e ) . ': ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention; the argument is exception text with the NID digit runs already masked.
 
             return $this->error('CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور — لطفاً دوباره تلاش کنید');
         }
@@ -174,7 +174,7 @@ final class HandwritingController extends RestBase
         } catch (HandwritingException $e) {
             return $this->error($e->errorCode, $e->httpStatus, $e->getMessage(), $e->data);
         } catch (\Throwable $e) {
-            error_log('[CPMS][HandwritingController] unexpected: ' . get_class($e) . ': ' . NationalIdValidator::redact_digits( $e->getMessage() ));
+            error_log( '[CPMS][HandwritingController] unexpected: ' . get_class( $e ) . ': ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention; the argument is exception text with the NID digit runs already masked.
 
             return $this->error('CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور — لطفاً دوباره تلاش کنید');
         }

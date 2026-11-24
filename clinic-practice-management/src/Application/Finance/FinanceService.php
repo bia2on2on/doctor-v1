@@ -1223,7 +1223,7 @@ final class FinanceService
         try {
             $this->visitService->applyTransition($actorUserId, $visit, 'settled', [], 'system');
         } catch (VisitException $e) {
-            error_log('[CPMS][Finance] settle skipped: ' . NationalIdValidator::redact_digits( $e->getMessage() ));
+            error_log( '[CPMS][Finance] settle skipped: ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- operational boundary log; exception text is NID-digit-masked and no request payload is logged.
         }
     }
 

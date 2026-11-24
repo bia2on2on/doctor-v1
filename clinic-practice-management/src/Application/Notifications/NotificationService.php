@@ -369,12 +369,11 @@ final class NotificationService
         }
 
         $rendered = NotificationEvents::render($event, $vars);
+        // B0-PR3 follow-up: raw vars were stored beside the already redacted title/body.
         $payload = [
             'title' => $rendered['title'],
-            'body' => $rendered['body'],
-            // B0-PR3 follow-up: raw vars used to be persisted beside the already
-            // redacted title/body; owner rule forbids a NID in a notification.
-            'vars' => self::redact_vars( $vars ),
+            'body'  => $rendered['body'],
+            'vars'  => self::redact_vars( $vars ),
         ];
 
         $id = $this->notifications->insert($clinic_id, array_merge($recipient, [

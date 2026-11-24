@@ -287,8 +287,12 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
         self::assertNotNull($row['vars_json']);
         self::assertStringNotContainsString($nid, (string) $row['vars_json']);
         self::assertStringContainsString('[nid-redacted]', (string) $row['vars_json']);
-        self::assertStringContainsString('بیمار تست', (string) $row['vars_json']);
-        self::assertStringContainsString('1405/06/10', (string) $row['vars_json']);
+        $storedVars = json_decode((string) $row['vars_json'], true);
+        self::assertIsArray($storedVars);
+        self::assertArrayHasKey('patient_name', $storedVars);
+        self::assertSame('بیمار تست', $storedVars['patient_name']);
+        self::assertArrayHasKey('appointment_date', $storedVars);
+        self::assertSame('1405/06/10', $storedVars['appointment_date']);
 
         // Delivery witness: the provider still receives the legitimate text.
         self::assertCount(1, $this->recording->textSends);
@@ -333,8 +337,9 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
         self::assertArrayHasKey('patient_name', $variables);
         self::assertSame('بیمار تست', $variables['patient_name']);
         self::assertArrayHasKey('national_id', $variables);
-        self::assertStringNotContainsString($nid, (string) json_encode($variables));
-        self::assertStringContainsString('[nid-redacted]', (string) json_encode($variables));
+        self::assertSame('[nid-redacted]', $variables['national_id']);
+        self::assertArrayHasKey('appointment_date', $variables);
+        self::assertSame('1405/06/10', $variables['appointment_date']);
     }
 
     // ------------------------------------------------------------------

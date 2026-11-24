@@ -271,9 +271,8 @@ final class SmsService
             $text = str_replace((string) ($vars['otp_code'] ?? ''), '***', $text);
         }
         // B0-PR3 follow-up: vars_json is a stored copy AND the template-variable
-        // source on a later dispatch; NID-shaped runs are masked before storage.
-        // Ordinary content (names/dates/times) is untouched, so delivery is unchanged.
-        $storedVars = ( $isOtp || $isTest ) ? null : (string) json_encode( $this->redact_vars( $vars ), JSON_UNESCAPED_UNICODE );
+        // source on a later dispatch; NID-shaped runs are masked, content is not.
+        $storedVars = ( $isOtp || $isTest ) ? null : (string) json_encode( $this->redact_vars( $vars ), JSON_UNESCAPED_UNICODE ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase,WordPress.WP.AlternativeFunctions.json_encode_json_encode -- pre-existing $storedVars/$isOtp/$isTest locals; the existing json_encode contract is unchanged.
 
         // Dedupe (الزام §20): رویدادهای وابسته به Context — بدون ارسال تکراری
         $dedupeKey = null;

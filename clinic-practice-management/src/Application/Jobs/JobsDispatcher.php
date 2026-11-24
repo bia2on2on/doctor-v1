@@ -112,12 +112,12 @@ final class JobsDispatcher
                 // می‌شود و Requeue/Backoffِ عمومی نمی‌گیرد؛ سایرِ خطاها مسیرِ
                 // Retry قبلی را دست‌نخورده نگه می‌دارند.
                 if ($e instanceof NonRetryableJobFailure) {
-                    $this->queue->failTerminal((int) $job['id'], NationalIdValidator::redact_digits( $e->getMessage() ), $workerId);
+                    $this->queue->failTerminal( (int) $job['id'], NationalIdValidator::redact_digits( $e->getMessage() ), $workerId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $workerId parameter of tick().
 
                     continue;
                 }
 
-                $this->queue->fail((int) $job['id'], NationalIdValidator::redact_digits( $e->getMessage() ), $workerId);
+                $this->queue->fail( (int) $job['id'], NationalIdValidator::redact_digits( $e->getMessage() ), $workerId ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $workerId parameter of tick().
             }
         }
 
