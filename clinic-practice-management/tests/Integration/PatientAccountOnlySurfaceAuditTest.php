@@ -1699,8 +1699,8 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         try {
             foreach ( $cases as $label => $cfg ) {
                 $uid = (int) $cfg['uid'];
-                if ( null !== $cfg['otp'] ) {
-                    $this->activateSession( (string) $cfg['otp'] );
+                if ( is_array( $cfg['otp'] ) ) {
+                    $this->activateSession( $cfg['otp'] );
                 } else {
                     PatientTwoProofTestHelper::acting_as( $uid );
                 }
