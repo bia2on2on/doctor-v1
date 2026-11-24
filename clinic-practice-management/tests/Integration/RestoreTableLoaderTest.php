@@ -600,12 +600,12 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         // The rows the failed rollback left behind make the emptiness check refuse a retry.
         $rows  = (int) $db->fetchValue('SELECT COUNT(*) FROM %i', [$logins]);
         $retry = null;
+        self::assertGreaterThan(0, $rows, 'the unknown-state load leaves rows behind, so a retry must be refused');
         try {
             (new RestoreTableLoader($db))->preflight(new RestoreDumpReader($this->dump_file), $version);
         } catch (BackupException $exception) {
             $retry = $exception->getErrorCode();
         }
-        self::assertGreaterThan(0, $rows, 'the unknown-state load leaves rows behind');
         self::assertSame('RESTORE_TARGET_NOT_EMPTY', $retry, 'a retry after an unknown state is refused by the emptiness check');
     }
 

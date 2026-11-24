@@ -277,7 +277,9 @@ final class RestoreDumpReaderTest extends TestCase
 
             public function stream_eof(): bool
             {
-                return false; // never reports EOF, so a failure cannot be mistaken for the end of the dump
+                // A healthy stream reports real EOF; the broken one never does, so its failure
+                // cannot be mistaken for the end of the dump.
+                return self::$fail_after_data ? false : feof(self::$handle);
             }
 
             /** @return array<string, int> */
@@ -318,12 +320,15 @@ final class RestoreDumpReaderTest extends TestCase
             'the wrapper path works when the stream does not fail'
         );
 
+        // The broken stream serves a whole valid statement first, then fails: the refusal is mid-dump.
         $failure = null;
+        $seen    = [];
         try {
-            $read("-- ---- table: cpms_patients ----\n", true);
+            $seen = $read("-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n", true);
         } catch (BackupException $exception) {
             $failure = $exception->getErrorCode();
         }
+        self::assertSame([], $seen, 'no table list is returned from a dump that could not be read to the end');
         self::assertSame('RESTORE_DUMP_UNREADABLE', $failure, 'the public api refuses a stream that fails without EOF');
     }
 
