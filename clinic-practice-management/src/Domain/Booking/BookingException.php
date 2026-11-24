@@ -12,6 +12,8 @@ use DomainException;
  */
 final class BookingException extends DomainException
 {
+    private bool $profile_incomplete = false;
+
     /**
      * @param array<string, mixed> $data
      */
@@ -30,5 +32,19 @@ final class BookingException extends DomainException
     public static function of(string $code, string $message, int $http = 400, array $data = []): self
     {
         return new self($code, $message, $http, $data);
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     */
+    public static function profile_incomplete( string $code, string $message, int $http = 400, array $data = [] ): self {
+        $exception                     = new self( $code, $message, $http, $data );
+        $exception->profile_incomplete = true;
+
+        return $exception;
+    }
+
+    public function is_profile_incomplete(): bool {
+        return $this->profile_incomplete;
     }
 }

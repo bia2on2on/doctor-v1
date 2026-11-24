@@ -1668,6 +1668,926 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertTrue( $witnessStep2Data['data']['registered'] );
     }
 
+    public function testConfirmProfileIncompleteDenialPreservesActiveHoldAndCapacityAndReleasesOnlyIdempotency(): void {
+        $db  = App::db();
+        $now = $db->nowUtcSql();
+
+        $mobile    = '09125550201';
+        $patientId = $this->insertPatient(
+            $this->clinicListed,
+            $mobile,
+            'بیمار',
+            'ناقص‌الف',
+            PatientTwoProofTestHelper::next_valid_national_id(),
+            null
+        );
+        $userId = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_PATIENT ] );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $this->clinicListed,
+            $patientId,
+            [
+                'mobile'             => $mobile,
+                'seed_session_scope' => true,
+                'set_current_user'   => true,
+            ]
+        );
+
+        $slotDate  = gmdate( 'Y-m-d', time() + 3 * 86400 );
+        $slotId    = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $slotDate, '09:00:00' );
+        $holdToken = 'hold-preserve-a-' . bin2hex( random_bytes( 6 ) );
+
+        $db->update( 'cpms_schedule_slots', [ 'held_count' => 1 ], [ 'id' => $slotId ] );
+        $db->insert(
+            'cpms_slot_holds',
+            [
+                'clinic_id'         => $this->clinicListed,
+                'slot_id'           => $slotId,
+                'holder_wp_user_id' => $userId,
+                'holder_mobile'     => $mobile,
+                'patient_id'        => $patientId,
+                'token'             => $holdToken,
+                'expires_at'        => gmdate( 'Y-m-d H:i:s', time() + 600 ) . '.000',
+                'status'            => 'active',
+                'created_at'        => $now,
+            ]
+        );
+        $holdId = $db->wpdb_last_insert_id();
+        self::assertGreaterThan( 0, $holdId );
+
+        $unrelatedIdemKey = wp_generate_uuid4();
+        $db->insert(
+            'cpms_idempotency_keys',
+            [
+                'key'           => $unrelatedIdemKey,
+                'clinic_id'     => $this->clinicListed,
+                'wp_user_id'    => $userId,
+                'endpoint'      => 'booking/confirm',
+                'context_id'    => 0,
+                'status'        => 1,
+                'response_code' => 200,
+                'response_json' => '{"ok":true}',
+                'created_at'    => $now,
+            ]
+        );
+
+        $holdsTable = $db->table( 'cpms_slot_holds' );
+        $slotsTable = $db->table( 'cpms_schedule_slots' );
+        $idemTable  = $db->table( 'cpms_idempotency_keys' );
+        $apptsTable = $db->table( 'cpms_appointments' );
+
+        $idemKey = wp_generate_uuid4();
+        $caught  = null;
+        try {
+            App::bookingService()->confirm( $holdToken, $userId, null, $idemKey );
+        } catch ( BookingException $e ) {
+            $caught = $e;
+        }
+
+        self::assertInstanceOf( BookingException::class, $caught );
+        self::assertSame( 'CLINIC_VALIDATION_FAILED', $caught->errorCode );
+        self::assertSame( 400, $caught->httpStatus );
+        self::assertTrue( $caught->is_profile_incomplete() );
+        self::assertSame( [], $caught->data );
+
+        $holdAfterService = $db->fetchRow(
+            'SELECT id, status, token, slot_id FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1',
+            [ $holdId ]
+        );
+        self::assertIsArray( $holdAfterService );
+        self::assertArrayHasKey( 'id', $holdAfterService );
+        self::assertArrayHasKey( 'status', $holdAfterService );
+        self::assertArrayHasKey( 'token', $holdAfterService );
+        self::assertArrayHasKey( 'slot_id', $holdAfterService );
+        self::assertSame( $holdId, (int) $holdAfterService['id'] );
+        self::assertSame( 'active', (string) $holdAfterService['status'] );
+        self::assertSame( $holdToken, (string) $holdAfterService['token'] );
+        self::assertSame( $slotId, (int) $holdAfterService['slot_id'] );
+
+        $slotAfterService = $db->fetchRow(
+            'SELECT capacity, booked_count, held_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slotId ]
+        );
+        self::assertIsArray( $slotAfterService );
+        self::assertArrayHasKey( 'capacity', $slotAfterService );
+        self::assertArrayHasKey( 'booked_count', $slotAfterService );
+        self::assertArrayHasKey( 'held_count', $slotAfterService );
+        self::assertSame( 2, (int) $slotAfterService['capacity'] );
+        self::assertSame( 0, (int) $slotAfterService['booked_count'] );
+        self::assertSame( 1, (int) $slotAfterService['held_count'] );
+
+        $releasedIdemCount = (int) $db->fetchValue(
+            'SELECT COUNT(*) FROM ' . $idemTable
+            . ' WHERE `key` = %s AND endpoint = %s AND wp_user_id = %d AND context_id = %d AND clinic_id = %d',
+            [ $idemKey, 'booking/confirm', $userId, 0, $this->clinicListed ]
+        );
+        self::assertSame( 0, $releasedIdemCount );
+
+        $unrelatedIdemRow = $db->fetchRow(
+            'SELECT status, response_code FROM ' . $idemTable
+            . ' WHERE `key` = %s AND endpoint = %s AND wp_user_id = %d AND context_id = %d AND clinic_id = %d LIMIT 1',
+            [ $unrelatedIdemKey, 'booking/confirm', $userId, 0, $this->clinicListed ]
+        );
+        self::assertIsArray( $unrelatedIdemRow );
+        self::assertArrayHasKey( 'status', $unrelatedIdemRow );
+        self::assertArrayHasKey( 'response_code', $unrelatedIdemRow );
+        self::assertSame( 1, (int) $unrelatedIdemRow['status'] );
+        self::assertSame( 200, (int) $unrelatedIdemRow['response_code'] );
+
+        $apptCountAfterService = (int) $db->fetchValue(
+            'SELECT COUNT(*) FROM ' . $apptsTable . ' WHERE slot_id = %d',
+            [ $slotId ]
+        );
+        self::assertSame( 0, $apptCountAfterService );
+
+        // REST boundary witness: POST /clinic/v1/booking/confirm returns 400 without leaking internal discriminator keys in data, while keeping the same hold active.
+        $restIdemKey = wp_generate_uuid4();
+        $restReq     = new WP_REST_Request( 'POST', '/clinic/v1/booking/confirm' );
+        $restReq->set_header( 'Content-Type', 'application/json' );
+        $restReq->set_header( 'X-WP-Nonce', wp_create_nonce( 'wp_rest' ) );
+        $restReq->set_header( 'Idempotency-Key', $restIdemKey );
+        $restReq->set_body( (string) wp_json_encode( [ 'hold_token' => $holdToken ] ) );
+        $restResp = rest_do_request( $restReq );
+        self::assertInstanceOf( WP_REST_Response::class, $restResp );
+        self::assertSame( 400, $restResp->get_status() );
+        $restPayload = $restResp->get_data();
+        self::assertIsArray( $restPayload );
+        self::assertArrayHasKey( 'code', $restPayload );
+        self::assertArrayHasKey( 'data', $restPayload );
+        self::assertSame( 'CLINIC_VALIDATION_FAILED', $restPayload['code'] );
+        self::assertIsArray( $restPayload['data'] );
+        self::assertSame( [ 'status' => 400 ], $restPayload['data'] );
+
+        $holdAfterRest = $db->fetchRow(
+            'SELECT status FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1',
+            [ $holdId ]
+        );
+        self::assertIsArray( $holdAfterRest );
+        self::assertArrayHasKey( 'status', $holdAfterRest );
+        self::assertSame( 'active', (string) $holdAfterRest['status'] );
+
+        $slotAfterRest = $db->fetchRow(
+            'SELECT booked_count, held_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slotId ]
+        );
+        self::assertIsArray( $slotAfterRest );
+        self::assertArrayHasKey( 'booked_count', $slotAfterRest );
+        self::assertArrayHasKey( 'held_count', $slotAfterRest );
+        self::assertSame( 0, (int) $slotAfterRest['booked_count'] );
+        self::assertSame( 1, (int) $slotAfterRest['held_count'] );
+
+        $restIdemCount = (int) $db->fetchValue(
+            'SELECT COUNT(*) FROM ' . $idemTable
+            . ' WHERE `key` = %s AND endpoint = %s AND wp_user_id = %d AND context_id = %d AND clinic_id = %d',
+            [ $restIdemKey, 'booking/confirm', $userId, 0, $this->clinicListed ]
+        );
+        self::assertSame( 0, $restIdemCount );
+    }
+
+    public function testConfirmNonProfileDenialsStillReleaseHoldAndCapacity(): void {
+        $db      = App::db();
+        $now     = $db->nowUtcSql();
+        $booking = App::bookingService();
+
+        $mobile    = '09125550202';
+        $patientId = $this->insertPatient(
+            $this->clinicListed,
+            $mobile,
+            'بیمار',
+            'کامل‌ب',
+            PatientTwoProofTestHelper::next_valid_national_id(),
+            '1990-04-12'
+        );
+        $userId = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_PATIENT ] );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $this->clinicListed,
+            $patientId,
+            [
+                'mobile'             => $mobile,
+                'seed_session_scope' => true,
+                'set_current_user'   => true,
+            ]
+        );
+
+        $holdsTable = $db->table( 'cpms_slot_holds' );
+        $slotsTable = $db->table( 'cpms_schedule_slots' );
+        $idemTable  = $db->table( 'cpms_idempotency_keys' );
+        $apptsTable = $db->table( 'cpms_appointments' );
+
+        // Case 1: 409 CLINIC_SLOT_TAKEN inside confirm() transaction (slot closed after hold) releases hold + capacity.
+        $date1 = gmdate( 'Y-m-d', time() + 3 * 86400 );
+        $slot1 = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $date1, '09:00:00' );
+        $hold1 = $booking->hold( $userId, $this->clinicianListed, $date1, '09:00:00', $slot1, $patientId, $this->locationListed );
+        self::assertArrayHasKey( 'hold_token', $hold1 );
+        $holdToken1 = (string) $hold1['hold_token'];
+
+        $holdRow1Before = $db->fetchRow(
+            'SELECT id, status FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
+            [ $holdToken1 ]
+        );
+        self::assertIsArray( $holdRow1Before );
+        self::assertArrayHasKey( 'id', $holdRow1Before );
+        self::assertArrayHasKey( 'status', $holdRow1Before );
+        self::assertSame( 'active', (string) $holdRow1Before['status'] );
+        $hold1Id = (int) $holdRow1Before['id'];
+
+        $db->update( 'cpms_schedule_slots', [ 'is_open' => 0 ], [ 'id' => $slot1 ] );
+
+        $idemKey1 = wp_generate_uuid4();
+        $ex1      = null;
+        try {
+            $booking->confirm( $holdToken1, $userId, null, $idemKey1 );
+        } catch ( BookingException $e ) {
+            $ex1 = $e;
+        }
+
+        self::assertInstanceOf( BookingException::class, $ex1 );
+        self::assertSame( 'CLINIC_SLOT_TAKEN', $ex1->errorCode );
+        self::assertSame( 409, $ex1->httpStatus );
+        self::assertFalse( $ex1->is_profile_incomplete() );
+
+        $holdRow1After = $db->fetchRow(
+            'SELECT status FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1',
+            [ $hold1Id ]
+        );
+        self::assertIsArray( $holdRow1After );
+        self::assertArrayHasKey( 'status', $holdRow1After );
+        self::assertSame( 'released', (string) $holdRow1After['status'] );
+
+        $slotRow1After = $db->fetchRow(
+            'SELECT booked_count, held_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slot1 ]
+        );
+        self::assertIsArray( $slotRow1After );
+        self::assertArrayHasKey( 'booked_count', $slotRow1After );
+        self::assertArrayHasKey( 'held_count', $slotRow1After );
+        self::assertSame( 0, (int) $slotRow1After['booked_count'] );
+        self::assertSame( 0, (int) $slotRow1After['held_count'] );
+
+        $idemCount1 = (int) $db->fetchValue(
+            'SELECT COUNT(*) FROM ' . $idemTable
+            . ' WHERE `key` = %s AND endpoint = %s AND wp_user_id = %d AND context_id = %d AND clinic_id = %d',
+            [ $idemKey1, 'booking/confirm', $userId, 0, $this->clinicListed ]
+        );
+        self::assertSame( 0, $idemCount1 );
+        self::assertSame(
+            0,
+            (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable . ' WHERE slot_id = %d', [ $slot1 ] )
+        );
+
+        // Case 2: 400 CLINIC_VALIDATION_FAILED non-profile denial inside confirm() transaction (nonexistent DST local time) ALSO releases hold + capacity.
+        $db->insert(
+            'cpms_locations',
+            [
+                'clinic_id'  => $this->clinicListed,
+                'name'       => 'DST Loc S2',
+                'timezone'   => 'America/New_York',
+                'is_active'  => 1,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]
+        );
+        $dstLocationId = $db->wpdb_last_insert_id();
+        $slot2         = $this->insertSlot( $this->clinicListed, $dstLocationId, $this->clinicianListed, '2027-03-14', '02:30:00' );
+        $holdToken2    = 'hold-dst-b-' . bin2hex( random_bytes( 6 ) );
+
+        $db->update( 'cpms_schedule_slots', [ 'held_count' => 1 ], [ 'id' => $slot2 ] );
+        $db->insert(
+            'cpms_slot_holds',
+            [
+                'clinic_id'         => $this->clinicListed,
+                'slot_id'           => $slot2,
+                'holder_wp_user_id' => $userId,
+                'holder_mobile'     => $mobile,
+                'patient_id'        => $patientId,
+                'token'             => $holdToken2,
+                'expires_at'        => gmdate( 'Y-m-d H:i:s', time() + 600 ) . '.000',
+                'status'            => 'active',
+                'created_at'        => $now,
+            ]
+        );
+        $hold2Id = $db->wpdb_last_insert_id();
+        self::assertGreaterThan( 0, $hold2Id );
+
+        $idemKey2 = wp_generate_uuid4();
+        $ex2      = null;
+        try {
+            $booking->confirm( $holdToken2, $userId, null, $idemKey2 );
+        } catch ( BookingException $e ) {
+            $ex2 = $e;
+        }
+
+        self::assertInstanceOf( BookingException::class, $ex2 );
+        self::assertSame( 'CLINIC_VALIDATION_FAILED', $ex2->errorCode );
+        self::assertSame( 400, $ex2->httpStatus );
+        self::assertFalse( $ex2->is_profile_incomplete() );
+
+        $holdRow2After = $db->fetchRow(
+            'SELECT status FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1',
+            [ $hold2Id ]
+        );
+        self::assertIsArray( $holdRow2After );
+        self::assertArrayHasKey( 'status', $holdRow2After );
+        self::assertSame( 'released', (string) $holdRow2After['status'] );
+
+        $slotRow2After = $db->fetchRow(
+            'SELECT booked_count, held_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slot2 ]
+        );
+        self::assertIsArray( $slotRow2After );
+        self::assertArrayHasKey( 'booked_count', $slotRow2After );
+        self::assertArrayHasKey( 'held_count', $slotRow2After );
+        self::assertSame( 0, (int) $slotRow2After['booked_count'] );
+        self::assertSame( 0, (int) $slotRow2After['held_count'] );
+
+        $idemCount2 = (int) $db->fetchValue(
+            'SELECT COUNT(*) FROM ' . $idemTable
+            . ' WHERE `key` = %s AND endpoint = %s AND wp_user_id = %d AND context_id = %d AND clinic_id = %d',
+            [ $idemKey2, 'booking/confirm', $userId, 0, $this->clinicListed ]
+        );
+        self::assertSame( 0, $idemCount2 );
+    }
+
+    public function testConfirmRetryAfterProfileCompletionSucceedsWithSameHoldIdAndSameIdempotencyKey(): void {
+        $db      = App::db();
+        $booking = App::bookingService();
+
+        $mobile    = '09125550203';
+        $patientId = $this->insertPatient(
+            $this->clinicListed,
+            $mobile,
+            'بیمار',
+            'تکمیلی',
+            PatientTwoProofTestHelper::next_valid_national_id(),
+            '1991-06-15'
+        );
+        $userId = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_PATIENT ] );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $this->clinicListed,
+            $patientId,
+            [
+                'mobile'             => $mobile,
+                'seed_session_scope' => true,
+                'set_current_user'   => true,
+            ]
+        );
+
+        $slotDate = gmdate( 'Y-m-d', time() + 4 * 86400 );
+        $slotId   = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $slotDate, '10:00:00' );
+        $holdRes  = $booking->hold( $userId, $this->clinicianListed, $slotDate, '10:00:00', $slotId, $patientId, $this->locationListed );
+        self::assertArrayHasKey( 'hold_token', $holdRes );
+        $holdToken = (string) $holdRes['hold_token'];
+
+        $holdsTable = $db->table( 'cpms_slot_holds' );
+        $slotsTable = $db->table( 'cpms_schedule_slots' );
+        $idemTable  = $db->table( 'cpms_idempotency_keys' );
+        $apptsTable = $db->table( 'cpms_appointments' );
+        $patsTable  = $db->table( 'cpms_patients' );
+
+        $initialHoldRow = $db->fetchRow(
+            'SELECT id, status, token FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
+            [ $holdToken ]
+        );
+        self::assertIsArray( $initialHoldRow );
+        self::assertArrayHasKey( 'id', $initialHoldRow );
+        self::assertArrayHasKey( 'status', $initialHoldRow );
+        $originalHoldId = (int) $initialHoldRow['id'];
+        self::assertGreaterThan( 0, $originalHoldId );
+        self::assertSame( 'active', (string) $initialHoldRow['status'] );
+
+        // Simulate legacy incomplete profile state at confirm time (birth_date NULL).
+        $db->query( 'UPDATE ' . $patsTable . ' SET birth_date = NULL WHERE id = %d', [ $patientId ] );
+        $incompletePatientRow = $db->fetchRow(
+            'SELECT birth_date FROM ' . $patsTable . ' WHERE id = %d LIMIT 1',
+            [ $patientId ]
+        );
+        self::assertIsArray( $incompletePatientRow );
+        self::assertArrayHasKey( 'birth_date', $incompletePatientRow );
+        self::assertNull( $incompletePatientRow['birth_date'] );
+
+        $sharedIdemKey = wp_generate_uuid4();
+        $firstEx       = null;
+        try {
+            $booking->confirm( $holdToken, $userId, 'تلاش اول', $sharedIdemKey );
+        } catch ( BookingException $e ) {
+            $firstEx = $e;
+        }
+
+        self::assertInstanceOf( BookingException::class, $firstEx );
+        self::assertSame( 'CLINIC_VALIDATION_FAILED', $firstEx->errorCode );
+        self::assertSame( 400, $firstEx->httpStatus );
+        self::assertTrue( $firstEx->is_profile_incomplete() );
+
+        $holdAfterDenial = $db->fetchRow(
+            'SELECT id, status FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1',
+            [ $originalHoldId ]
+        );
+        self::assertIsArray( $holdAfterDenial );
+        self::assertArrayHasKey( 'id', $holdAfterDenial );
+        self::assertArrayHasKey( 'status', $holdAfterDenial );
+        self::assertSame( $originalHoldId, (int) $holdAfterDenial['id'] );
+        self::assertSame( 'active', (string) $holdAfterDenial['status'] );
+
+        // Patient completes profile through the real self-service PatientService::updateMe() flow.
+        $updatedView = App::patientService()->updateMe( $userId, [ 'birth_date' => '1991-06-15' ] );
+        self::assertIsArray( $updatedView );
+        $completedPatientRow = $db->fetchRow(
+            'SELECT birth_date FROM ' . $patsTable . ' WHERE id = %d LIMIT 1',
+            [ $patientId ]
+        );
+        self::assertIsArray( $completedPatientRow );
+        self::assertArrayHasKey( 'birth_date', $completedPatientRow );
+        self::assertSame( '1991-06-15', (string) $completedPatientRow['birth_date'] );
+
+        // Retry confirm with the SAME hold_token (same hold id) AND the SAME Idempotency-Key.
+        $confirmed = $booking->confirm( $holdToken, $userId, 'تلاش دوم موفق', $sharedIdemKey );
+        self::assertIsArray( $confirmed );
+        self::assertArrayHasKey( 'appointment_id', $confirmed );
+        self::assertArrayHasKey( 'status', $confirmed );
+        $appointmentId = (int) $confirmed['appointment_id'];
+        self::assertGreaterThan( 0, $appointmentId );
+        self::assertSame( 'confirmed', (string) $confirmed['status'] );
+
+        $holdAfterConfirm = $db->fetchRow(
+            'SELECT id, status, token FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1',
+            [ $originalHoldId ]
+        );
+        self::assertIsArray( $holdAfterConfirm );
+        self::assertArrayHasKey( 'id', $holdAfterConfirm );
+        self::assertArrayHasKey( 'status', $holdAfterConfirm );
+        self::assertArrayHasKey( 'token', $holdAfterConfirm );
+        self::assertSame( $originalHoldId, (int) $holdAfterConfirm['id'] );
+        self::assertSame( 'converted', (string) $holdAfterConfirm['status'] );
+        self::assertSame( $holdToken, (string) $holdAfterConfirm['token'] );
+
+        $totalSlotHolds = (int) $db->fetchValue(
+            'SELECT COUNT(*) FROM ' . $holdsTable . ' WHERE slot_id = %d',
+            [ $slotId ]
+        );
+        self::assertSame( 1, $totalSlotHolds );
+
+        $slotAfterConfirm = $db->fetchRow(
+            'SELECT booked_count, held_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slotId ]
+        );
+        self::assertIsArray( $slotAfterConfirm );
+        self::assertArrayHasKey( 'booked_count', $slotAfterConfirm );
+        self::assertArrayHasKey( 'held_count', $slotAfterConfirm );
+        self::assertSame( 1, (int) $slotAfterConfirm['booked_count'] );
+        self::assertSame( 0, (int) $slotAfterConfirm['held_count'] );
+
+        $apptRow = $db->fetchRow(
+            'SELECT id, slot_id, patient_id, status FROM ' . $apptsTable . ' WHERE id = %d LIMIT 1',
+            [ $appointmentId ]
+        );
+        self::assertIsArray( $apptRow );
+        self::assertArrayHasKey( 'id', $apptRow );
+        self::assertArrayHasKey( 'slot_id', $apptRow );
+        self::assertArrayHasKey( 'patient_id', $apptRow );
+        self::assertArrayHasKey( 'status', $apptRow );
+        self::assertSame( $appointmentId, (int) $apptRow['id'] );
+        self::assertSame( $slotId, (int) $apptRow['slot_id'] );
+        self::assertSame( $patientId, (int) $apptRow['patient_id'] );
+        self::assertSame( 'confirmed', (string) $apptRow['status'] );
+
+        $completedIdemRow = $db->fetchRow(
+            'SELECT status, response_code FROM ' . $idemTable
+            . ' WHERE `key` = %s AND endpoint = %s AND wp_user_id = %d AND context_id = %d AND clinic_id = %d LIMIT 1',
+            [ $sharedIdemKey, 'booking/confirm', $userId, 0, $this->clinicListed ]
+        );
+        self::assertIsArray( $completedIdemRow );
+        self::assertArrayHasKey( 'status', $completedIdemRow );
+        self::assertArrayHasKey( 'response_code', $completedIdemRow );
+        self::assertSame( 1, (int) $completedIdemRow['status'] );
+        self::assertSame( 200, (int) $completedIdemRow['response_code'] );
+    }
+
+    public function testProfileIncompleteDiscriminatorIsTrueOnlyForTwoProfileGateCallersAndFalseElsewhere(): void {
+        $db      = App::db();
+        $wpdb    = $db->wpdb();
+        $booking = App::bookingService();
+
+        // 1) Direct constructors BookingException::of() and new BookingException() always keep discriminator false, even with identical code and message.
+        $sameMessage = 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید';
+        $viaOf       = BookingException::of( 'CLINIC_VALIDATION_FAILED', $sameMessage, 400 );
+        $viaNew      = new BookingException( 'CLINIC_VALIDATION_FAILED', $sameMessage, 400 );
+        $viaNamed    = BookingException::profile_incomplete( 'CLINIC_VALIDATION_FAILED', $sameMessage, 400 );
+        self::assertFalse( $viaOf->is_profile_incomplete() );
+        self::assertFalse( $viaNew->is_profile_incomplete() );
+        self::assertTrue( $viaNamed->is_profile_incomplete() );
+        self::assertSame( [], $viaNamed->data );
+
+        // 2) Caller #1: assert_patient_profile_complete_for_booking(null) and (0) set discriminator = true.
+        $gateById = new \ReflectionMethod( $booking, 'assert_patient_profile_complete_for_booking' );
+        $exNullId = null;
+        try {
+            $gateById->invoke( $booking, null );
+        } catch ( BookingException $e ) {
+            $exNullId = $e;
+        }
+        self::assertInstanceOf( BookingException::class, $exNullId );
+        self::assertTrue( $exNullId->is_profile_incomplete() );
+        self::assertSame( 'CLINIC_VALIDATION_FAILED', $exNullId->errorCode );
+        self::assertSame( 400, $exNullId->httpStatus );
+
+        $exZeroId = null;
+        try {
+            $gateById->invoke( $booking, 0 );
+        } catch ( BookingException $e ) {
+            $exZeroId = $e;
+        }
+        self::assertInstanceOf( BookingException::class, $exZeroId );
+        self::assertTrue( $exZeroId->is_profile_incomplete() );
+
+        // 3) Caller #2: assert_patient_profile_complete_row(null) and incomplete row set discriminator = true (tested through real confirm()).
+        $mobile    = '09125550204';
+        $patientId = $this->insertPatient(
+            $this->clinicListed,
+            $mobile,
+            'بیمار',
+            'جداساز',
+            PatientTwoProofTestHelper::next_valid_national_id(),
+            '1990-02-02'
+        );
+        $userId = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_PATIENT ] );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $this->clinicListed,
+            $patientId,
+            [
+                'mobile'             => $mobile,
+                'seed_session_scope' => true,
+                'set_current_user'   => true,
+            ]
+        );
+
+        $slotDate = gmdate( 'Y-m-d', time() + 4 * 86400 );
+        $slotId   = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $slotDate, '11:00:00' );
+        $holdRes  = $booking->hold( $userId, $this->clinicianListed, $slotDate, '11:00:00', $slotId, $patientId, $this->locationListed );
+        self::assertArrayHasKey( 'hold_token', $holdRes );
+        $holdToken = (string) $holdRes['hold_token'];
+
+        $holdsTable = $db->table( 'cpms_slot_holds' );
+        $slotsTable = $db->table( 'cpms_schedule_slots' );
+        $idemTable  = $db->table( 'cpms_idempotency_keys' );
+        $patsTable  = $db->table( 'cpms_patients' );
+
+        $holdRowInitial = $db->fetchRow(
+            'SELECT id, status FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
+            [ $holdToken ]
+        );
+        self::assertIsArray( $holdRowInitial );
+        self::assertArrayHasKey( 'id', $holdRowInitial );
+        $holdId = (int) $holdRowInitial['id'];
+
+        $expectedPatientLockSql = $db->prepare(
+            'SELECT id, first_name, last_name, mobile, national_id, birth_date FROM ' . $patsTable . ' WHERE id = %d LIMIT 1 FOR UPDATE',
+            [ $patientId ]
+        );
+
+        // 3a) Exact-SQL absent-row filter counted once reaches assert_patient_profile_complete_row(null) -> discriminator = true.
+        $absentMatches = 0;
+        $absentFilter  = static function ( string $query ) use ( $expectedPatientLockSql, $patsTable, &$absentMatches ): string {
+            if ( $query !== $expectedPatientLockSql ) {
+                return $query;
+            }
+            ++$absentMatches;
+            if ( 1 === $absentMatches ) {
+                return 'SELECT id FROM ' . $patsTable . ' WHERE 1 = 0 LIMIT 1';
+            }
+
+            return $query;
+        };
+
+        $absentIdemKey = wp_generate_uuid4();
+        $exAbsentRow   = null;
+        add_filter( 'query', $absentFilter, 5 );
+        try {
+            try {
+                $booking->confirm( $holdToken, $userId, null, $absentIdemKey );
+            } catch ( BookingException $e ) {
+                $exAbsentRow = $e;
+            }
+        } finally {
+            remove_filter( 'query', $absentFilter, 5 );
+        }
+
+        self::assertSame( 1, $absentMatches );
+        self::assertInstanceOf( BookingException::class, $exAbsentRow );
+        self::assertSame( 'CLINIC_VALIDATION_FAILED', $exAbsentRow->errorCode );
+        self::assertSame( 400, $exAbsentRow->httpStatus );
+        self::assertTrue( $exAbsentRow->is_profile_incomplete() );
+
+        $holdAfterAbsent = $db->fetchRow( 'SELECT status FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1', [ $holdId ] );
+        self::assertIsArray( $holdAfterAbsent );
+        self::assertArrayHasKey( 'status', $holdAfterAbsent );
+        self::assertSame( 'active', (string) $holdAfterAbsent['status'] );
+
+        // 4) Exact-SQL DB-error filter counted once on the SAME assert_patient_profile_complete_for_booking read throws LOCK_BUSY_CODE with discriminator = false; assertions outside callback.
+        $errorMatches  = 0;
+        $errorFilter   = static function ( string $query ) use ( $expectedPatientLockSql, $patsTable, &$errorMatches ): string {
+            if ( $query !== $expectedPatientLockSql ) {
+                return $query;
+            }
+            ++$errorMatches;
+            if ( 1 === $errorMatches ) {
+                return 'SELECT 1 FROM ' . $patsTable . ' WHERE cpms_fault_injection_no_such_column = 1 LIMIT 1';
+            }
+
+            return $query;
+        };
+        $busyIdemKey  = wp_generate_uuid4();
+        $exDbBusy     = null;
+        $prevSuppress = (bool) $wpdb->suppress_errors( true );
+        add_filter( 'query', $errorFilter, 5 );
+        try {
+            try {
+                $booking->confirm( $holdToken, $userId, null, $busyIdemKey );
+            } catch ( BookingException $e ) {
+                $exDbBusy = $e;
+            }
+        } finally {
+            remove_filter( 'query', $errorFilter, 5 );
+            $wpdb->suppress_errors( $prevSuppress );
+        }
+
+        self::assertSame( 1, $errorMatches );
+        self::assertInstanceOf( BookingException::class, $exDbBusy );
+        self::assertSame( 'CLINIC_BOOKING_BUSY', $exDbBusy->errorCode );
+        self::assertSame( 503, $exDbBusy->httpStatus );
+        self::assertFalse( $exDbBusy->is_profile_incomplete() );
+
+        $holdAfterBusy = $db->fetchRow( 'SELECT status FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1', [ $holdId ] );
+        self::assertIsArray( $holdAfterBusy );
+        self::assertArrayHasKey( 'status', $holdAfterBusy );
+        self::assertSame( 'active', (string) $holdAfterBusy['status'] );
+
+        $slotAfterBusy = $db->fetchRow( 'SELECT booked_count, held_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1', [ $slotId ] );
+        self::assertIsArray( $slotAfterBusy );
+        self::assertArrayHasKey( 'booked_count', $slotAfterBusy );
+        self::assertArrayHasKey( 'held_count', $slotAfterBusy );
+        self::assertSame( 0, (int) $slotAfterBusy['booked_count'] );
+        self::assertSame( 1, (int) $slotAfterBusy['held_count'] );
+
+        $busyIdemCount = (int) $db->fetchValue(
+            'SELECT COUNT(*) FROM ' . $idemTable
+            . ' WHERE `key` = %s AND endpoint = %s AND wp_user_id = %d AND context_id = %d AND clinic_id = %d',
+            [ $busyIdemKey, 'booking/confirm', $userId, 0, $this->clinicListed ]
+        );
+        self::assertSame( 0, $busyIdemCount );
+
+        // 5) Other real BookingService::confirm() BookingException denials also keep discriminator = false.
+        $exMissingIdem = null;
+        try {
+            $booking->confirm( $holdToken, $userId, null, '' );
+        } catch ( BookingException $e ) {
+            $exMissingIdem = $e;
+        }
+        self::assertInstanceOf( BookingException::class, $exMissingIdem );
+        self::assertSame( 'CLINIC_VALIDATION_FAILED', $exMissingIdem->errorCode );
+        self::assertFalse( $exMissingIdem->is_profile_incomplete() );
+
+        $exMissingHold = null;
+        try {
+            $booking->confirm( 'nonexistent-hold-' . bin2hex( random_bytes( 4 ) ), $userId, null, wp_generate_uuid4() );
+        } catch ( BookingException $e ) {
+            $exMissingHold = $e;
+        }
+        self::assertInstanceOf( BookingException::class, $exMissingHold );
+        self::assertSame( 'CLINIC_NOT_FOUND', $exMissingHold->errorCode );
+        self::assertFalse( $exMissingHold->is_profile_incomplete() );
+
+        // 6) Caller #2 second branch: incomplete patient row (birth_date = NULL) through real confirm() sets discriminator = true.
+        $db->query( 'UPDATE ' . $patsTable . ' SET birth_date = NULL WHERE id = %d', [ $patientId ] );
+        $incompleteIdemKey = wp_generate_uuid4();
+        $exIncompleteRow   = null;
+        try {
+            $booking->confirm( $holdToken, $userId, null, $incompleteIdemKey );
+        } catch ( BookingException $e ) {
+            $exIncompleteRow = $e;
+        }
+        self::assertInstanceOf( BookingException::class, $exIncompleteRow );
+        self::assertSame( 'CLINIC_VALIDATION_FAILED', $exIncompleteRow->errorCode );
+        self::assertSame( 400, $exIncompleteRow->httpStatus );
+        self::assertTrue( $exIncompleteRow->is_profile_incomplete() );
+    }
+
+    public function testPatientReschedulePathRemainsUnchangedBeforeAndAfterProfileIncompleteDenial(): void {
+        $db      = App::db();
+        $booking = App::bookingService();
+
+        $mobile    = '09125550205';
+        $patientId = $this->insertPatient(
+            $this->clinicListed,
+            $mobile,
+            'بیمار',
+            'جابه‌جایی',
+            PatientTwoProofTestHelper::next_valid_national_id(),
+            null
+        );
+        $userId = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_PATIENT ] );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userId,
+            $this->clinicListed,
+            $patientId,
+            [
+                'mobile'             => $mobile,
+                'seed_session_scope' => true,
+                'set_current_user'   => false,
+            ]
+        );
+
+        $staffUserId = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_SECRETARY ] );
+        App::membership_service()->create_membership( $this->clinicListed, $staffUserId, RolesAndCapabilities::ROLE_SECRETARY );
+
+        $dateOld    = gmdate( 'Y-m-d', time() + 3 * 86400 );
+        $dateTarget = gmdate( 'Y-m-d', time() + 4 * 86400 );
+        $slotOld    = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $dateOld, '09:00:00' );
+        $slotTarget = $this->insertSlot( $this->clinicListed, $this->locationListed, $this->clinicianListed, $dateTarget, '10:00:00' );
+
+        ScopeContext::set( ClinicScope::forClinic( $this->clinicListed, $this->locationListed )->withOrganization( $this->orgId ) );
+        try {
+            $created = $booking->createByStaff( $staffUserId, $patientId, $this->clinicianListed, $dateOld, '09:00:00', 'نوبت اولیه', $slotOld );
+        } finally {
+            ScopeContext::clear();
+        }
+        self::assertArrayHasKey( 'appointment_id', $created );
+        $origApptId = (int) $created['appointment_id'];
+        self::assertGreaterThan( 0, $origApptId );
+
+        $apptsTable = $db->table( 'cpms_appointments' );
+        $slotsTable = $db->table( 'cpms_schedule_slots' );
+        $holdsTable = $db->table( 'cpms_slot_holds' );
+        $idemTable  = $db->table( 'cpms_idempotency_keys' );
+
+        // Assert DB state BEFORE patient reschedule attempt.
+        $apptsCountBefore = (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable );
+        $holdsCountBefore = (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $holdsTable );
+
+        $origBefore = $db->fetchRow(
+            'SELECT status, rescheduled_to, slot_id FROM ' . $apptsTable . ' WHERE id = %d LIMIT 1',
+            [ $origApptId ]
+        );
+        self::assertIsArray( $origBefore );
+        self::assertArrayHasKey( 'status', $origBefore );
+        self::assertArrayHasKey( 'rescheduled_to', $origBefore );
+        self::assertArrayHasKey( 'slot_id', $origBefore );
+        self::assertSame( 'confirmed', (string) $origBefore['status'] );
+        self::assertNull( $origBefore['rescheduled_to'] );
+        self::assertSame( $slotOld, (int) $origBefore['slot_id'] );
+
+        $slotOldBefore = $db->fetchRow(
+            'SELECT booked_count, held_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slotOld ]
+        );
+        self::assertIsArray( $slotOldBefore );
+        self::assertArrayHasKey( 'booked_count', $slotOldBefore );
+        self::assertArrayHasKey( 'held_count', $slotOldBefore );
+        self::assertSame( 1, (int) $slotOldBefore['booked_count'] );
+        self::assertSame( 0, (int) $slotOldBefore['held_count'] );
+
+        $slotTargetBefore = $db->fetchRow(
+            'SELECT booked_count, held_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slotTarget ]
+        );
+        self::assertIsArray( $slotTargetBefore );
+        self::assertArrayHasKey( 'booked_count', $slotTargetBefore );
+        self::assertArrayHasKey( 'held_count', $slotTargetBefore );
+        self::assertSame( 0, (int) $slotTargetBefore['booked_count'] );
+        self::assertSame( 0, (int) $slotTargetBefore['held_count'] );
+
+        $reschedIdemKey = wp_generate_uuid4();
+        $idemBefore     = (int) $db->fetchValue(
+            'SELECT COUNT(*) FROM ' . $idemTable
+            . ' WHERE `key` = %s AND endpoint = %s AND wp_user_id = %d AND context_id = %d AND clinic_id = %d',
+            [ $reschedIdemKey, 'booking/reschedule', $userId, $origApptId, $this->clinicListed ]
+        );
+        self::assertSame( 0, $idemBefore );
+
+        // Attempt patient reschedule while profile is incomplete.
+        PatientTwoProofTestHelper::acting_as( $userId );
+        $denied = null;
+        try {
+            $booking->reschedule( $userId, $origApptId, $this->clinicianListed, $dateTarget, '10:00:00', $reschedIdemKey, $slotTarget );
+        } catch ( BookingException $e ) {
+            $denied = $e;
+        }
+
+        self::assertInstanceOf( BookingException::class, $denied );
+        self::assertSame( 'CLINIC_VALIDATION_FAILED', $denied->errorCode );
+        self::assertSame( 400, $denied->httpStatus );
+        self::assertTrue( $denied->is_profile_incomplete() );
+
+        // Assert DB state AFTER denied reschedule matches pre-call state and releases idempotency lock.
+        self::assertSame( $apptsCountBefore, (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable ) );
+        self::assertSame( $holdsCountBefore, (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $holdsTable ) );
+
+        $origAfterDeny = $db->fetchRow(
+            'SELECT status, rescheduled_to, slot_id FROM ' . $apptsTable . ' WHERE id = %d LIMIT 1',
+            [ $origApptId ]
+        );
+        self::assertIsArray( $origAfterDeny );
+        self::assertArrayHasKey( 'status', $origAfterDeny );
+        self::assertArrayHasKey( 'rescheduled_to', $origAfterDeny );
+        self::assertArrayHasKey( 'slot_id', $origAfterDeny );
+        self::assertSame( 'confirmed', (string) $origAfterDeny['status'] );
+        self::assertNull( $origAfterDeny['rescheduled_to'] );
+        self::assertSame( $slotOld, (int) $origAfterDeny['slot_id'] );
+
+        $slotOldAfterDeny = $db->fetchRow(
+            'SELECT booked_count, held_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slotOld ]
+        );
+        self::assertIsArray( $slotOldAfterDeny );
+        self::assertArrayHasKey( 'booked_count', $slotOldAfterDeny );
+        self::assertArrayHasKey( 'held_count', $slotOldAfterDeny );
+        self::assertSame( 1, (int) $slotOldAfterDeny['booked_count'] );
+        self::assertSame( 0, (int) $slotOldAfterDeny['held_count'] );
+
+        $slotTargetAfterDeny = $db->fetchRow(
+            'SELECT booked_count, held_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slotTarget ]
+        );
+        self::assertIsArray( $slotTargetAfterDeny );
+        self::assertArrayHasKey( 'booked_count', $slotTargetAfterDeny );
+        self::assertArrayHasKey( 'held_count', $slotTargetAfterDeny );
+        self::assertSame( 0, (int) $slotTargetAfterDeny['booked_count'] );
+        self::assertSame( 0, (int) $slotTargetAfterDeny['held_count'] );
+
+        $idemAfterDeny = (int) $db->fetchValue(
+            'SELECT COUNT(*) FROM ' . $idemTable
+            . ' WHERE `key` = %s AND endpoint = %s AND wp_user_id = %d AND context_id = %d AND clinic_id = %d',
+            [ $reschedIdemKey, 'booking/reschedule', $userId, $origApptId, $this->clinicListed ]
+        );
+        self::assertSame( 0, $idemAfterDeny );
+
+        // Positive witness: after completing profile, retry with the SAME Idempotency-Key succeeds cleanly.
+        App::patientService()->updateMe( $userId, [ 'birth_date' => '1991-09-10' ] );
+        $rescheduled = $booking->reschedule( $userId, $origApptId, $this->clinicianListed, $dateTarget, '10:00:00', $reschedIdemKey, $slotTarget );
+        self::assertArrayHasKey( 'appointment_id', $rescheduled );
+        self::assertArrayHasKey( 'previous_appointment_id', $rescheduled );
+        self::assertArrayHasKey( 'status', $rescheduled );
+        $newApptId = (int) $rescheduled['appointment_id'];
+        self::assertGreaterThan( 0, $newApptId );
+        self::assertSame( $origApptId, (int) $rescheduled['previous_appointment_id'] );
+        self::assertSame( 'confirmed', (string) $rescheduled['status'] );
+
+        $origAfterSuccess = $db->fetchRow(
+            'SELECT status, rescheduled_to FROM ' . $apptsTable . ' WHERE id = %d LIMIT 1',
+            [ $origApptId ]
+        );
+        self::assertIsArray( $origAfterSuccess );
+        self::assertArrayHasKey( 'status', $origAfterSuccess );
+        self::assertArrayHasKey( 'rescheduled_to', $origAfterSuccess );
+        self::assertSame( 'rescheduled', (string) $origAfterSuccess['status'] );
+        self::assertSame( $newApptId, (int) $origAfterSuccess['rescheduled_to'] );
+
+        $newApptRow = $db->fetchRow(
+            'SELECT status, rescheduled_from, slot_id FROM ' . $apptsTable . ' WHERE id = %d LIMIT 1',
+            [ $newApptId ]
+        );
+        self::assertIsArray( $newApptRow );
+        self::assertArrayHasKey( 'status', $newApptRow );
+        self::assertArrayHasKey( 'rescheduled_from', $newApptRow );
+        self::assertArrayHasKey( 'slot_id', $newApptRow );
+        self::assertSame( 'confirmed', (string) $newApptRow['status'] );
+        self::assertSame( $origApptId, (int) $newApptRow['rescheduled_from'] );
+        self::assertSame( $slotTarget, (int) $newApptRow['slot_id'] );
+
+        $slotOldAfterSuccess = $db->fetchRow(
+            'SELECT booked_count, held_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slotOld ]
+        );
+        self::assertIsArray( $slotOldAfterSuccess );
+        self::assertArrayHasKey( 'booked_count', $slotOldAfterSuccess );
+        self::assertArrayHasKey( 'held_count', $slotOldAfterSuccess );
+        self::assertSame( 0, (int) $slotOldAfterSuccess['booked_count'] );
+        self::assertSame( 0, (int) $slotOldAfterSuccess['held_count'] );
+
+        $slotTargetAfterSuccess = $db->fetchRow(
+            'SELECT booked_count, held_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slotTarget ]
+        );
+        self::assertIsArray( $slotTargetAfterSuccess );
+        self::assertArrayHasKey( 'booked_count', $slotTargetAfterSuccess );
+        self::assertArrayHasKey( 'held_count', $slotTargetAfterSuccess );
+        self::assertSame( 1, (int) $slotTargetAfterSuccess['booked_count'] );
+        self::assertSame( 0, (int) $slotTargetAfterSuccess['held_count'] );
+
+        $idemAfterSuccess = $db->fetchRow(
+            'SELECT status, response_code FROM ' . $idemTable
+            . ' WHERE `key` = %s AND endpoint = %s AND wp_user_id = %d AND context_id = %d AND clinic_id = %d LIMIT 1',
+            [ $reschedIdemKey, 'booking/reschedule', $userId, $origApptId, $this->clinicListed ]
+        );
+        self::assertIsArray( $idemAfterSuccess );
+        self::assertArrayHasKey( 'status', $idemAfterSuccess );
+        self::assertArrayHasKey( 'response_code', $idemAfterSuccess );
+        self::assertSame( 1, (int) $idemAfterSuccess['status'] );
+        self::assertSame( 200, (int) $idemAfterSuccess['response_code'] );
+    }
+
     /**
      * @return array{
      *     response: WP_REST_Response,

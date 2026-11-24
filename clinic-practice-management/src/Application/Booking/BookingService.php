@@ -1098,16 +1098,20 @@ final class BookingService
         } catch ( Throwable $e ) {
             // Free the Idempotency key on every failure: check() claimed it as
             // pending, so without release() the retry with the same key would be
-            // answered by a stale 409 in-flight replay. A retryable read failure
-            // (CLINIC_BOOKING_BUSY) is not a defect of the Hold, exactly like the
-            // existing CLINIC_SUSPENDED policy denial: the transaction already
-            // rolled back, so the active Hold and its capacity must survive
-            // untouched for that retry. Only these two codes skip the historical
-            // destructive compensation outside the rolled-back transaction.
+            // answered by a stale 409 in-flight replay. Profile-incomplete denials
+            // (structured BookingException::is_profile_incomplete() flag), transient
+            // read failures (CLINIC_BOOKING_BUSY), clinic suspension, and missing
+            // clinic scope are not defects of the Hold: the transaction already
+            // rolled back, so the active Hold and its capacity survive untouched.
             $denial = $this->toBookingException( $e );
             // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
             $denial_code = $denial->errorCode;
-            if ( 'CLINIC_SUSPENDED' !== $denial_code && self::LOCK_BUSY_CODE !== $denial_code && 'CLINIC_SCOPE_REQUIRED' !== $denial_code ) {
+            if (
+                ! $denial->is_profile_incomplete()
+                && 'CLINIC_SUSPENDED' !== $denial_code
+                && self::LOCK_BUSY_CODE !== $denial_code
+                && 'CLINIC_SCOPE_REQUIRED' !== $denial_code
+            ) {
                 // گارد affected-rows + اتمی: گذارِ Hold و کاهش شمارندهٔ اسلات
                 // در یک transaction انجام می‌شوند. اگر کاهش شمارنده شکست
                 // بخورد، همان transaction ROLLBACK می‌شود — شامل گذارِ Hold —
@@ -3100,7 +3104,7 @@ final class BookingService
 
     private function assert_patient_profile_complete_for_booking( ?int $patient_id ): void {
         if ( null === $patient_id || $patient_id <= 0 ) {
-            throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
+            throw BookingException::profile_incomplete( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
         }
         $row = $this->db->fetchRowForUpdate(
             'SELECT id, first_name, last_name, mobile, national_id, birth_date FROM ' . $this->db->table( 'cpms_patients' ) . ' WHERE id = %d LIMIT 1',
@@ -3117,7 +3121,7 @@ final class BookingService
      */
     private function assert_patient_profile_complete_row( ?array $patient ): void {
         if ( null === $patient ) {
-            throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
+            throw BookingException::profile_incomplete( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
         }
         $first_name  = trim( (string) ( $patient['first_name'] ?? '' ) );
         $last_name   = trim( (string) ( $patient['last_name'] ?? '' ) );
@@ -3135,7 +3139,7 @@ final class BookingService
             || ! NationalIdValidator::isValid( $national_id )
             || ! $valid_birth
         ) {
-            throw BookingException::of( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
+            throw BookingException::profile_incomplete( 'CLINIC_VALIDATION_FAILED', 'پروفایل شما ناقص است — ابتدا اطلاعات پروفایل خود را تکمیل کنید', 400 );
         }
     }
 
