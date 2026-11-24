@@ -37,7 +37,8 @@ use wp_xmlrpc_server;
  * Pin-test matrix proving what an account-only (`PURPOSE_LOGIN`) or Step-1
  * pending (`PURPOSE_VERIFY_MOBILE` + `clinic_id`) patient WP session issued by
  * `OtpService::verify()` can reach across every surface class, plus minimal
- * fail-closed fixes on `/wp/v2/users*`, `wp-admin` profile POST, and XML-RPC.
+ * fail-closed fixes on `/wp/v2/users*` and `wp-admin` `profile.php`
+ * (`personal_options_update`).
  */
 final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
     use SignedExpirationFixture;
@@ -381,10 +382,37 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
             self::assertStringNotContainsString( self::MOBILE_STEP1_NEW, $meBody );
             self::assertStringNotContainsString( 'Private Audit Clinic Z', $meBody );
 
-            // context=edit, collection listing, other-user lookup, and writes MUST fail closed (403).
+            // context=edit, own numeric ID, application-passwords prefix, collection listing, other-user lookup, and writes MUST fail closed (403).
             $meEditCtx = $this->dispatchRestWithNonce( 'GET', '/wp/v2/users/me', [], $nonce, [ 'context' => 'edit' ] );
             self::assertSame( 403, $meEditCtx->get_status() );
             self::assertSame( PatientAccess::PROOF_FAILED_CODE, $meEditCtx->get_data()['code'] ?? null );
+
+            $ownIdEditCtx = $this->dispatchRestWithNonce( 'GET', '/wp/v2/users/' . $session['user_id'], [], $nonce, [ 'context' => 'edit' ] );
+            self::assertSame( 403, $ownIdEditCtx->get_status() );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $ownIdEditCtx->get_data()['code'] ?? null );
+
+            $ownIdPost = $this->dispatchRestWithNonce(
+                'POST',
+                '/wp/v2/users/' . $session['user_id'],
+                [
+                    'first_name' => 'TamperedOwnId',
+                    'email'      => 'tampered-id-' . uniqid() . '@evil.test',
+                    'password'   => 'TamperedPass123!',
+                ],
+                $nonce
+            );
+            self::assertSame( 403, $ownIdPost->get_status(), 'POST /wp/v2/users/{own_id} must fail closed.' );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $ownIdPost->get_data()['code'] ?? null );
+
+            foreach ( [ '/wp/v2/users/me/application-passwords', '/wp/v2/users/' . $session['user_id'] . '/application-passwords' ] as $appPassRoute ) {
+                $appPassList = $this->dispatchRestWithNonce( 'GET', $appPassRoute, [], $nonce );
+                self::assertSame( 403, $appPassList->get_status(), 'GET ' . $appPassRoute . ' must fail closed.' );
+                self::assertSame( PatientAccess::PROOF_FAILED_CODE, $appPassList->get_data()['code'] ?? null );
+
+                $appPassCreate = $this->dispatchRestWithNonce( 'POST', $appPassRoute, [ 'name' => 'audit-token' ], $nonce );
+                self::assertSame( 403, $appPassCreate->get_status(), 'POST ' . $appPassRoute . ' must fail closed.' );
+                self::assertSame( PatientAccess::PROOF_FAILED_CODE, $appPassCreate->get_data()['code'] ?? null );
+            }
 
             $usersList = $this->dispatchRestWithNonce( 'GET', '/wp/v2/users', [], $nonce );
             self::assertSame( 403, $usersList->get_status() );
@@ -433,18 +461,8 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         self::assertNotNull( $redirect );
         self::assertSame( PatientPortalShell::portal_url(), $redirect );
 
-        // 2) Generic guardWpAdmin POST contract stays non-interfering while profile.php/user-edit.php POST is blocked (403).
+        // 2) Generic guardWpAdmin POST contract stays non-interfering while profile.php personal_options_update is blocked (403).
         self::assertNull( $this->captureGuardWpAdminRedirect( $this->userAccountActive, [ 'page' => 'index' ], 'POST' ) );
-
-        $GLOBALS['pagenow']        = 'profile.php';
-        $_SERVER['REQUEST_METHOD'] = 'POST';
-        $died                      = false;
-        try {
-            PatientPortalPage::guard_wp_admin_profile_mutation();
-        } catch ( WPDieException ) {
-            $died = true;
-        }
-        self::assertTrue( $died, 'POST /wp-admin/profile.php must fail closed for pure patient.' );
 
         $hookDied = false;
         try {
@@ -454,9 +472,15 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         }
         self::assertTrue( $hookDied, 'personal_options_update hook must fail closed for pure patient.' );
 
-        // Positive control: staff user is not blocked on profile.php POST guard.
+        // Positive control: staff user is not blocked on personal_options_update.
         PatientTwoProofTestHelper::acting_as( $this->staffDoctorUser );
-        PatientPortalPage::guard_wp_admin_profile_mutation();
+        $staffHookDied = false;
+        try {
+            do_action( 'personal_options_update', $this->staffDoctorUser );
+        } catch ( WPDieException ) {
+            $staffHookDied = true;
+        }
+        self::assertFalse( $staffHookDied, 'Positive control: personal_options_update must not block staff accounts.' );
 
         // 3) admin-post handlers: PortalLogin denies account-only/pending patient; FinanceDelegationPage denies non-admin.
         self::assertFalse( PortalLogin::is_authorized( $this->userAccountActive, 'staff' ) );

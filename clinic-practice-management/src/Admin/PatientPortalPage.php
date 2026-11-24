@@ -86,9 +86,7 @@ final class PatientPortalPage
         add_filter('show_admin_bar', [self::class, 'hideAdminBar'], 20);
         add_action('admin_menu', [self::class, 'menu']);
         add_action('admin_init', [self::class, 'guardWpAdmin']);
-        add_action( 'admin_init', [ self::class, 'guard_wp_admin_profile_mutation' ] );
         add_action( 'personal_options_update', [ self::class, 'guard_wp_admin_profile_hooks' ], 1 );
-        add_action( 'edit_user_profile_update', [ self::class, 'guard_wp_admin_profile_hooks' ], 1 );
         add_filter( 'rest_pre_dispatch', [ self::class, 'guard_wp_users_rest' ], 10, 3 );
         add_action( 'admin_enqueue_scripts', [self::class, 'enqueue_assets'] );
     }
@@ -251,35 +249,7 @@ final class PatientPortalPage
     }
 
     /**
-     * Blocks non-GET wp-admin profile/user-edit submissions by pure patients
-     * without altering `guardWpAdmin()` GET-redirect/POST-non-interference contract.
-     */
-    public static function guard_wp_admin_profile_mutation(): void {
-        if ( wp_doing_ajax() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || wp_doing_cron() ) {
-            return;
-        }
-
-        $method = isset( $_SERVER['REQUEST_METHOD'] )
-            ? strtoupper( sanitize_text_field( wp_unslash( (string) $_SERVER['REQUEST_METHOD'] ) ) )
-            : 'GET';
-        if ( 'GET' === $method ) {
-            return;
-        }
-
-        $pagenow = isset( $GLOBALS['pagenow'] ) ? (string) $GLOBALS['pagenow'] : '';
-        if ( ! in_array( $pagenow, [ 'profile.php', 'user-edit.php' ], true ) ) {
-            return;
-        }
-
-        if ( ! is_user_logged_in() || ! self::isPatientOnly( wp_get_current_user() ) ) {
-            return;
-        }
-
-        wp_die( esc_html( PatientAccess::PROOF_FAILED_MESSAGE ), '', [ 'response' => 403 ] );
-    }
-
-    /**
-     * Defense-in-depth block on wp-admin profile update hooks for pure patients.
+     * Fail-closed block on wp-admin own-profile update (`personal_options_update`) for pure patients.
      */
     public static function guard_wp_admin_profile_hooks(): void {
         if ( ! is_user_logged_in() || ! self::isPatientOnly( wp_get_current_user() ) ) {
