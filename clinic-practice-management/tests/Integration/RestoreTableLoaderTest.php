@@ -225,7 +225,12 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
             }
             if (preg_match($engine, $statement) === 1) {
                 $reads[] = $statement;
-                return 'SELECT \'x\' AS table_name, \'MyISAM\' AS engine';
+                preg_match_all("/'([^']+)'/", $statement, $names);
+                $faked = [];
+                foreach ($names[1] as $name) {
+                    $faked[] = "SELECT '" . $name . "' AS table_name, 'MyISAM' AS engine";
+                }
+                return implode(' UNION ALL ', $faked);
             }
             return $statement;
         };
