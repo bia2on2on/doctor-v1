@@ -232,6 +232,40 @@ final class PatientAccess {
         return $this->has_scoped_staff_authority( $wp_user_id );
     }
 
+    /** True for verified scoped staff, false for none, null on error or missing dependency. */
+    public function scoped_staff_actor_state( int $wp_user_id ): ?bool {
+        if ( $wp_user_id > 0 && null !== $this->scoped_staff_checker ) {
+            try {
+                return (bool) ( $this->scoped_staff_checker )( $wp_user_id );
+            } catch ( Throwable ) {
+                return null;
+            }
+        }
+        if ( $wp_user_id <= 0 || null === $this->db || null === $this->memberships || null === $this->authorization ) {
+            return null;
+        }
+        $was_strict = $this->db->is_strict();
+        $this->db->setStrict( true );
+        try {
+            $org_sql = 'SELECT id FROM ' . $this->db->table( 'cpms_organization_memberships' ) . " WHERE wp_user_id = %d AND status = 'active' LIMIT 1";
+            if ( [] !== $this->db->fetch_all_strict( $org_sql, [ $wp_user_id ] ) ) {
+                return true;
+            }
+            foreach ( $this->memberships->active_clinic_ids_for_user( $wp_user_id ) as $clinic_id ) {
+                foreach ( RolesAndCapabilities::ALL_CAPS as $capability ) {
+                    if ( $clinic_id <= 0 || $this->authorization->can( $wp_user_id, $clinic_id, $capability ) ) {
+                        return $clinic_id <= 0 ? null : true;
+                    }
+                }
+            }
+            return false;
+        } catch ( Throwable ) {
+            return null;
+        } finally {
+            $this->db->setStrict( $was_strict );
+        }
+    }
+
     /**
      * Computes the two-factor patient access level (`none` | `booking` | `full`)
      * for `$wp_user_id`, failing closed on any missing proof, inactive account,

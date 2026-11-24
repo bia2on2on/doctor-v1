@@ -131,6 +131,23 @@ final class PatientPortalPage
         return false;
     }
 
+    /** Three-way actor decision (`PATIENT` | `NOT_PATIENT` | `UNKNOWN`) for fail-closed guards. */
+    private static function guard_actor_state( \WP_User $user ): string {
+        $roles = (array) ( $user->roles ?? [] );
+        if ( 1 !== count( $roles ) || ! in_array( RolesAndCapabilities::ROLE_PATIENT, $roles, true ) || user_can( $user, 'manage_options' ) || self::holds_any_cpms_capability( $user ) ) {
+            return 'NOT_PATIENT';
+        }
+        try {
+            $scoped = App::patient_access()->scoped_staff_actor_state( (int) $user->ID );
+        } catch ( \Throwable ) {
+            return 'UNKNOWN';
+        }
+        if ( null === $scoped ) {
+            return 'UNKNOWN';
+        }
+        return $scoped ? 'NOT_PATIENT' : 'PATIENT';
+    }
+
     /**
      * Production pure-patient destination — frontend Patient Portal URL
      * (never under /wp-admin/ as of Phase 9 Slice 3).
@@ -207,7 +224,7 @@ final class PatientPortalPage
         if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
             return;
         }
-        if (!is_user_logged_in() || !self::isPatientOnly(wp_get_current_user())) {
+        if ( ! is_user_logged_in() || 'NOT_PATIENT' === self::guard_actor_state( wp_get_current_user() ) ) {
             return;
         }
         wp_safe_redirect(self::pageUrl());
@@ -230,7 +247,7 @@ final class PatientPortalPage
             return $result;
         }
 
-        if ( ! is_user_logged_in() || ! self::isPatientOnly( wp_get_current_user() ) ) {
+        if ( ! is_user_logged_in() || 'NOT_PATIENT' === self::guard_actor_state( wp_get_current_user() ) ) {
             return $result;
         }
 
@@ -252,7 +269,7 @@ final class PatientPortalPage
      * Fail-closed block on wp-admin own-profile update (`personal_options_update`) for pure patients.
      */
     public static function guard_wp_admin_profile_hooks(): void {
-        if ( ! is_user_logged_in() || ! self::isPatientOnly( wp_get_current_user() ) ) {
+        if ( ! is_user_logged_in() || 'NOT_PATIENT' === self::guard_actor_state( wp_get_current_user() ) ) {
             return;
         }
 

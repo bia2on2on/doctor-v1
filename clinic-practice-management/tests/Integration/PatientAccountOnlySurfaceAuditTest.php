@@ -431,9 +431,17 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
 
             $usersList = $this->dispatchRestWithNonce( 'GET', '/wp/v2/users', [], $nonce );
             self::assertSame( 403, $usersList->get_status() );
+            $usersListData = $usersList->get_data();
+            self::assertIsArray( $usersListData );
+            self::assertArrayHasKey( 'code', $usersListData );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $usersListData['code'] );
 
             $otherUser = $this->dispatchRestWithNonce( 'GET', '/wp/v2/users/' . $this->staffDoctorUser, [], $nonce );
             self::assertSame( 403, $otherUser->get_status() );
+            $otherUserData = $otherUser->get_data();
+            self::assertIsArray( $otherUserData );
+            self::assertArrayHasKey( 'code', $otherUserData );
+            self::assertSame( PatientAccess::PROOF_FAILED_CODE, $otherUserData['code'] );
 
             foreach ( [ 'POST', 'PUT', 'PATCH' ] as $writeMethod ) {
                 $writeResp = $this->dispatchRestWithNonce(
@@ -857,5 +865,175 @@ final class PatientAccountOnlySurfaceAuditTest extends WP_UnitTestCase {
         self::assertInstanceOf( WP_REST_Response::class, $res );
 
         return $res;
+    }
+
+    /**
+     * MUTATION LINE (a): If `guard_actor_state` falls back to `isPatientOnly()` (`false` on DB failure)
+     * or guards do not deny `UNKNOWN`, `POST /wp/v2/users/me` returns 200 and `personal_options_update` proceeds.
+     */
+    public function testLookupFailureFailsClosedOnPatientUsersMeWriteAndProfileHook(): void {
+        global $wpdb;
+
+        $this->seedOtp( $this->clinicPublic, self::MOBILE_ACCOUNT_ACTIVE, '778899', OtpService::PURPOSE_LOGIN );
+        $session = $this->verifyOtpWithSession( self::MOBILE_ACCOUNT_ACTIVE, '778899', OtpService::PURPOSE_LOGIN );
+        $this->activateSession( $session );
+
+        $patUser = get_userdata( $this->userAccountActive );
+        self::assertInstanceOf( WP_User::class, $patUser );
+
+        $orgTable    = App::db()->table( 'cpms_organization_memberships' );
+        $exactSql    = 'SELECT id FROM ' . $orgTable . " WHERE wp_user_id = {$this->userAccountActive} AND status = 'active' LIMIT 1";
+        $hits        = 0;
+        $seenQueries = 0;
+        $fault       = static function ( mixed $query ) use ( $exactSql, $orgTable, &$hits, &$seenQueries ): mixed {
+            ++$seenQueries;
+            if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                ++$hits;
+                return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+            }
+            return $query;
+        };
+
+        $prevPost     = $_POST;
+        $prevSuppress = (bool) $wpdb->suppress_errors( true );
+        add_filter( 'query', $fault, 5 );
+        try {
+            $nonce     = wp_create_nonce( 'wp_rest' );
+            $writeResp = $this->dispatchRestWithNonce( 'POST', '/wp/v2/users/me', [ 'first_name' => 'Tampered' ], $nonce );
+            $restHits  = $hits;
+            $restSeen  = $seenQueries;
+
+            $hits           = 0;
+            $seenQueries    = 0;
+            $_POST['email'] = (string) $patUser->user_email;
+            $hookDied       = false;
+            try {
+                do_action( 'personal_options_update', $this->userAccountActive );
+            } catch ( WPDieException ) {
+                $hookDied = true;
+            }
+            $hookHits = $hits;
+            $hookSeen = $seenQueries;
+        } finally {
+            remove_filter( 'query', $fault, 5 );
+            $wpdb->suppress_errors( $prevSuppress );
+            $_POST = $prevPost;
+        }
+
+        self::assertGreaterThan( 0, $restSeen );
+        self::assertSame( 1, $restHits );
+        self::assertSame( 403, $writeResp->get_status() );
+        $writeData = $writeResp->get_data();
+        self::assertIsArray( $writeData );
+        self::assertArrayHasKey( 'code', $writeData );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $writeData['code'] );
+
+        self::assertTrue( $hookDied );
+        self::assertGreaterThan( 0, $hookSeen );
+        self::assertSame( 1, $hookHits );
+    }
+
+    /**
+     * MUTATION LINE (b): If `guard_actor_state` runs the scoped lookup before WP role candidacy
+     * or treats non-patient accounts as `UNKNOWN`, staff `POST /wp/v2/users/me` returns 403 and hook dies.
+     */
+    public function testLookupFailureSpyDoesNotBlockStaffDoctorWpRoleAccount(): void {
+        global $wpdb;
+
+        PatientTwoProofTestHelper::acting_as( $this->staffDoctorUser );
+        $staffUser = get_userdata( $this->staffDoctorUser );
+        self::assertInstanceOf( WP_User::class, $staffUser );
+
+        $orgTable    = App::db()->table( 'cpms_organization_memberships' );
+        $exactSql    = 'SELECT id FROM ' . $orgTable . " WHERE wp_user_id = {$this->staffDoctorUser} AND status = 'active' LIMIT 1";
+        $hits        = 0;
+        $seenQueries = 0;
+        $fault       = static function ( mixed $query ) use ( $exactSql, $orgTable, &$hits, &$seenQueries ): mixed {
+            ++$seenQueries;
+            if ( is_string( $query ) && trim( $query ) === $exactSql ) {
+                ++$hits;
+                return 'SELECT cpms_fault_injection_no_such_column FROM ' . $orgTable;
+            }
+            return $query;
+        };
+        $preMail     = static function ( mixed $pre ): mixed {
+            unset( $pre );
+            return false;
+        };
+
+        $prevPost     = $_POST;
+        $prevSuppress = (bool) $wpdb->suppress_errors( true );
+        add_filter( 'query', $fault, 5 );
+        add_filter( 'pre_wp_mail', $preMail, 1, 1 );
+        try {
+            $nonce          = wp_create_nonce( 'wp_rest' );
+            $staffResp      = $this->dispatchRestWithNonce( 'POST', '/wp/v2/users/me', [ 'first_name' => 'دکتر-تست' ], $nonce );
+            $_POST['email'] = (string) $staffUser->user_email;
+            $hookDied       = false;
+            try {
+                do_action( 'personal_options_update', $this->staffDoctorUser );
+            } catch ( WPDieException ) {
+                $hookDied = true;
+            }
+        } finally {
+            remove_filter( 'query', $fault, 5 );
+            remove_filter( 'pre_wp_mail', $preMail, 1 );
+            $wpdb->suppress_errors( $prevSuppress );
+            $_POST = $prevPost;
+        }
+
+        self::assertGreaterThan( 0, $seenQueries );
+        self::assertSame( 0, $hits );
+        self::assertSame( 200, $staffResp->get_status() );
+        self::assertFalse( $hookDied );
+    }
+
+    /**
+     * MUTATION LINE (c): If `guard_wp_users_rest` blocks safe `GET /wp/v2/users/me`, status becomes 403;
+     * if bound patients are exempted from write blocking, `POST /wp/v2/users/me` returns 200.
+     */
+    public function testFullyBoundPatientAllowedSelfReadAndDeniedSelfUpdate(): void {
+        $boundUserId = $this->createUser( 'audit_bound_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+        PatientTwoProofTestHelper::seed_patient_proof( $boundUserId, $this->clinicPublic, $this->patientRecord );
+
+        $nonce = wp_create_nonce( 'wp_rest' );
+        $meGet = $this->dispatchRestWithNonce( 'GET', '/wp/v2/users/me', [], $nonce );
+        self::assertSame( 200, $meGet->get_status() );
+
+        $mePost = $this->dispatchRestWithNonce( 'POST', '/wp/v2/users/me', [ 'first_name' => 'Tampered' ], $nonce );
+        self::assertSame( 403, $mePost->get_status() );
+        $postData = $mePost->get_data();
+        self::assertIsArray( $postData );
+        self::assertArrayHasKey( 'code', $postData );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $postData['code'] );
+    }
+
+    /**
+     * MUTATION LINE (d): If `guard_actor_state` fails to classify `administrator` (`manage_options`)
+     * as `NOT_PATIENT`, `GET /wp/v2/users` returns 403.
+     */
+    public function testAdministratorWitnessNotBlockedOnUsersCollection(): void {
+        $adminId = $this->createUser( 'audit_admin_' . uniqid(), 'AdminPass#Audit2026!', 'administrator' );
+        wp_set_current_user( $adminId );
+
+        $nonce = wp_create_nonce( 'wp_rest' );
+        $resp  = $this->dispatchRestWithNonce( 'GET', '/wp/v2/users', [], $nonce );
+        self::assertSame( 200, $resp->get_status() );
+    }
+
+    /**
+     * MUTATION LINE (e): If `guard_actor_state` treats a mixed `ROLE_PATIENT` + staff-role account
+     * as `PATIENT`, `POST /wp/v2/users/me` returns 403 instead of 200.
+     */
+    public function testMixedPatientAndStaffRoleAccountNotBlockedOnOwnMeUpdate(): void {
+        $mixedId   = $this->createUser( 'audit_mixed_' . uniqid(), $this->patientKnownPass, RolesAndCapabilities::ROLE_PATIENT );
+        $mixedUser = get_userdata( $mixedId );
+        self::assertInstanceOf( WP_User::class, $mixedUser );
+        $mixedUser->add_role( RolesAndCapabilities::ROLE_DOCTOR );
+
+        wp_set_current_user( $mixedId );
+        $nonce = wp_create_nonce( 'wp_rest' );
+        $resp  = $this->dispatchRestWithNonce( 'POST', '/wp/v2/users/me', [ 'first_name' => 'MixedUpdated' ], $nonce );
+        self::assertSame( 200, $resp->get_status() );
     }
 }
