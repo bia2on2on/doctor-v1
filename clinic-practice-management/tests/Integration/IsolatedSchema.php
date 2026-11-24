@@ -399,7 +399,7 @@ trait IsolatedSchema
                 (array) $childSession,
                 (string) ($this->capturedTokens[$childUserId ?? 0] ?? '')
             );
-        } else {        } else {
+        } else {
             // License gate and session scope from production wiring write
             // nothing (gate is pure; session reads hit the harness connection
             // inside its outer transaction — rolled back at tear_down). The
