@@ -1942,15 +1942,19 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
             [
                 'clinic_id'  => $this->clinicListed,
                 'name'       => 'DST Loc S2',
+                'slug'       => 'dst-loc-s2-' . bin2hex( random_bytes( 4 ) ),
                 'timezone'   => 'America/New_York',
+                'is_primary' => 0,
                 'is_active'  => 1,
                 'created_at' => $now,
                 'updated_at' => $now,
             ]
         );
         $dstLocationId = $db->wpdb_last_insert_id();
-        $slot2         = $this->insertSlot( $this->clinicListed, $dstLocationId, $this->clinicianListed, '2027-03-14', '02:30:00' );
-        $holdToken2    = 'hold-dst-b-' . bin2hex( random_bytes( 6 ) );
+        self::assertGreaterThan( 0, $dstLocationId );
+        $slot2 = $this->insertSlot( $this->clinicListed, $dstLocationId, $this->clinicianListed, '2027-03-14', '02:30:00' );
+        self::assertGreaterThan( 0, $slot2 );
+        $holdToken2 = 'hold-dst-b-' . bin2hex( random_bytes( 6 ) );
 
         $db->update( 'cpms_schedule_slots', [ 'held_count' => 1 ], [ 'id' => $slot2 ] );
         $db->insert(
