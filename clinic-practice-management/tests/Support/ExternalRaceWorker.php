@@ -162,6 +162,51 @@ final class ExternalRaceWorker
     }
 
     /**
+     * Strict alive check (ROUND4-STRICT-ALIVE): true ONLY when a FRESH
+     * proc_get_status() call succeeds and reports the process plainly alive —
+     * an array whose 'running' key is exactly true, with 'signaled' and
+     * 'stopped' not both interpretable as termination/stoppage (each treated as
+     * doubt below). Any false return, missing or non-true 'running' key, or
+     * any read error returns false — the opposite fail direction of
+     * isRunning(). Deliberately free of every side effect: it does NOT feed
+     * the once-only final-status cache in refreshStatus(), never marks the
+     * process as reaped, and never reads/writes $this->closed, so the
+     * semantics of isRunning(), finalStatus(), waitForExit() and terminate()
+     * are unchanged. proc_get_status is documented to only reliably report
+     * 'running' for the live process; the exit code is therefore never read
+     * here and is irrelevant to this check.
+     *
+     * NOTE: no caching of any kind happens in this method — every call is a
+     * fresh read; a 'running === false' observation from THIS method does not
+     * populate the finalStatus cache (refreshStatus() remains the only
+     * place that does so).
+     */
+    public function isConfirmedRunning(): bool
+    {
+        if ($this->closed || !is_resource($this->process)) {
+            return false;
+        }
+        $status = @proc_get_status($this->process);
+        if (!is_array($status)) {
+            // Doubt (including proc_get_status failure → false): not confirmed.
+            return false;
+        }
+        if (($status['running'] ?? null) !== true) {
+            // Missing key, non-bool, or the process is no longer running.
+            return false;
+        }
+        // signaled/stopped not explicitly true — a SIGSTOP'ped worker or a
+        // signal-terminated one is NOT 'plainly alive' for this check. Their
+        // absence (older manuals name these keys only on POSIX) is tolerated
+        // only because 'running' stayed true; an explicit true is a doubt.
+        if (($status['signaled'] ?? false) === true || ($status['stopped'] ?? false) === true) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
      * The cached final status of the worker, or null before the first
      * not-running observation (e.g. before waitForExit() returns). Served from
      * the cache captured at the single read that observed the exit — never

@@ -503,7 +503,7 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                     );
                     self::assertIsArray($parentLockWhileChildBlocked, 'A must still hold the exact definition row lock when B times out.');
                     self::assertSame($parentLockBefore['lock_id'], $parentLockWhileChildBlocked['lock_id']);
-                    self::assertTrue($worker->isRunning(), 'B must still be alive and awaiting release, not exited.');
+                    self::assertTrue($worker->isConfirmedRunning(), 'B must be observably alive and awaiting release, not exited.');
                 }
 
                 // Poll current Performance Schema state. The interval only
@@ -638,7 +638,7 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                 if ($isMariaDb) {
                     // B already proved it cannot complete while A holds the row; it
                     // is now deterministically parked awaiting A's RELEASE.
-                    self::assertTrue($worker->isRunning(), 'B must still be awaiting release after A deactivated the role.');
+                    self::assertTrue($worker->isConfirmedRunning(), 'B must be observably awaiting release after A deactivated the role.');
                 } else {
                     self::assertIsArray($waitEvidenceAfterTransition, 'B must remain blocked by A until A commits the deactivation.');
                 }
