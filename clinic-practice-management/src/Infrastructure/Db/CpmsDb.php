@@ -185,19 +185,36 @@ final class CpmsDb
     }
 
     /**
-     * Diagnostic spelling wpdb emits for a LIKE candidate (WP 7.1.3).
+     * Diagnostic spellings wpdb can emit for one bound string (WP 7.1.3).
+     * Includes values already escaped by esc_like() (as LIKE terms are) and
+     * raw values going through prepare() directly.
+     *
+     * @param string $value Bound candidate value.
+     *
+     * @return list<string>
      */
-    private function wpdb_escaped_value( string $value ): string {
-        if ( ! method_exists( $this->wpdb, 'esc_like' ) || ! method_exists( $this->wpdb, '_real_escape' ) ) {
-            return '';
+    private function wpdb_escaped_values( string $value ): array {
+        if ( ! method_exists( $this->wpdb, '_real_escape' ) ) {
+            return [];
         }
 
-        $escaped = $this->wpdb->_real_escape( $this->wpdb->esc_like( $value ) );
-        if ( method_exists( $this->wpdb, 'remove_placeholder_escape' ) ) {
-            $escaped = $this->wpdb->remove_placeholder_escape( $escaped );
+        $candidates   = [ $value ];
+        if ( method_exists( $this->wpdb, 'esc_like' ) ) {
+            $candidates[] = $this->wpdb->esc_like( $value );
         }
 
-        return is_string( $escaped ) ? $escaped : '';
+        $spellings = [];
+        foreach ( $candidates as $candidate ) {
+            $escaped = $this->wpdb->_real_escape( $candidate );
+            if ( method_exists( $this->wpdb, 'remove_placeholder_escape' ) ) {
+                $escaped = $this->wpdb->remove_placeholder_escape( $escaped );
+            }
+            if ( is_string( $escaped ) && '' !== $escaped ) {
+                $spellings[] = $escaped;
+            }
+        }
+
+        return array_values( array_unique( $spellings ) );
     }
 
     /**
@@ -258,8 +275,13 @@ final class CpmsDb
                     return '[nid-redacted]';
                 }
                 if ( strlen( $digits ) >= 10 ) {
-                    $escaped = $this->wpdb_escaped_value( $value );
-                    $needles = '' === $escaped ? [ $value, $digits ] : [ $value, $digits, $escaped ];
+                    $needles = array_merge( [ $value, $digits ], $this->wpdb_escaped_values( $value ) );
+                    usort(
+                        $needles,
+                        static function ( string $left, string $right ): int {
+                            return strlen( $right ) <=> strlen( $left );
+                        }
+                    );
                     $text    = str_replace( $needles, '[nid-redacted]', $text );
                 }
             } elseif ( is_int( $value ) && ! $is_template && strlen( (string) $value ) >= 10 ) {

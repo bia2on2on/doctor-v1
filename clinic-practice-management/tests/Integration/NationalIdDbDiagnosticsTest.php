@@ -10,6 +10,7 @@ use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Tests\Support\WpSqlFailureLedger;
 use Closure;
+use ReflectionClass;
 use ReflectionMethod;
 use ReflectionProperty;
 use RuntimeException;
@@ -712,9 +713,9 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
     {
         $spelling = "049\xFF937\xFF0899";
         $text     = "prefix {$spelling} suffix";
-        $constant = new ReflectionProperty(CpmsDb::class, 'NID_TOKEN_PATTERN');
-        $constant->setAccessible(true);
-        $pattern = (string) $constant->getValue();
+        $pattern = (new ReflectionClass(CpmsDb::class))->getConstant('NID_TOKEN_PATTERN');
+        self::assertNotFalse($pattern, 'NID_TOKEN_PATTERN constant exists');
+        self::assertIsString($pattern, 'NID_TOKEN_PATTERN is a string');
 
         self::assertIsInt(preg_match('/[0-9]{3}/', '049'));
         self::assertSame(PREG_NO_ERROR, preg_last_error(), 'PCRE state clean before the subject');
@@ -800,10 +801,12 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
     /** R3d — the wpdb-escaped LIKE spelling is redacted alongside the original. */
     public function testEscapedLikeTermIsValueFree(): void
     {
-        $term    = '049%937%0899';
-        $escaped = $this->wpdb->remove_placeholder_escape(
+        $term         = '049%937%0899';
+        $like         = '%' . $this->wpdb->esc_like($term) . '%';
+        $escaped      = $this->wpdb->remove_placeholder_escape(
             $this->wpdb->_real_escape($this->wpdb->esc_like($term))
         );
+        $like_escaped = $this->wpdb->remove_placeholder_escape($this->wpdb->_real_escape($like));
 
         // The query filter sees the wpdb-escaped spelling, not the raw term.
         $expected = $this->captureExactSql(
@@ -817,7 +820,7 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
             $expected,
             $replacement,
             fn () => (new PatientRepository($this->db))->search($this->clinic_id, $term, 20),
-            [$term, '0499370899', $escaped],
+            [$term, '0499370899', $escaped, $like_escaped],
             'LIKE escaped'
         );
     }
