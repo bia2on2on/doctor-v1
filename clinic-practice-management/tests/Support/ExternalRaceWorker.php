@@ -40,7 +40,12 @@ use RuntimeException;
  * core table), only the configuration file + wp-settings.php like a real
  * installation (the same shape as tests/bin/custom-role-archival-race-worker.php).
  */
-final class ExternalRaceWorker
+/**
+ * NOTE: intentionally non-final — the Unit failure-path suite uses a tiny
+ * test-only subclass to inject doubtful status arrays through the protected
+ * readStatus() seam (B5). No production code instantiates a subclass.
+ */
+class ExternalRaceWorker
 {
     public const TASK_ENV = 'CPMS_RACE_PAYLOAD';
 
