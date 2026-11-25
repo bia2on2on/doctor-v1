@@ -176,6 +176,15 @@ final class CpmsDb
     }
 
     /**
+     * ASCII digits left after removing every non-digit, or null on PCRE error.
+     */
+    private function nid_digits( string $value ): ?string {
+        $digits = preg_replace( '/\D/', '', $value );
+
+        return null === $digits || PREG_NO_ERROR !== preg_last_error() ? null : $digits;
+    }
+
+    /**
      * Whether any value carries ten or more digits (the NID shape).
      *
      * @param array<mixed> $values Values to inspect.
@@ -188,8 +197,11 @@ final class CpmsDb
                 }
                 continue;
             }
-            if ( is_string( $value ) && $this->redact_nid_text( $value ) !== $value ) {
-                return true;
+            if ( is_string( $value ) ) {
+                $digits = $this->nid_digits( $value );
+                if ( null === $digits || strlen( $digits ) >= 10 || $this->redact_nid_text( $value ) !== $value ) {
+                    return true;
+                }
             }
         }
 
@@ -208,8 +220,14 @@ final class CpmsDb
                 $text = $this->redact_nid( $text, $value );
                 continue;
             }
-            if ( is_string( $value ) && $value !== '' && $this->redact_nid_text( $value ) !== $value ) {
-                $text = str_replace( $value, '[nid-redacted]', $text );
+            if ( is_string( $value ) && $value !== '' ) {
+                $digits = $this->nid_digits( $value );
+                if ( null === $digits ) {
+                    return '[nid-redacted]';
+                }
+                if ( strlen( $digits ) >= 10 ) {
+                    $text = str_replace( [ $value, $digits ], '[nid-redacted]', $text );
+                }
             }
         }
 
@@ -222,15 +240,23 @@ final class CpmsDb
      * guard trigger and the diagnostic redactor so they cannot disagree.
      */
     private function redact_nid_text( string $text ): string {
-        return preg_replace_callback(
+        if ( PREG_NO_ERROR !== preg_last_error() ) {
+            return '[nid-redacted]';
+        }
+
+        $redacted = preg_replace_callback(
             self::NID_TOKEN_PATTERN,
             static function ( array $token ): string {
-                return preg_match_all( '/[0-9۰-۹٠-٩]/u', $token[0] ) >= 10
+                $count = preg_match_all( '/[0-9۰-۹٠-٩]/u', $token[0] );
+
+                return false === $count || PREG_NO_ERROR !== preg_last_error() || $count >= 10
                     ? '[nid-redacted]'
                     : $token[0];
             },
             $text
-        ) ?? $text;
+        );
+
+        return null === $redacted || PREG_NO_ERROR !== preg_last_error() ? '[nid-redacted]' : $redacted;
     }
 
     /**

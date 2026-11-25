@@ -10,6 +10,7 @@ use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Tests\Support\WpSqlFailureLedger;
 use Closure;
+use ReflectionMethod;
 use ReflectionProperty;
 use RuntimeException;
 use Throwable;
@@ -667,5 +668,157 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
         self::assertCount(2, $thrown, 'R2d: both strict calls threw');
         self::assertSame('Database error (national ID redacted).', (string) $thrown[0]->getMessage());
         self::assertSame('Database error (national ID redacted).', (string) $thrown[1]->getMessage());
+    }
+
+    // ------------------------------------------------------- ROUND 3C additions
+
+    /** @return array<string, array{label: string, spelling: string, digits: string}> */
+    public static function acceptedNidSpellings(): array
+    {
+        $digits = '0499370899';
+
+        return [
+            'tab filler' => ['label' => 'tab filler', 'spelling' => "049\t937\t0899", 'digits' => $digits],
+            'underscore filler' => ['label' => 'underscore filler', 'spelling' => '049_937_0899', 'digits' => $digits],
+            'comma filler' => ['label' => 'comma filler', 'spelling' => '049,937,0899', 'digits' => $digits],
+            'letter filler' => ['label' => 'letter filler', 'spelling' => '049abc937xyz0899', 'digits' => $digits],
+            'Persian digit filler' => [
+                'label' => 'Persian digit filler',
+                'spelling' => "049\u{06F1}937\u{06F2}0899",
+                'digits' => $digits,
+            ],
+            'Arabic-Indic digit filler' => [
+                'label' => 'Arabic-Indic digit filler',
+                'spelling' => "049\u{0661}937\u{0662}0899",
+                'digits' => $digits,
+            ],
+            'ZWNJ filler' => [
+                'label' => 'ZWNJ filler',
+                'spelling' => "049\u{200C}937\u{200C}0899",
+                'digits' => $digits,
+            ],
+        ];
+    }
+
+    /** @dataProvider acceptedNidSpellings */
+    public function testAcceptedNidSpellingDuplicateErrorIsValueFree(array $case): void
+    {
+        $line = $this->runDuplicateSpellingCase((string) $case['spelling'], (string) $case['digits']);
+
+        self::assertStringStartsWith('[cpms-nid-db] failed guarded query', $line, $case['label']);
+    }
+
+    /** R3c — the single redacted log line keeps useful value-free context. */
+    public function testRedactedLogKeepsValueFreeContext(): void
+    {
+        $line = $this->runDuplicateSpellingCase('049-937-0899', '0499370899');
+
+        self::assertStringContainsString('error=Duplicate entry', $line);
+        self::assertStringContainsString('u_pat_mrn', $line);
+        self::assertStringNotContainsString('049-937-0899', $line);
+        self::assertStringNotContainsString('0499370899', $line);
+    }
+
+    /** R3c — invalid UTF-8 in diagnostic text returns the fixed placeholder. */
+    public function testInvalidUtf8RedactionFailsClosed(): void
+    {
+        $spelling = "049\xFF937\xFF0899";
+        $text     = "prefix {$spelling} suffix";
+        $method   = new ReflectionMethod(CpmsDb::class, 'redact_nid_text');
+        $method->setAccessible(true);
+        $result = $method->invoke($this->db, $text);
+
+        self::assertSame('[nid-redacted]', $result);
+        self::assertStringNotContainsString($spelling, (string) $result);
+        self::assertStringNotContainsString('0499370899', (string) $result);
+    }
+
+    /** R3c — a forced PCRE error yields the fixed placeholder, never the subject. */
+    public function testForcedPcreFailureFailsClosed(): void
+    {
+        $previous = (string) ini_get('pcre.backtrack_limit');
+        ini_set('pcre.backtrack_limit', '1');
+
+        try {
+            $probe = preg_match('/(?:\D+|<\d+>)*[!?]/', str_repeat('foobar foobar foobar ', 16));
+            if (false !== $probe && PREG_NO_ERROR === preg_last_error()) {
+                self::markTestSkipped('Could not deterministically force a PCRE failure in this runtime.');
+            }
+
+            $method = new ReflectionMethod(CpmsDb::class, 'redact_nid_text');
+            $method->setAccessible(true);
+            $result = $method->invoke($this->db, '0499370899');
+
+            self::assertSame('[nid-redacted]', $result);
+            self::assertStringNotContainsString('0499370899', (string) $result);
+        } finally {
+            ini_set('pcre.backtrack_limit', $previous);
+        }
+    }
+
+    /** @return string The single redacted log line from the real duplicate failure. */
+    private function runDuplicateSpellingCase(string $spelling, string $digits): string
+    {
+        $data        = $this->newPatientData($digits);
+        $data['mrn'] = $spelling;
+        self::assertTrue($this->db->insert('cpms_patients', $data), 'seed row with the NID-shaped MRN');
+
+        $columns  = '`' . implode('`, `', array_keys($data)) . '`';
+        $sql      = 'INSERT INTO `' . $this->db->table('cpms_patients') . '` (' . $columns . ') VALUES ('
+            . implode(', ', array_fill(0, count($data), '%s')) . ')';
+        $expected = $this->db->prepare($sql, array_values($data));
+        $hits     = 0;
+        $probe    = static function (string $query) use ($expected, &$hits): string {
+            if ($query === $expected) {
+                ++$hits;
+            }
+
+            return $query;
+        };
+
+        add_filter('query', $probe, 5);
+        $this->db->setStrict(true);
+        $thrown = null;
+        try {
+            try {
+                $this->db->query($sql, array_values($data));
+            } catch (Throwable $error) {
+                $thrown = $error;
+            }
+        } finally {
+            $this->db->setStrict(false);
+            remove_filter('query', $probe, 5);
+        }
+
+        self::assertSame(1, $hits, 'exact-SQL anchored filter matched once');
+        self::assertInstanceOf(RuntimeException::class, $thrown, 'strict guarded call threw');
+        self::assertSame('Database error (national ID redacted).', $thrown->getMessage());
+        $dbh   = $this->wpdb->dbh;
+        $errno = $dbh instanceof \mysqli ? mysqli_errno($dbh) : 0;
+        self::assertNotSame(0, $errno, 'a real DB failure occurred');
+
+        $entries = is_array($GLOBALS['EZSQL_ERROR'] ?? null) ? $GLOBALS['EZSQL_ERROR'] : [];
+        $last    = end($entries);
+        self::assertIsArray($last);
+        self::assertArrayHasKey('query', $last);
+        self::assertArrayHasKey('error_str', $last);
+        foreach (['query', 'error_str'] as $key) {
+            self::assertStringNotContainsString($spelling, (string) $last[$key], 'EZSQL_ERROR ' . $key);
+            self::assertStringNotContainsString($digits, (string) $last[$key], 'EZSQL_ERROR ' . $key . ' digits');
+        }
+
+        $lines = array_values(array_filter(
+            explode("\n", (string) @file_get_contents($this->error_log_path)),
+            static fn (string $entry): bool => str_contains($entry, '[cpms-nid-db]')
+        ));
+        self::assertCount(1, $lines, 'exactly one redacted log line');
+        $line = (string) $lines[0];
+        self::assertStringNotContainsString($spelling, $line, 'redacted log spelling');
+        self::assertStringNotContainsString($digits, $line, 'redacted log digits');
+
+        $this->assertNoNidInDiagnostics($spelling, $thrown);
+        $this->assertNoNidInDiagnostics($digits, $thrown);
+
+        return $line;
     }
 }
