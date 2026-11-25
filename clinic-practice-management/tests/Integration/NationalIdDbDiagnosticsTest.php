@@ -800,14 +800,15 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
     /** R3d — the wpdb-escaped LIKE spelling is redacted alongside the original. */
     public function testEscapedLikeTermIsValueFree(): void
     {
-        $term     = '049%937%0899';
-        $expected = $this->captureExactSql(
-            $term,
-            fn () => (new PatientRepository($this->db))->search($this->clinic_id, $term, 20)
+        $term    = '049%937%0899';
+        $escaped = $this->wpdb->remove_placeholder_escape(
+            $this->wpdb->_real_escape($this->wpdb->esc_like($term))
         );
 
-        $escaped     = $this->wpdb->remove_placeholder_escape(
-            $this->wpdb->_real_escape($this->wpdb->esc_like($term))
+        // The query filter sees the wpdb-escaped spelling, not the raw term.
+        $expected = $this->captureExactSql(
+            $escaped,
+            fn () => (new PatientRepository($this->db))->search($this->clinic_id, $term, 20)
         );
         $replacement = "SELECT '{$escaped}' AS nid_probe FROM " . $this->db->table('cpms_patients')
             . ' WHERE cpms_nid_diag_no_such_column = 1 LIMIT 1';
