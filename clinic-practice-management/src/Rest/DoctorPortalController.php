@@ -10,6 +10,7 @@ use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Machine\VisitMachine;
 use ClinicCore\Domain\Time\Jalali;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use WP_Error;
 use WP_REST_Request;
@@ -513,7 +514,7 @@ final class DoctorPortalController extends RestBase {
 		} catch ( \ClinicCore\Application\Handwriting\HandwritingException $e ) {
 			return $this->error( $e->errorCode, $e->httpStatus, $e->getMessage(), $e->data ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- existing exception contract
 		} catch ( \Throwable $e ) {
-			error_log( '[CPMS][DoctorPortalController] handwriting: ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- existing controller convention
+			error_log( '[CPMS][DoctorPortalController] handwriting: ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- existing controller convention
 			return $this->error( 'CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور — لطفاً دوباره تلاش کنید' );
 		}
 		return $this->error( 'CLINIC_NOT_FOUND', 404, 'مراجعه یافت نشد' );
@@ -1450,7 +1451,7 @@ final class DoctorPortalController extends RestBase {
 		} catch ( \ClinicCore\Domain\Visits\VisitException $e ) {
 			return $this->error( $e->errorCode, $e->httpStatus, $e->getMessage(), $e->data ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- legacy PSR-style, established contract
 		} catch ( \Throwable $e ) {
-			error_log( '[CPMS][DoctorPortalController] unexpected: ' . get_class( $e ) . ': ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
+			error_log( '[CPMS][DoctorPortalController] unexpected: ' . get_class( $e ) . ': ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
 			return $this->error( 'CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور — لطفاً دوباره تلاش کنید' );
 		}
 	}
