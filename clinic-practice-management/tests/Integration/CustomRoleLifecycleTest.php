@@ -694,11 +694,21 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                 $collectTerminalLine($finalLine);
             }
             if ($worker instanceof ExternalRaceWorker) {
-                $drained = 0;
-                while ($drained < 32 && ($drainedLine = $worker->readLineWait((float) self::RACE_SIGNAL_TIMEOUT_SECONDS)) !== null) {
-                    $drained++;
+                $drain = $worker->drainRemainingLines((float) self::RACE_SIGNAL_TIMEOUT_SECONDS);
+                foreach ($drain['lines'] as $drainedLine) {
                     $collectTerminalLine($drainedLine);
                 }
+                if (is_string($drain['trailing']) && $drain['trailing'] !== '') {
+                    $collectTerminalLine($drain['trailing']);
+                }
+                self::assertTrue(
+                    $drain['complete'],
+                    'The worker did not reach EOF within the bounded drain window; a later terminal line cannot be ruled out.'
+                );
+                self::assertFalse(
+                    $worker->outputTruncated(),
+                    'Worker stdout exceeded the bounded rolling buffer and bytes were discarded; output integrity cannot be proven.'
+                );
             }
             foreach ($terminalLines as $line) {
                 if (str_starts_with($line, 'RESULT:')) {

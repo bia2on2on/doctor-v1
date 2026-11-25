@@ -83,6 +83,9 @@ final class ExternalRaceWorker
 
     private bool $closed = false;
 
+    /** Sticky: stdout buffer ever discarded bytes (1 MiB rolling window). */
+    private bool $outputTruncated = false;
+
     /** Sticky: any read observed signaled === true (never reset). */
     private bool $signaledObserved = false;
 
@@ -141,8 +144,15 @@ final class ExternalRaceWorker
         return new self($process, $pipes);
     }
 
-    /** @param resource|null $pipe */
-    private function __construct($process, array $pipes)
+    /**
+     * PROTECTED on purpose (test-only seam): the Unit suite launches a real
+     * but harmless child, then a subclass injects doubtful status arrays to
+     * prove the doubt rule. Tests only; production-like callers use launch().
+     *
+     * @param resource $process
+     * @param array<int, resource> $pipes
+     */
+    protected function __construct($process, array $pipes)
     {
         $this->process = $process;
         $status = $this->readStatus();
@@ -170,7 +180,10 @@ final class ExternalRaceWorker
         }
         $status = $this->readStatus();
 
-        return !is_array($status) || ($status['running'] ?? true) === true;
+        return !is_array($status)
+            || !array_key_exists('running', $status)
+            || !is_bool($status['running'])
+            || $status['running'] === true;
     }
 
     /**
@@ -278,6 +291,64 @@ final class ExternalRaceWorker
         }
     }
 
+    /**
+     * Bounded drain of everything the worker wrote that has not been
+     * consumed yet. Waits (usleep polling, as everywhere in this class) for
+     * the worker to exit and its stdout to go EOF, then returns EVERY line
+     * still present — including a final line without a trailing newline,
+     * which is returned as `trailing` instead of being dropped. There is no
+     * line-count cap.
+     *
+     * The caller MUST fail the test when `complete` is false (the deadline
+     * expired before the worker/EOF was observed): a later terminal line
+     * then cannot be ruled out. The caller MUST also fail the test when
+     * outputTruncated() is true.
+     *
+     * @return array{lines: list<string>, trailing: ?string, complete: bool}
+     */
+    public function drainRemainingLines(float $timeoutSeconds): array
+    {
+        $lines = [];
+        $trailing = null;
+        $complete = false;
+
+        $deadline = microtime(true) + $timeoutSeconds;
+        while (microtime(true) < $deadline) {
+            $this->pump();
+            if ($this->closed) {
+                // Pipes are closed by close(); everything the child wrote is
+                // already in the buffer. One final pump above drained it.
+                $complete = true;
+                break;
+            }
+            $status = $this->readStatus();
+            if (is_array($status) && is_bool($status['running'] ?? null) && $status['running'] === false) {
+                $this->pump(); // final drain of the bytes the child wrote before dying
+                $complete = true;
+                break;
+            }
+            usleep(1000);
+        }
+
+        while (($pos = strpos($this->stdoutBuffer, "\n")) !== false) {
+            $line = substr($this->stdoutBuffer, 0, $pos);
+            $this->stdoutBuffer = substr($this->stdoutBuffer, $pos + 1);
+            $lines[] = rtrim($line, "\r");
+        }
+        if ($this->stdoutBuffer !== '') {
+            $trailing = rtrim($this->stdoutBuffer, "\r");
+            $this->stdoutBuffer = '';
+        }
+
+        return ['lines' => $lines, 'trailing' => $trailing, 'complete' => $complete];
+    }
+
+    /** True when the stdout rolling buffer ever discarded bytes (>1 MiB window). */
+    public function outputTruncated(): bool
+    {
+        return $this->outputTruncated;
+    }
+
     /** Write one line of input to the worker's stdin (protocol-pipe workers). Returns the byte count (0 on failure). */
     public function writeCommand(string $command): int
     {
@@ -302,7 +373,7 @@ final class ExternalRaceWorker
                 return $this->exitCode ?? -1;
             }
             $status = $this->readStatus();
-            if (is_array($status) && ($status['running'] ?? false) === false) {
+            if (is_array($status) && is_bool($status['running'] ?? null) && $status['running'] === false) {
                 $exitCode = $this->exitCode ?? (int) ($status['exitcode'] ?? -1);
                 $this->close();
 
@@ -337,14 +408,18 @@ final class ExternalRaceWorker
     /**
      * The ONE and ONLY proc_get_status() call site in this class. Every
      * status read (constructor, isRunning, isConfirmedRunning, readStatus
-     * callers in waitForExit/terminate) routes here.
+     * callers in waitForExit/terminate) routes here. PROTECTED on purpose
+     * (B5): the Unit suite injects doubtful status arrays through a tiny
+     * test-only subclass to prove the doubt rule; production-like callers
+     * use the public API.
      *
      * When running === false is observed for the first time, the status
      * array is captured in the final-status cache BEFORE returning (a first
-     * exit observation on any path is never lost). The sticky signaled/stopped
-     * flags are set on ANY read observing them; the cached snapshot merges
-     * them, so a signalled/stopped observation from any path makes the final
-     * strict child check fail.
+     * exit observation on any path is never lost). A MISSING or non-bool
+     * 'running' is DOUBT (B5): no cache write; callers see doubt. The sticky
+     * signaled/stopped flags are set on ANY read observing them; the cached
+     * snapshot merges them, so a signalled/stopped observation from any
+     * path makes the final strict child check fail.
      *
      * php-8.2 proc_open.c: proc_get_status() uses waitpid(WNOHANG|WUNTRACED);
      * the exit code of a normally exited child is only valid on the first
@@ -354,7 +429,7 @@ final class ExternalRaceWorker
      *
      * @return array<string, mixed>|null
      */
-    private function readStatus(): ?array
+    protected function readStatus(): ?array
     {
         if ($this->closed) {
             return null;
@@ -386,7 +461,12 @@ final class ExternalRaceWorker
         if (($status['stopped'] ?? false) === true) {
             $this->stoppedObserved = true;
         }
-        if (($status['running'] ?? false) === false && $this->finalStatus === null) {
+        if (!array_key_exists('running', $status) || !is_bool($status['running'])) {
+            // B5: a missing or non-bool 'running' key is DOUBT — it is never
+            // treated as exit. No cache write; callers see doubt.
+            return $status;
+        }
+        if ($status['running'] === false && $this->finalStatus === null) {
             // The one and only decisive read: cache it and never re-read.
             $this->finalStatus = [
                 'exitCode' => (int) ($status['exitcode'] ?? -1),
@@ -413,6 +493,7 @@ final class ExternalRaceWorker
                 $this->stdoutBuffer .= $chunk;
                 if (strlen($this->stdoutBuffer) > 1048576) {
                     $this->stdoutBuffer = substr($this->stdoutBuffer, -1048576);
+                    $this->outputTruncated = true;
                 }
             } else {
                 $this->diagnostics .= $chunk;
@@ -447,6 +528,12 @@ final class ExternalRaceWorker
         if ($this->closed) {
             return;
         }
+        if (!is_resource($this->process)) {
+            // Test-only injected workers may hold no process at all; there is
+            // nothing to signal and nothing to wait for.
+            $this->closed = true;
+            return;
+        }
         $this->pump();
 
         if ($this->finalStatus === null) {
@@ -459,7 +546,7 @@ final class ExternalRaceWorker
             while (microtime(true) < $deadline) {
                 $this->pump();
                 $status = $this->readStatus();
-                if (is_array($status) && ($status['running'] ?? true) === false) {
+                if (is_array($status) && is_bool($status['running'] ?? null) && $status['running'] === false) {
                     break;
                 }
                 usleep(10000);
@@ -474,7 +561,7 @@ final class ExternalRaceWorker
                 while (microtime(true) < $deadline) {
                     $this->pump();
                     $status = $this->readStatus();
-                    if (is_array($status) && ($status['running'] ?? true) === false) {
+                    if (is_array($status) && is_bool($status['running'] ?? null) && $status['running'] === false) {
                         break;
                     }
                     usleep(10000);
