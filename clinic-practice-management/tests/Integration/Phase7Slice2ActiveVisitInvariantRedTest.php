@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Application\Booking\BookingService;
+use ClinicCore\Application\Notifications\SmsService;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Application\Visits\VisitService;
@@ -13,7 +14,11 @@ use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Domain\Licensing\LicenseDecision;
 use ClinicCore\Domain\Licensing\LicenseGate;
+use ClinicCore\Domain\Visits\VisitException;
+use ClinicCore\Infrastructure\Audit\AuditLogger;
+use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Logging\OpLogger;
+use ClinicCore\Infrastructure\Queue\JobQueue;
 use ClinicCore\Infrastructure\Repository\AppointmentRepository;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
@@ -21,9 +26,12 @@ use ClinicCore\Infrastructure\Repository\SlotRepository;
 use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Infrastructure\Repository\VisitRepository;
 use ClinicCore\Infrastructure\Security\Idempotency;
+use ClinicCore\Infrastructure\Sms\CredentialVault;
+use ClinicCore\Infrastructure\Sms\SmsProviderRegistry;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Settings\SettingsFactory;
 use Throwable;
-use ClinicCore\Tests\Support\ExternalRaceWorker;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 /**
@@ -492,6 +500,9 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
 
     public function testConcurrentCheckInAndPatientCancelNeverLeaveLiveVisitOnCancelledAppointment(): void
     {
+        if (!function_exists('pcntl_fork')) {
+            $this->markTestSkipped('pcntl_fork not available (CI Linux has it)');
+        }
 
         $observations = [];
         for ($attempt = 1; $attempt <= self::RACE_ATTEMPTS; $attempt++) {
@@ -519,6 +530,9 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
 
     public function testConcurrentCheckInAndRescheduleNeverLeaveLiveVisitOnRescheduledAppointment(): void
     {
+        if (!function_exists('pcntl_fork')) {
+            $this->markTestSkipped('pcntl_fork not available (CI Linux has it)');
+        }
 
         $observations = [];
         for ($attempt = 1; $attempt <= self::RACE_ATTEMPTS; $attempt++) {
@@ -987,16 +1001,14 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
     }
 
     // ==================================================================
-    // Concurrency harness (external proc_open workers + independent DB
-    // connections on each worker + absolute-time barrier — the established
-    // repo pattern)
+    // Concurrency harness (pcntl_fork + independent wpdb per child +
+    // absolute-time barrier — the established repo pattern)
     // ==================================================================
 
     /**
-     * Launch one external worker per worker spec; every worker opens its OWN
-     * connection, wires the REAL product services, aligns on a shared absolute
-     * time and then fires the product call. Outcomes are collected from temp
-     * files; a non-zero worker exit is a harness failure, not a race outcome.
+     * Fork one child per worker; every child opens its OWN connection, wires
+     * the REAL product services, aligns on a shared absolute time and then
+     * fires the product call. Outcomes are collected from temp files.
      *
      * @param list<array<string, mixed>> $workers
      *
@@ -1005,41 +1017,27 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
     private function runRace(array $workers, int $appointmentId): array
     {
         $fireAt = microtime(true) + self::BARRIER_SEC;
+        $pids = [];
         $files = [];
         $crashed = [];
-        // External proc_open workers: no descriptor is inherited from this
-        // harness process, so a graceful exit cannot run mysqlnd on the
-        // shared session. Exit 0 = clean job done.
-        $script = dirname(__DIR__) . '/bin/fork-race-wp-worker.php';
-        $launched = [];
 
         foreach ($workers as $i => $worker) {
             $files[$i] = sys_get_temp_dir() . '/cpms-p7s2-race-' . $this->fileTag . '-' . $i . '.json';
-            @unlink($files[$i]);
-            $task = [
-                'mode' => 'active_visit_race',
-                'role' => (string) ($worker['role'] ?? ''),
-                'offset' => (float) ($worker['offset'] ?? 0.0),
-                'fire_at' => $fireAt,
-                'appointment_id' => $appointmentId,
-                'patient_id' => $this->patientId,
-                'patient_user_id' => $this->patientUserId,
-                'secretary_user_id' => $this->secretaryUserId,
-                'clinician_id' => $this->clinicianId,
-                'clinic_id' => $this->clinicId,
-                'outcome' => $files[$i],
-            ];
-            if (($worker['role'] ?? '') === 'reschedule') {
-                $task['dest_date'] = (string) ($worker['dest_date'] ?? '');
-                $task['dest_time'] = (string) ($worker['dest_time'] ?? '');
-                $task['dest_slot_id'] = (int) ($worker['dest_slot_id'] ?? 0);
-                $task['idem_key'] = (string) ($worker['idem_key'] ?? '');
+            $pid = pcntl_fork();
+            if ($pid === -1) {
+                $this->fail('pcntl_fork failed');
             }
-            $launched[$i] = ExternalRaceWorker::launch($script, $task);
+            if ($pid === 0) {
+                // Child: NEVER returns (an escaped exception would make the
+                // copied PHPUnit continue and re-run the suite inside the child).
+                $this->raceChild($fireAt, $files[$i], $worker, $appointmentId);
+            }
+            $pids[$i] = $pid;
         }
 
-        foreach ($launched as $i => $proc) {
-            if ($proc->waitForExit(30.0) !== 0) {
+        foreach ($pids as $i => $pid) {
+            pcntl_waitpid($pid, $status);
+            if (!ForkChildExit::childTerminatedCleanly($status)) {
                 $crashed[] = $i;
             }
         }
@@ -1059,6 +1057,217 @@ final class Phase7Slice2ActiveVisitInvariantRedTest extends WP_UnitTestCase
         }
 
         return $outcomes;
+    }
+
+    /**
+     * Child body: fresh connection -> explicit scope -> real services ->
+     * barrier -> one production mutation -> outcome file -> lifetime-guard termination.
+     *
+     * @param array<string, mixed> $worker
+     */
+    private function raceChild(float $fireAt, string $file, array $worker, int $appointmentId): void
+    {
+        $wdb = null;
+        try {
+            global $wpdb;
+            $wdb = new \wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
+            if (!method_exists($wdb, 'set_prefix')) {
+                ForkChildExit::terminate(9);
+            }
+            $wdb->set_prefix($wpdb->prefix);
+            $wpdb = $wdb;
+            // The integration bootstrap maps `/*cpms*/` transaction SQL to
+            // SAVEPOINTs (parent test transaction). Children need REAL
+            // transactions on their own connection.
+            remove_all_filters('query');
+            $wdb->has_connected = false;
+            $wdb->init_charset();
+            $wdb->check_connection();
+
+            ScopeContext::set(ClinicScope::forClinic($this->clinicId));
+
+            $cpms = new CpmsDb($wdb);
+            $op = new OpLogger($cpms);
+            $audit = new AuditLogger($cpms, $op);
+            $factory = new SettingsFactory($cpms, $audit);
+            $gate = new Phase7Slice2AllowAllLicenseGate();
+
+            while (microtime(true) < $fireAt + (float) ($worker['offset'] ?? 0.0)) {
+                usleep(250);
+            }
+
+            $outcome = ['result' => 'unknown'];
+            try {
+                $outcome = $this->raceWorker($worker, $cpms, $factory, $audit, $op, $gate, $appointmentId);
+            } catch (VisitException $e) {
+                $outcome = [
+                    'result' => 'error',
+                    'role' => (string) ($worker['role'] ?? ''),
+                    'code' => $e->errorCode,
+                    'http' => $e->httpStatus,
+                    'message' => $e->getMessage(),
+                ];
+            } catch (BookingException $e) {
+                $outcome = [
+                    'result' => 'error',
+                    'role' => (string) ($worker['role'] ?? ''),
+                    'code' => $e->errorCode,
+                    'http' => $e->httpStatus,
+                    'message' => $e->getMessage(),
+                    'trace' => $this->bookingErrorTrace($e),
+                ];
+            } catch (Throwable $e) {
+                // A raw (non-product) failure inside the child is harness
+                // evidence: report WHERE it happened, never just the message.
+                $outcome = [
+                    'result' => 'fatal',
+                    'role' => (string) ($worker['role'] ?? ''),
+                    'detail' => get_class($e) . ': ' . $e->getMessage(),
+                    'at' => basename($e->getFile()) . ':' . $e->getLine(),
+                    'trace' => $this->throwableTrace($e),
+                ];
+            }
+            file_put_contents($file, (string) json_encode($outcome, JSON_UNESCAPED_UNICODE));
+        } catch (Throwable $e) {
+            @file_put_contents(
+                $file,
+                (string) json_encode(
+                    [
+                        'result' => 'fatal',
+                        'role' => (string) ($worker['role'] ?? ''),
+                        'detail' => 'child bootstrap: ' . get_class($e) . ': ' . $e->getMessage(),
+                        'at' => basename($e->getFile()) . ':' . $e->getLine(),
+                        'trace' => $this->throwableTrace($e),
+                    ],
+                    JSON_UNESCAPED_UNICODE
+                )
+            );
+        }
+        if ($wdb instanceof \wpdb) {
+            @$wdb->close();
+        }
+        ForkChildExit::terminate(0);
+    }
+
+    /**
+     * One REAL product call per worker role, on the child's own connection.
+     *
+     * @param array<string, mixed> $worker
+     *
+     * @return array<string, mixed>
+     */
+    private function raceWorker(
+        array $worker,
+        CpmsDb $cpms,
+        SettingsFactory $factory,
+        AuditLogger $audit,
+        OpLogger $op,
+        LicenseGate $gate,
+        int $appointmentId
+    ): array {
+        $role = (string) ($worker['role'] ?? '');
+
+        if ($role === 'check_in') {
+            $visits = new VisitService(
+                $cpms,
+                new VisitRepository($cpms),
+                new AppointmentRepository($cpms),
+                $factory,
+                $audit,
+                $gate,
+                $op,
+                null,
+                new MembershipRepository($cpms)
+            );
+            $row = $cpms->fetchRow('SELECT slot_date FROM ' . $cpms->table('cpms_appointments') . ' WHERE id = %d', [$appointmentId]);
+            VisitService::setTestNowUtc(new \DateTimeImmutable((string) $row['slot_date'] . ' 00:00:00', new \DateTimeZone(self::TZ)));
+            try {
+                $visit = $visits->checkIn($this->secretaryUserId, $this->patientId, $appointmentId);
+            } finally {
+                VisitService::setTestNowUtc(null);
+            }
+
+            return [
+                'result' => 'ok',
+                'role' => 'check_in',
+                'visit_id' => (int) $visit['id'],
+                'visit_status' => (string) $visit['status'],
+            ];
+        }
+
+        if ($role === 'cancel' || $role === 'reschedule') {
+            $sms = new SmsService(
+                $cpms,
+                $factory,
+                new SmsProviderRegistry(),
+                new CredentialVault(),
+                $audit,
+                $op,
+                new JobQueue($cpms, $op),
+                fn (): int => $this->clinicId
+            );
+            $booking = new BookingService(
+                $cpms,
+                new SlotRepository($cpms),
+                new AppointmentRepository($cpms),
+                new PatientRepository($cpms),
+                $factory,
+                $gate,
+                $audit,
+                $op,
+                new Idempotency($cpms),
+                $sms,
+                null,
+                new MembershipRepository($cpms)
+            );
+
+            if ($role === 'cancel') {
+                $result = $booking->cancelByPatient($this->patientUserId, $appointmentId, 'p7s2 race cancel');
+
+                return ['result' => 'ok', 'role' => 'cancel', 'appointment_status' => (string) $result['status']];
+            }
+
+            $result = $booking->reschedule(
+                $this->patientUserId,
+                $appointmentId,
+                $this->clinicianId,
+                (string) $worker['dest_date'],
+                (string) $worker['dest_time'],
+                (string) $worker['idem_key'],
+                (int) $worker['dest_slot_id']
+            );
+
+            return ['result' => 'ok', 'role' => 'reschedule', 'appointment_id' => (int) $result['appointment_id']];
+        }
+
+        return ['result' => 'fatal', 'detail' => 'unknown worker role: ' . $role];
+    }
+
+    /**
+     * Compact origin trace for a Booking error (diagnoses which product guard
+     * rejected the call — the message alone is shared by several guards).
+     *
+     * @return list<string>
+     */
+    private function bookingErrorTrace(BookingException $e): array
+    {
+        return $this->throwableTrace($e);
+    }
+
+    /**
+     * Compact call chain for any Throwable (child diagnostics).
+     *
+     * @return list<string>
+     */
+    private function throwableTrace(Throwable $e): array
+    {
+        $out = [];
+        foreach (array_slice($e->getTrace(), 0, 8) as $frame) {
+            $out[] = ($frame['class'] ?? '') . ($frame['type'] ?? '') . ($frame['function'] ?? '')
+                . ' @ ' . basename((string) ($frame['file'] ?? '?')) . ':' . (string) ($frame['line'] ?? '?');
+        }
+
+        return $out;
     }
 
     /**

@@ -31,16 +31,18 @@
  *  CONCURRENCY (check-in vs no-show on the same appointment row):
  *   - terminal no_show must never end with a genuinely active bound Visit;
  *   - one representative real-DB race with genuinely independent
- *     processes/connections (external proc_open workers; each worker builds its own fresh
+ *     processes/connections (pcntl fork; each child builds its own fresh
  *     wpdb connection and removes the test-only SAVEPOINT query-rewrite so
  *     its commits are real; final state read on a fresh mysqli — never the
  *     parent's REPEATABLE-READ snapshot).
- *   - The no-show side is the MANUAL markNoShowByStaff path (the reception-route
- *     chain), the secretary-side surface this RED covers.
+ *   - The no-show side is the AUTOMATIC sweep — the only FR-5.5 no-show
+ *     path that exists at current HEAD (the manual surface itself is part
+ *     of the RED; calling a not-yet-existing method would be a child
+ *     fatal = harness failure, not product evidence).
  *   - BOTH workers fire at the SAME barrier instant (zero offset) — a
  *     genuine simultaneous start competing for the same appointment row
  *     lock. A scheduling offset/lead alone is NOT accepted as concurrency
- *     evidence: each worker records wall-clock `call_started_at` /
+ *     evidence: each child records wall-clock `call_started_at` /
  *     `call_finished_at` around its real product call, and the test
  *     asserts a strict in-flight overlap of the two call windows
  *     (max(starts) < min(ends)) — structurally guaranteed in a true lock
@@ -50,10 +52,10 @@
  *     orders is the second half of the proof: the loser observed the
  *     winner's committed row state, which is impossible without having
  *     waited on the winner's row lock.
- *   - Independence evidence recorded per worker: distinct worker PIDs
+ *   - Independence evidence recorded per child: distinct child PIDs
  *     (≠ parent PID, ≠ each other), own fresh wpdb connection
  *     (check_connection), and the test-only query-filter census
- *     (absent from the fresh worker boot).
+ *     (present before, removed after).
  *   - Both legal serialization orders are asserted; no sequential
  *     execution is manufactured as concurrency evidence (if an attempt
  *     shows no in-flight overlap, the attempt fails as a harness defect).
@@ -118,7 +120,7 @@ use DateTimeZone;
 use Throwable;
 use WP_REST_Request;
 use WP_REST_Response;
-use ClinicCore\Tests\Support\ExternalRaceWorker;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
@@ -140,10 +142,14 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     /** Race harness: barrier countdown before the simultaneous fire. */
     private const BARRIER_SEC = 1.5;
     private const RACE_ATTEMPTS = 3;
-    /** Wait deadline for one external race worker (barrier sight 45 s + product-call budget + buffer). */
-    private const RACE_WORKER_EXIT_TIMEOUT_SEC = 50.0;
-    /** Worker-side deadline: after this the worker writes a fatal outcome and exits itself. */
-    private const RACE_WORKER_BARRIER_DEADLINE_SEC = 45.0;
+    /** Bounded wait for the forked children to finish after the barrier is released. */
+    private const RACE_FINISH_DEADLINE_SEC = 30.0;
+    /** Bounded wait for a SIGKILLed child to be reaped; never block the suite on it. */
+    private const RACE_REAP_DEADLINE_SEC = 5.0;
+    /** Child-side deadline: after this the child writes a fatal outcome and exits itself. */
+    private const RACE_CHILD_BARRIER_DEADLINE_SEC = 45.0;
+    /** Bounded EINTR retries for one child probe: a transient signal is never a reason to kill. */
+    private const RACE_PROBE_RETRIES = 20;
 
     /** P2: head start that decides which worker takes the appointment row lock first. */
     private const RACE_HEAD_START_SEC = 0.35;
@@ -165,7 +171,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
 
     /** @var int[] */
     private array $userIds = [];
-    private array $parentLaunchProbe = [];
+    private array $parentForkProbe = [];
 
     private int $jobsHighWater = 0;
     private int $oplogsHighWater = 0;
@@ -210,7 +216,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         // Service-level assertions attribute audit rows to the fixture Clinic.
         ScopeContext::set(ClinicScope::forClinic($this->clinicA));
 
-        // Committed fixture: visible to the external race workers (their own DB
+        // Committed fixture: visible to forked race children (their own DB
         // connections) — the test transaction would hide it from them.
         $wpdb->query('COMMIT'); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
     }
@@ -672,17 +678,17 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     //
     // The race runs ONCE per class and its observations are asserted by ONE test per
     // invariant, so a red run names the invariant instead of hiding several behind a
-    // single aggregate name. The harness has its own test: a worker launch / bootstrap /
-    // worker-exit problem can never be mistaken for product evidence.
+    // single aggregate name. The harness has its own test: a fork / bootstrap /
+    // child-exit problem can never be mistaken for product evidence.
 
     /** @var array<int, array{attempt: int, outcomes: array<string, array<string, mixed>>, state: array<string, mixed>}>|null */
     private static ?array $race_observations = null;
 
-    /** @var string|null Harness-level fatal (worker launch, worker exit, outcome file); null means the harness completed. */
+    /** @var string|null Harness-level fatal (fork, child exit, outcome file); null means the harness completed. */
     private static ?string $race_harness_error = null;
 
-    /** @var string|null (a) worker launch / worker exit / outcome file. */
-    private static ?string $race_error_worker = null;
+    /** @var string|null (a) fork / child exit / outcome file. */
+    private static ?string $race_error_fork = null;
 
     /** @var string|null (b) seeding or COMMIT: the seeded rows were not visible to a fresh connection. */
     private static ?string $race_error_seed = null;
@@ -690,13 +696,12 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     /** @var string|null (c) post-race state read: a row the state reader needs was missing. */
     private static ?string $race_error_state = null;
 
-    /** @var bool Whether this run could launch external race workers (recorded for the report, never asserted softly). */
-    private static bool $race_external_worker_available = false;
+    /** @var bool Whether this run has pcntl_fork (recorded for the report, never asserted softly). */
+    private static bool $race_pcntl_available = false;
 
     /**
      * PER-ATTEMPT phase record, written WITHOUT asserting so each diagnostic test can
-     * name its own phase: attempt => ['workers'|'seed'|'state' => 'reached'|error text]. The
-     * 'workers' label covers the external workers being launched.
+     * name its own phase: attempt => ['fork'|'seed'|'state' => 'reached'|error text].
      * Every attempt starts at 'not-reached', so an earlier success can never mask a
      * later failure.
      *
@@ -705,19 +710,24 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     private static array $race_phase = [];
 
     /**
-     * T2: the external-worker race needs proc_open and a pipe to consume the
-     * worker's output, and returns from launch with a normal exit code. Missing
-     * pcntl primitives are fine — external workers are reaped by the launcher.
-     * CI fails loudly, a local run skips.
+     * T2: the forked race needs fork, wait and a kill primitive. Missing `posix_kill`
+     * would leave a child polling a barrier file the parent removes, so all of them are
+     * required: CI fails loudly, a local run skips with the missing names.
      */
-    private function requireRaceCapabilities(): void
+    private function requireForkCapabilities(): void
     {
         $missing = [];
-        if (!function_exists('proc_open')) {
-            $missing[] = 'proc_open';
+        if (!function_exists('pcntl_fork')) {
+            $missing[] = 'pcntl_fork';
         }
-        if (!defined('PHP_BINARY') || PHP_BINARY === '') {
-            $missing[] = 'PHP_BINARY';
+        if (!function_exists('pcntl_waitpid')) {
+            $missing[] = 'pcntl_waitpid';
+        }
+        if (!function_exists('posix_kill')) {
+            $missing[] = 'posix_kill';
+        }
+        if (!defined('SIGKILL')) {
+            $missing[] = 'SIGKILL';
         }
         if ($missing === []) {
             return;
@@ -726,11 +736,93 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         $detail = 'missing: ' . implode(', ', $missing);
         if ('true' === getenv('GITHUB_ACTIONS')) {
             self::fail(
-                'the external-worker race cannot run in this CI environment (' . $detail . '), so its evidence would be '
+                'the forked race cannot run in this CI environment (' . $detail . '), so its evidence would be '
                 . 'silently skipped. This suite FAILS instead of skipping whenever GITHUB_ACTIONS=true.'
             );
         }
-        $this->markTestSkipped('the external-worker race cannot run here (' . $detail . ').');
+        $this->markTestSkipped('the forked race cannot run here (' . $detail . ').');
+    }
+
+    /**
+     * T2: one non-blocking `pcntl_waitpid()` poll that separates a reaped child from a
+     * transient (EINTR) and a hard waitpid error instead of treating every -1 as ECHILD.
+     *
+     * @return array{state: string, status: int} state: reaped|running|gone|error;
+     *                                           status: wait status or the pcntl error
+     */
+    private function pollChild(int $pid): array
+    {
+        if ($pid <= 0) {
+            return ['state' => 'error', 'status' => 0];
+        }
+
+        $status = 0;
+        $waited = pcntl_waitpid($pid, $status, WNOHANG);
+        if ($pid === $waited) {
+            return ['state' => 'reaped', 'status' => $status];
+        }
+        if (0 === $waited) {
+            return ['state' => 'running', 'status' => $status];
+        }
+
+        $error = pcntl_get_last_error();
+        if (defined('PCNTL_ECHILD') && PCNTL_ECHILD === $error) {
+            return ['state' => 'gone', 'status' => 0];
+        }
+
+        return ['state' => 'error', 'status' => $error];
+    }
+
+    /**
+     * T1: probe one child, retrying EINTR a bounded number of times, so a transient signal
+     * can never be mistaken for "safe to kill" (and never for "safe to skip").
+     *
+     * @return array{state: string, status: int}
+     */
+    private function probeChild(int $pid): array
+    {
+        $poll    = $this->pollChild($pid);
+        $retries = 0;
+        while ('error' === $poll['state']
+            && defined('PCNTL_EINTR') && PCNTL_EINTR === $poll['status']
+            && $retries < self::RACE_PROBE_RETRIES
+        ) {
+            ++$retries;
+            usleep(1000);
+            $poll = $this->pollChild($pid);
+        }
+
+        return $poll;
+    }
+
+    /**
+     * T1: the reaper's decision for ONE probe result — pure, so the rule "a reaped child is
+     * never signalled" is testable without forking.
+     *
+     * @return string drop|kill|retry
+     */
+    private static function reapActionFor(string $state, int $status): string
+    {
+        if ('reaped' === $state || 'gone' === $state) {
+            return 'drop';
+        }
+        if ('running' === $state) {
+            return 'kill';
+        }
+        if (defined('PCNTL_EINTR') && PCNTL_EINTR === $status) {
+            return 'retry';
+        }
+
+        return 'kill';
+    }
+
+    /** T2: SIGKILL exactly one owned pid; guarded so a missing primitive cannot fatal. */
+    private function killChild(int $pid): void
+    {
+        if ($pid <= 0 || !function_exists('posix_kill') || !defined('SIGKILL')) {
+            return;
+        }
+        @posix_kill($pid, SIGKILL);
     }
 
     /**
@@ -744,18 +836,18 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             return self::$race_observations ?? [];
         }
 
-        // P5/T2: a missing primitive must not let CI silently skip the external-worker race.
-        // proc_open is required: without it a launch failure would leave a worker polling a
-        // barrier file the parent deletes, i.e. a stuck process.
-        $this->requireRaceCapabilities();
-        self::$race_external_worker_available = true;
+        // P5/T2: a missing primitive must not let CI silently skip the forked race suite.
+        // posix_kill is required too: without it a fork/readiness failure would leave a
+        // child polling a barrier file the parent deletes, i.e. a stuck process.
+        $this->requireForkCapabilities();
+        self::$race_pcntl_available = true;
 
         $observations = [];
         $race_anchor  = new DateTimeImmutable( 'now', new DateTimeZone( self::TZ ) );
         $seed_failure = null;
         try {
             for ($attempt = 1; $attempt <= self::RACE_ATTEMPTS; $attempt++) {
-                self::$race_phase[$attempt] = ['workers' => 'not-reached', 'seed' => 'not-reached', 'state' => 'not-reached'];
+                self::$race_phase[$attempt] = ['fork' => 'not-reached', 'seed' => 'not-reached', 'state' => 'not-reached'];
 
                 // G4: the WHOLE seed — patient insert, its COMMIT, the appointment seed and
                 // the third-connection visibility probe — lives inside the seed-phase try,
@@ -827,11 +919,11 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                 try {
                     $outcomes = $this->runRace( $seed['id'], $patientId, $workers, $attempt, $race_anchor );
                 } catch (Throwable $e) {
-                    self::$race_error_worker = 'attempt ' . $attempt . ': ' . get_class($e) . ': ' . $e->getMessage();
-                    self::$race_phase[$attempt]['workers'] = get_class($e) . ': ' . $e->getMessage();
+                    self::$race_error_fork = 'attempt ' . $attempt . ': ' . get_class($e) . ': ' . $e->getMessage();
+                    self::$race_phase[$attempt]['fork'] = get_class($e) . ': ' . $e->getMessage();
                     throw $e;
                 }
-                self::$race_phase[$attempt]['workers'] = 'reached';
+                self::$race_phase[$attempt]['fork'] = 'reached';
 
                 try {
                     $state = $this->raceState($seed['id'], $seed['slot_id']);
@@ -923,24 +1015,24 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     }
 
     /**
-     * (a) worker launch / worker exit / outcome file.
+     * (a) fork / child exit / outcome file.
      *
      * P4: this asserts ONLY its own phase — it deliberately does not call the shared
      * `raceAttempts()` gate, so a seed or state-read failure cannot turn this name red
      * as well and hide which phase actually failed.
      */
-    public function testRaceHarnessWorkersPhaseCompleted(): void
+    public function testRaceHarnessForkPhaseCompleted(): void
     {
-        $observations = $this->raceObservations(); // also records external-worker availability / skips locally
+        $observations = $this->raceObservations(); // also records pcntl availability / skips locally
         self::assertTrue(
-            self::$race_external_worker_available,
-            'this run recorded external-worker availability: ' . var_export(self::$race_external_worker_available, true)
+            self::$race_pcntl_available,
+            'this run recorded pcntl_fork availability: ' . var_export(self::$race_pcntl_available, true)
         );
-        $this->assertRacePhaseOnEveryAttempt('workers', 'workers phase');
+        $this->assertRacePhaseOnEveryAttempt('fork', 'fork phase');
         self::assertSame(
             self::RACE_ATTEMPTS,
             count($observations),
-            'workers phase: every attempt must be recorded, got ' . count($observations)
+            'fork phase: every attempt must be recorded, got ' . count($observations)
         );
     }
 
@@ -969,6 +1061,211 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     }
 
     /**
+     * A2: run the REAL reaper with a scripted probe sequence, recording probes and signals.
+     * The clock only moves when the reaper sleeps, so no test waits real seconds.
+     *
+     * @param int[] $pids
+     * @param array<int, array{state: string, status: int}> $script answers in call order;
+     *                                                            the last answer repeats
+     *
+     * @return array{probes: array<int, int>, signals: array<int, int>, unconfirmed: array<int, int>, sleeps: int}
+     */
+    private static function driveReaper(array $pids, array $script, float $deadline = 5.0, float $secondsPerSleep = 1.0): array
+    {
+        $probes  = [];
+        $signals = [];
+        $sleeps  = 0;
+        $now     = 0.0;
+
+        $answers = array_values($script);
+
+        $result = self::reapOwnedChildren(
+            $pids,
+            static function (int $pid) use (&$probes, &$answers): array {
+                $probes[] = $pid;
+                if ([] === $answers) {
+                    return ['state' => 'error', 'status' => PCNTL_EINVAL];
+                }
+
+                return count($answers) === 1 ? $answers[0] : array_shift($answers);
+            },
+            static function (int $pid) use (&$signals): void {
+                $signals[] = $pid;
+            },
+            static function (int $microseconds) use (&$sleeps, &$now, $secondsPerSleep): void {
+                ++$sleeps;
+                $now += $secondsPerSleep;
+                unset($microseconds);
+            },
+            static function () use (&$now): float {
+                return $now;
+            },
+            $deadline
+        );
+
+        return [
+            'probes'      => $probes,
+            'signals'     => $signals,
+            'unconfirmed' => $result['unconfirmed'],
+            'sleeps'      => $sleeps,
+        ];
+    }
+
+    /**
+     * T1: the reaper's own decision rule. A child whose probe already reaped it (or that is
+     * reported gone via ECHILD) must NEVER be signalled — PID reuse would let the signal hit
+     * an unrelated process — and a transient EINTR must retry the probe instead of killing.
+     */
+    public function testReaperNeverSignalsAReapedChildAndRetriesOnEintr(): void
+    {
+        if (!defined('PCNTL_EINTR') || !defined('PCNTL_EINVAL')) {
+            if ('true' === getenv('GITHUB_ACTIONS')) {
+                self::fail('the pcntl error constants are missing in CI, so this reaper rule could not be checked');
+            }
+            $this->markTestSkipped('pcntl error constants are unavailable here.');
+        }
+
+        self::assertSame('drop', self::reapActionFor('reaped', 0), 'a REAPED child must be dropped before any signal');
+        self::assertSame('drop', self::reapActionFor('gone', 0), 'an ECHILD child must be dropped before any signal');
+        self::assertSame('kill', self::reapActionFor('running', 0), 'a child confirmed running may be SIGKILLed');
+        self::assertSame('retry', self::reapActionFor('error', PCNTL_EINTR), 'EINTR must retry the probe, never signal');
+        self::assertSame(
+            'kill',
+            self::reapActionFor('error', PCNTL_EINVAL),
+            'a hard, non-ECHILD waitpid error keeps the pid owned and escalates'
+        );
+
+        // A2: every scenario below runs the REAL reaper (reapOwnedChildren) — the method the
+        // cleanup itself calls — with scripted probes, not a model of it.
+
+        // (1) mutation caught: "restore $pending = $owned after pass 1" — a pid reaped on
+        // pass 1 would be re-probed and, on the scripted hard error, escalated to a SIGKILL.
+        $reaped = self::driveReaper([4242], [['state' => 'reaped', 'status' => 0]]);
+        self::assertSame([4242], $reaped['probes'], 'a pid reaped on pass 1 is probed exactly once');
+        self::assertSame([], $reaped['signals'], 'a pid reaped on pass 1 is never signalled');
+        self::assertSame([], $reaped['unconfirmed'], 'a pid reaped on pass 1 never stays pending');
+
+        // (2) mutation caught: "signal on retry" — EINTR is a transient syscall interruption.
+        $eintr = self::driveReaper(
+            [4242],
+            [['state' => 'error', 'status' => PCNTL_EINTR], ['state' => 'reaped', 'status' => 0]]
+        );
+        self::assertSame([4242, 4242], $eintr['probes'], 'an EINTR probe is retried');
+        self::assertSame([], $eintr['signals'], 'an EINTR probe is never signalled');
+        self::assertSame([], $eintr['unconfirmed'], 'the retried pid is dropped once it is reaped');
+
+        // (2b) mutation caught: "signal on 'retry' in pass 2 ONLY" — pass 1 sees EINTR, pass 2
+        // sees EINTR again and only then a reaped pid, so a pass-2-only regression reds here.
+        $eintrTwice = self::driveReaper(
+            [4242],
+            [
+                ['state' => 'error', 'status' => PCNTL_EINTR],
+                ['state' => 'error', 'status' => PCNTL_EINTR],
+                ['state' => 'reaped', 'status' => 0],
+            ]
+        );
+        self::assertSame([4242, 4242, 4242], $eintrTwice['probes'], 'EINTR is retried in BOTH passes');
+        self::assertSame([], $eintrTwice['signals'], 'an EINTR probe in pass 2 is never signalled either');
+        self::assertSame([], $eintrTwice['unconfirmed'], 'the pid is dropped once a later probe reaps it');
+
+        // (3) mutation caught: "drop a pid whose latest probe says running" — a live child
+        // would leak instead of being killed.
+        $running = self::driveReaper(
+            [4242],
+            [['state' => 'running', 'status' => 0], ['state' => 'reaped', 'status' => 0]]
+        );
+        self::assertSame([4242, 4242], $running['probes'], 'a running child is re-probed in pass 2');
+        self::assertSame([4242], $running['signals'], 'a running child is SIGKILLed exactly once');
+        self::assertSame([], $running['unconfirmed'], 'the killed child is dropped once a probe reaps it');
+
+        // (4) mutation caught: "treat a hard waitpid error as gone" — that would abandon a
+        // child the kernel may still be running.
+        $hard = self::driveReaper(
+            [4242],
+            [['state' => 'error', 'status' => PCNTL_EINVAL], ['state' => 'reaped', 'status' => 0]]
+        );
+        self::assertSame([4242, 4242], $hard['probes'], 'a hard error keeps the pid owned and re-probed');
+        self::assertSame([4242], $hard['signals'], 'a hard error escalates to exactly one SIGKILL');
+        self::assertSame([], $hard['unconfirmed'], 'the pid is dropped once a later probe reaps it');
+
+        // (5) mutation caught: "probe or signal pid <= 0" — posix_kill(0) signals the whole
+        // process group.
+        $invalid = self::driveReaper([0, -7], [['state' => 'reaped', 'status' => 0]]);
+        self::assertSame([], $invalid['probes'], 'pid <= 0 is never probed');
+        self::assertSame([], $invalid['signals'], 'pid <= 0 is never signalled');
+
+        // (6) mutation caught: "silently abandon a child that is never confirmed reaped".
+        // Exact sequences, not just counts: the injected clock advances 1 s per sleep with a
+        // 5 s bound, so the pid is probed once in pass 1 and once per bounded-reap iteration
+        // (clock 0..5 inclusive = 6 iterations) and is signalled on every one of them.
+        $stuck = self::driveReaper([4242], [['state' => 'running', 'status' => 0]], 5.0, 1.0);
+        self::assertSame(
+            [4242, 4242, 4242, 4242, 4242, 4242, 4242],
+            $stuck['probes'],
+            'a never-confirmed pid is probed exactly once per pass-2 iteration plus the pass-1 probe'
+        );
+        self::assertSame(
+            [4242, 4242, 4242, 4242, 4242, 4242, 4242],
+            $stuck['signals'],
+            'each bounded-reap iteration SIGKILLs the still-running pid'
+        );
+        self::assertSame([4242], $stuck['unconfirmed'], 'a never-confirmed pid is REPORTED, not silently dropped');
+    }
+
+    /**
+     * B2: the CLEANUP wrapper must turn an unconfirmed result into a failure that names the
+     * pid. Testing the core's return value alone would stay green if the wrapper dropped it.
+     */
+    public function testReaperCleanupFailsAndNamesThePidWhenAChildIsNeverConfirmedReaped(): void
+    {
+        if (!defined('PCNTL_EINTR')) {
+            if ('true' === getenv('GITHUB_ACTIONS')) {
+                self::fail('the pcntl error constants are missing in CI, so this reaper rule could not be checked');
+            }
+            $this->markTestSkipped('pcntl error constants are unavailable here.');
+        }
+
+        $now    = 0.0;
+        $caught = null;
+
+        try {
+            $this->reapRaceChildren(
+                [4242],
+                99, // attempt tag with no real harness files behind it
+                0,  // no worker files to remove
+                static function (int $pid): array {
+                    unset($pid);
+
+                    return ['state' => 'running', 'status' => 0];
+                },
+                static function (int $pid): void {
+                    unset($pid);
+                },
+                static function (int $microseconds) use (&$now): void {
+                    unset($microseconds);
+                    $now += 1.0;
+                },
+                static function () use (&$now): float {
+                    return $now;
+                }
+            );
+        } catch (Throwable $e) {
+            $caught = $e;
+        }
+
+        self::assertInstanceOf(
+            \PHPUnit\Framework\AssertionFailedError::class,
+            $caught,
+            'the cleanup must FAIL when a child is never confirmed reaped'
+        );
+        self::assertStringContainsString(
+            '4242',
+            (string) $caught->getMessage(),
+            'the failure message must name the unconfirmed pid'
+        );
+    }
+
+    /**
      * One observation per attempt, failing loudly when the harness did not finish.
      *
      * @return array<int, array{attempt: int, outcomes: array<string, array<string, mixed>>, state: array<string, mixed>}>
@@ -979,7 +1276,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
 
         self::assertNull(
             self::$race_harness_error,
-            'the worker harness itself must complete before any product invariant is read: ' . (string) self::$race_harness_error
+            'the fork harness itself must complete before any product invariant is read: ' . (string) self::$race_harness_error
         );
         self::assertCount(
             self::RACE_ATTEMPTS,
@@ -991,7 +1288,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     }
 
     /** The harness must not be mistaken for a product result. */
-    // Harness-only: no product mutation reds this name — it exists so a worker launch,
+    // Harness-only: no product mutation reds this name — it exists so a fork, child
     // exit or missing outcome file can never masquerade as product evidence.
     public function testRaceHarnessCompletedEveryAttemptWithChildOutcomes(): void
     {
@@ -1018,7 +1315,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
                 self::assertNotSame(
                     'fatal',
                     $outcome['result'] ?? null,
-                    "{$context} [{$role}]: worker bootstrap fatal is a harness failure, not product evidence — " . wp_json_encode($outcome)
+                    "{$context} [{$role}]: child bootstrap fatal is a harness failure, not product evidence — " . wp_json_encode($outcome)
                 );
                 self::assertNotSame(
                     'exception',
@@ -1046,15 +1343,15 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
             $ci = $row['outcomes']['check_in'];
             $ns = $row['outcomes']['no_show'];
 
-            self::assertIsInt($ci['pid'] ?? null, "{$context}: check-in worker must record its PID");
-            self::assertIsInt($ns['pid'] ?? null, "{$context}: no-show worker must record its PID");
-            self::assertNotSame($parentPid, $ci['pid'], "{$context}: check-in must run in a worker process");
-            self::assertNotSame($parentPid, $ns['pid'], "{$context}: no-show must run in a worker process");
+            self::assertIsInt($ci['pid'] ?? null, "{$context}: check-in child must record its PID");
+            self::assertIsInt($ns['pid'] ?? null, "{$context}: no-show child must record its PID");
+            self::assertNotSame($parentPid, $ci['pid'], "{$context}: check-in must run in a child process");
+            self::assertNotSame($parentPid, $ns['pid'], "{$context}: no-show must run in a child process");
             self::assertNotSame($ci['pid'], $ns['pid'], "{$context}: the workers must be distinct processes");
         }
     }
 
-    // Harness-only: no product mutation reds this name — it proves each worker owned its
+    // Harness-only: no product mutation reds this name — it proves each child owned its
     // own connection and that its commits are real, not parent savepoints.
     public function testRaceWorkersOwnedIndependentDbConnections(): void
     {
@@ -1065,35 +1362,25 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
 
             self::assertTrue(
                 (bool) ($ci['own_wpdb_connected'] ?? false),
-                "{$context}: check-in worker must own its DB connection — " . wp_json_encode($ci)
+                "{$context}: check-in child must own its DB connection — " . wp_json_encode($ci)
             );
             self::assertTrue(
                 (bool) ($ns['own_wpdb_connected'] ?? false),
-                "{$context}: no-show worker must own its DB connection — " . wp_json_encode($ns)
+                "{$context}: no-show child must own its DB connection — " . wp_json_encode($ns)
             );
             foreach (['check_in' => $ci, 'no_show' => $ns] as $role => $outcome) {
-                $probes = ' worker_before: ' . wp_json_encode($outcome['probe_before'] ?? null)
-                    . ' worker_after: ' . wp_json_encode($outcome['probe_after'] ?? null)
-                    . ' parent_at_launch: ' . wp_json_encode($outcome['parent_probe'] ?? null);
-                // The harness carries the test-only query-rewrite (parent-side census),
-                // so this scenario really is about torn-down savepoint semantics — the
-                // assertion below pins what the PARENT observes.
+                $probes = ' child_before: ' . wp_json_encode($outcome['probe_before'] ?? null)
+                    . ' child_after: ' . wp_json_encode($outcome['probe_after'] ?? null)
+                    . ' parent_at_fork: ' . wp_json_encode($outcome['parent_probe'] ?? null);
                 self::assertGreaterThanOrEqual(
                     1,
-                    (int) ($this->parentLaunchProbe['query_callbacks'] ?? 0),
-                    'the harness must carry the test-only query-rewrite (parent-side census)'
-                );
-                // The external worker boots a fresh WordPress: it can hold NO inherited
-                // savepoint rewrite at all — stronger than the old inherit-then-strip
-                self::assertSame(
-                    0,
                     (int) ($outcome['query_filters_before'] ?? 0),
-                    "{$context}: [{$role}] the external worker must boot WITHOUT the harness query-rewrite" . $probes
+                    "{$context}: [{$role}] the test-only query-rewrite must have been present in the forked child" . $probes
                 );
                 self::assertSame(
                     0,
                     (int) ($outcome['query_filters_after'] ?? 0),
-                    "{$context}: [{$role}] the worker boot has still zero 'query' hooks at call time (real commits, not parent savepoints)" . $probes
+                    "{$context}: [{$role}] the test-only query-rewrite must be removed in the child (real commits, not parent savepoints)" . $probes
                 );
             }
         }
@@ -1594,14 +1881,14 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
         );
     }
 
-    // ============ T12b — both serialization orders, deterministically (no external processes) ============
+    // ============ T12b — both serialization orders, deterministically (no fork) ============
 
     /**
      * Order 1 — the check-in commits first, so the manual no-show must be refused
      * by the active-Visit guard (HAS_ACTIVE_VISIT) and nothing may mutate.
      *
      * The appointment is CHECK-IN ELIGIBLE (pinned clock on its own trusted local
-     * day, before slot + grace). That is what the external-worker race cannot provide: it
+     * day, before slot + grace). That is what the forked race cannot provide: it
      * seeds past-grace rows, where the check-in is refused by the ER-06 guard and
      * the "check-in wins" branch is unreachable.
      */
@@ -1724,136 +2011,519 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
     // ================= Concurrency harness (real-DB, independent connections) =================
 
     /**
-     * Launch two genuinely independent external worker processes, each with its own
-     * fresh wpdb connection (never the parent's: inherited sockets plus the parent's
-     * open test transaction would corrupt the evidence). Both workers wait for a
-     * shared barrier (absolute time + file signal), then run their real product call
-     * at barrier + offset. External workers inherit no descriptor at all — a graceful
-     * exit cannot run mysqlnd on the harness's shared session.
+     * Fork two genuinely independent worker processes, each with its own
+     * fresh wpdb connection (never the parent's: forked sockets plus the
+     * parent's open test transaction would corrupt the evidence). Both
+     * workers wait for a shared barrier (absolute time + file signal), then
+     * run their real product call at barrier + offset.
      *
      * @param array<int, array{role: string, offset: float}> $workers
      *
      * @return array<string, array<string, mixed>> role => outcome
      */
     private function runRace( int $appointmentId, int $patientId, array $workers, int $attempt, DateTimeImmutable $race_anchor ): array {
-        $this->parentLaunchProbe = self::queryHookCensus();
+        $this->parentForkProbe = self::queryHookCensus();
 
-        /** @var array<int, ExternalRaceWorker> $launched external workers still in flight */
-        $launched = [];
+        /** @var array<int, int> $pids parent-owned pids that have NOT been reaped yet */
+        $pids     = [];
         $outcomes = [];
 
-        $script   = dirname(__DIR__) . '/bin/fork-race-wp-worker.php';
-        $readyOf  = static fn (int $index): string => sys_get_temp_dir() . '/' . self::raceFileName($this->fileTag, 'ready', $attempt, $index);
-        $outcomeOf = static fn (int $index): string => sys_get_temp_dir() . '/' . self::raceFileName($this->fileTag, 'outcome', $attempt, $index);
-        $barrier   = sys_get_temp_dir() . '/' . self::raceFileName($this->fileTag, 'barrier', $attempt);
-
-        // G3: launch, readiness, barrier, outcome read and cleanup all live inside ONE
-        // try/finally, so a launch failure, a readiness timeout or a stuck worker can
-        // never leave a worker or a harness file behind.
+        // G3: fork, readiness, barrier, outcome read and cleanup all live inside ONE
+        // try/finally, so a fork failure, a readiness timeout or a stuck child can never
+        // leave a child or a harness file behind.
         try {
             foreach ($workers as $i => $worker) {
-                @unlink($outcomeOf($i));
-                @unlink($readyOf($i));
-                // Pin only the eligibility clock (check_in workers). The barrier and
-                // overlap still use real time.
-                $anchor = null;
-                if ('check_in' === $worker['role']) {
-                    $anchor = (float) $race_anchor->format('U.u');
+                $pid = pcntl_fork();
+                if (-1 === $pid) {
+                    $last = error_get_last();
+                    $this->fail(
+                        'harness fatal (fork failed for [' . $worker['role'] . '] after '
+                        . count($pids) . ' child(ren): ' . ($last['message'] ?? 'unknown') . ')'
+                    );
                 }
-                $launched[$i] = ExternalRaceWorker::launch($script, [
-                    'mode' => 'noshow_race',
-                    'role' => (string) $worker['role'],
-                    'offset' => (float) $worker['offset'],
-                    'barrier_file' => $barrier,
-                    'ready_file' => $readyOf($i),
-                    'child_deadline_sec' => self::RACE_WORKER_BARRIER_DEADLINE_SEC,
-                    'parent_probe' => $this->parentLaunchProbe,
-                    'appointment_id' => $appointmentId,
-                    'patient_id' => $patientId,
-                    'clinic_a' => $this->clinicA,
-                    'secretary_a' => $this->secretaryA,
-                    'visit_now_anchor' => $anchor,
-                    'outcome' => $outcomeOf($i),
-                ]);
+                if ($pid === 0) {
+                    if ( 'check_in' === $worker['role'] ) {
+                        // Pin only the eligibility clock. The fork barrier and overlap still use real time.
+                        VisitService::setTestNowUtc( $race_anchor );
+                    }
+                    $this->raceWorker($worker['role'], (float) $worker['offset'], $appointmentId, $patientId, $attempt, $i);
+                    ForkChildExit::terminate(1); // backstop — a returning child is a harness fault, not a pass
+                }
+                $pids[$i] = $pid;
             }
 
-            // P4 readiness handshake: each worker writes a ready file once its own DB
+            // P4 readiness handshake: each child writes a ready file once its own DB
             // connection and services exist, and only then does the parent release the
-            // barrier. Without it a slow worker could start its product call after the
+            // barrier. Without it a slow child could start its product call after the
             // other one already finished, which would make the overlap evidence depend on
             // process scheduling luck rather than on the row lock.
-            $readyDeadline = microtime(true) + 20.0;
+            $readyDeadline = microtime(true) + 10.0;
             foreach (array_keys($workers) as $readyIndex) {
-                $readyFile = $readyOf($readyIndex);
+                $readyFile = $this->fileTag . '-ready-' . $attempt . '-' . $readyIndex;
                 while (!@is_file($readyFile)) {
                     if (microtime(true) > $readyDeadline) {
                         $this->fail(
-                            'harness fatal: worker [' . $workers[$readyIndex]['role'] . '] did not reach the barrier '
-                            . 'within 20 s (ready file missing: ' . $readyFile . ')'
+                            'harness fatal: child [' . $workers[$readyIndex]['role'] . '] did not reach the barrier '
+                            . 'within 10 s (ready file missing: ' . $readyFile . ')'
                         );
                     }
                     usleep(1000);
                 }
             }
             foreach (array_keys($workers) as $readyIndex) {
-                @unlink($readyOf($readyIndex));
+                @unlink($this->fileTag . '-ready-' . $attempt . '-' . $readyIndex);
             }
 
-            // Q3(a): the release instant is computed only AFTER every worker is ready, so a
-            // slow worker can never be handed an instant that has already passed.
+            // Q3(a): the release instant is computed only AFTER every child is ready, so a
+            // slow child can never be handed an instant that has already passed.
             $fireAt  = microtime(true) + self::BARRIER_SEC;
-            @file_put_contents($barrier, (string) $fireAt); // workers poll this file and read the release instant
+            $barrier = $this->fileTag . '-barrier-' . $attempt;
+            @file_put_contents($barrier, (string) $fireAt); // children poll this file and its timestamp
 
-            // Wait both workers out strictly: exit 0 is the only accepted termination.
-            foreach ($launched as $i => $proc) {
-                $code = $proc->waitForExit(self::RACE_WORKER_EXIT_TIMEOUT_SEC);
-                if ($code !== 0) {
-                    $detail  = '';
-                    $rawFile = $outcomeOf($i);
-                    if (is_file($rawFile)) {
-                        $detail = ' outcome: ' . (string) @file_get_contents($rawFile);
+            // G3: a bounded, non-blocking wait loop. Only pids still in $pids are signalled
+            // by the finally block, and a pid leaves the set the moment waitpid reaps it.
+            $finishDeadline = microtime(true) + self::RACE_FINISH_DEADLINE_SEC;
+            while ($pids !== []) {
+                foreach ($pids as $idx => $pid) {
+                    $poll = $this->pollChild($pid);
+                    if ('running' === $poll['state']) {
+                        continue;
                     }
+                    if ('error' === $poll['state'] && defined('PCNTL_EINTR') && PCNTL_EINTR === $poll['status']) {
+                        continue; // interrupted syscall: retry, bounded by $finishDeadline
+                    }
+                    if ('gone' === $poll['state']) {
+                        // ECHILD: someone else already reaped it, so its exit status is lost.
+                        unset($pids[$idx]);
+                        $this->fail('harness fatal: child [' . $workers[$idx]['role'] . '] (pid ' . $pid . ') was already reaped (ECHILD) before its exit status could be read');
+                    }
+                    if ('error' === $poll['state']) {
+                        // Any OTHER waitpid error: keep the pid owned, kill it and retry; the
+                        // reaper confirms it or fails the test with the pid listed.
+                        $this->killChild($pid);
+                        continue;
+                    }
+                    unset($pids[$idx]); // reaped here: never signal this pid again
+                    if (!ForkChildExit::childTerminatedCleanly($poll['status'])) {
+                        $detail  = '';
+                        $rawFile = $this->fileTag . '-outcome-' . $attempt . '-' . $idx;
+                        if (is_file($rawFile)) {
+                            $detail = ' outcome: ' . (string) @file_get_contents($rawFile);
+                        }
+                        $this->fail(
+                            'harness fatal: child [' . $workers[$idx]['role'] . '] exited abnormally (status=' . $poll['status'] . ')' . $detail
+                        );
+                    }
+                }
+                if ($pids !== [] && microtime(true) > $finishDeadline) {
                     $this->fail(
-                        'harness fatal: worker [' . $workers[$i]['role'] . '] exited with status ' . $code . $detail
+                        'harness fatal: children did not finish within ' . self::RACE_FINISH_DEADLINE_SEC
+                        . ' s (still running worker indexes: ' . implode(',', array_keys($pids)) . ')'
                     );
+                }
+                if ($pids !== []) {
+                    usleep(1000);
                 }
             }
 
             // G2: read and validate EVERY outcome into memory first. The unlink happens in
             // the finally block below, after this loop — never before it.
             foreach (array_values($workers) as $i => $worker) {
-                $raw  = @file_get_contents($outcomeOf($i));
+                $file = $this->fileTag . '-outcome-' . $attempt . '-' . $i;
+                $raw  = @file_get_contents($file);
                 if ($raw === false || $raw === '') {
-                    $this->fail('harness fatal: worker [' . $worker['role'] . '] wrote no outcome (bootstrap failure — not a product error)');
+                    $this->fail('harness fatal: child [' . $worker['role'] . '] wrote no outcome (fork/bootstrap failure — not a product error)');
                 }
                 $decoded = json_decode($raw, true);
                 if (!is_array($decoded) || !isset($decoded['result'])) {
-                    $this->fail('harness fatal: worker [' . $worker['role'] . '] wrote malformed outcome (not a product error)');
+                    $this->fail('harness fatal: child [' . $worker['role'] . '] wrote malformed outcome (not a product error)');
                 }
                 $outcomes[$worker['role']] = $decoded;
             }
         } finally {
-            // G2/G3: cleanup (bounded terminate + removal of this attempt's harness files)
-            // runs on EVERY path, after the outcomes were read.
-            foreach ($launched as $proc) {
-                $proc->terminate();
-            }
-            for ($i = 0; $i < count($workers); $i++) {
-                @unlink($readyOf($i));
-                @unlink($outcomeOf($i));
-            }
-            @unlink($barrier);
+            // G2/G3: cleanup (SIGKILL of unreaped children + removal of this attempt's
+            // ready/outcome/barrier files) runs on EVERY path, after the outcomes were read.
+            $this->reapRaceChildren($pids, $attempt, count($workers));
         }
 
         return $outcomes;
     }
 
-    /** Deterministic harness file name for one attempt artifact. */
-    private static function raceFileName(string $fileTag, string $kind, int $attempt, int $index = -1): string
-    {
-        return $fileTag . '-' . $kind . '-' . $attempt . ($index >= 0 ? '-' . $index : '');
+    /**
+     * Child body: fresh independent DB connection + real service wiring,
+     * barrier wait, product call, outcome file, exit.
+     *
+     * The outcome records the independence/evidence fields the parent
+     * asserts on: child PID, own-wpdb connection, the test-only query-
+     * filter census (before/after removal), and wall-clock call windows.
+     */
+    private static function queryHookCensus(): array {
+        // Probe the 'query' hook exactly as WP core sees it — no functions
+        // beyond core (WP 6.7 has no has_filters()).
+        $probe = [
+            'wp_loaded' => defined('ABSPATH'),
+            'wp_hook_class' => class_exists('WP_Hook'),
+            'wp_filter_global_type' => gettype($GLOBALS['wp_filter'] ?? null),
+            'wp_filter_key_count' => is_array($GLOBALS['wp_filter'] ?? null) ? count($GLOBALS['wp_filter']) : -1,
+            'query_hook_present' => is_array($GLOBALS['wp_filter'] ?? null) && isset($GLOBALS['wp_filter']['query']),
+            'query_callbacks' => 0,
+            'has_filter_query' => has_filter('query'),
+        ];
+        if ($probe['query_hook_present']) {
+            $hook = $GLOBALS['wp_filter']['query'];
+            if (is_object($hook) && isset($hook->callbacks)) {
+                $probe['query_callbacks'] = (int) array_sum(array_map('count', (array) $hook->callbacks));
+            }
+        }
+
+        return $probe;
     }
 
+    /**
+     * A1: the reaper's whole pass logic with the probe, the signal, the sleep and the clock
+     * injected, so a test executes THIS code — not a copy of it — without forking.
+     *
+     * Pass 1 probes each owned pid once and builds the pending set: a pid the probe reports
+     * reaped or gone (ECHILD) is dropped right there and never enters it. Pass 2 re-probes
+     * ONLY pending pids until the injected deadline. Every probe result goes through
+     * reapActionFor(), so "reaped" and "gone" can never become a signal and EINTR can never
+     * become one either. pid <= 0 is never probed and never signalled.
+     *
+     * @param int[] $pids
+     * @param callable(int): array{state: string, status: int} $probe one raw poll of one pid
+     * @param callable(int): void $signal SIGKILL exactly one pid
+     * @param callable(int): void $sleep microseconds
+     * @param callable(): float $clock monotonic seconds
+     *
+     * @return array{probes: array<int, int>, signals: array<int, int>, unconfirmed: array<int, int>}
+     */
+    private static function reapOwnedChildren(
+        array $pids,
+        callable $probe,
+        callable $signal,
+        callable $sleep,
+        callable $clock,
+        float $reapDeadlineSeconds
+    ): array {
+        $probes  = [];
+        $signals = [];
+        $pending = [];
+
+        // Pass 1: probe once per owned pid; a reaped/gone pid is dropped before it can ever
+        // reach the pending set (the pre-round-8 bug copied it in and could later SIGKILL a
+        // numeric pid the kernel had already freed).
+        foreach ($pids as $pid) {
+            if ($pid <= 0) {
+                continue;
+            }
+            $poll     = $probe($pid);
+            $probes[] = $pid;
+            $action   = self::reapActionFor($poll['state'], $poll['status']);
+            if ('drop' === $action) {
+                continue;
+            }
+            $pending[] = $pid;
+            if ('kill' === $action) {
+                $signal($pid);
+                $signals[] = $pid;
+            }
+        }
+
+        // Pass 2: bounded reap over the injected clock — retry on EINTR, escalate on a hard
+        // waitpid error, never block the suite.
+        $reapDeadline = $clock() + $reapDeadlineSeconds;
+        while ($pending !== [] && $clock() <= $reapDeadline) {
+            foreach ($pending as $key => $pid) {
+                $poll     = $probe($pid);
+                $probes[] = $pid;
+                $action   = self::reapActionFor($poll['state'], $poll['status']);
+                if ('drop' === $action) {
+                    unset($pending[$key]);
+                    continue;
+                }
+                if ('kill' === $action) {
+                    $signal($pid);
+                    $signals[] = $pid;
+                }
+            }
+            if ($pending !== []) {
+                $sleep(1000);
+            }
+        }
+
+        return [
+            'probes'      => $probes,
+            'signals'     => $signals,
+            'unconfirmed' => array_values($pending),
+        ];
+    }
+
+    /**
+     * G3/T1: terminate and reap ONLY the children the parent has not reaped yet, with a
+     * bounded wait, then remove this attempt's harness files.
+     *
+     * A pid leaves the owned set the moment ONE probe reports it reaped or gone (ECHILD),
+     * and only pids whose LATEST probe says "running" (or a hard, non-ECHILD waitpid error)
+     * are signalled — an EINTR probe is retried, never signalled. Never pid <= 0.
+     *
+     * @param array<int, int> $pids parent-owned, unreaped pids
+     */
+    private function reapRaceChildren(
+        array $pids,
+        int $attempt,
+        int $workerCount,
+        ?callable $probe = null,
+        ?callable $signal = null,
+        ?callable $sleep = null,
+        ?callable $clock = null
+    ): void {
+        $owned = [];
+        foreach ($pids as $pid) {
+            if ($pid > 0) {
+                $owned[] = $pid;
+            }
+        }
+        // A1: the whole pass logic lives in ONE injected method so the test can execute it
+        // with scripted probes. The production call passes no overrides, so it uses the real
+        // probe, the real kill wrapper and the real sleep/clock — behaviour is unchanged.
+        // B2: the overrides exist only so this wrapper's OWN failure step can be tested.
+        $result = self::reapOwnedChildren(
+            $owned,
+            $probe ?? function (int $pid): array {
+                return $this->probeChild($pid);
+            },
+            $signal ?? function (int $pid): void {
+                $this->killChild($pid);
+            },
+            $sleep ?? static function (int $microseconds): void {
+                usleep($microseconds);
+            },
+            $clock ?? static function (): float {
+                return microtime(true);
+            },
+            self::RACE_REAP_DEADLINE_SEC
+        );
+
+        for ($i = 0; $i < $workerCount; $i++) {
+            @unlink($this->fileTag . '-ready-' . $attempt . '-' . $i);
+            @unlink($this->fileTag . '-outcome-' . $attempt . '-' . $i);
+        }
+        @unlink($this->fileTag . '-barrier-' . $attempt);
+
+        if ($result['unconfirmed'] !== []) {
+            $this->fail(
+                'harness fatal: ' . count($result['unconfirmed']) . ' child(ren) could not be confirmed reaped within '
+                . self::RACE_REAP_DEADLINE_SEC . ' s of SIGKILL (pids: ' . implode(', ', $result['unconfirmed'])
+                . ') — they are reported, NOT silently abandoned'
+            );
+        }
+    }
+
+    private function raceWorker(string $role, float $offset, int $appointmentId, int $patientId, int $attempt, int $index): void {
+        // The child must NEVER return to the inherited PHPUnit machinery:
+        // an uncaught Throwable would be caught by PHPUnit's own (inherited)
+        // handler and the child would re-run the remaining suite in parallel
+        // with the parent (proven: run 35434123610, exit code 2). Every
+        // unexpected Throwable therefore becomes a fatal outcome + exit(1).
+        try {
+            $this->raceWorkerBody($role, $offset, $appointmentId, $patientId, $attempt, $index);
+            ForkChildExit::terminate(0); // child-only — unreachable
+        } catch (Throwable $e) {
+            @file_put_contents(
+                $this->fileTag . '-outcome-' . $attempt . '-' . $index,
+                json_encode([
+                    'role' => $role,
+                    'result' => 'fatal',
+                    'detail' => get_class($e) . ': ' . $e->getMessage()
+                        . ' @ ' . basename((string) $e->getFile()) . ':' . $e->getLine(),
+                ])
+            );
+            ForkChildExit::terminate(1); // child-only — non-zero = harness fatal (not a product error)
+        }
+    }
+
+    private function raceWorkerBody(string $role, float $offset, int $appointmentId, int $patientId, int $attempt, int $index): void {
+        global $wpdb;
+        $own = new \wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
+        $own->set_prefix($wpdb->prefix);
+        // The test-only SAVEPOINT query-rewrite must NOT apply to the child:
+        // its transactions must be real commits visible to other connections.
+        $probeBefore = self::queryHookCensus();
+        remove_all_filters('query');
+        $probeAfter = self::queryHookCensus();
+        if (property_exists($own, 'has_connected') && $own->has_connected) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName
+            @$own->close();
+        }
+        $own->has_connected = false; // phpcs:ignore WordPress.NamingConventions.ValidVariableName
+        @$own->init_charset();
+        if (!$own->check_connection()) {
+            @file_put_contents(
+                $this->fileTag . '-outcome-' . $attempt . '-' . $index,
+                json_encode(['role' => $role, 'result' => 'fatal', 'error' => 'wpdb connection failed in child'])
+            );
+            ForkChildExit::terminate(1); // non-zero = harness fatal (not a product error)
+        }
+
+        ScopeContext::set(ClinicScope::forClinic($this->clinicA));
+        $cpms = new CpmsDb($own);
+        $op = new OpLogger($cpms);
+        $audit = new AuditLogger($cpms, $op);
+        $factory = new SettingsFactory($cpms, $audit);
+        $visits = new VisitService(
+            $cpms,
+            new VisitRepository($cpms),
+            new AppointmentRepository($cpms),
+            $factory,
+            $audit,
+            new Phase7Fr55AllowAllLicenseGate(),
+            $op,
+            null,
+            new MembershipRepository($cpms)
+        );
+
+        // Constructed BEFORE the barrier: the measured window must contain only
+        // the product call, so reported overlap cannot be an artefact of building
+        // dependencies inside the window (reader finding A1).
+        $providers = new SmsProviderRegistry();
+        $providers->register(new LogSmsProvider($op));
+        $booking = new BookingService(
+            $cpms,
+            new SlotRepository($cpms),
+            new AppointmentRepository($cpms),
+            new PatientRepository($cpms),
+            $factory,
+            new Phase7Fr55AllowAllLicenseGate(),
+            $audit,
+            $op,
+            new Idempotency($cpms),
+            new SmsService(
+                $cpms,
+                $factory,
+                $providers,
+                new CredentialVault(),
+                $audit,
+                $op,
+                new JobQueue($cpms, $op, new JobWake()),
+                fn (): int => $this->clinicA
+            ),
+            null,
+            new MembershipRepository($cpms)
+        );
+
+        // Tell the parent this child is fully bootstrapped (services built, own
+        // connection open) so the barrier is never released for a child still booting.
+        @file_put_contents($this->fileTag . '-ready-' . $attempt . '-' . $index, '1');
+
+        // Q3(a): the release instant comes from the barrier FILE (written only after
+        // every child is ready), so no child can be given a stale instant.
+        $barrierFile = $this->fileTag . '-barrier-' . $attempt;
+        $fireAt      = 0.0;
+        // T2: the child needs its OWN deadline. If the parent fails before releasing the
+        // barrier (fork/readiness error) the child must exit by itself instead of polling a
+        // file the parent is about to delete.
+        $childDeadline = microtime(true) + self::RACE_CHILD_BARRIER_DEADLINE_SEC;
+        while (true) {
+            if (0.0 === $fireAt && @is_file($barrierFile)) {
+                $raw = (string) @file_get_contents($barrierFile);
+                if ('' !== $raw) {
+                    $fireAt = (float) $raw;
+                }
+            }
+            if ($fireAt > 0.0 && microtime(true) >= $fireAt + $offset) {
+                break;
+            }
+            if (0.0 === $fireAt && microtime(true) > $childDeadline) {
+                @file_put_contents(
+                    $this->fileTag . '-outcome-' . $attempt . '-' . $index,
+                    json_encode([
+                        'role' => $role,
+                        'result' => 'fatal',
+                        'detail' => 'child never saw the barrier within ' . self::RACE_CHILD_BARRIER_DEADLINE_SEC . ' s',
+                    ])
+                );
+                ForkChildExit::terminate(1); // child-only — the parent reports an abnormal exit, never a pass
+            }
+            usleep(250);
+        }
+
+        $startedAt = microtime(true);
+        $outcome = ['role' => $role, 'appointment_id' => $appointmentId, 'result' => 'exception', 'error' => 'not reached'];
+        try {
+            if ($role === 'no_show') {
+                // R4 (1.0): the second worker drives the REAL manual no-show path
+                // (BookingService::markNoShowByStaff — the same call chain the
+                // reception route uses). The retired automatic sweep is not a
+                // product path any more and cannot be raced.
+                $booking->markNoShowByStaff($this->secretaryA, $appointmentId, 'race: manual no-show');
+                $outcome = [
+                    'role' => $role,
+                    'appointment_id' => $appointmentId,
+                    'result' => 'ok',
+                ];
+            } else { // check_in
+                $v = $visits->checkIn($this->secretaryA, $patientId, $appointmentId);
+                if (is_array($v) && !isset($v['id'])) {
+                    $outcome = [
+                        'role' => $role,
+                        'appointment_id' => $appointmentId,
+                        'result' => 'rejected',
+                        'error' => 'check-in rejected: ' . (string) ($v['error_code'] ?? 'unknown') . ' — ' . (string) ($v['message'] ?? ''),
+                    ];
+                } else {
+                    $outcome = [
+                        'role' => $role,
+                        'appointment_id' => $appointmentId,
+                        'result' => 'ok',
+                        'visit_id' => (int) ($v['id'] ?? 0),
+                        'visit_status' => (string) ($v['status'] ?? ''),
+                        'visit_source' => (string) ($v['source'] ?? ''),
+                    ];
+                }
+            }
+        } catch (BookingException $e) {
+            $outcome = [
+                'role' => $role,
+                'appointment_id' => $appointmentId,
+                'result' => 'rejected',
+                'error_code' => $e->errorCode, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+                'http_status' => $e->httpStatus, // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+                'error' => $e->getMessage(),
+            ];
+        } catch (VisitException $e) {
+            $outcome = [
+                'role' => $role,
+                'appointment_id' => $appointmentId,
+                'result' => 'rejected',
+                'error_code' => $e->errorCode,
+                'http_status' => $e->httpStatus,
+                'error' => $e->getMessage(),
+            ];
+        } catch (Throwable $e) {
+            $outcome = ['role' => $role, 'appointment_id' => $appointmentId, 'result' => 'exception', 'error' => get_class($e) . ': ' . $e->getMessage()];
+        }
+        $finishedAt = microtime(true);
+
+        // Independence / overlap evidence (asserted by the parent):
+        $outcome['pid'] = getmypid();
+        $outcome['own_wpdb_connected'] = true;
+        $outcome['query_filters_before'] = (int) $probeBefore['query_callbacks'];
+        $outcome['query_filters_after'] = (int) $probeAfter['query_callbacks'];
+        $outcome['probe_before'] = $probeBefore;
+        $outcome['probe_after'] = $probeAfter;
+        $outcome['parent_probe'] = $this->parentForkProbe;
+        $outcome['call_started_at'] = $startedAt;
+        $outcome['call_finished_at'] = $finishedAt;
+
+        @file_put_contents($this->fileTag . '-outcome-' . $attempt . '-' . $index, json_encode($outcome));
+        // Wrapper owns the process exit (exit(0) on success / exit(1) on fatal).
+    }
+
+    /**
+     * Final-state read on a fresh mysqli — the parent's wpdb holds a
+     * REPEATABLE-READ snapshot from before the children committed.
+     *
+     * @return array<string, mixed>
+     */
     private function raceState(int $appointmentId, int $slotId): array {
         $conn = $this->freshMysqli();
         $db = App::db();
@@ -2484,7 +3154,7 @@ final class Phase7Fr55NoShowRedTest extends WP_UnitTestCase {
 }
 
 /**
- * Test-local license gate (worker-safe): pure, no external call, always
+ * Test-local license gate (fork-safe): pure, no external call, always
  * allowed. Production uses the wired gate; this one only removes license
  * noise from the race children.
  */

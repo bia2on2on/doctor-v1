@@ -5,14 +5,14 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
-use ClinicCore\Tests\Support\ExternalRaceWorker;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 /**
  * Concurrency Tests (F3) — TP-03: N Request هم‌زمان روی یک Slot.
  *
  * تضمین ADR-0004 در سطح DB با Conditional UPDATE اتمیک است (بدون Read-then-Write).
- * این تست با **پردازهای واقعی موازی** (External proc_open workers — اتصال mysqli مستقل هر پرداز)
+ * این تست با **پردازهای واقعی موازی** (pcntl_fork — اتصال mysqli مستقل هر پرداز)
  * و **اتصال‌های موازی** همان تضمین را می‌سنجد:
  *
  *  - ظرفیت ۱: دقیقاً یک Claim/Hold موفق؛ بقیه fail
@@ -267,39 +267,65 @@ final class ConcurrencyTest extends WP_UnitTestCase
         return (int) $locationId;
     }
 
-    // ---------- External race orchestration ----------
+    // ---------- Fork orchestration ----------
 
     /**
      * @param string $sql همان SQL اتمیک SlotRepository (متد atomicXxx)
-     * @return int تعداد پردازهای موفق (outcome '0')
+     * @return int تعداد پردازهای موفق (exit code 0)
      */
     private function forkWorkers(int $count, string $sql, int $slotId): int
     {
-        // External proc_open workers: no descriptor is inherited from this
-        // harness process, so a graceful exit(0) in a worker cannot run
-        // mysqlnd on the shared session. Exit 0 = clean job done
-        // (whatever the race outcome); any other code is a harness fatal.
-        $script = dirname(__DIR__) . '/bin/fork-race-atomic-worker.php';
+        if (!function_exists('pcntl_fork')) {
+            $this->markTestSkipped('pcntl_fork not available in this environment (CI Linux has it)');
+        }
+
+        $pids = [];
+        $outcome_files = [];
         $tag = bin2hex(random_bytes(8));
-        $outcomeFiles = [];
-        $workers = [];
         for ($i = 0; $i < $count; $i++) {
-            $outcomeFiles[$i] = sys_get_temp_dir() . '/cpms-conc-' . $tag . '-' . $i . '.out';
-            @unlink($outcomeFiles[$i]);
-            $workers[$i] = ExternalRaceWorker::launch($script, [
-                'mode' => 'conditional_update',
-                'sql_b64' => base64_encode($sql),
-                'id' => $slotId,
-                'outcome' => $outcomeFiles[$i],
-            ]);
+            $outcome_files[$i] = sys_get_temp_dir() . '/cpms-conc-' . $tag . '-' . $i . '.out';
+            $pid = pcntl_fork();
+            if ($pid === -1) {
+                $this->fail('pcntl_fork failed');
+            }
+            if ($pid === 0) {
+                /*
+                 * ---- Child: اتصال مستقل + یک UPDATE اتمیک ----
+                 * هر خطا باید به exit() منجر شود: اگر استثنایی (حتی
+                 * markTestSkipped) از فرزند فرار کند، PHPUnitِ کپی‌شده در فرزند
+                 * «ادامه» می‌دهد و کل Suite را دوباره اجرا می‌کند (zombie) —
+                 * خروجی‌ها interleave شده و اتصال مشترک والد خراب می‌شود.
+                 */
+                $exitCode = 1;
+                $mysqli = null;
+                try {
+                    $mysqli = $this->freshMysqli();
+                    $stmt = $mysqli->prepare($sql);
+                    if ($stmt !== false) {
+                        $now = gmdate('Y-m-d H:i:s') . '.000';
+                        if ($stmt->bind_param('si', $now, $slotId)) {
+                            $stmt->execute();
+                            $exitCode = $stmt->affected_rows === 1 ? 0 : 1;
+                            $stmt->close();
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    $exitCode = 1;
+                }
+                if ($mysqli instanceof \mysqli) {
+                    @$mysqli->close();
+                }
+                @file_put_contents($outcome_files[$i], (string) $exitCode);
+                ForkChildExit::terminate(0);
+            }
+            $pids[$i] = $pid;
         }
 
         $successes = 0;
-        foreach ($workers as $i => $worker) {
-            $code = $worker->waitForExit(20.0);
-            self::assertSame(0, $code, 'external race worker ' . $i . ' must exit with status 0 (task ' . $tag . ')');
-            $raw = @file_get_contents($outcomeFiles[$i]);
-            @unlink($outcomeFiles[$i]);
+        foreach ($pids as $i => $pid) {
+            pcntl_waitpid($pid, $status);
+            $raw = @file_get_contents($outcome_files[$i]);
+            @unlink($outcome_files[$i]);
             if ($raw === '0') {
                 $successes++;
             }

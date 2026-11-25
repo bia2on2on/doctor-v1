@@ -4,7 +4,7 @@
  * IsolatedSchema — shared infrastructure for tests that need an ISOLATED,
  * DISPOSABLE database with real migrations (CI-only).
  *
- * Why: tests that race independent connections and commit transactions cannot
+ * Why: tests that fork independent connections and commit transactions cannot
  * run on the shared WP test database (the harness wraps everything in one
  * outer transaction per test, and the `query` filter rewrites CREATE/DROP
  * TABLE to TEMPORARY). Each test using this trait gets its own schema
@@ -14,17 +14,17 @@
  *  - No shared data is ever read or modified (schema is per-test).
  *  - Cleanup is best-effort and NEVER outranks safety (DROP DATABASE, not
  *    table scans): tearDown performs a bounded DROP; a shutdown hook drops
- *    only schemas with no retain-block marker — otherwise the schema is
- *    RETAINED loudly (fail-closed). Race actors run as external processes
- *    (ExternalRaceWorker), which never load this trait and therefore never
- *    run its shutdown cleanup; only the PHPUnit process triggers it. The
- *    per-process migration mirror directory is wiped at process end.
+ *    only schemas with NO unconfirmed forked child of this process (and no
+ *    block marker) — otherwise the schema is RETAINED loudly (fail-closed);
+ *    forked children never run shutdown cleanup at all. The per-process
+ *    migration mirror directory is wiped at process end (retained, loudly, when
+ *    forked children cannot be confirmed gone — see registerFatalCleanup()).
  *  - Production code runs unchanged; the WP test bootstrap rewrites CpmsDb's
  *    marked transaction-control statements to SAVEPOINTs (the marker exists
  *    so the rewriter knows to nest them in the outer transaction). Tests
  *    either open a real outer START TRANSACTION (savepoints nest in it) or
  *    let the implicit transaction of a bare connection be COMMITted by the
- *    caller (external workers do the latter, exactly like production's real
+ *    caller (forked workers do the latter, exactly like production's real
  *    top-level transactions).
  *
  * Fixture visibility contract:
@@ -73,15 +73,17 @@ declare(strict_types=1);
 namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Application\Auth\PatientAccess;
+use ClinicCore\Application\Auth\PatientSessionProofStore;
+use ClinicCore\Application\Auth\PatientSessionScope;
 use ClinicCore\Application\Booking\BookingService;
 use ClinicCore\Application\Notifications\SmsService;
 use ClinicCore\Auth\RolesAndCapabilities;
+use ClinicCore\Domain\Licensing\ActiveLicenseGate;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
 use ClinicCore\Infrastructure\Db\CpmsDb;
 use ClinicCore\Infrastructure\Logging\OpLogger;
 use ClinicCore\Infrastructure\Queue\JobQueue;
 use ClinicCore\Infrastructure\Repository\AppointmentRepository;
-use ClinicCore\Application\Auth\PatientSessionProofStore;
 use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
 use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Infrastructure\Repository\SlotRepository;
@@ -133,7 +135,7 @@ trait IsolatedSchema
 
     /**
      * Fail-closed drop refusal: schemas that must NOT be dropped because a
-     * race worker is known or potentially still active. Set via
+     * forked child is known or potentially still active. Set via
      * blockDisposableSchemaDrop(); honored by dropDisposableSchema() and by
      * the shutdown-hook backstop. A retained, loudly-reported schema beats a
      * drop issued under a live, potentially mid-transaction process.
@@ -141,6 +143,104 @@ trait IsolatedSchema
      * @var array<string, string> schema => reason
      */
     private static array $dropBlockedSchemas = [];
+
+    /**
+     * PIDs of children forked by this process that have NOT been confirmed
+     * dead (waitpid returned the pid, or errno ECHILD). Populated right after
+     * each successful pcntl_fork() via noteForkedChild(); an entry is removed
+     * ONLY by noteChildConfirmedReaped(). A non-empty map means "some fork
+     * made by this process may still be active": dropDisposableSchema()
+     * refuses the DROP and the shutdown backstop RETAINS open schemas,
+     * loudly — independently of whether tearDown managed to set a block.
+     * Process-local (copy-on-write across fork): the parent's registry is
+     * never shared with children.
+     *
+     * @var array<int, int> pid => pid
+     */
+    private static array $pendingChildPids = [];
+
+    /**
+     * Count of fork sites currently "in flight": incremented BEFORE
+     * pcntl_fork() and decremented only AFTER the parent has either
+     * registered the child pid in $pendingChildPids or confirmed the fork
+     * produced no parent-side child. Covers the bounded interval in which
+     * the parent may hold an UNREGISTERED live child — including a fatal or
+     * exit that lands between pcntl_fork() returning and noteForkedChild():
+     * at shutdown, a nonzero value RETAINS every open schema and
+     * dropDisposableSchema() refuses — fail-closed. A child that ends up
+     * inheriting this nonzero value is already cleanup-disabled at birth, so
+     * it additionally never wipes the mirror nor issues DROP. Any observer
+     * treats nonzero as "child state cannot be established" and must refuse
+     * cleanup.
+     */
+    private static int $pendingForkIntent = 0;
+
+    /** Called immediately BEFORE every pcntl_fork() site. */
+    public static function noteForkIntentBegin(): void
+    {
+        self::$pendingForkIntent++;
+    }
+
+    /**
+     * Called after the fork site has done everything it can (child registered
+     * or not). Never goes below zero.
+     */
+    public static function noteForkIntentResolved(): void
+    {
+        if (self::$pendingForkIntent > 0) {
+            self::$pendingForkIntent--;
+        }
+    }
+
+    /** @return int outstanding fork sites whose children are not yet accounted for */
+    public static function pendingForkIntent(): int
+    {
+        return self::$pendingForkIntent;
+    }
+
+    /**
+     * Set inside a FORKED CHILD at childExit() time: THIS process must not
+     * run any shutdown cleanup (schema DROP or migration-mirror wipe). The
+     * parent owns the disposable-schema lifecycle; an inherited shutdown hook
+     * in a child could otherwise DROP the shared schema while the parent (or
+     * a sibling) is still active.
+     */
+    private static bool $fatalCleanupDisabledInThisProcess = false;
+
+    /** Called by the fork parent right after each successful pcntl_fork(). */
+    public static function noteForkedChild(int $pid): void
+    {
+        if ($pid > 0) {
+            self::$pendingChildPids[$pid] = $pid;
+        }
+    }
+
+    /**
+     * Called ONLY when the child is confirmed gone: waitpid returned its pid,
+     * or failed with errno ECHILD (the child was already reaped in this
+     * process). Any other outcome (still running, EINTR, error we cannot
+     * interpret) keeps the entry — silence is never treated as death.
+     */
+    public static function noteChildConfirmedReaped(int $pid): void
+    {
+        unset(self::$pendingChildPids[$pid]);
+    }
+
+    /** @return array<int, int> child pids noted at fork time and not yet confirmed dead */
+    public static function pendingChildPids(): array
+    {
+        return array_values(self::$pendingChildPids);
+    }
+
+    /**
+     * Disable ALL shutdown cleanup in THIS process. Forked children call this
+     * at childExit() time so the inherited shutdown hook is inert here, no
+     * matter which way the child ends (SIGKILL, exit(0), or a failed kill).
+     */
+    public static function disableFatalCleanupForThisProcess(): void
+    {
+        self::$fatalCleanupDisabledInThisProcess = true;
+    }
 
     /**
      * Create the disposable schema and skip the test loudly if it cannot be
@@ -251,7 +351,7 @@ trait IsolatedSchema
 
     /**
      * Seed patient sessions for the given users and capture the session arrays
-     * so external workers can authenticate through the documented reader seam.
+     * so forked workers can authenticate through the documented reader seam.
      */
     protected function seedSessions(array $userIds): void
     {
@@ -298,8 +398,13 @@ trait IsolatedSchema
     }
 
     /**
-     * Mark this test's disposable schema as NOT safe to DROP (e.g. race
-     * workers unconfirmed stopped). Honored by dropDisposableSchema() and by
+     * Total isolation, reliable cleanup: close the coordinator connection and
+     * DROP the whole disposable schema regardless of what any test did. No
+     * scanning, no per-table DELETE of anything shared.
+     */
+    /**
+     * Mark this test's disposable schema as NOT safe to DROP (e.g. forked
+     * children unconfirmed reaped). Honored by dropDisposableSchema() and by
      * the shutdown-hook backstop; both refuse and report loudly instead of
      * dropping under potentially active processes.
      */
@@ -313,11 +418,6 @@ trait IsolatedSchema
         fwrite(STDERR, 'disposable schema cleanup: drop REFUSED for ' . $name . ' — ' . $reason . PHP_EOL);
     }
 
-    /**
-     * Total isolation, reliable cleanup: close the coordinator connection and
-     * DROP the whole disposable schema regardless of what any test did. No
-     * scanning, no per-table DELETE of anything shared.
-     */
     protected function dropDisposableSchema(): void
     {
         unset($_COOKIE[LOGGED_IN_COOKIE]);
@@ -328,9 +428,23 @@ trait IsolatedSchema
         }
         if ('' !== $this->disposableDb) {
             $schema = $this->disposableDb;
-            // FAIL CLOSED (worker-reaper registry): a race worker that cannot
-            // be confirmed stopped retains the schema loudly, regardless of
-            // whether tearDown managed to set the block.
+            // FAIL CLOSED (fork registry + fork intent): this process may
+            // hold forks that were never confirmed dead, or a fork site may
+            // be in flight (parent fatal/exit between pcntl_fork() and the
+            // child registration). Neither resolves itself; refuse
+            // unconditionally, regardless of whether tearDown ran.
+            $pending = self::pendingChildPids();
+            $intent = self::pendingForkIntent();
+            if ($pending !== [] || $intent > 0) {
+                $reasons = [];
+                if ($pending !== []) {
+                    $reasons[] = 'registered unconfirmed pids=' . implode(',', $pending);
+                }
+                if ($intent > 0) {
+                    $reasons[] = 'fork intent in flight (intent=' . $intent . '): a fatal/exit before parent-side registration of a child cannot be ruled out';
+                }
+                $this->blockDisposableSchemaDrop('unconfirmed forked child process(es) may still be active; ' . implode('; ', $reasons));
+            }
             if (isset(self::$dropBlockedSchemas[$schema])) {
                 $reason = self::$dropBlockedSchemas[$schema];
                 fwrite(STDERR, 'disposable schema cleanup: refusing DROP (fail-closed): ' . $schema . ' — ' . $reason . PHP_EOL);
@@ -338,7 +452,7 @@ trait IsolatedSchema
             }
             // Dedicated fresh connection for the DDL (never the WP query filter,
             // never the harness transaction) with a bounded metadata-lock wait:
-            // if a surviving worker holds metadata locks on the schema,
+            // if a surviving forked child holds metadata locks on the schema,
             // the DROP fails LOUDLY within ~10s instead of hanging tearDown
             // indefinitely. A failure is an exception, never silent.
             $dropped = false;
@@ -376,8 +490,8 @@ trait IsolatedSchema
 
     /**
      * Production service graph bound to one explicit connection.
-     * $forChild=true builds everything an independent connection needs without
-     * touching the parent's global singletons; false uses the production wiring
+     * $forChild=true builds everything a fork needs without touching the
+     * parent's global singletons; false uses the production wiring
      * (App::licenseGate()/smsService()/patient_session_scope()).
      *
      * @return array{service: BookingService, db: CpmsDb}
@@ -391,13 +505,54 @@ trait IsolatedSchema
         $idem = new Idempotency($db);
 
         if ($forChild) {
-            // Shared with tests/bin/fork-race-wp-worker.php: the external worker
-            // reconstructs this exact stack on its own connection.
-            return \ClinicCore\Tests\Support\DisposableSchemaChildStack::build(
-                $conn,
-                (int) $childUserId,
-                (array) $childSession,
-                (string) ($this->capturedTokens[$childUserId ?? 0] ?? '')
+            $registry = new SmsProviderRegistry();
+            $registry->register(new LogSmsProvider($op));
+            $registry->register(new GenericApiSmsProvider(static fn (): array => []));
+            $sms = new SmsService(
+                $db,
+                $settingsFactory,
+                $registry,
+                new CredentialVault(),
+                $audit,
+                $op,
+                new JobQueue($db, $op),
+                static fn (): int => 0
+            );
+            $license = new ActiveLicenseGate();
+            $sessions = new PatientSessionScope(
+                $db,
+                static fn (int $uid, ?string $token) => (null !== $childSession && $childUserId === $uid) ? $childSession : null,
+                static fn (int $uid): array => []
+            );
+            $childToken = null !== $childUserId ? ($this->capturedTokens[$childUserId] ?? '') : '';
+            $proofStore = new PatientSessionProofStore(
+                static fn (int $uid): object => new class($childUserId, $childToken, $childSession) {
+                    /** @param array<string, mixed>|null $session */
+                    public function __construct(
+                        private readonly ?int $expectedUid,
+                        private readonly string $expectedToken,
+                        private readonly ?array $session
+                    ) {
+                    }
+
+                    /** @return array<string, mixed>|null */
+                    public function get(string $token): ?array
+                    {
+                        return (null !== $this->session && '' !== $this->expectedToken && $token === $this->expectedToken)
+                            ? $this->session
+                            : null;
+                    }
+
+                    /** @param array<string, mixed> $session */
+                    public function update(string $token, array $session): void
+                    {
+                    }
+
+                    public function destroy_all(): void
+                    {
+                    }
+                },
+                static fn (): string => $childToken
             );
         } else {
             // License gate and session scope from production wiring write
@@ -683,9 +838,11 @@ trait IsolatedSchema
     /**
      * One process-lifetime shutdown hook: drop any disposable schema that is
      * still registered and unblocked (e.g. after a fatal that bypassed
-     * tearDown) and wipe the migration mirror. FAIL-CLOSED: an open schema
-     * with a retain-block marker is RETAINED loudly. Loud on STDERR for
-     * every anomaly — a leaked schema or mirror is never hidden.
+     * tearDown) and wipe the migration mirror. FAIL-CLOSED: a forked child
+     * (cleanup disabled in its own process) performs no cleanup; a parent
+     * with any unconfirmed forked child RETAINS every open schema AND the
+     * migration mirror loudly. Loud on STDERR for every anomaly — a leaked
+     * schema or mirror is never hidden.
      */
     private static function registerFatalCleanup(): void
     {
@@ -695,8 +852,36 @@ trait IsolatedSchema
         }
         $registered = true;
         register_shutdown_function(static function (): void {
+            // A forked child at exit must NEVER run cleanup here: the schema
+            // belongs to the parent, and the child's inherited registry of
+            // open schemas is a stale snapshot. Disable first, always.
+            if (self::$fatalCleanupDisabledInThisProcess) {
+                fwrite(STDERR, 'disposable schema cleanup: shutdown cleanup disabled in this process (forked child, pid=' . getmypid() . '); the parent owns cleanup' . PHP_EOL);
+                return;
+            }
+            // BOOTSTRAP ORDER (fail-closed): decide fork-retention BEFORE any
+            // cleanup side effect, not after. An unconfirmed forked child
+            // (or an interrupted fork site) cannot prove what the child
+            // still references — the migration mirror is spawn/consume state
+            // the child shares with this process, so retaining it under the
+            // same condition as open schemas is required for consistency.
+            $unconfirmed = self::pendingChildPids();
+            $intent = self::pendingForkIntent();
+            $retentionNote = null;
+            if ($unconfirmed !== [] || $intent > 0) {
+                $parts = [];
+                if ($unconfirmed !== []) {
+                    $parts[] = 'pids=' . implode(',', $unconfirmed);
+                }
+                if ($intent > 0) {
+                    $parts[] = 'fork intent in flight (intent=' . $intent . '): a fatal/exit before parent-side registration of a child cannot be ruled out';
+                }
+                $retentionNote = 'unconfirmed forked child process(es) may still be active; ' . implode('; ', $parts);
+            }
             try {
-                if (is_dir((string) self::$migrationMirror)) {
+                if (null !== $retentionNote && is_dir((string) self::$migrationMirror)) {
+                    fwrite(STDERR, 'disposable schema cleanup: backstop RETAINING migration mirror at ' . self::$migrationMirror . ' (fail-closed): ' . $retentionNote . PHP_EOL);
+                } elseif (is_dir((string) self::$migrationMirror)) {
                     $deleted = 0;
                     $failed  = 0;
                     foreach (glob(self::$migrationMirror . '/*.php') ?: [] as $wrapperFile) {
@@ -716,10 +901,17 @@ trait IsolatedSchema
                 // Never silent: a failed mirror wipe leaks (harmless) temp wrappers.
                 fwrite(STDERR, 'disposable schema cleanup: mirror wipe error: ' . $e->getMessage() . PHP_EOL);
             }
-            // FAIL CLOSED: a retain-block recorded by any test (e.g. a race
-            // worker that cannot be confirmed stopped) outranks cleanup.
+            // FAIL CLOSED: reuse the bootstrap decision computed before ANY
+            // cleanup side effect (see above). We cannot prove no child is
+            // mid-transaction on any open schema; retain ALL of them loudly.
             foreach (array_keys(self::$openSchemas) as $name) {
+                if (null !== $retentionNote) {
+                    fwrite(STDERR, 'disposable schema cleanup: backstop RETAINING ' . $name . ' (fail-closed): ' . $retentionNote . PHP_EOL);
+                    continue;
+                }
                 if (isset(self::$dropBlockedSchemas[$name])) {
+                    // FAIL CLOSED at process end as well: a known/potentially
+                    // active forked child outranks cleanup. Retain + report.
                     fwrite(STDERR, 'disposable schema cleanup: backstop RETAINING ' . $name . ' (fail-closed): ' . self::$dropBlockedSchemas[$name] . PHP_EOL);
                     continue;
                 }

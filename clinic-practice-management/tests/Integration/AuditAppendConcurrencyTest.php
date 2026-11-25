@@ -6,7 +6,7 @@ namespace ClinicCore\Tests\Integration;
 
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Infrastructure\Audit\HashChain;
-use ClinicCore\Tests\Support\ExternalRaceWorker;
+use ClinicCore\Tests\Support\ForkChildExit;
 use WP_UnitTestCase;
 
 /**
@@ -272,7 +272,7 @@ final class AuditAppendConcurrencyTest extends WP_UnitTestCase
     // ------------------------------------------------------------------
 
     /**
-     * Launch $count external workers, each appending one audit row through the guard.
+     * Fork $count workers each appending one audit row through the guard.
      * Each worker uses its own mysqli connection and replicates the AuditLogger
      * logic (guard FOR UPDATE → tail FOR UPDATE → compute hash → insert → update guard).
      *
@@ -280,43 +280,131 @@ final class AuditAppendConcurrencyTest extends WP_UnitTestCase
      */
     private function assertConcurrentAuditInsertsPreserveChain(int $count, int $beforeCount): void
     {
+        if (!function_exists('pcntl_fork')) {
+            $this->markTestSkipped('pcntl_fork not available');
+        }
+
+        $pids = [];
         $outcome_files = [];
         $tag = bin2hex(random_bytes(8));
         // Ensure parent session holds no open transaction lock on cpms_audit_logs
-        // before external workers acquire FOR UPDATE on tail + guard.
+        // before forked children acquire FOR UPDATE on tail + guard.
         App::db()->wpdb()->query('COMMIT');
 
-        $script = dirname(__DIR__) . '/bin/fork-race-atomic-worker.php';
-        $workers = [];
         for ($i = 0; $i < $count; $i++) {
             $outcome_files[$i] = sys_get_temp_dir() . '/cpms-audit-ins-' . $tag . '-' . $i . '.out';
-            @unlink($outcome_files[$i]);
-            $workers[$i] = ExternalRaceWorker::launch($script, [
-                'mode' => 'audit_append_replicated',
-                'worker_index' => $i,
-                'clinic_id' => $this->clinicId,
-                'outcome' => $outcome_files[$i],
-            ]);
+            $pid = pcntl_fork();
+            if ($pid === -1) {
+                $this->fail('pcntl_fork failed');
+            }
+            if ($pid === 0) {
+                // Child — independent mysqli, single transactional audit append.
+                $exit = 1;
+                $mysqli = null;
+                try {
+                    $mysqli = $this->freshMysqli();
+                    $mysqli->begin_transaction();
+                    // 1) Guard lock
+                    $guard = $mysqli->query('SELECT id FROM ' . $this->table('cpms_audit_seq') . ' WHERE id = 1 FOR UPDATE');
+                    if ($guard === false || $guard->num_rows !== 1) {
+                        throw new \RuntimeException('guard lock failed');
+                    }
+                    $guard->free();
+                    // 2) Tail current read
+                    $tail = $mysqli->query('SELECT row_hash FROM ' . $this->table('cpms_audit_logs') . ' ORDER BY id DESC LIMIT 1 FOR UPDATE');
+                    $prevHash = HashChain::GENESIS;
+                    if ($tail !== false && $tail->num_rows === 1) {
+                        $row = $tail->fetch_assoc();
+                        $prevHash = (string) ($row['row_hash'] ?? HashChain::GENESIS);
+                    }
+                    if ($tail instanceof \mysqli_result) {
+                        $tail->free();
+                    }
+
+                    // 3) Build canonical fields and hash (mirrors HashChain::fieldsFor;
+                    // use 1-based resource_id so DB integer value matches fieldsFor).
+                    $resourceId = $i + 1;
+                    $now = gmdate('Y-m-d H:i:s') . '.000';
+                    $fields = [
+                        'action' => 'CONCURRENT_TEST_' . $i,
+                        'actor_role' => 'system',
+                        'actor_wp_user_id' => null,
+                        'clinic_id' => $this->clinicId,
+                        'created_at' => $now,
+                        'ip_hash' => null,
+                        'patient_id' => null,
+                        'request_id' => 'test-req-' . getmypid() . '-' . $i,
+                        'resource_id' => $resourceId,
+                        'resource_type' => 'test',
+                        'session_id' => null,
+                    ];
+                    ksort($fields);
+                    $canonical = json_encode($fields, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '';
+                    $rowHash = hash('sha256', $prevHash . $canonical);
+
+                    $clinicId = $this->clinicId;
+                    $actorRole = 'system';
+                    $action = 'CONCURRENT_TEST_' . $i;
+                    $resourceType = 'test';
+                    $requestId = 'test-req-' . getmypid() . '-' . $i;
+                    $sql = sprintf(
+                        "INSERT INTO %s (clinic_id, actor_wp_user_id, actor_role, action, resource_type, resource_id, patient_id, ip_hash, session_id, request_id, prev_hash, row_hash, created_at) VALUES (%d, NULL, '%s', '%s', '%s', %d, NULL, NULL, NULL, '%s', '%s', '%s', '%s')",
+                        $this->table('cpms_audit_logs'),
+                        $clinicId,
+                        $mysqli->real_escape_string($actorRole),
+                        $mysqli->real_escape_string($action),
+                        $mysqli->real_escape_string($resourceType),
+                        $resourceId,
+                        $mysqli->real_escape_string($requestId),
+                        $mysqli->real_escape_string($prevHash),
+                        $mysqli->real_escape_string($rowHash),
+                        $mysqli->real_escape_string($now)
+                    );
+                    if ($mysqli->query($sql) === false) {
+                        throw new \RuntimeException('insert failed: ' . $mysqli->error);
+                    }
+                    $auditId = $mysqli->insert_id;
+                    // Update guard bookkeeping (part of same tx)
+                    $mysqli->query(sprintf("UPDATE %s SET last_audit_id = %d, updated_at = '%s' WHERE id = 1", $this->table('cpms_audit_seq'), (int) $auditId, $mysqli->real_escape_string($now)));
+                    $mysqli->commit();
+                    $exit = 0;
+                } catch (\Throwable $e) {
+                    if ($mysqli instanceof \mysqli) {
+                        try {
+                            $mysqli->rollback();
+                        } catch (\Throwable) {
+                        }
+                    }
+                    $exit = 2;
+                    // Child must not run PHPUnit again — exit immediately.
+                    error_log('audit child failed: ' . $e->getMessage());
+                }
+                if ($mysqli instanceof \mysqli) {
+                    @$mysqli->close();
+                }
+                @file_put_contents($outcome_files[$i], (string) $exit);
+                ForkChildExit::terminate(0);
+            }
+            $pids[$i] = $pid;
         }
 
         $success = 0;
         $failed = 0;
-        foreach ($workers as $i => $worker) {
-            $code = $worker->waitForExit(20.0);
+        foreach ($pids as $i => $pid) {
+            pcntl_waitpid($pid, $status);
             $raw = @file_get_contents($outcome_files[$i]);
             @unlink($outcome_files[$i]);
-            if ($code === 0 && $raw === '0') {
+            if ($raw === '0') {
                 $success++;
             } else {
                 $failed++;
             }
         }
-        self::assertSame(0, $failed, $count . '-way audit appends must exit with status 0 (no harness fatal): failed=' . $failed);
 
         $this->assertSame($count, $success, $count . '-way concurrent audit inserts must all succeed (failed=' . $failed . ')');
         $this->assertSame(0, $failed);
         // End any open REPEATABLE READ snapshot before non-locking verifier reads
-        // so rows committed by the external workers are visible here.
+        // so rows committed by forked child connections are visible here.
         App::db()->wpdb()->query('COMMIT');
 
         // Verify chain integrity after this batch.
@@ -331,28 +419,55 @@ final class AuditAppendConcurrencyTest extends WP_UnitTestCase
 
     private function forkBookingHolds(int $count, int $slotId): int
     {
+        if (!function_exists('pcntl_fork')) {
+            $this->markTestSkipped('pcntl_fork not available');
+        }
+        $pids = [];
         $outcome_files = [];
         $tag = bin2hex(random_bytes(8));
-        // Direct conditional UPDATE only; neither BookingService nor AuditLogger runs.
-        $holdSql = 'UPDATE ' . $this->table('cpms_schedule_slots')
-            . ' SET held_count = held_count + 1, updated_at = ? WHERE id = ? AND is_open = 1 AND capacity - booked_count - held_count > 0';
-        $script = dirname(__DIR__) . '/bin/fork-race-atomic-worker.php';
-        $workers = [];
         for ($i = 0; $i < $count; $i++) {
             $outcome_files[$i] = sys_get_temp_dir() . '/cpms-audit-hold-' . $tag . '-' . $i . '.out';
-            @unlink($outcome_files[$i]);
-            $workers[$i] = ExternalRaceWorker::launch($script, [
-                'mode' => 'conditional_update',
-                'sql_b64' => base64_encode($holdSql),
-                'id' => $slotId,
-                'outcome' => $outcome_files[$i],
-            ]);
+            $pid = pcntl_fork();
+            if ($pid === -1) {
+                $this->fail('pcntl_fork failed');
+            }
+            if ($pid === 0) {
+                $exit = 1;
+                $mysqli = null;
+                try {
+                    $mysqli = $this->freshMysqli();
+                    // Direct conditional UPDATE only; neither BookingService nor AuditLogger runs.
+                    $mysqli->begin_transaction();
+                    $now = gmdate('Y-m-d H:i:s') . '.000';
+                    $stmt = $mysqli->prepare('UPDATE ' . $this->table('cpms_schedule_slots') . ' SET held_count = held_count + 1, updated_at = ? WHERE id = ? AND is_open = 1 AND capacity - booked_count - held_count > 0');
+                    if ($stmt !== false) {
+                        $stmt->bind_param('si', $now, $slotId);
+                        $stmt->execute();
+                        $exit = $stmt->affected_rows === 1 ? 0 : 1;
+                        $stmt->close();
+                    }
+                    if ($exit === 0) {
+                        $mysqli->commit();
+                    } else {
+                        $mysqli->rollback();
+                    }
+                } catch (\Throwable) {
+                    if ($mysqli instanceof \mysqli) {
+                        try { $mysqli->rollback(); } catch (\Throwable) {}
+                    }
+                    $exit = 1;
+                }
+                if ($mysqli instanceof \mysqli) {
+                    @$mysqli->close();
+                }
+                @file_put_contents($outcome_files[$i], (string) $exit);
+                ForkChildExit::terminate(0);
+            }
+            $pids[$i] = $pid;
         }
-
         $successes = 0;
-        foreach ($workers as $i => $worker) {
-            $code = $worker->waitForExit(20.0);
-            self::assertSame(0, $code, 'external hold worker ' . $i . ' must exit with status 0 (task ' . $tag . ')');
+        foreach ($pids as $i => $pid) {
+            pcntl_waitpid($pid, $status);
             $raw = @file_get_contents($outcome_files[$i]);
             @unlink($outcome_files[$i]);
             if ($raw === '0') {
@@ -378,6 +493,26 @@ final class AuditAppendConcurrencyTest extends WP_UnitTestCase
         }
         $this->assertSame(1, $genesisCount, 'only the first audit row may have GENESIS prev_hash; unexpected genesis at IDs: ' . implode(',', $unexpected));
         $this->assertSame([], $unexpected);
+    }
+
+    private function freshMysqli(): \mysqli
+    {
+        global $wpdb;
+        $host = defined('DB_HOST') ? (string) DB_HOST : '127.0.0.1';
+        // WP_TESTS config may include port: "127.0.0.1:3307" for MariaDB.
+        $port = 3306;
+        if (str_contains($host, ':')) {
+            [$host, $portStr] = explode(':', $host, 2);
+            $port = (int) $portStr;
+        }
+        $user = defined('DB_USER') ? (string) DB_USER : 'root';
+        $pass = defined('DB_PASSWORD') ? (string) DB_PASSWORD : 'root';
+        $name = defined('DB_NAME') ? (string) DB_NAME : ($wpdb->dbname ?? 'wordpress_test');
+        $mysqli = new \mysqli($host, $user, $pass, $name, $port);
+        if ($mysqli->connect_error) {
+            throw new \RuntimeException('mysqli connect failed: ' . $mysqli->connect_error);
+        }
+        return $mysqli;
     }
 
     private function table(string $short): string
