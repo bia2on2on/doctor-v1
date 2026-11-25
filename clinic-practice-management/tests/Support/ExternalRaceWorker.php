@@ -129,31 +129,6 @@ final class ExternalRaceWorker
         return new self($process, $pipes);
     }
 
-    /**
-     * Reads the absolute path an Integration test passes to children.
-     *
-     * @return array<string, mixed> the decoded task (or throws)
-     */
-    public static function decodeTask(): array
-    {
-        $raw = getenv(self::TASK_ENV);
-        $task = is_string($raw) && $raw !== '' ? json_decode($raw, true) : null;
-        if (!is_array($task)) {
-            exit(2); // TASK_UNREADABLE — sanitized failure, exit non-zero
-        }
-
-        return $task;
-    }
-
-    /**
-     * The worker holds no inherited descriptors; nothing to restore. This
-     * helper exists so tests can sanity-check /proc availability.
-     */
-    public static function descriptorPinningAvailable(): bool
-    {
-        return is_dir('/proc/self/fd');
-    }
-
     /** @param resource|null $pipe */
     private function __construct($process, array $pipes)
     {
@@ -167,19 +142,6 @@ final class ExternalRaceWorker
                 $this->pipes[$i] = $pipe;
             }
         }
-    }
-
-    /**
-     * The raw pipes (stdout in 0, stderr in 1) for protocol-pipe workers.
-     * The caller reads them outside this class while the worker is alive;
-     * the launcher must not call waitForExit() concurrently from two
-     * contexts.
-     *
-     * @return array<int, resource>
-     */
-    public function pipes(): array
-    {
-        return $this->pipes;
     }
 
     /** The worker's process id, or 0 when /proc or proc_get_status cannot report it. */
@@ -338,21 +300,7 @@ final class ExternalRaceWorker
         }
     }
 
-    /** Raw stdout retained so far (bounded to 1 MiB). */
-    public function stdout(): string
-    {
-        $this->pump();
 
-        return $this->stdoutBuffer;
-    }
-
-    /** Bounded stderr tail, for failure attribution (never a credential carrier). */
-    public function diagnostics(): string
-    {
-        $this->pump();
-
-        return $this->diagnostics;
-    }
 
     /**
      * Bounded termination: SIGTERM then SIGKILL after a short grace.
