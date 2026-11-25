@@ -581,19 +581,13 @@ final class BookingService
         }
 
         // N-4: Hold Active موجود همان بیمار/اسلات → Idempotent (بازگردانی همان Token)
-        if ( null !== $patient_id_to_persist && $patient_id_to_persist > 0 ) {
-            $existing = $this->db->fetchRow(
-                'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
-                . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s AND patient_id = %d LIMIT 1',
-                [ $wp_user_id, $trusted_clinic_id, (int) $slot['id'], 'active', $this->db->nowUtcSql(), $patient_id_to_persist ]
-            );
-        } else {
-            $existing = $this->db->fetchRow(
-                'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
-                . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s AND patient_id IS NULL LIMIT 1',
-                [ $wp_user_id, $trusted_clinic_id, (int) $slot['id'], 'active', $this->db->nowUtcSql() ]
-            );
-        }
+        $existing = $this->find_reusable_active_hold_at(
+            $wp_user_id,
+            $trusted_clinic_id,
+            (int) $slot['id'],
+            $patient_id_to_persist,
+            $this->now()
+        );
         if ($existing !== null) {
             return [
                 'hold_token' => (string) $existing['token'],
@@ -632,19 +626,13 @@ final class BookingService
                 // held while the actor blocks on the Location row, and every other
                 // booking path follows the same order so no ABBA cycle exists.
                 $this->enforce_account_pending_appointment_cap( $wp_user_id, null, $logins_table_exists );
-                if ( null !== $patient_id_to_persist && $patient_id_to_persist > 0 ) {
-                    $existing_in_tx = $this->db->fetchRow(
-                        'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
-                        . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s AND patient_id = %d LIMIT 1',
-                        [ $wp_user_id, $trusted_clinic_id, (int) $slot['id'], 'active', $this->db->nowUtcSql(), $patient_id_to_persist ]
-                    );
-                } else {
-                    $existing_in_tx = $this->db->fetchRow(
-                        'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
-                        . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s AND patient_id IS NULL LIMIT 1',
-                        [ $wp_user_id, $trusted_clinic_id, (int) $slot['id'], 'active', $this->db->nowUtcSql() ]
-                    );
-                }
+                $existing_in_tx = $this->find_reusable_active_hold_at(
+                    $wp_user_id,
+                    $trusted_clinic_id,
+                    (int) $slot['id'],
+                    $patient_id_to_persist,
+                    $this->now()
+                );
                 if ( null !== $existing_in_tx ) {
                     return $existing_in_tx;
                 }
@@ -698,7 +686,7 @@ final class BookingService
                     'expires_at'        => $expires_at,
                     'status'            => 'active',
                     'created_at'        => $this->db->nowUtcSql(),
-            ];
+                ];
                 if ( $has_patient_col ) {
                     $row['patient_id'] = $patient_id_to_persist;
                 }
@@ -3279,6 +3267,41 @@ final class BookingService
                 static fn ( array $row ): bool => isset( $proved_map[ (int) ( $row['id'] ?? 0 ) ] )
             )
         );
+    }
+
+    /**
+     * Plain `SELECT` for an unexpired active hold of the resolved subject,
+     * comparing `DATETIME(3)` `expires_at` conservatively at millisecond precision
+     * and rechecking `toDateTime(expires_at) > $now_utc` to match `confirm()`.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function find_reusable_active_hold_at(
+        int $wp_user_id,
+        int $trusted_clinic_id,
+        int $slot_id,
+        ?int $patient_id_to_persist,
+        \DateTimeImmutable $now_utc
+    ): ?array {
+        $cutoff_utc_sql = $now_utc->format( 'Y-m-d H:i:s.' ) . substr( $now_utc->format( 'u' ), 0, 3 );
+        if ( null !== $patient_id_to_persist && $patient_id_to_persist > 0 ) {
+            $candidate = $this->db->fetchRow(
+                'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
+                . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s AND patient_id = %d LIMIT 1',
+                [ $wp_user_id, $trusted_clinic_id, $slot_id, 'active', $cutoff_utc_sql, $patient_id_to_persist ]
+            );
+        } else {
+            $candidate = $this->db->fetchRow(
+                'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
+                . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s AND patient_id IS NULL LIMIT 1',
+                [ $wp_user_id, $trusted_clinic_id, $slot_id, 'active', $cutoff_utc_sql ]
+            );
+        }
+        if ( null === $candidate || $this->toDateTime( (string) ( $candidate['expires_at'] ?? '' ) ) <= $now_utc ) {
+            return null;
+        }
+
+        return $candidate;
     }
 
     private ?bool $holdsPatientIdColCache = null;

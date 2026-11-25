@@ -552,6 +552,144 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
         );
     }
 
+    /**
+     * T-F2 (Mission 3, C1/C4):
+     *  - Fixed-row sub-second DATETIME(3) boundary proof (zero sleep; time moves
+     *    strictly in test data). End-to-end BookingService::hold() reads real
+     *    wall-clock DateTimeImmutable("now") without a public clock-injection seam,
+     *    so sub-second boundary evaluation is tested deterministically against real
+     *    persisted cpms_slot_holds DATETIME(3) rows via find_reusable_active_hold_at().
+     */
+    public function testTF2SubSecondFractionalExpiryBoundaryNeverReusesExpiredHold(): void
+    {
+        $db           = new CpmsDb($this->fixtureWpdb);
+        $holdsTable   = $this->rawTable('cpms_slot_holds');
+        $holderMobile = $this->patientMobile($this->patientAId);
+        $stack        = $this->stackOn($this->fixtureWpdb, true, $this->userAId, $this->capturedSessions[$this->userAId]);
+
+        // 1) Verify BookingService::hold() writes .000 millisecond precision.
+        $mintDate   = gmdate('Y-m-d', time() + 7 * 86400);
+        $mintSlotId = $this->insertSlot(2, 0, $mintDate);
+        $minted     = $this->transactionalCommit(
+            $this->fixtureWpdb,
+            fn (): array => $stack['service']->hold(
+                $this->userAId,
+                $this->clinicianId,
+                $mintDate,
+                '09:00:00',
+                $mintSlotId,
+                $this->patientAId
+            )
+        );
+        self::assertSame(1, preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.000$/', (string) ($minted['expires_at'] ?? '')));
+
+        // 2) Fixed-instant sub-second boundary rows inside the same UTC second (14:30:10).
+        $f2Date   = gmdate('Y-m-d', time() + 8 * 86400);
+        $f2SlotId = $this->insertSlot(5, 0, $f2Date);
+        $finder   = new \ReflectionMethod(\ClinicCore\Application\Booking\BookingService::class, 'find_reusable_active_hold_at');
+        $fixedNow = new \DateTimeImmutable('2030-05-15 14:30:10.500250', new \DateTimeZone('UTC'));
+        $exact500 = new \DateTimeImmutable('2030-05-15 14:30:10.500000', new \DateTimeZone('UTC'));
+        $exact501 = new \DateTimeImmutable('2030-05-15 14:30:10.501000', new \DateTimeZone('UTC'));
+
+        // 2a) Earlier fraction in the same second (.250 < .500250): must NOT be reused.
+        $earlierToken = 'tok-f2-250-' . bin2hex(random_bytes(6));
+        $this->insertRow($this->fixtureWpdb, $holdsTable, [
+            'clinic_id'         => $this->clinicId,
+            'slot_id'           => $f2SlotId,
+            'holder_wp_user_id' => $this->userAId,
+            'holder_mobile'     => $holderMobile,
+            'token'             => $earlierToken,
+            'expires_at'        => '2030-05-15 14:30:10.250',
+            'status'            => 'active',
+            'created_at'        => '2030-05-15 14:20:10.000',
+            'patient_id'        => $this->patientAId,
+        ]);
+        self::assertSame(
+            '2030-05-15 14:30:10.250',
+            (string) $db->fetchValue("SELECT expires_at FROM {$holdsTable} WHERE token = %s", [$earlierToken]),
+            'DATETIME(3) column must preserve millisecond fraction'
+        );
+        self::assertNull(
+            $finder->invoke($stack['service'], $this->userAId, $this->clinicId, $f2SlotId, $this->patientAId, $fixedNow),
+            'hold expiring at .250 in the same second as .500250 must be treated as expired'
+        );
+        $this->fixtureWpdb->query($this->fixtureWpdb->prepare("UPDATE {$holdsTable} SET status = %s WHERE token = %s", 'expired', $earlierToken));
+
+        // 2b) Same millisecond (.500 <= .500250 and .500 <= .500000): conservative <= treated as expired.
+        $equalMsToken = 'tok-f2-500-' . bin2hex(random_bytes(6));
+        $this->insertRow($this->fixtureWpdb, $holdsTable, [
+            'clinic_id'         => $this->clinicId,
+            'slot_id'           => $f2SlotId,
+            'holder_wp_user_id' => $this->userAId,
+            'holder_mobile'     => $holderMobile,
+            'token'             => $equalMsToken,
+            'expires_at'        => '2030-05-15 14:30:10.500',
+            'status'            => 'active',
+            'created_at'        => '2030-05-15 14:20:10.000',
+            'patient_id'        => $this->patientAId,
+        ]);
+        self::assertNull(
+            $finder->invoke($stack['service'], $this->userAId, $this->clinicId, $f2SlotId, $this->patientAId, $fixedNow),
+            'hold expiring at .500 must be treated as expired at .500250'
+        );
+        self::assertNull(
+            $finder->invoke($stack['service'], $this->userAId, $this->clinicId, $f2SlotId, $this->patientAId, $exact500),
+            'hold expiring at .500 must be treated as expired at exact .500000 boundary'
+        );
+        $this->fixtureWpdb->query($this->fixtureWpdb->prepare("UPDATE {$holdsTable} SET status = %s WHERE token = %s", 'expired', $equalMsToken));
+
+        // 2c) Later millisecond in the same second (.501 > .500250): live before .501000, expired at .501000.
+        $laterToken = 'tok-f2-501-' . bin2hex(random_bytes(6));
+        $this->insertRow($this->fixtureWpdb, $holdsTable, [
+            'clinic_id'         => $this->clinicId,
+            'slot_id'           => $f2SlotId,
+            'holder_wp_user_id' => $this->userAId,
+            'holder_mobile'     => $holderMobile,
+            'token'             => $laterToken,
+            'expires_at'        => '2030-05-15 14:30:10.501',
+            'status'            => 'active',
+            'created_at'        => '2030-05-15 14:20:10.000',
+            'patient_id'        => $this->patientAId,
+        ]);
+        $liveRow = $finder->invoke($stack['service'], $this->userAId, $this->clinicId, $f2SlotId, $this->patientAId, $fixedNow);
+        self::assertIsArray($liveRow, 'hold expiring at .501 must remain live at .500250');
+        self::assertSame($laterToken, (string) ($liveRow['token'] ?? ''));
+        self::assertSame('2030-05-15 14:30:10.501', (string) ($liveRow['expires_at'] ?? ''));
+        self::assertNull(
+            $finder->invoke($stack['service'], $this->userAId, $this->clinicId, $f2SlotId, $this->patientAId, $exact501),
+            'hold expiring at .501 must become expired at .501000'
+        );
+        $this->fixtureWpdb->query($this->fixtureWpdb->prepare("UPDATE {$holdsTable} SET status = %s WHERE token = %s", 'expired', $laterToken));
+
+        // 2d) Historical NULL-subject SQL branch also enforces sub-second millisecond boundary.
+        $nullFracToken = 'tok-f2-null-' . bin2hex(random_bytes(6));
+        $this->insertRow($this->fixtureWpdb, $holdsTable, [
+            'clinic_id'         => $this->clinicId,
+            'slot_id'           => $f2SlotId,
+            'holder_wp_user_id' => $this->userAId,
+            'holder_mobile'     => $holderMobile,
+            'token'             => $nullFracToken,
+            'expires_at'        => '2030-05-15 14:30:10.400',
+            'status'            => 'active',
+            'created_at'        => '2030-05-15 14:20:10.000',
+            'patient_id'        => null,
+        ]);
+        self::assertNull(
+            $finder->invoke($stack['service'], $this->userAId, $this->clinicId, $f2SlotId, null, $fixedNow),
+            'NULL-subject hold expiring at .400 must be treated as expired at .500250'
+        );
+        $this->fixtureWpdb->query(
+            $this->fixtureWpdb->prepare(
+                "UPDATE {$holdsTable} SET expires_at = %s WHERE token = %s",
+                '2030-05-15 14:30:10.800',
+                $nullFracToken
+            )
+        );
+        $liveNullRow = $finder->invoke($stack['service'], $this->userAId, $this->clinicId, $f2SlotId, null, $fixedNow);
+        self::assertIsArray($liveNullRow, 'NULL-subject hold expiring at .800 must be live at .500250');
+        self::assertSame($nullFracToken, (string) ($liveNullRow['token'] ?? ''));
+    }
+
     // ================= fixture & subprocess helpers =================
 
     private function seedSecondLinkedPatientOnAccount(int $userId, string $mrn): int
@@ -753,13 +891,14 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
         stream_set_blocking($pipes[2], false);
 
         return [
-            'process'   => $process,
-            'pipes'     => [1 => $pipes[1], 2 => $pipes[2]],
-            'stdout'    => '',
-            'stderr'    => '',
-            'exit_code' => null,
-            'signaled'  => false,
-            'stopped'   => false,
+            'process'    => $process,
+            'pipes'      => [1 => $pipes[1], 2 => $pipes[2]],
+            'stdout'     => '',
+            'stderr'     => '',
+            'last_stage' => 'spawned',
+            'exit_code'  => null,
+            'signaled'   => false,
+            'stopped'    => false,
         ];
     }
 
@@ -794,6 +933,38 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
     }
 
     /**
+     * Updates $worker['last_stage'] from any complete JSON lines buffered in
+     * stdout without consuming them, keeping strictly alphanumeric stage tokens.
+     *
+     * @param array<string, mixed> $worker
+     */
+    private function refreshLastChildStage(array &$worker): string
+    {
+        $buf   = (string) ($worker['stdout'] ?? '');
+        $parts = explode("\n", $buf);
+        array_pop($parts);
+        foreach ($parts as $rawLine) {
+            $trimmed = trim($rawLine);
+            if ('' === $trimmed) {
+                continue;
+            }
+            $decoded = json_decode($trimmed, true);
+            if (
+                is_array($decoded)
+                && isset($decoded['stage'])
+                && is_string($decoded['stage'])
+                && 1 === preg_match('/^[a-z0-9_]{1,32}$/', $decoded['stage'])
+            ) {
+                $worker['last_stage'] = $decoded['stage'];
+            }
+        }
+
+        $stage = (string) ($worker['last_stage'] ?? 'unknown');
+
+        return 1 === preg_match('/^[a-z0-9_]{1,32}$/', $stage) ? $stage : 'unknown';
+    }
+
+    /**
      * @param array<string, mixed> $worker
      */
     private function awaitChildReadyConnectionId(array &$worker): int
@@ -807,14 +978,21 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
                 $worker['stdout'] = substr((string) $worker['stdout'], $pos + 1);
                 $decoded = json_decode($firstLine, true);
                 if (is_array($decoded) && 'ready' === ($decoded['stage'] ?? '') && (int) ($decoded['connection_id'] ?? 0) > 0) {
+                    $worker['last_stage'] = 'ready';
+
                     return (int) $decoded['connection_id'];
                 }
                 $this->terminateChildWorker($worker);
-                self::fail('unexpected child ready handshake: ' . $firstLine);
+                self::fail('unexpected child ready handshake');
             }
             if (is_array($status) && false === ($status['running'] ?? true) && false === strpos((string) $worker['stdout'], "\n")) {
                 $this->pumpChildWorker($worker);
-                self::fail('child exited before READY handshake; stdout=' . $worker['stdout'] . ' stderr=' . $worker['stderr']);
+                $lastStage = $this->refreshLastChildStage($worker);
+                self::fail(
+                    'child exited before READY handshake; exit_code='
+                    . (string) (int) ($worker['exit_code'] ?? -1)
+                    . '; last_stage=' . $lastStage
+                );
             }
             usleep(10000);
         }
@@ -826,6 +1004,7 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
     /**
      * Polls ONLY information_schema.INNODB_TRX for trx_state = 'LOCK WAIT' on
      * the child's MySQL thread ID with a bounded loop and hard timeout.
+     * Emits strictly value-free diagnostics on premature exit or timeout.
      *
      * @param array<string, mixed> $worker
      */
@@ -839,7 +1018,7 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
             $result = $observer->query($sql);
             if (false === $result) {
                 $this->terminateChildWorker($worker);
-                self::fail('information_schema.INNODB_TRX query failed: ' . $observer->error);
+                self::fail('information_schema.INNODB_TRX query failed');
             }
             $row = $result->fetch_row();
             $result->free();
@@ -850,18 +1029,84 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
             $status = $this->pumpChildWorker($worker);
             if (is_array($status) && false === ($status['running'] ?? true)) {
                 $this->pumpChildWorker($worker);
+                $lastStage = $this->refreshLastChildStage($worker);
                 self::fail(
-                    'child exited prematurely without entering INNODB_TRX LOCK WAIT; exit='
-                    . var_export($worker['exit_code'], true)
-                    . ' stdout=' . $worker['stdout']
-                    . ' stderr=' . $worker['stderr']
+                    'child exited prematurely without entering INNODB_TRX LOCK WAIT'
+                    . '; child_running=false'
+                    . '; child_exit_code=' . (string) (int) ($worker['exit_code'] ?? -1)
+                    . '; last_stage=' . $lastStage
                 );
             }
             usleep(10000);
         }
 
+        $finalStatus  = $this->pumpChildWorker($worker);
+        $childRunning = is_array($finalStatus) && (bool) ($finalStatus['running'] ?? false);
+        $childExit    = $childRunning
+            ? 'none'
+            : (string) (null !== $worker['exit_code'] ? (int) $worker['exit_code'] : (int) ($finalStatus['exitcode'] ?? -1));
+        $lastStage    = $this->refreshLastChildStage($worker);
+
+        $trxCountDiag  = 'unreadable';
+        $trxStatesDiag = 'unreadable';
+        $trxRes        = @$observer->query(
+            'SELECT trx_state FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = ' . (int) $childConnId
+        );
+        if ($trxRes instanceof \mysqli_result) {
+            $states = [];
+            while (null !== ($trxRow = $trxRes->fetch_row())) {
+                $cleanState = trim((string) preg_replace('/[^A-Za-z0-9 _-]/', '', (string) ($trxRow[0] ?? '')));
+                $states[]   = '' !== $cleanState ? substr($cleanState, 0, 32) : 'empty';
+            }
+            $trxRes->free();
+            $trxCountDiag  = (string) count($states);
+            $trxStatesDiag = [] === $states ? 'none' : implode(',', $states);
+        }
+
+        $processlistDiag = 'unreadable';
+        $plRes           = @$observer->query(
+            'SELECT COMMAND, STATE FROM information_schema.PROCESSLIST WHERE ID = ' . (int) $childConnId
+        );
+        if ($plRes instanceof \mysqli_result) {
+            $plRow = $plRes->fetch_row();
+            $plRes->free();
+            if (null === $plRow) {
+                $processlistDiag = 'not_found';
+            } else {
+                $cmdRaw   = (string) preg_replace('/\d+/', '#', (string) ($plRow[0] ?? ''));
+                $stateRaw = (string) preg_replace('/\d+/', '#', (string) ($plRow[1] ?? ''));
+                $cmdClean = trim((string) preg_replace('/[^A-Za-z# _:\/.-]/', '', $cmdRaw));
+                $stClean  = trim((string) preg_replace('/[^A-Za-z# _:\/.-]/', '', $stateRaw));
+                $processlistDiag = ('' !== $cmdClean ? substr($cmdClean, 0, 24) : 'empty')
+                    . ':'
+                    . ('' !== $stClean ? substr($stClean, 0, 64) : 'empty');
+            }
+        }
+
         $this->terminateChildWorker($worker);
-        self::fail('timed out waiting for child transaction to reach INNODB_TRX trx_state = LOCK WAIT');
+        $diagMessage = 'timed out waiting for child transaction to reach INNODB_TRX trx_state = LOCK WAIT'
+            . '; child_running=' . ($childRunning ? 'true' : 'false')
+            . '; child_exit_code=' . $childExit
+            . '; last_stage=' . $lastStage
+            . '; innodb_trx_count=' . $trxCountDiag
+            . '; innodb_trx_states=' . $trxStatesDiag
+            . '; processlist_state=' . $processlistDiag;
+        if (!$childRunning) {
+            self::fail($diagMessage);
+        }
+        if ('ready' !== $lastStage) {
+            self::fail($diagMessage);
+        }
+        if ('0' === $trxCountDiag && str_starts_with($processlistDiag, 'Sleep:')) {
+            self::fail($diagMessage);
+        }
+        if ('0' === $trxCountDiag) {
+            self::fail($diagMessage);
+        }
+        if (str_contains($trxStatesDiag, 'RUNNING')) {
+            self::fail($diagMessage);
+        }
+        self::fail($diagMessage);
     }
 
     /**
@@ -963,179 +1208,164 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
 
     private static function childWorkerPhpCode(): string
     {
-        return <<<'PHP'
-ini_set('display_errors', '0');
-ini_set('log_errors', '0');
-
-$emit = static function (array $msg): void {
-    fwrite(STDOUT, json_encode($msg) . "\n");
-    fflush(STDOUT);
-};
-
-try {
-    $pluginRoot = getcwd();
-    $configPath = (string) getenv('WP_TESTS_CONFIG_FILE_PATH');
-    $autoload   = $pluginRoot . '/vendor/autoload.php';
-    if ('' === $configPath || !is_file($configPath) || !is_file($autoload)) {
-        $emit(['stage' => 'done', 'ok' => false, 'error' => 'BOOT_PATHS_MISSING']);
-        exit(2);
-    }
-
-    ob_start();
-    require $configPath;
-    if (!defined('ABSPATH')) {
-        $coreDir = rtrim((string) getenv('WP_CORE_DIR'), '/');
-        if ('' !== $coreDir) {
-            define('ABSPATH', $coreDir . '/');
-        }
-    }
-    if (!defined('WP_USE_THEMES')) {
-        define('WP_USE_THEMES', false);
-    }
-    if (!defined('DISABLE_WP_CRON')) {
-        define('DISABLE_WP_CRON', true);
-    }
-    require_once rtrim((string) ABSPATH, '/') . '/wp-settings.php';
-    require_once $autoload;
-    ob_end_clean();
-
-    remove_all_filters('query');
-
-    $dbName      = (string) getenv('CPMS_HOLD_DB_NAME');
-    $dbUser      = (string) getenv('CPMS_HOLD_DB_USER');
-    $dbPass      = (string) getenv('CPMS_HOLD_DB_PASSWORD');
-    $dbHost      = (string) getenv('CPMS_HOLD_DB_HOST');
-    $prefix      = (string) getenv('CPMS_HOLD_TABLE_PREFIX');
-    $userId      = (int) getenv('CPMS_HOLD_USER_ID');
-    $clinicianId = (int) getenv('CPMS_HOLD_CLINICIAN_ID');
-    $slotDate    = (string) getenv('CPMS_HOLD_SLOT_DATE');
-    $slotTime    = (string) getenv('CPMS_HOLD_SLOT_TIME');
-    $slotId      = (int) getenv('CPMS_HOLD_SLOT_ID');
-    $patientId   = (int) getenv('CPMS_HOLD_PATIENT_ID');
-    $sessToken   = (string) getenv('CPMS_HOLD_SESSION_TOKEN');
-    $sessData    = json_decode((string) getenv('CPMS_HOLD_SESSION_JSON'), true);
-    if (!is_array($sessData)) {
-        $sessData = [];
-    }
-
-    $own = new \wpdb($dbUser, $dbPass, $dbName, $dbHost);
-    $own->set_prefix($prefix);
-    $own->show_errors(false);
-    $own->suppress_errors(false);
-    if (!$own->check_connection(false)) {
-        $emit(['stage' => 'done', 'ok' => false, 'error' => 'DB_CONNECT_FAILED']);
-        exit(3);
-    }
-    $own->query('SET SESSION innodb_lock_wait_timeout = 20');
-    $connId = (int) $own->get_var('SELECT CONNECTION_ID()');
-    if ($connId <= 0) {
-        $emit(['stage' => 'done', 'ok' => false, 'error' => 'NO_CONN_ID']);
-        exit(4);
-    }
-
-    $db              = new \ClinicCore\Infrastructure\Db\CpmsDb($own);
-    $op              = new \ClinicCore\Infrastructure\Logging\OpLogger($db);
-    $audit           = new \ClinicCore\Infrastructure\Audit\AuditLogger($db, $op);
-    $settingsFactory = new \ClinicCore\Settings\SettingsFactory($db, $audit);
-    $idem            = new \ClinicCore\Infrastructure\Security\Idempotency($db);
-    $registry        = new \ClinicCore\Infrastructure\Sms\SmsProviderRegistry();
-    $registry->register(new \ClinicCore\Infrastructure\Sms\Providers\LogSmsProvider($op));
-    $registry->register(new \ClinicCore\Infrastructure\Sms\Providers\GenericApiSmsProvider(static fn (): array => []));
-    $sms = new \ClinicCore\Application\Notifications\SmsService(
-        $db,
-        $settingsFactory,
-        $registry,
-        new \ClinicCore\Infrastructure\Sms\CredentialVault(),
-        $audit,
-        $op,
-        new \ClinicCore\Infrastructure\Queue\JobQueue($db, $op),
-        static fn (): int => 0
-    );
-    $license  = new \ClinicCore\Domain\Licensing\ActiveLicenseGate();
-    $sessions = new \ClinicCore\Application\Auth\PatientSessionScope(
-        $db,
-        static fn (int $uid, ?string $tok) => $uid === $userId ? $sessData : null,
-        static fn (int $uid): array => []
-    );
-    $proofStore = new \ClinicCore\Application\Auth\PatientSessionProofStore(
-        static fn (int $uid): object => new class($sessToken, $sessData) {
-            /** @param array<string, mixed> $session */
-            public function __construct(
-                private readonly string $expectedToken,
-                private readonly array $session
-            ) {
-            }
-
-            /** @return array<string, mixed>|null */
-            public function get(string $token): ?array
-            {
-                return ('' !== $this->expectedToken && $token === $this->expectedToken) ? $this->session : null;
-            }
-
-            /** @param array<string, mixed> $session */
-            public function update(string $token, array $session): void
-            {
-            }
-
-            public function destroy_all(): void
-            {
-            }
-        },
-        static fn (): string => $sessToken
-    );
-    $patientAccess = new \ClinicCore\Application\Auth\PatientAccess(
-        $db,
-        new \ClinicCore\Infrastructure\Repository\PatientRepository($db),
-        static fn (int $uid): ?array => $uid === $userId
-            ? [
-                'exists'        => true,
-                'roles'         => [\ClinicCore\Auth\RolesAndCapabilities::ROLE_PATIENT],
-                'has_staff_cap' => false,
-            ]
-            : null,
-        logins: new \ClinicCore\Infrastructure\Repository\PatientLoginRepository($db),
-        proofs: $proofStore
-    );
-    $service = new \ClinicCore\Application\Booking\BookingService(
-        $db,
-        new \ClinicCore\Infrastructure\Repository\SlotRepository($db),
-        new \ClinicCore\Infrastructure\Repository\AppointmentRepository($db),
-        new \ClinicCore\Infrastructure\Repository\PatientRepository($db),
-        $settingsFactory,
-        $license,
-        $audit,
-        $op,
-        $idem,
-        $sms,
-        null,
-        null,
-        null,
-        $sessions,
-        $patientAccess
-    );
-
-    $emit(['stage' => 'ready', 'connection_id' => $connId]);
-
-    $result = $service->hold($userId, $clinicianId, $slotDate, $slotTime, $slotId, $patientId);
-    $own->close();
-    $emit(['stage' => 'done', 'ok' => true, 'result' => $result]);
-    exit(0);
-} catch (\ClinicCore\Domain\Booking\BookingException $e) {
-    $emit([
-        'stage'       => 'done',
-        'ok'          => false,
-        'error_code'  => $e->errorCode,
-        'http_status' => $e->httpStatus,
-    ]);
-    exit(1);
-} catch (\Throwable $e) {
-    $emit([
-        'stage' => 'done',
-        'ok'    => false,
-        'error' => get_class($e),
-    ]);
-    exit(1);
-}
-PHP;
+        return implode("\n", [
+            'ini_set("display_errors", "0");',
+            'ini_set("log_errors", "0");',
+            '$emit = static function (array $msg): void {',
+            '    fwrite(STDOUT, json_encode($msg) . "\n");',
+            '    fflush(STDOUT);',
+            '};',
+            'try {',
+            '    $pluginRoot = getcwd();',
+            '    $configPath = (string) getenv("WP_TESTS_CONFIG_FILE_PATH");',
+            '    $autoload   = $pluginRoot . "/vendor/autoload.php";',
+            '    if ("" === $configPath || !is_file($configPath) || !is_file($autoload)) {',
+            '        $emit(["stage" => "done", "ok" => false, "error" => "BOOT_PATHS_MISSING"]);',
+            '        exit(2);',
+            '    }',
+            '    ob_start();',
+            '    require $configPath;',
+            '    if (!defined("ABSPATH")) {',
+            '        $coreDir = rtrim((string) getenv("WP_CORE_DIR"), "/");',
+            '        if ("" !== $coreDir) {',
+            '            define("ABSPATH", $coreDir . "/");',
+            '        }',
+            '    }',
+            '    if (!defined("WP_USE_THEMES")) {',
+            '        define("WP_USE_THEMES", false);',
+            '    }',
+            '    if (!defined("DISABLE_WP_CRON")) {',
+            '        define("DISABLE_WP_CRON", true);',
+            '    }',
+            '    require_once rtrim((string) ABSPATH, "/") . "/wp-settings.php";',
+            '    require_once $autoload;',
+            '    ob_end_clean();',
+            '    remove_all_filters("query");',
+            '    $dbName      = (string) getenv("CPMS_HOLD_DB_NAME");',
+            '    $dbUser      = (string) getenv("CPMS_HOLD_DB_USER");',
+            '    $dbPass      = (string) getenv("CPMS_HOLD_DB_PASSWORD");',
+            '    $dbHost      = (string) getenv("CPMS_HOLD_DB_HOST");',
+            '    $prefix      = (string) getenv("CPMS_HOLD_TABLE_PREFIX");',
+            '    $userId      = (int) getenv("CPMS_HOLD_USER_ID");',
+            '    $clinicianId = (int) getenv("CPMS_HOLD_CLINICIAN_ID");',
+            '    $slotDate    = (string) getenv("CPMS_HOLD_SLOT_DATE");',
+            '    $slotTime    = (string) getenv("CPMS_HOLD_SLOT_TIME");',
+            '    $slotId      = (int) getenv("CPMS_HOLD_SLOT_ID");',
+            '    $patientId   = (int) getenv("CPMS_HOLD_PATIENT_ID");',
+            '    $sessToken   = (string) getenv("CPMS_HOLD_SESSION_TOKEN");',
+            '    $sessData    = json_decode((string) getenv("CPMS_HOLD_SESSION_JSON"), true);',
+            '    if (!is_array($sessData)) {',
+            '        $sessData = [];',
+            '    }',
+            '    $own = new \wpdb($dbUser, $dbPass, $dbName, $dbHost);',
+            '    $own->set_prefix($prefix);',
+            '    $own->show_errors(false);',
+            '    $own->suppress_errors(false);',
+            '    if (!$own->check_connection(false)) {',
+            '        $emit(["stage" => "done", "ok" => false, "error" => "DB_CONNECT_FAILED"]);',
+            '        exit(3);',
+            '    }',
+            '    $own->query("SET SESSION innodb_lock_wait_timeout = 20");',
+            '    $connId = (int) $own->get_var("SELECT CONNECTION_ID()");',
+            '    if ($connId <= 0) {',
+            '        $emit(["stage" => "done", "ok" => false, "error" => "NO_CONN_ID"]);',
+            '        exit(4);',
+            '    }',
+            '    $db              = new \ClinicCore\Infrastructure\Db\CpmsDb($own);',
+            '    $op              = new \ClinicCore\Infrastructure\Logging\OpLogger($db);',
+            '    $audit           = new \ClinicCore\Infrastructure\Audit\AuditLogger($db, $op);',
+            '    $settingsFactory = new \ClinicCore\Settings\SettingsFactory($db, $audit);',
+            '    $idem            = new \ClinicCore\Infrastructure\Security\Idempotency($db);',
+            '    $registry        = new \ClinicCore\Infrastructure\Sms\SmsProviderRegistry();',
+            '    $registry->register(new \ClinicCore\Infrastructure\Sms\Providers\LogSmsProvider($op));',
+            '    $registry->register(new \ClinicCore\Infrastructure\Sms\Providers\GenericApiSmsProvider(static fn (): array => []));',
+            '    $sms = new \ClinicCore\Application\Notifications\SmsService(',
+            '        $db,',
+            '        $settingsFactory,',
+            '        $registry,',
+            '        new \ClinicCore\Infrastructure\Sms\CredentialVault(),',
+            '        $audit,',
+            '        $op,',
+            '        new \ClinicCore\Infrastructure\Queue\JobQueue($db, $op),',
+            '        static fn (): int => 0',
+            '    );',
+            '    $license  = new \ClinicCore\Domain\Licensing\ActiveLicenseGate();',
+            '    $sessions = new \ClinicCore\Application\Auth\PatientSessionScope(',
+            '        $db,',
+            '        static fn (int $uid, ?string $tok) => $uid === $userId ? $sessData : null,',
+            '        static fn (int $uid): array => []',
+            '    );',
+            '    $proofStore = new \ClinicCore\Application\Auth\PatientSessionProofStore(',
+            '        static fn (int $uid): object => new class($sessToken, $sessData) {',
+            '            public function __construct(',
+            '                private readonly string $expectedToken,',
+            '                private readonly array $session',
+            '            ) {',
+            '            }',
+            '            public function get(string $token): ?array',
+            '            {',
+            '                return ("" !== $this->expectedToken && $token === $this->expectedToken) ? $this->session : null;',
+            '            }',
+            '            public function update(string $token, array $session): void',
+            '            {',
+            '            }',
+            '            public function destroy_all(): void',
+            '            {',
+            '            }',
+            '        },',
+            '        static fn (): string => $sessToken',
+            '    );',
+            '    $patientAccess = new \ClinicCore\Application\Auth\PatientAccess(',
+            '        $db,',
+            '        new \ClinicCore\Infrastructure\Repository\PatientRepository($db),',
+            '        static fn (int $uid): ?array => $uid === $userId',
+            '            ? [',
+            '                "exists"        => true,',
+            '                "roles"         => [\ClinicCore\Auth\RolesAndCapabilities::ROLE_PATIENT],',
+            '                "has_staff_cap" => false,',
+            '            ]',
+            '            : null,',
+            '        logins: new \ClinicCore\Infrastructure\Repository\PatientLoginRepository($db),',
+            '        proofs: $proofStore',
+            '    );',
+            '    $service = new \ClinicCore\Application\Booking\BookingService(',
+            '        $db,',
+            '        new \ClinicCore\Infrastructure\Repository\SlotRepository($db),',
+            '        new \ClinicCore\Infrastructure\Repository\AppointmentRepository($db),',
+            '        new \ClinicCore\Infrastructure\Repository\PatientRepository($db),',
+            '        $settingsFactory,',
+            '        $license,',
+            '        $audit,',
+            '        $op,',
+            '        $idem,',
+            '        $sms,',
+            '        null,',
+            '        null,',
+            '        null,',
+            '        $sessions,',
+            '        $patientAccess',
+            '    );',
+            '    $emit(["stage" => "ready", "connection_id" => $connId]);',
+            '    $result = $service->hold($userId, $clinicianId, $slotDate, $slotTime, $slotId, $patientId);',
+            '    $own->close();',
+            '    $emit(["stage" => "done", "ok" => true, "result" => $result]);',
+            '    exit(0);',
+            '} catch (\ClinicCore\Domain\Booking\BookingException $e) {',
+            '    $emit([',
+            '        "stage"       => "done",',
+            '        "ok"          => false,',
+            '        "error_code"  => $e->errorCode,',
+            '        "http_status" => $e->httpStatus,',
+            '    ]);',
+            '    exit(1);',
+            '} catch (\Throwable $e) {',
+            '    $emit([',
+            '        "stage" => "done",',
+            '        "ok"    => false,',
+            '        "error" => get_class($e),',
+            '    ]);',
+            '    exit(1);',
+            '}',
+        ]);
     }
 }
