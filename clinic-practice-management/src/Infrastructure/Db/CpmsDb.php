@@ -185,23 +185,52 @@ final class CpmsDb
     }
 
     /**
-     * Whether any value carries ten or more digits (the NID shape).
-     *
-     * @param array<mixed> $values Values to inspect.
+     * Diagnostic spelling wpdb emits for a LIKE candidate (WP 7.1.3).
      */
-    private function has_nid_value( array $values ): bool {
+    private function wpdb_escaped_value( string $value ): string {
+        if ( ! method_exists( $this->wpdb, 'esc_like' ) || ! method_exists( $this->wpdb, '_real_escape' ) ) {
+            return '';
+        }
+
+        $escaped = $this->wpdb->_real_escape( $this->wpdb->esc_like( $value ) );
+        if ( method_exists( $this->wpdb, 'remove_placeholder_escape' ) ) {
+            $escaped = $this->wpdb->remove_placeholder_escape( $escaped );
+        }
+
+        return is_string( $escaped ) ? $escaped : '';
+    }
+
+    /**
+     * Whether any bound value carries ten or more digits (the NID shape).
+     * The first top-level slot is the SQL template/table and is scanned only
+     * with the contiguous-token pattern.
+     *
+     * @param array<mixed> $values       Values to inspect.
+     * @param bool         $template_slot Whether the first slot is a template.
+     */
+    private function has_nid_value( array $values, bool $template_slot = true ): bool {
+        $first = true;
         foreach ( $values as $value ) {
+            $is_template = $first && $template_slot;
+            $first       = false;
             if ( is_array( $value ) ) {
-                if ( $this->has_nid_value( $value ) ) {
+                if ( $this->has_nid_value( $value, false ) ) {
                     return true;
                 }
                 continue;
             }
             if ( is_string( $value ) ) {
-                $digits = $this->nid_digits( $value );
-                if ( null === $digits || strlen( $digits ) >= 10 || $this->redact_nid_text( $value ) !== $value ) {
+                if ( ! $is_template ) {
+                    $digits = $this->nid_digits( $value );
+                    if ( null === $digits || strlen( $digits ) >= 10 ) {
+                        return true;
+                    }
+                }
+                if ( $this->redact_nid_text( $value ) !== $value ) {
                     return true;
                 }
+            } elseif ( is_int( $value ) && ! $is_template && strlen( (string) $value ) >= 10 ) {
+                return true;
             }
         }
 
@@ -214,20 +243,27 @@ final class CpmsDb
      * @param string       $text   Diagnostic text to clean.
      * @param array<mixed> $values Candidate NID-bearing values.
      */
-    private function redact_nid( string $text, array $values ): string {
+    private function redact_nid( string $text, array $values, bool $template_slot = true ): string {
+        $first = true;
         foreach ( $values as $value ) {
+            $is_template = $first && $template_slot;
+            $first       = false;
             if ( is_array( $value ) ) {
-                $text = $this->redact_nid( $text, $value );
+                $text = $this->redact_nid( $text, $value, false );
                 continue;
             }
-            if ( is_string( $value ) && $value !== '' ) {
+            if ( is_string( $value ) && $value !== '' && ! $is_template ) {
                 $digits = $this->nid_digits( $value );
                 if ( null === $digits ) {
                     return '[nid-redacted]';
                 }
                 if ( strlen( $digits ) >= 10 ) {
-                    $text = str_replace( [ $value, $digits ], '[nid-redacted]', $text );
+                    $escaped = $this->wpdb_escaped_value( $value );
+                    $needles = '' === $escaped ? [ $value, $digits ] : [ $value, $digits, $escaped ];
+                    $text    = str_replace( $needles, '[nid-redacted]', $text );
                 }
+            } elseif ( is_int( $value ) && ! $is_template && strlen( (string) $value ) >= 10 ) {
+                $text = str_replace( (string) $value, '[nid-redacted]', $text );
             }
         }
 
