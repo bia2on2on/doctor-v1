@@ -83,6 +83,18 @@ final class ExternalRaceWorker
 
     private bool $closed = false;
 
+    /** Sticky: any read observed signaled === true (never reset). */
+    private bool $signaledObserved = false;
+
+    /** Sticky: any read observed stopped === true (never reset). */
+    private bool $stoppedObserved = false;
+
+    /** True once terminate() could NOT confirm the worker exited (SIGKILL grace also expired). */
+    private bool $unreaped = false;
+
+    /** True once proc_terminate() itself reported failure on any signal attempt. */
+    private bool $signalFailure = false;
+
     /**
      * @param array<string, mixed> $task non-secret task parameters only
      */
@@ -133,7 +145,7 @@ final class ExternalRaceWorker
     private function __construct($process, array $pipes)
     {
         $this->process = $process;
-        $status = @proc_get_status($this->process);
+        $status = $this->readStatus();
         if (is_array($status) && isset($status['pid']) && (int) $status['pid'] > 0) {
             $this->pid = (int) $status['pid'];
         }
@@ -156,54 +168,54 @@ final class ExternalRaceWorker
         if ($this->closed || $this->finalStatus !== null) {
             return false;
         }
-        $status = $this->refreshStatus();
+        $status = $this->readStatus();
 
         return !is_array($status) || ($status['running'] ?? true) === true;
     }
 
     /**
-     * Strict alive check (ROUND4-STRICT-ALIVE): true ONLY when a FRESH
-     * proc_get_status() call succeeds and reports the process plainly alive —
-     * an array whose 'running' key is exactly true, with 'signaled' and
-     * 'stopped' not both interpretable as termination/stoppage (each treated as
-     * doubt below). Any false return, missing or non-true 'running' key, or
-     * any read error returns false — the opposite fail direction of
-     * isRunning(). Deliberately free of every side effect: it does NOT feed
-     * the once-only final-status cache in refreshStatus(), never marks the
-     * process as reaped, and never reads/writes $this->closed, so the
-     * semantics of isRunning(), finalStatus(), waitForExit() and terminate()
-     * are unchanged. proc_get_status is documented to only reliably report
-     * 'running' for the live process; the exit code is therefore never read
-     * here and is irrelevant to this check.
+     * Strict alive check (ROUND4-STRICT-ALIVE, tightened in ROUND5): true ONLY
+     * when a fresh proc_get_status() read — routed through readStatus(), the
+     * single status-read site — returns an array with 'running', 'signaled'
+     * AND 'stopped' all present and all of type bool, 'running' is exactly
+     * true, and 'signaled'/'stopped' are exactly false. Any missing key,
+     * non-bool key, read failure or doubt returns false — the opposite fail
+     * direction of isRunning().
      *
-     * NOTE: no caching of any kind happens in this method — every call is a
-     * fresh read; a 'running === false' observation from THIS method does not
-     * populate the finalStatus cache (refreshStatus() remains the only
-     * place that does so).
+     * Side effects are explicit, not "none": the read is routed through
+     * readStatus(), which caches the final status on the FIRST not-running
+     * observation from ANY path and sets the sticky signaled/stopped flags on
+     * any read that observes them. A 'running === false' observation from
+     * this method therefore DOES populate the final-status cache — this is
+     * deliberate (so an exit first observed here is never lost; php-8.2's
+     * proc_get_status uses waitpid(WNOHANG|WUNTRACED) and pre-8.3 consumes
+     * the exit event on first delivery). The mid-test two assertions that
+     * use this method call it while the child is expected alive, so they
+     * never observe not-running in a passing test run.
+     *
+     * The exit code is never read by this method.
      */
     public function isConfirmedRunning(): bool
     {
         if ($this->closed || !is_resource($this->process)) {
             return false;
         }
-        $status = @proc_get_status($this->process);
+        $status = $this->readStatus();
         if (!is_array($status)) {
             // Doubt (including proc_get_status failure → false): not confirmed.
             return false;
         }
-        if (($status['running'] ?? null) !== true) {
-            // Missing key, non-bool, or the process is no longer running.
+        if (!array_key_exists('running', $status) || !is_bool($status['running'])) {
             return false;
         }
-        // signaled/stopped not explicitly true — a SIGSTOP'ped worker or a
-        // signal-terminated one is NOT 'plainly alive' for this check. Their
-        // absence (older manuals name these keys only on POSIX) is tolerated
-        // only because 'running' stayed true; an explicit true is a doubt.
-        if (($status['signaled'] ?? false) === true || ($status['stopped'] ?? false) === true) {
+        if (!array_key_exists('signaled', $status) || !is_bool($status['signaled'])) {
+            return false;
+        }
+        if (!array_key_exists('stopped', $status) || !is_bool($status['stopped'])) {
             return false;
         }
 
-        return true;
+        return $status['running'] === true && $status['signaled'] === false && $status['stopped'] === false;
     }
 
     /**
@@ -241,7 +253,18 @@ final class ExternalRaceWorker
                 return null;
             }
             $this->pump();
-            $status = $this->refreshStatus();
+            if ($this->closed) {
+                // Pipes are closed and the worker is already gone and reaped:
+                // no further bytes can arrive. Drain what is buffered, then
+                // finish instead of spinning to the deadline.
+                $pos = strpos($this->stdoutBuffer, "\n");
+                if ($pos !== false) {
+                    continue;
+                }
+
+                return null;
+            }
+            $status = $this->readStatus();
             if (is_array($status) && ($status['running'] ?? true) === false) {
                 $this->pump(); // final drain
                 $pos = strpos($this->stdoutBuffer, "\n");
@@ -278,7 +301,7 @@ final class ExternalRaceWorker
             if ($this->closed) {
                 return $this->exitCode ?? -1;
             }
-            $status = $this->refreshStatus();
+            $status = $this->readStatus();
             if (is_array($status) && ($status['running'] ?? false) === false) {
                 $exitCode = $this->exitCode ?? (int) ($status['exitcode'] ?? -1);
                 $this->close();
@@ -295,25 +318,80 @@ final class ExternalRaceWorker
     }
 
     /**
+     * Records whether terminate() could NOT confirm the worker's exit (after
+     * SIGTERM with its 2s bound and SIGKILL with a further 5s bound) and had to
+     * abandon proc_close() to avoid blocking. Read by the test AFTER all
+     * fixture cleanup to turn the run red with a clear message.
+     */
+    public function wasNotReaped(): bool
+    {
+        return $this->unreaped;
+    }
+
+    /** True once any proc_terminate() call itself reported failure on a signal attempt. */
+    public function signalFailed(): bool
+    {
+        return $this->signalFailure;
+    }
+
+    /**
+     * The ONE and ONLY proc_get_status() call site in this class. Every
+     * status read (constructor, isRunning, isConfirmedRunning, readStatus
+     * callers in waitForExit/terminate) routes here.
+     *
+     * When running === false is observed for the first time, the status
+     * array is captured in the final-status cache BEFORE returning (a first
+     * exit observation on any path is never lost). The sticky signaled/stopped
+     * flags are set on ANY read observing them; the cached snapshot merges
+     * them, so a signalled/stopped observation from any path makes the final
+     * strict child check fail.
+     *
+     * php-8.2 proc_open.c: proc_get_status() uses waitpid(WNOHANG|WUNTRACED);
+     * the exit code of a normally exited child is only valid on the first
+     * such read — hence the cache-once rule. Reference (not fetched from
+     * this sandbox — outbound network here is GitHub/PyPI/npm only):
+     * https://www.php.net/manual/en/function.proc-get-status.php — PHP manual.
+     *
      * @return array<string, mixed>|null
      */
-    private function refreshStatus(): ?array
+    private function readStatus(): ?array
     {
-        if ($this->closed || !is_resource($this->process)) {
+        if ($this->closed) {
             return null;
+        }
+        if (!is_resource($this->process)) {
+            return $this->finalStatus !== null
+                ? [
+                    'running' => false,
+                    'exitcode' => $this->finalStatus['exitCode'],
+                    'signaled' => $this->finalStatus['signaled'],
+                    'stopped' => $this->finalStatus['stopped'],
+                ]
+                : null;
         }
         $status = @proc_get_status($this->process);
         if (!is_array($status)) {
             return $this->finalStatus !== null
-                ? ['running' => false, 'exitcode' => $this->finalStatus['exitCode']]
+                ? [
+                    'running' => false,
+                    'exitcode' => $this->finalStatus['exitCode'],
+                    'signaled' => $this->finalStatus['signaled'],
+                    'stopped' => $this->finalStatus['stopped'],
+                ]
                 : null;
+        }
+        if (($status['signaled'] ?? false) === true) {
+            $this->signaledObserved = true;
+        }
+        if (($status['stopped'] ?? false) === true) {
+            $this->stoppedObserved = true;
         }
         if (($status['running'] ?? false) === false && $this->finalStatus === null) {
             // The one and only decisive read: cache it and never re-read.
             $this->finalStatus = [
                 'exitCode' => (int) ($status['exitcode'] ?? -1),
-                'signaled' => (bool) ($status['signaled'] ?? false),
-                'stopped' => (bool) ($status['stopped'] ?? false),
+                'signaled' => (($status['signaled'] ?? false) === true) || $this->signaledObserved,
+                'stopped' => (($status['stopped'] ?? false) === true) || $this->stoppedObserved,
             ];
             $this->exitCode = $this->finalStatus['exitCode'];
         }
@@ -348,7 +426,21 @@ final class ExternalRaceWorker
 
 
     /**
-     * Bounded termination: SIGTERM then SIGKILL after a short grace.
+     * Bounded termination, always reaping or refusing loudly:
+     *   1. SIGTERM is sent unconditionally (proc_terminate needs no status
+     *      read, so an unreadable status never skips the signal); a failed
+     *      signal is recorded (signalFailed()).
+     *   2. Status is polled up to a 2s bound (usleep poll style, as before).
+     *   3. If the exit is not CONFIRMED (the once-only final-status cache was
+     *      filled by the decisive running===false read), SIGKILL is sent and
+     *      status is polled up to a further 5s bound.
+     *   4. proc_close() — which BLOCKS until the child exits (php-8.2
+     *      ext/standard/proc_open.c, proc_close waits) — is called ONLY after
+     *      a confirmed exit. If the exit is still not confirmed, the pipes
+     *      are closed, proc_close() is NEVER called, the worker is remembered
+     *      as not reaped (wasNotReaped()), and the caller (the test) must
+     *      fail AFTER all fixture/hook cleanup has run.
+     * Never throws.
      */
     public function terminate(): void
     {
@@ -356,22 +448,51 @@ final class ExternalRaceWorker
             return;
         }
         $this->pump();
-        $status = $this->refreshStatus();
-        if (is_array($status) && ($status['running'] ?? false) === true) {
-            @proc_terminate($this->process);
+
+        if ($this->finalStatus === null) {
+            // Not confirmed exited: signal FIRST. The signal is sent
+            // regardless of status readability.
+            if (!@proc_terminate($this->process)) {
+                $this->signalFailure = true;
+            }
             $deadline = microtime(true) + 2.0;
-            while (microtime(true) < $deadline && is_resource($this->process)) {
-                $status = $this->refreshStatus();
-                if (!is_array($status) || ($status['running'] ?? false) !== true) {
+            while (microtime(true) < $deadline) {
+                $this->pump();
+                $status = $this->readStatus();
+                if (is_array($status) && ($status['running'] ?? true) === false) {
                     break;
                 }
                 usleep(10000);
             }
-            $status = $this->refreshStatus();
-            if (is_array($status) && ($status['running'] ?? false) === true) {
-                @proc_terminate($this->process, 9);
+
+            if ($this->finalStatus === null) {
+                // Not confirmed after SIGTERM: escalate to SIGKILL.
+                if (!@proc_terminate($this->process, 9)) {
+                    $this->signalFailure = true;
+                }
+                $deadline = microtime(true) + 5.0;
+                while (microtime(true) < $deadline) {
+                    $this->pump();
+                    $status = $this->readStatus();
+                    if (is_array($status) && ($status['running'] ?? true) === false) {
+                        break;
+                    }
+                    usleep(10000);
+                }
+            }
+
+            if ($this->finalStatus === null) {
+                // Still not confirmed: never call the blocking proc_close();
+                // close the pipes, remember "not reaped", and let the test
+                // fail AFTER fixture cleanup has run.
+                $this->closePipesOnly();
+                $this->unreaped = true;
+                $this->closed = true;
+
+                return;
             }
         }
+
         $this->close();
     }
 
@@ -380,16 +501,24 @@ final class ExternalRaceWorker
         if ($this->closed) {
             return;
         }
+        $this->pump();
         $this->closed = true;
+        $this->closePipesOnly();
+        if (is_resource($this->process) && $this->finalStatus !== null) {
+            // Reaps only after a CONFIRMED exit; proc_close() blocks until
+            // then, so it is never reached otherwise.
+            @proc_close($this->process);
+        }
+    }
+
+    private function closePipesOnly(): void
+    {
         foreach ($this->pipes as $pipe) {
             if (is_resource($pipe)) {
                 fclose($pipe);
             }
         }
         $this->pipes = [];
-        if (is_resource($this->process)) {
-            @proc_close($this->process); // reap; no zombie survives the suite
-        }
     }
 
     /**
@@ -406,7 +535,14 @@ final class ExternalRaceWorker
         $dir = '/proc/self/fd';
         $entries = @scandir($dir);
         if (!is_array($entries)) {
-            return $pinned; // /proc-less host: nothing can be enumerated, so nothing is pinned
+            if (PHP_OS_FAMILY === 'Linux') {
+                // Fail closed: without /proc/self/fd no descriptor isolation
+                // can be established and no worker may be launched.
+                throw new RuntimeException('/proc/self/fd cannot be scanned on Linux; external race workers cannot be launched safely');
+            }
+
+            // Non-Linux hosts pin nothing (nothing is claimed about isolation).
+            return $pinned;
         }
         foreach ($entries as $entry) {
             if (!is_string($entry) || !ctype_digit($entry)) {

@@ -273,6 +273,11 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
 
     public function testAssignmentWaitsForLockedDefinitionAndRevalidatesAfterDeactivation(): void
     {
+        if (PHP_OS_FAMILY !== 'Linux') {
+            // Descriptor isolation is only established through /proc/self/fd,
+            // which Linux provides. Non-Linux hosts skip explicitly.
+            self::markTestSkipped('External race workers require Linux (/proc/self/fd descriptor isolation).');
+        }
         if (!function_exists('proc_open') || !class_exists('mysqli')) {
             self::markTestSkipped('Requires proc_open and MySQLi for independent MySQL connections.');
         }
@@ -673,11 +678,29 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
             $childStatus = $worker instanceof ExternalRaceWorker ? $worker->finalStatus() : null;
             $childReaped = true;
 
-            // The worker emits exactly one terminal line ('RESULT:*' or 'ERROR:*')
-            // after the retry; earlier protocol lines were consumed above.
+            // The worker emits exactly one terminal line ('RESULT:*' or
+            // 'ERROR:*') after the retry. Drain the remaining output until
+            // EOF (waitForExit already returned, so the worker is gone), then
+            // require EXACTLY ONE terminal line — even an identical duplicate
+            // is a failure. Unknown non-terminal lines are ignored as before.
             $finalLine = $worker instanceof ExternalRaceWorker ? $worker->readLineWait((float) self::RACE_SIGNAL_TIMEOUT_SECONDS) : null;
-            $resultLines = is_string($finalLine) && $finalLine !== '' ? [$finalLine] : [];
-            foreach ($resultLines as $line) {
+            $terminalLines = [];
+            $collectTerminalLine = static function (string $line) use (&$terminalLines): void {
+                if (str_starts_with($line, 'RESULT:') || str_starts_with($line, 'ERROR:')) {
+                    $terminalLines[] = $line;
+                }
+            };
+            if (is_string($finalLine) && $finalLine !== '') {
+                $collectTerminalLine($finalLine);
+            }
+            if ($worker instanceof ExternalRaceWorker) {
+                $drained = 0;
+                while ($drained < 32 && ($drainedLine = $worker->readLineWait((float) self::RACE_SIGNAL_TIMEOUT_SECONDS)) !== null) {
+                    $drained++;
+                    $collectTerminalLine($drainedLine);
+                }
+            }
+            foreach ($terminalLines as $line) {
                 if (str_starts_with($line, 'RESULT:')) {
                     $childOutcome = substr($line, strlen('RESULT:'));
                 } elseif (str_starts_with($line, 'ERROR:')) {
@@ -685,6 +708,11 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                     $childOutcome = 'ERROR:' . (preg_match('/\A[A-Za-z0-9_\\]{1,128}\z/D', $class) === 1 ? $class : 'unknown');
                 }
             }
+            self::assertCount(
+                1,
+                $terminalLines,
+                'The worker must emit exactly one terminal line (RESULT:/ERROR:). A duplicate or a missing terminal line is a failure.'
+            );
 
             // Worker hygiene: B ends with a plain, graceful exit(0); it holds no
             // descriptor of this process, so its shutdown path cannot tear down the
@@ -776,27 +804,40 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                 . PHP_EOL
             );
         } finally {
-            if ($observer instanceof \mysqli) {
-                $observer->close();
+            // Nested try/finally: observer close, termination, query-hook
+            // restore and committed-fixture cleanup for both clinics ALWAYS
+            // run even if termination throws. The unreaped-worker verdict is
+            // reported only AFTER all of that has run, as a hard test failure.
+            try {
+                if ($observer instanceof \mysqli) {
+                    $observer->close();
+                }
+                if ($worker instanceof ExternalRaceWorker) {
+                    $worker->terminate();
+                }
+            } finally {
+                try {
+                    // Restore WordPress' integration bootstrap query handlers before
+                    // fixture cleanup and PHPUnit tearDown rollback.
+                    if ($queryHooks !== null) {
+                        $GLOBALS['wp_filter']['query'] = $queryHooks;
+                    } else {
+                        unset($GLOBALS['wp_filter']['query']);
+                    }
+                } finally {
+                    try {
+                        $this->cleanupCommittedRaceFixtures(
+                            [$this->clinicA, $this->clinicB],
+                            [$managerId, $this->managerB, $this->suspendedManager, $this->member, $this->nonMember, $targetUser],
+                            $definitionId
+                        );
+                    } finally {
+                        if ($worker instanceof ExternalRaceWorker && $worker->wasNotReaped()) {
+                            self::fail('External race worker B could not be reaped after SIGTERM and SIGKILL; refusing to leave an unreaped child behind a green run.');
+                        }
+                    }
+                }
             }
-
-            if ($worker instanceof ExternalRaceWorker) {
-                $worker->terminate();
-            }
-
-            // Restore WordPress' integration bootstrap query handlers before
-            // fixture cleanup and PHPUnit tearDown rollback.
-            if ($queryHooks !== null) {
-                $GLOBALS['wp_filter']['query'] = $queryHooks;
-            } else {
-                unset($GLOBALS['wp_filter']['query']);
-            }
-
-            $this->cleanupCommittedRaceFixtures(
-                [$this->clinicA, $this->clinicB],
-                [$managerId, $this->managerB, $this->suspendedManager, $this->member, $this->nonMember, $targetUser],
-                $definitionId
-            );
         }
     }
 
