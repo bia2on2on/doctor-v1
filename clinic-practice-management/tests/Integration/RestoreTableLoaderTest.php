@@ -516,8 +516,8 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
      * Only a single PARSING open is tampered (RestoreDumpTamperingStream). Every path-fingerprint
      * open, and every other parsing pass, serves clean bytes, so `assert_same_file()` and the
      * leading `digest()` gate cannot be the ones that refuse. The refusal is pinned to the pass
-     * gate by its exact message, because that message is the only one emitted from the
-     * comparison of a streamed pass digest (RestoreTableLoader.php:180).
+     * gate by its exact message, because the three `RESTORE_DUMP_CHANGED` sites carry three
+     * different messages and only the pass gate emits this one.
      */
     public function testRefusesBytesChangedWhileTheInsertingPassReads(): void
     {
@@ -538,12 +538,16 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
             $failure = $exception->getErrorCode();
             $message = $exception->getMessage();
         } finally {
-            stream_wrapper_unregister('cpmstamper');
+            if (in_array('cpmstamper', stream_get_wrappers(), true)) {
+                stream_wrapper_unregister('cpmstamper');
+            }
         }
 
+        self::assertSame(0, RestoreDumpTamperingStream::$unclassified, 'every open was classifiable');
         self::assertSame(1, RestoreDumpTamperingStream::$tampered, 'exactly one parsing open is tampered');
         self::assertSame(1, RestoreDumpTamperingStream::$tampered_parse, 'the SECOND parsing pass is the tampered one');
-        self::assertGreaterThan(1, RestoreDumpTamperingStream::$parses, 'the load really reached a later parsing pass');
+        self::assertGreaterThanOrEqual(2, RestoreDumpTamperingStream::$parses, 'the load reached at least pass index+1 = 2');
+        self::assertGreaterThan(0, RestoreDumpTamperingStream::$fingerprints, 'the path-fingerprint opens were seen and left clean');
         self::assertSame('RESTORE_DUMP_CHANGED', $failure, 'the changed pass is refused');
         self::assertSame('The dump changed while it was being read.', $message, 'the refusal comes from the PASS digest gate');
         foreach (['cpms_clinics', 'cpms_organizations', 'cpms_patients', 'cpms_patient_logins'] as $short) {
@@ -561,6 +565,8 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
             }
         }
         self::assertSame(0, RestoreDumpTamperingStream::$tampered, 'the clean policy tampers nothing');
+        self::assertSame(0, RestoreDumpTamperingStream::$unclassified, 'the clean control was fully classifiable');
+        self::assertGreaterThanOrEqual(1, RestoreDumpTamperingStream::$parses, 'the clean control really parsed');
         self::assertSame(['tables' => $this->loaded_tables, 'rows' => $this->loaded_rows, 'bindings_closed' => 2], $result);
     }
 
@@ -590,11 +596,16 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
             $failure = $exception->getErrorCode();
             $message = $exception->getMessage();
         } finally {
-            stream_wrapper_unregister('cpmsearly');
+            if (in_array('cpmsearly', stream_get_wrappers(), true)) {
+                stream_wrapper_unregister('cpmsearly');
+            }
         }
 
+        self::assertSame(0, RestoreDumpTamperingStream::$unclassified, 'every open was classifiable');
         self::assertSame(1, RestoreDumpTamperingStream::$tampered, 'exactly one earlier pass is tampered');
         self::assertSame(0, RestoreDumpTamperingStream::$tampered_parse, 'it is the FIRST table pass, not the last');
+        self::assertGreaterThanOrEqual(1, RestoreDumpTamperingStream::$parses, 'at least pass index+1 = 1 parsing open');
+        self::assertGreaterThan(0, RestoreDumpTamperingStream::$fingerprints, 'the path-fingerprint opens were seen and left clean');
         self::assertSame('RESTORE_DUMP_CHANGED', $failure, 'an earlier changed pass is refused too');
         self::assertSame('The dump changed while it was being read.', $message, 'the per-pass gate is what refuses');
         foreach (['cpms_clinics', 'cpms_organizations', 'cpms_patients', 'cpms_patient_logins'] as $short) {
@@ -627,11 +638,16 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
             $failure = $exception->getErrorCode();
             $message = $exception->getMessage();
         } finally {
-            stream_wrapper_unregister('cpmsshort');
+            if (in_array('cpmsshort', stream_get_wrappers(), true)) {
+                stream_wrapper_unregister('cpmsshort');
+            }
         }
 
+        self::assertSame(0, RestoreDumpTamperingStream::$unclassified, 'every open was classifiable');
         self::assertSame(1, RestoreDumpTamperingStream::$tampered, 'exactly one parsing open is cut');
         self::assertSame(0, RestoreDumpTamperingStream::$tampered_parse, 'it is the FIRST table pass');
+        self::assertGreaterThanOrEqual(1, RestoreDumpTamperingStream::$parses, 'at least pass index+1 = 1 parsing open');
+        self::assertGreaterThan(0, RestoreDumpTamperingStream::$fingerprints, 'the path-fingerprint opens were seen and left clean');
         self::assertLessThan($file_size, RestoreDumpTamperingStream::$tampered_bytes, 'the wrapper really served fewer bytes than the file holds');
         self::assertSame('RESTORE_DUMP_CHANGED', $failure, 'an orderly short read is still a different dump');
         self::assertSame('The dump changed while it was being read.', $message, 'the PASS digest gate refuses, not a path or syntax gate');
@@ -1095,11 +1111,22 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
 /**
  * Test-only stream wrapper that tampers with ONE chosen parsing open.
  *
- * `hash_file()` (the path fingerprint) and the reader's parsing `fopen()` both arrive here as
- * a plain `stream_open`, so an open counter alone cannot tell them apart. `open()` always
- * calls `is_file()`/`is_readable()` first, which hit `url_stat()`, and `hash_file()` never
- * does — so after a `url_stat()` the next-but-one open is the parsing open. That is the only
- * reliable discriminator from inside a wrapper (OBSERVED: RestoreDumpReader::open()).
+ * `hash_file()` (the path fingerprint) and the reader's parsing `fopen()` both arrive here as a
+ * plain `stream_open`, so an open counter alone cannot tell them apart. This wrapper classifies
+ * each open from its CALL STACK instead: `debug_backtrace()` records every frame, and the frame
+ * immediately above `stream_open` is the internal function that opened the stream.
+ *
+ * Why that is deterministic (php-src reading, not trial and error):
+ * - A user wrapper's `stream_open` is invoked as a real method call: `zend_call_method_if_exists()`
+ *   in `main/streams/userspace.c` (PHP-8.2, the version the Integration job runs).
+ * - A user-function frame records its caller (`EX(prev_execute_data) = EG(current_execute_data)`,
+ *   `Zend/zend_execute.c` `zend_init_func_execute_data()`), and an internal-function frame does too
+ *   (`call->prev_execute_data = EG(current_execute_data)`, `Zend/zend_execute_API.c` `zend_call_function()`).
+ *   PHP 8.1 takes the `ZEND_USER_FUNCTION` branch of the same function; 8.5 keeps both.
+ * - `zend_fetch_debug_backtrace()` walks `prev_execute_data` for every frame, internal or not, and
+ *   emits the `function` key from `func->common.function_name` (`Zend/zend_builtin_functions.c`).
+ * So an internal `fopen`/`hash_file` frame IS visible. If a build ever fails to expose it, the
+ * open is counted as UNCLASSIFIED and refused loudly instead of being served as clean bytes.
  */
 final class RestoreDumpTamperingStream {
     public static string $path = '';
@@ -1109,55 +1136,78 @@ final class RestoreDumpTamperingStream {
     public static int $target_parse = -1;
     /** Bytes served by the ONE tampered open only, not the sum over every open. */
     public static int $tampered_bytes = 0;
-    public static int $opens          = 0;
-    public static int $parses         = 0;
-    public static int $tampered       = 0;
-    public static int $tampered_open  = -1;
+    /** Opens whose caller could not be classified: every test asserts this stays 0. */
+    public static int $unclassified   = 0;
     /** Which PARSING pass (0-based) was tampered at, so a test can pin it exactly. */
     public static int $tampered_parse = -1;
-    public static int $served         = 0;
+    public static int $opens          = 0;
+    public static int $parses         = 0;
+    public static int $fingerprints   = 0;
+    public static int $tampered       = 0;
+    public static int $tampered_open  = -1;
 
-    /** Static: PHP may build a NEW wrapper object per stream operation, so arming cannot be per instance. */
-    public static int $armed = 0;
-    private string $bytes    = '';
-    private int $pos         = 0;
+    private string $bytes = '';
+    private int $pos      = 0;
 
     public static function reset(string $path, string $mode, int $target_parse): void {
         self::$path           = $path;
         self::$mode           = $mode;
         self::$target_parse   = $target_parse;
+        self::$tampered_bytes = 0;
+        self::$unclassified   = 0;
+        self::$tampered_parse = -1;
         self::$opens          = 0;
         self::$parses         = 0;
+        self::$fingerprints   = 0;
         self::$tampered       = 0;
         self::$tampered_open  = -1;
-        self::$tampered_parse = -1;
-        self::$tampered_bytes = 0;
-        self::$served         = 0;
-        self::$armed          = 0;
     }
 
-    /** @return array<string, int> */
+    /** A pure stat provider: `is_file()`/`is_readable()` must not be refused, but never classify. */
     public function url_stat(string $path, int $flags): array {
-        $size = (int) filesize(self::$path);
-        // `is_file()`/`is_readable()` stat the path; the decision already made by PHP 8.3's
-        // `php_hash_do_hash()` (ext/hash/hash.c) means `hash_file()` opens WITHOUT a stat. So a
-        // stat is followed by exactly one fingerprint open and one parsing open: arm for that.
-        self::$armed = 2;
+        return ['size' => (int) filesize(self::$path), 'mode' => 0100644, 'mtime' => 0, 'atime' => 0, 'ctime' => 0];
+    }
 
-        return ['size' => $size, 'mode' => 0100644, 'mtime' => 0, 'atime' => 0, 'ctime' => 0];
+    /**
+     * The caller decides what the open is; nothing here depends on a stat or on call order.
+     *
+     * Frame 0 is this method; the frames just above it are the internal function that asked for
+     * the stream. Only those are inspected, so an unrelated `fopen` deeper in the stack cannot
+     * be mistaken for the caller.
+     */
+    private static function classify(): string {
+        $trace = debug_backtrace(\DEBUG_BACKTRACE_IGNORE_ARGS, 4);
+        foreach (array_slice($trace, 1, 3) as $frame) {
+            $name = (string) ($frame['function'] ?? '');
+            if ('hash_file' === $name) {
+                return 'fingerprint';
+            }
+            if ('fopen' === $name) {
+                return 'parsing';
+            }
+        }
+
+        return 'unclassified';
     }
 
     /** @param array<string, mixed> $options */
     public function stream_open(string $path, string $mode, int $options, ?array &$opened_path): bool {
         $index = self::$opens;
         ++self::$opens;
-        $is_parse = false;
-        if (self::$armed > 0) {
-            --self::$armed;
-            if (0 === self::$armed) {
-                $is_parse = true;
-                ++self::$parses;
-            }
+        $kind = self::classify();
+        if ('unclassified' === $kind) {
+            // Fail closed: a wrapper that cannot tell would silently serve clean bytes and let a
+            // test pass for the wrong reason, so the open is counted and refused. The refusals then
+            // surface as a reader/failure error AND as a non-zero unclassified count in the test.
+            ++self::$unclassified;
+
+            return false;
+        }
+        $is_parse = 'parsing' === $kind;
+        if ($is_parse) {
+            ++self::$parses;
+        } else {
+            ++self::$fingerprints;
         }
         $bytes = (string) file_get_contents(self::$path);
         if ($is_parse && self::$parses - 1 === self::$target_parse && 'clean' !== self::$mode) {
@@ -1176,7 +1226,6 @@ final class RestoreDumpTamperingStream {
         }
         $this->bytes = $bytes;
         $this->pos   = 0;
-        self::$served += strlen($bytes);
         if ($is_parse && self::$parses - 1 === self::$target_parse) {
             self::$tampered_bytes = strlen($bytes);
         }
