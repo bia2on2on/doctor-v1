@@ -813,7 +813,7 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
             $escaped,
             fn () => (new PatientRepository($this->db))->search($this->clinic_id, $term, 20)
         );
-        $replacement = "SELECT '{$escaped}' AS nid_probe FROM " . $this->db->table('cpms_patients')
+        $replacement = "SELECT '{$like_escaped}' AS nid_probe FROM " . $this->db->table('cpms_patients')
             . ' WHERE cpms_nid_diag_no_such_column = 1 LIMIT 1';
 
         $this->assertGuardedFailureValueFree(

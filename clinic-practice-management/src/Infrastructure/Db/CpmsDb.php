@@ -198,7 +198,7 @@ final class CpmsDb
             return [];
         }
 
-        $candidates   = [ $value ];
+        $candidates = [ $value ];
         if ( method_exists( $this->wpdb, 'esc_like' ) ) {
             $candidates[] = $this->wpdb->esc_like( $value );
         }
@@ -282,7 +282,7 @@ final class CpmsDb
                             return strlen( $right ) <=> strlen( $left );
                         }
                     );
-                    $text    = str_replace( $needles, '[nid-redacted]', $text );
+                    $text = str_replace( $needles, '[nid-redacted]', $text );
                 }
             } elseif ( is_int( $value ) && ! $is_template && strlen( (string) $value ) >= 10 ) {
                 $text = str_replace( (string) $value, '[nid-redacted]', $text );
