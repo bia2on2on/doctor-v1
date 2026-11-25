@@ -887,6 +887,146 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
     }
 
     /**
+     * R3g1 — guard cleanup against entries in core's real query-log row format.
+     * This proves the guard's cleanup against entries in core's real row format;
+     * it does NOT prove that core's SAVEQUERIES switch works end to end in CI.
+     */
+    public function testR3g1QueryLogCoreRowFormatIsScrubbed(): void
+    {
+        $value = self::NID_A;
+        $sql   = "SELECT '{$value}' AS nid_probe FROM " . $this->db->table('cpms_patients')
+            . ' WHERE cpms_nid_diag_no_such_column = 1 LIMIT 1';
+
+        $saved_queries = $this->wpdb->queries;
+        $hits          = 0;
+        $seen_sql      = null;
+        $logger        = function (string $query) use ($sql, &$hits, &$seen_sql): string {
+            if ($query !== $sql) {
+                return $query;
+            }
+            ++$hits;
+            $seen_sql = $query;
+            $this->wpdb->log_query($query, 0.0, 'r3g1-core-format', 0.0, []);
+
+            return $query;
+        };
+
+        add_filter('query', $logger, 5);
+        try {
+            // CONTROL: raw $wpdb call; core's own log_query() row must hold the value.
+            $this->wpdb->queries = is_array($saved_queries) ? $saved_queries : [];
+            $raw_ok              = $this->wpdb->query($sql);
+            self::assertFalse($raw_ok, 'raw control must fail in the database');
+            self::assertSame(1, $hits, 'core-format filter matched once');
+
+            $control_found = false;
+            foreach (is_array($this->wpdb->queries) ? $this->wpdb->queries : [] as $entry) {
+                if (is_array($entry) && isset($entry[0]) && str_contains((string) $entry[0], $value)) {
+                    $control_found = true;
+                }
+            }
+            self::assertTrue($control_found, 'core row format really holds the synthetic value');
+
+            // GUARDED: same real failure through CpmsDb, same core-format logger.
+            $this->wpdb->queries = $saved_queries;
+            $this->db->setStrict(true);
+            $thrown = null;
+            try {
+                $this->db->fetchRow($sql);
+            } catch (Throwable $error) {
+                $thrown = $error;
+            } finally {
+                $this->db->setStrict(false);
+            }
+
+            self::assertInstanceOf(RuntimeException::class, $thrown, 'guarded real failure threw');
+            self::assertSame('Database error (national ID redacted).', $thrown->getMessage());
+            self::assertSame(2, $hits, 'core-format filter matched once per flow');
+            self::assertIsString($seen_sql, 'the filter saw the real statement');
+
+            $sensitive = [$value, $value, (string) $seen_sql];
+            foreach (is_array($this->wpdb->queries) ? $this->wpdb->queries : [] as $entry) {
+                if (!is_array($entry) || !isset($entry[0]) || !is_string($entry[0])) {
+                    continue;
+                }
+                foreach ($sensitive as $needle) {
+                    self::assertStringNotContainsString((string) $needle, $entry[0], 'guarded core-format row is value-free');
+                }
+            }
+        } finally {
+            $this->db->setStrict(false);
+            remove_filter('query', $logger, 5);
+            $this->wpdb->queries = $saved_queries;
+        }
+    }
+
+    /**
+     * R3g2 — real PatientRepository::search() SQL fails with all four escaped
+     * LIKE spellings intact; every diagnostic channel stays value-free.
+     */
+    public function testR3g2RealRepositorySearchSqlIsValueFree(): void
+    {
+        $term   = '049%937%0899';
+        $digits = '0499370899';
+        $prefix = 'SELECT id, mrn, first_name, last_name, mobile, national_id, birth_date, gender, status';
+
+        $capture_hits = 0;
+        $captured     = null;
+        $capture      = function (string $query) use ($prefix, &$capture_hits, &$captured): string {
+            if (!str_starts_with($query, $prefix) || !str_contains($query, 'LIKE')) {
+                return $query;
+            }
+            ++$capture_hits;
+            $captured = $query;
+
+            return $query;
+        };
+
+        add_filter('query', $capture, 5);
+        try {
+            (new PatientRepository($this->db))->search($this->clinic_id, $term, 20);
+        } finally {
+            remove_filter('query', $capture, 5);
+        }
+        self::assertSame(1, $capture_hits, 'real production SELECT captured once');
+        self::assertIsString($captured, 'real production SQL was captured');
+
+        $production_sql = (string) $captured;
+        self::assertMatchesRegularExpression(
+            "/'([^']*{$digits}[^']*)'/",
+            $production_sql,
+            'emitted SQL contains the real escaped LIKE term'
+        );
+        preg_match("/'([^']*{$digits}[^']*)'/", $production_sql, $matches);
+        $escaped = (string) ($matches[1] ?? '');
+        self::assertStringContainsString('049\\\\%937\\\\%0899', $escaped, 'double-backslash escaped spelling from real SQL');
+
+        $failing_sql = preg_replace(
+            '/\bWHERE\b/',
+            'WHERE cpms_nid_diag_no_such_column = 1 AND ',
+            $production_sql,
+            1
+        );
+        self::assertIsString($failing_sql, 'production SQL modified in place');
+        self::assertStringContainsString('cpms_nid_diag_no_such_column', (string) $failing_sql);
+
+        $this->assertGuardedFailureValueFree(
+            $production_sql,
+            (string) $failing_sql,
+            fn () => (new PatientRepository($this->db))->search($this->clinic_id, $term, 20),
+            [$term, $escaped, $digits],
+            'R3g2 real search SQL'
+        );
+
+        foreach (['last_query', 'last_error', 'func_call'] as $property) {
+            self::assertTrue(property_exists($this->wpdb, $property), 'wpdb exposes ' . $property);
+            foreach ([$term, $escaped, $digits] as $needle) {
+                self::assertStringNotContainsString($needle, (string) $this->wpdb->{$property}, 'R3g2 ' . $property);
+            }
+        }
+    }
+
+    /**
      * @param list<string> $sensitive
      */
     private function assertGuardedFailureValueFree(
