@@ -433,7 +433,11 @@ final class MissingRunningWorker extends ExternalRaceWorker
             return ['pid' => 4242, 'running' => 'false', 'signaled' => false, 'stopped' => false, 'exitcode' => 0];
         }
         if ($this->shape === self::SHAPE_DOUBT_THEN_VALID) {
-            if ($this->rawReads === 1) {
+            // Doubt for the first TWO raw reads: the parent constructor
+            // consumes raw read #1 (its own readStatus() call), so the
+            // doubt the TEST observes is read #2; the valid exit begins at
+            // read #3.
+            if ($this->rawReads <= 2) {
                 return ['pid' => 4242, 'signaled' => false, 'stopped' => false, 'exitcode' => 0]; // doubt
             }
 
