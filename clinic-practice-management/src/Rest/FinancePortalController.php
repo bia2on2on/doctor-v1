@@ -45,6 +45,7 @@ use ClinicCore\Application\Scope\ScopeRequiredException;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Time\Jalali;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Domain\Visits\VisitException;
 use ClinicCore\Infrastructure\Repository\InvoiceRepository;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
@@ -850,7 +851,7 @@ final class FinancePortalController extends RestBase {
 		} catch ( VisitException $exception ) {
 			return $this->error( $exception->errorCode, $exception->httpStatus, $exception->getMessage(), $exception->data ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- established VisitException contract.
 		} catch ( Throwable $exception ) {
-			error_log( '[CPMS][FinancePortalController] unexpected: ' . get_class( $exception ) . ': ' . $exception->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
+			error_log( '[CPMS][FinancePortalController] unexpected: ' . get_class( $exception ) . ': ' . NationalIdValidator::redact_digits( $exception->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
 			return $this->error( 'CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور — لطفاً دوباره تلاش کنید' );
 		}
 	}
@@ -946,7 +947,7 @@ final class FinancePortalController extends RestBase {
 		} catch ( FinanceException $exception ) {
 			return $this->error( $exception->errorCode, $exception->httpStatus, $exception->getMessage(), $exception->data ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- established FinanceException contract.
 		} catch ( Throwable $exception ) {
-			error_log( '[CPMS][FinancePortalController] unexpected: ' . get_class( $exception ) . ': ' . $exception->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
+			error_log( '[CPMS][FinancePortalController] unexpected: ' . get_class( $exception ) . ': ' . NationalIdValidator::redact_digits( $exception->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
 			return $this->error( 'CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور — لطفاً دوباره تلاش کنید' );
 		}
 
@@ -1102,7 +1103,7 @@ final class FinancePortalController extends RestBase {
 		} catch ( VisitException $exception ) {
 			return $this->error( $exception->errorCode, $exception->httpStatus, $exception->getMessage(), $exception->data ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- established VisitException contract.
 		} catch ( Throwable $exception ) {
-			error_log( '[CPMS][FinancePortalController] unexpected: ' . get_class( $exception ) . ': ' . $exception->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
+			error_log( '[CPMS][FinancePortalController] unexpected: ' . get_class( $exception ) . ': ' . NationalIdValidator::redact_digits( $exception->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
 			return $this->error( 'CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور — لطفاً دوباره تلاش کنید' );
 		}
 

@@ -7,6 +7,7 @@ namespace ClinicCore\Rest;
 use ClinicCore\Application\Visits\VisitService;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Domain\Visits\VisitException;
 use WP_Error;
 use WP_REST_Request;
@@ -468,7 +469,7 @@ final class QueueController extends RestBase {
 		} catch ( VisitException $e ) {
 			return $this->error( $e->errorCode, $e->httpStatus, $e->getMessage(), $e->data ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- legacy PSR-style, established contract
 		} catch ( \Throwable $e ) {
-			error_log( '[CPMS][QueueController] unexpected: ' . get_class( $e ) . ': ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- WPCS
+			error_log( '[CPMS][QueueController] unexpected: ' . get_class( $e ) . ': ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- WPCS
 			return $this->error( 'CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور — لطفاً دوباره تلاش کنید' );
 		}
 	}

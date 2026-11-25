@@ -84,8 +84,21 @@ final class OtpService
         private readonly OpLogger $op,
         private readonly SmsService $sms,
         private readonly JobQueue $jobs,
-        private readonly ?PatientSessionScope $session_scope = null
+        private readonly ?PatientSessionScope $session_scope = null,
+        private readonly ?PatientNidHmac $nid_hmac = null
     ) {
+    }
+
+    /**
+     * Bucket key for a normalized mobile: the raw digits never enter a
+     * rate-limit key (the identity policy forbids it, and a mobile-shaped
+     * national id would be stored verbatim). One HMAC per normalized form, so
+     * every accepted spelling of the same number lands in the same bucket.
+     */
+    private function mobile_bucket( string $prefix, string $mobile ): string {
+        $hmac = $this->nid_hmac ?? new PatientNidHmac();
+
+        return $hmac->mobile_rate_limit_key_with_domain( $prefix, 'otp', $mobile );
     }
 
     private function session_scope(): PatientSessionScope {
@@ -193,13 +206,16 @@ final class OtpService
         $policy    = $settings->otpPolicy();
         $user_id   = $userId;
         $clinic_id = $clinicId;
-        // The guard is a separate, hashed per-mobile row in the existing rate
-        // table. Its zero timestamp makes it eligible for ordinary rate-limit
-        // cleanup. An UPSERT takes an exclusive InnoDB row lock until the
-        // outermost transaction commits, including when cleanup races it.
-        // It serializes all purposes and Clinics, matching the existing global
-        // per-mobile limits; it never stores a raw mobile or a code.
-        $guard_key = 'otp-send-guard:' . hash( 'sha256', $mobile );
+        // The guard is a separate per-mobile row in the existing rate table,
+        // keyed by a KEYED HMAC of the normalized number: like otp-day/otp-hour
+        // it is unreadable without the CPMS_NID_HMAC_KEY secret, so a
+        // mobile-shaped national id is not stored verbatim (a keyless hash of a
+        // 10-digit space is trivially enumerable). Its zero timestamp makes it
+        // eligible for ordinary rate-limit cleanup. An UPSERT takes an exclusive
+        // InnoDB row lock until the outermost transaction commits, including
+        // when cleanup races it. It serializes all purposes and Clinics,
+        // matching the existing global per-mobile limits.
+        $guard_key = $this->mobile_bucket( 'otp-send-guard', $mobile );
         $issue = $this->db->transactional(
             function () use ( $guard_key, $mobile, $purpose, $policy, $settings, $user_id, $ip, $clinic_id, $daily_max, $hourly_max ): array {
                 $locked = $this->db->query(
@@ -273,8 +289,8 @@ final class OtpService
                 // both counters were below their caps a moment ago; the only
                 // way hit() can disagree is a window rollover in between, and
                 // then refusing is the fail-closed answer.
-                $day_charge = $this->rate->hit( 'otp-day:' . $mobile, $daily_max, self::DAY_WINDOW_SEC );
-                $hour_charge = $this->rate->hit( 'otp-hour:' . $mobile, $hourly_max, self::HOUR_WINDOW_SEC );
+                $day_charge = $this->rate->hit( $this->mobile_bucket( 'otp-day', $mobile ), $daily_max, self::DAY_WINDOW_SEC );
+                $hour_charge = $this->rate->hit( $this->mobile_bucket( 'otp-hour', $mobile ), $hourly_max, self::HOUR_WINDOW_SEC );
                 if ( ! $day_charge['allowed'] || ! $hour_charge['allowed'] ) {
                     throw new \RuntimeException( 'OTP issuance quota invariant violated' );
                 }
@@ -791,14 +807,14 @@ final class OtpService
      * @return OtpException|null null یعنی سهمیه آزاد است.
      */
     private function issuance_quota_denial( string $mobile, int $daily_max, int $hourly_max ): ?OtpException {
-        if ( $this->rate->peek( 'otp-day:' . $mobile, self::DAY_WINDOW_SEC ) >= max( 1, $daily_max ) ) {
+        if ( $this->rate->peek( $this->mobile_bucket( 'otp-day', $mobile ), self::DAY_WINDOW_SEC ) >= max( 1, $daily_max ) ) {
             return new OtpException(
                 'CLINIC_OTP_DAILY_LIMIT',
                 'محدودیت ارسال کد در روز به پایان رسیده است',
                 $this->quota_denied_meta( self::DAY_WINDOW_SEC )
             );
         }
-        if ( $this->rate->peek( 'otp-hour:' . $mobile, self::HOUR_WINDOW_SEC ) >= max( 1, $hourly_max ) ) {
+        if ( $this->rate->peek( $this->mobile_bucket( 'otp-hour', $mobile ), self::HOUR_WINDOW_SEC ) >= max( 1, $hourly_max ) ) {
             return new OtpException(
                 'CLINIC_RATE_LIMITED',
                 'درخواست‌های شما موقتاً محدود شده است',
