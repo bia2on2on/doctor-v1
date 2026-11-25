@@ -35,6 +35,7 @@ final class RestoreTableLoader {
     public function preflight( RestoreDumpReader $reader, ?string $expected_version = null ): array {
         $digest      = $reader->digest();
         $dump_tables = $reader->tables();
+        $this->assert_completed_pass_digest( $reader, $digest );
         $columns     = [];
         $rows        = [];
         $source      = '';
@@ -56,6 +57,7 @@ final class RestoreTableLoader {
             }
             $columns[ $table ] = $batch['columns'];
         }
+        $this->assert_completed_pass_digest( $reader, $digest );
 
         return [
             'source_version' => $source,
@@ -110,6 +112,8 @@ final class RestoreTableLoader {
                             $rows            += $this->insert_batch( $table, $batch['columns'], $batch['rows'] );
                             $counts[ $table ] = ( $counts[ $table ] ?? 0 ) + count( $batch['rows'] );
                         }
+                        // Every completed pass, not only the last one, must be the plan's bytes.
+                        $this->assert_completed_pass_digest( $reader, (string) $plan['digest'] );
                     }
                     // The bytes this pass consumed must be the bytes the plan was built from:
                     // checked BEFORE the transaction commits, so a mismatch rolls back.
@@ -156,6 +160,19 @@ final class RestoreTableLoader {
     private function clear_last_query(): void {
         $this->db->wpdb()->last_query = '';
         $this->db->wpdb()->last_error = '';
+    }
+
+    /**
+     * هر پاسِ کامل‌شده باید همان بایت‌های plan باشد (پیش از COMMIT و پیش از هر نوشتن).
+     *
+     * A pass the reader abandoned mid-way leaves the digest null, and a null digest is never
+     * compared as if that pass had completed; only a finished pass can disprove the bytes.
+     */
+    private function assert_completed_pass_digest( RestoreDumpReader $reader, string $expected ): void {
+        $streamed = $reader->last_pass_digest();
+        if ( null !== $streamed && $streamed !== $expected ) {
+            throw BackupException::of( 'RESTORE_DUMP_CHANGED', 'The dump changed while it was being read.' );
+        }
     }
 
     /**

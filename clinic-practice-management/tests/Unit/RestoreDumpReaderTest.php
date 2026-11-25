@@ -416,4 +416,26 @@ final class RestoreDumpReaderTest extends TestCase
         self::assertSame(['cpms_patients'], $second->tables());
         self::assertNotSame($reader->last_pass_digest(), $second->last_pass_digest(), 'changed bytes change the digest');
     }
+
+    /** RB-49: a pass abandoned mid-way never reports a digest, so it can never be read as completed. */
+    public function testAnAbandonedPassReportsNoDigest(): void
+    {
+        $dump = "INSERT INTO `cpms_patients` (`id`) VALUES (1);\nINSERT INTO `cpms_patients` (`id`) VALUES (2);\n";
+        self::assertTrue(file_put_contents($this->file, $dump) > 0);
+
+        $reader  = new RestoreDumpReader($this->file);
+        $batches = 0;
+        foreach ($reader->inserts() as $batch) {
+            self::assertSame('1', $batch['rows'][0]['id'], 'the first batch is the first statement');
+            self::assertCount(1, $batch['rows'], 'the first batch holds only that statement');
+            ++$batches;
+            break; // stop after the first batch: the pass never reaches EOF.
+        }
+        self::assertSame(1, $batches, 'the pass really was abandoned after one batch');
+        self::assertNull($reader->last_pass_digest(), 'an unfinished pass leaves no digest to compare');
+
+        // A later FULL pass does report one, so the null above is not a permanent state.
+        self::assertSame(['cpms_patients'], $reader->tables());
+        self::assertSame(hash('sha256', $dump), $reader->last_pass_digest(), 'a completed pass covers the whole file');
+    }
 }
