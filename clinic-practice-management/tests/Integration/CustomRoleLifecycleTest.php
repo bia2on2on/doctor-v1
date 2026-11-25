@@ -279,7 +279,9 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
             self::markTestSkipped('External race workers require Linux (/proc/self/fd descriptor isolation).');
         }
         if (!function_exists('proc_open') || !class_exists('mysqli')) {
-            self::markTestSkipped('Requires proc_open and MySQLi for independent MySQL connections.');
+            // Fail-closed on Linux (ROUND7): a missing prerequisite FAILS the
+            // test — only the non-Linux host may skip.
+            self::fail('proc_open and MySQLi are required on Linux CI runners for the independent MySQL connections; skipping is not allowed.');
         }
 
         // Keep the repository-seeded definition free of a create-audit row. The
@@ -708,6 +710,10 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                 self::assertFalse(
                     $worker->outputTruncated(),
                     'Worker stdout exceeded the bounded rolling buffer and bytes were discarded; output integrity cannot be proven.'
+                );
+                self::assertFalse(
+                    $worker->outputReadFailed(),
+                    'A stdout read failure invalidates the drained-output accounting.'
                 );
             }
             foreach ($terminalLines as $line) {

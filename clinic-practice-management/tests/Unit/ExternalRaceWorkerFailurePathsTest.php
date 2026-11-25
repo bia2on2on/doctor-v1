@@ -38,14 +38,26 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
 
     protected function tearDown(): void
     {
+        $errors = [];
         foreach ($this->workers as $worker) {
-            $worker->terminate();
+            // Each worker gets its own try/finally so one throwing
+            // terminate() cannot skip the remaining workers nor the unlink
+            // of the temp scripts; exceptions are collected and rethrown
+            // AFTER full cleanup — never swallowed.
+            try {
+                $worker->terminate();
+            } catch (\Throwable $exception) {
+                $errors[] = get_class($exception) . ': ' . $exception->getMessage();
+            }
         }
         $this->workers = [];
         foreach ($this->temporaryFiles as $file) {
             @unlink($file);
         }
         $this->temporaryFiles = [];
+        if ($errors !== []) {
+            throw new \RuntimeException('tearDown could not terminate all registered workers: ' . implode(' | ', $errors));
+        }
         parent::tearDown();
     }
 
@@ -77,8 +89,8 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             $status = $worker->finalStatus();
             self::assertIsArray($status, 'the decisive first not-running read must be cached and readable');
             self::assertTrue(
-                $status['signaled'] === true || $status['exitCode'] !== 0,
-                'a blocked child must be observed as signaled or as a non-zero exit — a clean exit 0 means the child was NOT blocked or was never signaled'
+                $status['signaled'] === true || (is_int($status['exitCode']) && $status['exitCode'] > 0),
+                'a blocked child must be observed as signaled or as a POSITIVE non-zero exit — a clean exit 0, or exit -1 with signaled=false, means the child was NOT blocked or was never signaled'
             );
         } finally {
             $worker->terminate();
@@ -128,10 +140,13 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
 
         try {
             $started = microtime(true);
-            $worker->waitForExit(20.0); // bounded; must return far before the deadline
+            // waitForExit() returns the INT exit code (-1 on deadline expiry,
+            // which assertTrue could never see), so the boolean observation
+            // itself is asserted through waitForConfirmedExit().
+            self::assertTrue($worker->waitForConfirmedExit(20.0), 'waitForConfirmedExit() must report TRUE: the child died by its own SIGKILL and the exit must be OBSERVED, not deadline-expired');
             $elapsed = microtime(true) - $started;
 
-            self::assertLessThan(10.0, $elapsed, 'the child died by its own SIGKILL; waitForExit() must observe it promptly, not spin to the deadline');
+            self::assertLessThan(10.0, $elapsed, 'the child died by its own SIGKILL; waitForConfirmedExit() must observe it promptly, not spin to the deadline');
             $status = $worker->finalStatus();
             self::assertIsArray($status, 'the exit observation must be cached');
             self::assertTrue($status['signaled'], 'a SIGKILLed child must be cached as signaled');
@@ -189,6 +204,43 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
     }
 
     /**
+     * FIX 1: a descendant that INHERITS the worker's stdout (proc_open with
+     * the STDOUT resource as descriptor spec) outlives the direct worker and
+     * writes later. The drain must either capture the late line or return
+     * complete=false — NEVER complete=true with the late line lost. The
+     * descendant is bounded: it exits by itself right after writing, and is
+     * never left running after the test.
+     */
+    public function testDrainNeverCompletesTrueWithALateLineLostFromADescendant(): void
+    {
+        $grandchild = $this->temporaryScript(
+            "<?php\nusleep(300000);\nfwrite(STDOUT, \"LATE:line\n\");\nexit(0);\n"
+        );
+        $workerScript = $this->temporaryScript(
+            "<?php\n\$g = " . var_export($grandchild, true) . ";\n\$descriptors = [0 => ['pipe', 'r'], 1 => STDOUT, 2 => STDOUT];\n\$process = @proc_open([PHP_BINARY, \$g], \$descriptors, \$pipes);\nexit(is_resource(\$process) ? 0 : 7);\n"
+        );
+        $worker = $this->launchWorker($workerScript);
+
+        try {
+            // No waitForExit() first: drainRemainingLines() does its own
+            // bounded wait and never closes the pipes, so EOF stays observable.
+            $drain = $worker->drainRemainingLines(3.0);
+            if ($drain['complete']) {
+                self::assertContains(
+                    'LATE:line',
+                    $drain['lines'],
+                    'complete=true implies stdout reached EOF with every writer closed — the late line MUST have been captured, never lost'
+                );
+            }
+            // complete=false is the fail-closed outcome and is also valid;
+            // the forbidden state is only (complete=true && line missing).
+            self::assertSame(0, $worker->waitForExit(5.0), 'the direct worker must exit 0 — exit 7 means the STDOUT resource descriptor spec is unsupported on this PHP build');
+        } finally {
+            $worker->terminate();
+        }
+    }
+
+    /**
      * More than 1 MiB of stdout must set the sticky outputTruncated flag so
      * the caller can fail closed on lost bytes.
      */
@@ -205,24 +257,73 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
     }
 
     /**
-     * B5: a status array WITHOUT a bool 'running' key — or with a non-bool —
-     * is DOUBT. It must not be cached as a final status, must report
-     * isRunning() true (doubt direction), and isConfirmedRunning() false.
-     * Driven deterministically through a tiny test-only subclass of the
-     * status-read seam; the public API is untouched.
+     * B5/ROUND7: a raw status array WITHOUT a bool 'running' key — or with a
+     * non-bool — is DOUBT. It must not be cached as a final status, must
+     * report isRunning() true (doubt direction), and isConfirmedRunning()
+     * false. The subclass overrides ONLY the raw seam (readRawStatus()), so
+     * readStatus() — the real validation + cache guard — is what runs here.
+     * terminate() on an always-doubt worker can never confirm exit: it sends
+     * SIGTERM, spins the 2s bound, SIGKILLs, spins the 5s bound, then closes
+     * the pipes and refuses the reaping path; wasNotReaped() is therefore
+     * TRUE by design (asserted, not assumed). The underlying child really
+     * exits quickly — it is unobservable to the doubtful launcher.
      */
     public function testMissingOrNonBoolRunningKeyIsDoubtNeverExit(): void
     {
         foreach (['missing', 'nonbool'] as $shape) {
-            $script = $this->exitsCleanlyScript();
-            $worker = new MissingRunningWorker($script, $shape);
+            $worker = $this->launchDoubtWorker($shape);
             try {
                 self::assertTrue($worker->isRunning(), 'doubt must keep the fail-closed alive direction (' . $shape . ')');
                 self::assertFalse($worker->isConfirmedRunning(), 'doubt can never confirm alive (' . $shape . ')');
                 self::assertNull($worker->finalStatus(), 'doubt must never be cached as a final status (' . $shape . ')');
             } finally {
                 $worker->terminate();
+                self::assertTrue($worker->wasNotReaped(), 'injected doubt can never confirm exit, so terminate() must refuse the reaping path (' . $shape . ')');
             }
+        }
+    }
+
+    /**
+     * ROUND7 FIX 2(c): after a doubt result, a following raw VALID
+     * running=false array IS accepted through the real guard and the
+     * final-status cache IS written.
+     */
+    public function testDoubtThenValidFalseIsAcceptedAndCaches(): void
+    {
+        $worker = $this->launchDoubtWorker('doubtThenValid');
+        try {
+            self::assertTrue($worker->isRunning(), 'the first read must be doubt (fail-closed alive)');
+            self::assertNull($worker->finalStatus(), 'the doubt read may not write the cache');
+            self::assertFalse($worker->isConfirmedRunning(), 'the second raw read reports a valid exit; the strict alive check is false');
+            $status = $worker->finalStatus();
+            self::assertIsArray($status, 'a valid running=false AFTER doubt MUST be cached by the real guard');
+            self::assertSame(0, $status['exitCode']);
+            self::assertFalse($status['signaled']);
+            self::assertFalse($status['stopped']);
+        } finally {
+            $worker->terminate();
+            self::assertFalse($worker->wasNotReaped(), 'the cache was now valid, so terminate() must reap cleanly');
+        }
+    }
+
+    /**
+     * ROUND7 FIX 2(d): the cache-once contract — a decisive running=false
+     * first, then a later raw running=true, must NOT rewrite the cached
+     * final status. (The code already guarantees cache-once; asserted.)
+     */
+    public function testCachedExitIsNotOverwrittenByALaterAliveRead(): void
+    {
+        $worker = $this->launchDoubtWorker('exitThenAlive');
+        try {
+            self::assertFalse($worker->isRunning(), 'a decisive valid exit read caches not-running');
+            $snapshot = $worker->finalStatus();
+            self::assertIsArray($snapshot);
+            self::assertSame(137, $snapshot['exitCode']);
+            $worker->isConfirmedRunning(); // raw read #2 claims alive; the cache may not change
+            self::assertSame($snapshot, $worker->finalStatus(), 'a later alive raw read must NOT rewrite the cached final status');
+        } finally {
+            $worker->terminate();
+            self::assertFalse($worker->wasNotReaped());
         }
     }
 
@@ -230,6 +331,19 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
     private function launchWorker(string $script): ExternalRaceWorker
     {
         $worker = ExternalRaceWorker::launch($script, []);
+        $this->workers[] = $worker;
+
+        return $worker;
+    }
+
+    /**
+     * Launch a directly-constructed doubt-injection worker and REGISTER it
+     * for tearDown() cleanup (it is real, and may hold a live process).
+     */
+    private function launchDoubtWorker(string $shape): MissingRunningWorker
+    {
+        $script = $this->exitsCleanlyScript();
+        $worker = new MissingRunningWorker($script, $shape);
         $this->workers[] = $worker;
 
         return $worker;
@@ -279,33 +393,57 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
 }
 
 /**
- * Test-only subclass: injects a doubtful status array (missing or non-bool
- * 'running') through the single status-read seam to prove the doubt rule
- * without any environment dependency. The child script is launched normally;
- * the injected array simply shadows what proc_get_status() would report.
- * FAKE STATUS IS NOT A FAKE CHILD: the process is real (and harmless; it has
- * already exited by the time any assertion runs).
+ * Test-only subclass: injects doubtful RAW status arrays through the raw
+ * seam (readRawStatus) — NEVER readStatus(), so the real validation and
+ * final-status cache run unchanged on top of the injected data. FAKE STATUS
+ * IS NOT A FAKE CHILD: the process is real (and harmless; it has already
+ * exited by the time any assertion runs).
  */
 final class MissingRunningWorker extends ExternalRaceWorker
 {
+    public const SHAPE_MISSING = 'missing';
+
+    public const SHAPE_NONBOOL = 'nonbool';
+
+    public const SHAPE_DOUBT_THEN_VALID = 'doubtThenValid';
+
+    public const SHAPE_EXIT_THEN_ALIVE = 'exitThenAlive';
+
     private string $shape;
+
+    private int $rawReads = 0;
 
     public function __construct(string $script, string $shape)
     {
         $this->shape = $shape;
-        // Minimal launch: stdio pipes only, no pinning — the test never
-        // signals or reads this child through the real path.
+        // Minimal launch: stdio pipes only, no pinning — the doubt tests
+        // drive every read through the injected arrays.
         $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
         $process = @proc_open([PHP_BINARY, $script], $descriptors, $pipes, dirname($script, 3), []);
         parent::__construct($process, is_array($pipes) ? $pipes : []);
     }
 
-    protected function readStatus(): ?array
+    protected function readRawStatus()
     {
-        if ($this->shape === 'missing') {
+        $this->rawReads++;
+        if ($this->shape === self::SHAPE_MISSING) {
             return ['pid' => 4242, 'signaled' => false, 'stopped' => false, 'exitcode' => 0];
         }
+        if ($this->shape === self::SHAPE_NONBOOL) {
+            return ['pid' => 4242, 'running' => 'false', 'signaled' => false, 'stopped' => false, 'exitcode' => 0];
+        }
+        if ($this->shape === self::SHAPE_DOUBT_THEN_VALID) {
+            if ($this->rawReads === 1) {
+                return ['pid' => 4242, 'signaled' => false, 'stopped' => false, 'exitcode' => 0]; // doubt
+            }
 
-        return ['pid' => 4242, 'running' => 'false', 'signaled' => false, 'stopped' => false, 'exitcode' => 0];
+            return ['pid' => 4242, 'running' => false, 'signaled' => false, 'stopped' => false, 'exitcode' => 0]; // valid exit
+        }
+        // SHAPE_EXIT_THEN_ALIVE: decisive first read, then a later alive claim.
+        if ($this->rawReads === 1) {
+            return ['pid' => 4242, 'running' => false, 'signaled' => false, 'stopped' => false, 'exitcode' => 137];
+        }
+
+        return ['pid' => 4242, 'running' => true, 'signaled' => false, 'stopped' => false, 'exitcode' => 0];
     }
 }

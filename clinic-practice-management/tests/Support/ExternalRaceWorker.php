@@ -91,6 +91,12 @@ class ExternalRaceWorker
     /** Sticky: stdout buffer ever discarded bytes (1 MiB rolling window). */
     private bool $outputTruncated = false;
 
+    /** Sticky: a stdout stream_get_contents() call returned false (never resets). */
+    private bool $stdoutReadFailed = false;
+
+    /** Sticky: the stdout read end was observed at EOF (every writer — direct child and any descendant inheriting the pipe — closed). */
+    private bool $stdoutEofObserved = false;
+
     /** Sticky: any read observed signaled === true (never reset). */
     private bool $signaledObserved = false;
 
@@ -298,16 +304,24 @@ class ExternalRaceWorker
 
     /**
      * Bounded drain of everything the worker wrote that has not been
-     * consumed yet. Waits (usleep polling, as everywhere in this class) for
-     * the worker to exit and its stdout to go EOF, then returns EVERY line
-     * still present — including a final line without a trailing newline,
-     * which is returned as `trailing` instead of being dropped. There is no
-     * line-count cap.
+     * consumed yet. Waits (usleep polling, as everywhere in this class) until
+     * the stdout READ END reaches EOF, then returns EVERY line still present —
+     * including a final line without a trailing newline, which is returned as
+     * `trailing` instead of being dropped. There is no line-count cap.
      *
-     * The caller MUST fail the test when `complete` is false (the deadline
-     * expired before the worker/EOF was observed): a later terminal line
-     * then cannot be ruled out. The caller MUST also fail the test when
-     * outputTruncated() is true.
+     * `complete` is true ONLY when stdout really reached EOF before the
+     * deadline — i.e. every writer (the direct child AND any descendant
+     * that inherited the pipe) is closed. A direct worker that exited while
+     * a descendant still holds the pipe open does NOT complete: EOF is not
+     * observable, the deadline keeps polling, and the return is
+     * complete=false. A launcher whose stdout was torn down WITHOUT the EOF
+     * ever being observed (pipes closed by close() over an unobserved
+     * transport) also returns complete=false — EOF is never inferred from a
+     * closed resource or from the worker's exit alone.
+     *
+     * The caller MUST fail the test when `complete` is false (a later
+     * terminal line then cannot be ruled out). The caller MUST also fail the
+     * test when outputTruncated() or outputReadFailed() is true.
      *
      * @return array{lines: list<string>, trailing: ?string, complete: bool}
      */
@@ -320,18 +334,17 @@ class ExternalRaceWorker
         $deadline = microtime(true) + $timeoutSeconds;
         while (microtime(true) < $deadline) {
             $this->pump();
-            if ($this->closed) {
-                // Pipes are closed by close(); everything the child wrote is
-                // already in the buffer. One final pump above drained it.
+            if ($this->stdoutEofWasSeen() || $this->stdoutReachedEof()) {
+                $this->pump(); // bytes may have arrived just before EOF was observed
                 $complete = true;
                 break;
             }
-            $status = $this->readStatus();
-            if (is_array($status) && is_bool($status['running'] ?? null) && $status['running'] === false) {
-                $this->pump(); // final drain of the bytes the child wrote before dying
-                $complete = true;
+            if ($this->closed || !isset($this->pipes[1]) || !is_resource($this->pipes[1])) {
+                // The launcher tore stdout down before EOF was ever
+                // observed: completeness is unknowable. Never claim it.
                 break;
             }
+            $this->readStatus(); // decisive read, if any, records the exit for terminate()
             usleep(1000);
         }
 
@@ -371,18 +384,36 @@ class ExternalRaceWorker
      */
     public function waitForExit(float $timeoutSeconds = 25.0): int
     {
+        if (!$this->waitForConfirmedExit($timeoutSeconds)) {
+            // waitForConfirmedExit already ran terminate() on the deadline.
+            return -1;
+        }
+
+        return $this->exitCode ?? -1;
+    }
+
+    /**
+     * True ONLY when the worker's exit was OBSERVED (a decisive running==false
+     * read, or a close with the final status cached) before the deadline.
+     * False when the deadline expired — terminate() then runs, exactly as in
+     * waitForExit(). Added in ROUND7 so tests can assert the observation
+     * itself (e.g. self-SIGKILL observed promptly after the child's signal).
+     */
+    public function waitForConfirmedExit(float $timeoutSeconds = 25.0): bool
+    {
         $deadline = microtime(true) + $timeoutSeconds;
         do {
             $this->pump();
             if ($this->closed) {
-                return $this->exitCode ?? -1;
+                // A close that cached the final status IS an observation; a
+                // close without one (e.g. pipes torn down on doubt) is not.
+                return $this->finalStatus !== null;
             }
             $status = $this->readStatus();
             if (is_array($status) && is_bool($status['running'] ?? null) && $status['running'] === false) {
-                $exitCode = $this->exitCode ?? (int) ($status['exitcode'] ?? -1);
                 $this->close();
 
-                return $exitCode;
+                return true;
             }
             usleep(5000);
         } while (microtime(true) < $deadline);
@@ -390,7 +421,7 @@ class ExternalRaceWorker
         // Bounded: never leaves an orphan, never blocks the suite.
         $this->terminate();
 
-        return -1;
+        return false;
     }
 
     /**
@@ -411,12 +442,12 @@ class ExternalRaceWorker
     }
 
     /**
-     * The ONE and ONLY proc_get_status() call site in this class. Every
-     * status read (constructor, isRunning, isConfirmedRunning, readStatus
-     * callers in waitForExit/terminate) routes here. PROTECTED on purpose
-     * (B5): the Unit suite injects doubtful status arrays through a tiny
-     * test-only subclass to prove the doubt rule; production-like callers
-     * use the public API.
+     * Every status read (constructor, isRunning, isConfirmedRunning,
+     * waitForExit, terminate) routes here. NOT the proc_get_status() call
+     * site itself — readRawStatus() is. PROTECTED on purpose (B5/ROUND7):
+     * the Unit suite injects doubtful raw arrays through a tiny test-only
+     * subclass overriding readRawStatus(); this validation and cache path
+     * is exactly what production callers exercise.
      *
      * When running === false is observed for the first time, the status
      * array is captured in the final-status cache BEFORE returning (a first
@@ -434,31 +465,54 @@ class ExternalRaceWorker
      *
      * @return array<string, mixed>|null
      */
+    protected function readRawStatus()
+    {
+        // The ONE and ONLY proc_get_status() call site in this class.
+        // PROTECTED test-only seam (ROUND7): the Unit failure-path suite
+        // injects doubtful raw arrays through a tiny subclass overriding
+        // THIS method only — never readStatus(). readStatus() (validation
+        // and the final-status cache) always runs unchanged on top of
+        // whatever this returns.
+        if (!is_resource($this->process)) {
+            // proc_get_status() cannot be called without a resource; this
+            // synthesizes the cached decisive exit (or null) so closed
+            // workers still report not-running through readStatus().
+            return $this->synthesizedStatusFromCache();
+        }
+
+        return @proc_get_status($this->process);
+    }
+
+    /**
+     * The cached final status re-shaped as a raw-looking status array, or
+     * null before the first decisive read. Used when the raw seam cannot
+     * consult proc_get_status (already closed) or when it returned false on
+     * the first observation (never lost).
+     *
+     * @return array<string, mixed>|null
+     */
+    private function synthesizedStatusFromCache(): ?array
+    {
+        if ($this->finalStatus === null) {
+            return null;
+        }
+
+        return [
+            'running' => false,
+            'exitcode' => $this->finalStatus['exitCode'],
+            'signaled' => $this->finalStatus['signaled'],
+            'stopped' => $this->finalStatus['stopped'],
+        ];
+    }
+
     protected function readStatus(): ?array
     {
         if ($this->closed) {
             return null;
         }
-        if (!is_resource($this->process)) {
-            return $this->finalStatus !== null
-                ? [
-                    'running' => false,
-                    'exitcode' => $this->finalStatus['exitCode'],
-                    'signaled' => $this->finalStatus['signaled'],
-                    'stopped' => $this->finalStatus['stopped'],
-                ]
-                : null;
-        }
-        $status = @proc_get_status($this->process);
+        $status = $this->readRawStatus();
         if (!is_array($status)) {
-            return $this->finalStatus !== null
-                ? [
-                    'running' => false,
-                    'exitcode' => $this->finalStatus['exitCode'],
-                    'signaled' => $this->finalStatus['signaled'],
-                    'stopped' => $this->finalStatus['stopped'],
-                ]
-                : null;
+            return $this->synthesizedStatusFromCache();
         }
         if (($status['signaled'] ?? false) === true) {
             $this->signaledObserved = true;
@@ -490,7 +544,22 @@ class ExternalRaceWorker
             if (!isset($this->pipes[$which]) || !is_resource($this->pipes[$which])) {
                 continue;
             }
-            $chunk = (string) stream_get_contents($this->pipes[$which]);
+            $chunk = stream_get_contents($this->pipes[$which]);
+            if ($chunk === false) {
+                // A failed read must not silently pass for an empty one:
+                // the drain's completeness accounting gets a sticky signal.
+                if ($which === 1) {
+                    $this->stdoutReadFailed = true;
+                }
+                continue;
+            }
+            if ($which === 1 && !$this->stdoutEofObserved && feof($this->pipes[1])) {
+                // Once the read end hits EOF no further bytes can ever
+                // arrive on this pipe (all writers — direct child and any
+                // descendant inheriting it — are closed). Sticky.
+                $this->stdoutEofObserved = true;
+            }
+            $chunk = (string) $chunk;
             if ($chunk === '') {
                 continue;
             }
@@ -510,6 +579,28 @@ class ExternalRaceWorker
     }
 
 
+
+    /** True when any stdout stream_get_contents() call returned false (sticky). */
+    public function outputReadFailed(): bool
+    {
+        return $this->stdoutReadFailed;
+    }
+
+    /** True when the stdout read end was observed at EOF (all writers closed). Internal poll helper. */
+    private function stdoutEofWasSeen(): bool
+    {
+        return $this->stdoutEofObserved;
+    }
+
+    /** Live EOF probe: feof() returns true only after an actual read hit end-of-file. */
+    private function stdoutReachedEof(): bool
+    {
+        if (!isset($this->pipes[1]) || !is_resource($this->pipes[1])) {
+            return $this->stdoutEofObserved; // pipes gone: only the sticky observation counts
+        }
+
+        return feof($this->pipes[1]);
+    }
 
     /**
      * Bounded termination, always reaping or refusing loudly:
