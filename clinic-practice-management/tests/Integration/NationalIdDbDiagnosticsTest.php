@@ -992,12 +992,13 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
         self::assertIsString($captured, 'real production SQL was captured');
 
         $production_sql = (string) $captured;
+        $term_pattern   = "/'([^']*049[^']*937[^']*0899[^']*)'/";
         self::assertMatchesRegularExpression(
-            "/'([^']*{$digits}[^']*)'/",
+            $term_pattern,
             $production_sql,
             'emitted SQL contains the real escaped LIKE term'
         );
-        preg_match("/'([^']*{$digits}[^']*)'/", $production_sql, $matches);
+        preg_match($term_pattern, $production_sql, $matches);
         $escaped = (string) ($matches[1] ?? '');
         self::assertStringContainsString('049\\\\%937\\\\%0899', $escaped, 'double-backslash escaped spelling from real SQL');
 
