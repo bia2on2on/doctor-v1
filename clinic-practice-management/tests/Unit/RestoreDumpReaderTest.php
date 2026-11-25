@@ -420,7 +420,8 @@ final class RestoreDumpReaderTest extends TestCase
     /** RB-49: a pass abandoned mid-way never reports a digest, so it can never be read as completed. */
     public function testAnAbandonedPassReportsNoDigest(): void
     {
-        $dump = "INSERT INTO `cpms_patients` (`id`) VALUES (1);\nINSERT INTO `cpms_patients` (`id`) VALUES (2);\n";
+        $dump = "-- ---- table: cpms_patients ----\nINSERT INTO `cpms_patients` (`id`) VALUES (1);\n"
+            . "INSERT INTO `cpms_patients` (`id`) VALUES (2);\n";
         self::assertTrue(file_put_contents($this->file, $dump) > 0);
 
         $reader  = new RestoreDumpReader($this->file);

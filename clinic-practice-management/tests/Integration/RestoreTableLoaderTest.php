@@ -542,7 +542,8 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         }
 
         self::assertSame(1, RestoreDumpTamperingStream::$tampered, 'exactly one parsing open is tampered');
-        self::assertGreaterThanOrEqual(1, RestoreDumpTamperingStream::$parses, 'a parsing open really happened');
+        self::assertSame(1, RestoreDumpTamperingStream::$tampered_parse, 'the SECOND parsing pass is the tampered one');
+        self::assertGreaterThan(1, RestoreDumpTamperingStream::$parses, 'the load really reached a later parsing pass');
         self::assertSame('RESTORE_DUMP_CHANGED', $failure, 'the changed pass is refused');
         self::assertSame('The dump changed while it was being read.', $message, 'the refusal comes from the PASS digest gate');
         foreach (['cpms_clinics', 'cpms_organizations', 'cpms_patients', 'cpms_patient_logins'] as $short) {
@@ -593,6 +594,7 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         }
 
         self::assertSame(1, RestoreDumpTamperingStream::$tampered, 'exactly one earlier pass is tampered');
+        self::assertSame(0, RestoreDumpTamperingStream::$tampered_parse, 'it is the FIRST table pass, not the last');
         self::assertSame('RESTORE_DUMP_CHANGED', $failure, 'an earlier changed pass is refused too');
         self::assertSame('The dump changed while it was being read.', $message, 'the per-pass gate is what refuses');
         foreach (['cpms_clinics', 'cpms_organizations', 'cpms_patients', 'cpms_patient_logins'] as $short) {
@@ -629,6 +631,7 @@ final class RestoreTableLoaderTest extends WP_UnitTestCase {
         }
 
         self::assertSame(1, RestoreDumpTamperingStream::$tampered, 'exactly one parsing open is cut');
+        self::assertSame(0, RestoreDumpTamperingStream::$tampered_parse, 'it is the FIRST table pass');
         self::assertLessThan($file_size, RestoreDumpTamperingStream::$tampered_bytes, 'the wrapper really served fewer bytes than the file holds');
         self::assertSame('RESTORE_DUMP_CHANGED', $failure, 'an orderly short read is still a different dump');
         self::assertSame('The dump changed while it was being read.', $message, 'the PASS digest gate refuses, not a path or syntax gate');
@@ -1110,6 +1113,8 @@ final class RestoreDumpTamperingStream {
     public static int $parses         = 0;
     public static int $tampered       = 0;
     public static int $tampered_open  = -1;
+    /** Which PARSING pass (0-based) was tampered at, so a test can pin it exactly. */
+    public static int $tampered_parse = -1;
     public static int $served         = 0;
 
     /** Static: PHP may build a NEW wrapper object per stream operation, so arming cannot be per instance. */
@@ -1125,6 +1130,7 @@ final class RestoreDumpTamperingStream {
         self::$parses         = 0;
         self::$tampered       = 0;
         self::$tampered_open  = -1;
+        self::$tampered_parse = -1;
         self::$tampered_bytes = 0;
         self::$served         = 0;
         self::$armed          = 0;
@@ -1156,7 +1162,8 @@ final class RestoreDumpTamperingStream {
         $bytes = (string) file_get_contents(self::$path);
         if ($is_parse && self::$parses - 1 === self::$target_parse && 'clean' !== self::$mode) {
             ++self::$tampered;
-            self::$tampered_open = $index;
+            self::$tampered_open  = $index;
+            self::$tampered_parse = self::$parses - 1;
             if ('comment' === self::$mode) {
                 // The leading newline makes the comment's prefix blank, which is what the reader
                 // accepts; without it the refusal would be RESTORE_DUMP_UNSUPPORTED_STATEMENT.

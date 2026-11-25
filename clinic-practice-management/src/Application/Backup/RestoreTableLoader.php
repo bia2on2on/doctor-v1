@@ -35,10 +35,13 @@ final class RestoreTableLoader {
     public function preflight( RestoreDumpReader $reader, ?string $expected_version = null ): array {
         $digest      = $reader->digest();
         $dump_tables = $reader->tables();
+
+        // The tables() pass is complete now; a dump that changed under it is refused before any write.
         $this->assert_completed_pass_digest( $reader, $digest );
-        $columns     = [];
-        $rows        = [];
-        $source      = '';
+
+        $columns = [];
+        $rows    = [];
+        $source  = '';
         foreach ( $reader->inserts() as $batch ) {
             $table = $batch['table'];
             if ( ! in_array( $table, $dump_tables, true ) ) {
@@ -57,6 +60,7 @@ final class RestoreTableLoader {
             }
             $columns[ $table ] = $batch['columns'];
         }
+        // ... and so is the inserts() pass. Failing here still precedes the first write.
         $this->assert_completed_pass_digest( $reader, $digest );
 
         return [
