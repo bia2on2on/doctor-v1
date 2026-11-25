@@ -672,40 +672,28 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
 
     // ------------------------------------------------------- ROUND 3C additions
 
-    /** @return array<string, array{label: string, spelling: string, digits: string}> */
+    /** @return array<string, array{0: string, 1: string, 2: string}> */
     public static function acceptedNidSpellings(): array
     {
         $digits = '0499370899';
 
         return [
-            'tab filler' => ['label' => 'tab filler', 'spelling' => "049\t937\t0899", 'digits' => $digits],
-            'underscore filler' => ['label' => 'underscore filler', 'spelling' => '049_937_0899', 'digits' => $digits],
-            'comma filler' => ['label' => 'comma filler', 'spelling' => '049,937,0899', 'digits' => $digits],
-            'letter filler' => ['label' => 'letter filler', 'spelling' => '049abc937xyz0899', 'digits' => $digits],
-            'Persian digit filler' => [
-                'label' => 'Persian digit filler',
-                'spelling' => "049\u{06F1}937\u{06F2}0899",
-                'digits' => $digits,
-            ],
-            'Arabic-Indic digit filler' => [
-                'label' => 'Arabic-Indic digit filler',
-                'spelling' => "049\u{0661}937\u{0662}0899",
-                'digits' => $digits,
-            ],
-            'ZWNJ filler' => [
-                'label' => 'ZWNJ filler',
-                'spelling' => "049\u{200C}937\u{200C}0899",
-                'digits' => $digits,
-            ],
+            'tab filler' => ['tab filler', "049\t937\t0899", $digits],
+            'underscore filler' => ['underscore filler', '049_937_0899', $digits],
+            'comma filler' => ['comma filler', '049,937,0899', $digits],
+            'letter filler' => ['letter filler', '049abc937xyz0899', $digits],
+            'Persian digit filler' => ['Persian digit filler', "049\u{06F1}937\u{06F2}0899", $digits],
+            'Arabic-Indic digit filler' => ['Arabic-Indic digit filler', "049\u{0661}937\u{0662}0899", $digits],
+            'ZWNJ filler' => ['ZWNJ filler', "049\u{200C}937\u{200C}0899", $digits],
         ];
     }
 
     /** @dataProvider acceptedNidSpellings */
-    public function testAcceptedNidSpellingDuplicateErrorIsValueFree(array $case): void
+    public function testAcceptedNidSpellingDuplicateErrorIsValueFree(string $label, string $spelling, string $digits): void
     {
-        $line = $this->runDuplicateSpellingCase((string) $case['spelling'], (string) $case['digits']);
+        $line = $this->runDuplicateSpellingCase($spelling, $digits);
 
-        self::assertStringStartsWith('[cpms-nid-db] failed guarded query', $line, $case['label']);
+        self::assertStringStartsWith('[cpms-nid-db] failed guarded query', $line, $label);
     }
 
     /** R3c — the single redacted log line keeps useful value-free context. */
