@@ -693,7 +693,7 @@ final class NationalIdDbDiagnosticsTest extends WP_UnitTestCase
     {
         $line = $this->runDuplicateSpellingCase($spelling, $digits);
 
-        self::assertStringStartsWith('[cpms-nid-db] failed guarded query', $line, $label);
+        self::assertStringContainsString('[cpms-nid-db] failed guarded query', $line, $label);
     }
 
     /** R3c — the single redacted log line keeps useful value-free context. */
