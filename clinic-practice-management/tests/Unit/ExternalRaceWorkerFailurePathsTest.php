@@ -39,26 +39,30 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
     protected function tearDown(): void
     {
         $errors = [];
-        foreach ($this->workers as $worker) {
-            // Each worker gets its own try/finally so one throwing
-            // terminate() cannot skip the remaining workers nor the unlink
-            // of the temp scripts; exceptions are collected and rethrown
-            // AFTER full cleanup — never swallowed.
-            try {
-                $worker->terminate();
-            } catch (\Throwable $exception) {
-                $errors[] = get_class($exception) . ': ' . $exception->getMessage();
+        try {
+            foreach ($this->workers as $worker) {
+                // Each worker gets its own try/catch so one throwing
+                // terminate() cannot skip the remaining workers.
+                try {
+                    $worker->terminate();
+                } catch (\Throwable $exception) {
+                    $errors[] = get_class($exception) . ': ' . $exception->getMessage();
+                }
             }
+        } finally {
+            // Unlinks and parent::tearDown() run even if terminate() blew up
+            // catastrophically — and unlink failures are NOT a new failure condition.
+            $this->workers = [];
+            foreach ($this->temporaryFiles as $file) {
+                @unlink($file);
+            }
+            $this->temporaryFiles = [];
+            parent::tearDown();
         }
-        $this->workers = [];
-        foreach ($this->temporaryFiles as $file) {
-            @unlink($file);
-        }
-        $this->temporaryFiles = [];
+        // Aggregated exceptions are rethrown AFTER full cleanup — never swallowed.
         if ($errors !== []) {
             throw new \RuntimeException('tearDown could not terminate all registered workers: ' . implode(' | ', $errors));
         }
-        parent::tearDown();
     }
 
     /**
@@ -204,38 +208,97 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
     }
 
     /**
-     * FIX 1: a descendant that INHERITS the worker's stdout (proc_open with
-     * the STDOUT resource as descriptor spec) outlives the direct worker and
-     * writes later. The drain must either capture the late line or return
-     * complete=false — NEVER complete=true with the late line lost. The
-     * descendant is bounded: it exits by itself right after writing, and is
-     * never left running after the test.
+     * ROUND8 ITEM A (requested ORDER): the descendant is alive (pid signal)
+     * and blocked on a gate file. The direct worker has ALREADY exited and
+     * that exit is CONFIRMED via waitForConfirmedExit() BEFORE the drain
+     * runs. The drain must NOT report complete — the pipe is still held
+     * open by the descendant and EOF is unobservable; and on the current
+     * code the read end is torn down at confirmed exit anyway, which makes
+     * completeness unknowable rather than true. These assertions encode the
+     * OBSERVED behavior of the head (LIMITATION, see the round-8 log and
+     * report) — they are NOT the desired end state. Gate release then proves
+     * the descendant ends boundedly (bounded poll). The descendant can never
+     * live forever: pid-signalled readiness, 30s self-timeout in-script,
+     * TERM→KILL cleanup in finally.
      */
-    public function testDrainNeverCompletesTrueWithALateLineLostFromADescendant(): void
+    public function testDrainAfterConfirmedExitDoesNotClaimEofWhileDescendantHoldsStdout(): void
     {
-        $grandchild = $this->temporaryScript(
-            "<?php\nusleep(300000);\nfwrite(STDOUT, \"LATE:line\n\");\nexit(0);\n"
-        );
-        $workerScript = $this->temporaryScript(
-            "<?php\n\$g = " . var_export($grandchild, true) . ";\n\$descriptors = [0 => ['pipe', 'r'], 1 => STDOUT, 2 => STDOUT];\n\$process = @proc_open([PHP_BINARY, \$g], \$descriptors, \$pipes);\nexit(is_resource(\$process) ? 0 : 7);\n"
-        );
+        ['workerScript' => $workerScript, 'pidFile' => $pidFile, 'gateFile' => $gateFile] = $this->descendantFixture();
         $worker = $this->launchWorker($workerScript);
+        $descendantPid = null;
 
         try {
-            // No waitForExit() first: drainRemainingLines() does its own
-            // bounded wait and never closes the pipes, so EOF stays observable.
-            $drain = $worker->drainRemainingLines(3.0);
-            if ($drain['complete']) {
-                self::assertContains(
-                    'LATE:line',
-                    $drain['lines'],
-                    'complete=true implies stdout reached EOF with every writer closed — the late line MUST have been captured, never lost'
-                );
-            }
-            // complete=false is the fail-closed outcome and is also valid;
-            // the forbidden state is only (complete=true && line missing).
-            self::assertSame(0, $worker->waitForExit(5.0), 'the direct worker must exit 0 — exit 7 means the STDOUT resource descriptor spec is unsupported on this PHP build');
+            $descendantPid = $this->waitForDescendantPid($pidFile, 10.0);
+            self::assertNotNull($descendantPid, 'the descendant must signal readiness by writing its pid within the bounded window (proxy assertion)');
+            self::assertTrue($worker->waitForConfirmedExit(5.0), 'the direct worker exit must be CONFIRMED before the drain runs');
+
+            $drain = $worker->drainRemainingLines(0.5);
+            self::assertFalse($drain['complete'], 'the descendant still holds stdout: EOF is not observable — complete must be false');
+            self::assertSame([], $drain['lines'], 'no line may arrive while the descendant is blocked on the gate');
+            self::assertNull($drain['trailing'], 'no trailing bytes may exist without an arrival');
+            self::assertFalse($this->descendantExited($descendantPid, 0.2), 'the descendant must still be alive while the gate is held');
+
+            touch($gateFile);
+
+            $drainAfter = $worker->drainRemainingLines(5.0);
+            // LIMITATION (see round-8 log): waitForConfirmedExit() closes the
+            // stdout read end, so no later drain can EVER observe EOF or
+            // receive the late line on the current code. This assertion
+            // encodes exactly that — it will become assertTrue + received
+            // once the owner decides how the read end survives confirmed exit.
+            self::assertFalse($drainAfter['complete'], 'LIMITATION: pipes torn down at confirmed exit — completeness is unknowable afterwards (false by design today)');
+            self::assertNotContains('LATE:line', $drainAfter['lines'], 'LIMITATION: the late line is unreceivable after the read end is torn down — asserts the observed limitation, not the desired contract');
+            self::assertTrue($this->descendantExited($descendantPid, 5.0), 'after the gate is released the descendant must exit within the bounded window');
         } finally {
+            if (!is_file($gateFile)) {
+                @touch($gateFile); // let the descendant end even on failure
+            }
+            $this->shutdownDescendant($descendantPid);
+            $worker->terminate();
+        }
+    }
+
+    /**
+     * ROUND8 ITEM A (the OTHER order — EOF semantics proof): the drain runs
+     * WITHOUT calling waitForConfirmedExit() first, so the stdout read end
+     * stays OPEN and EOF is observable. While the descendant is blocked on
+     * the gate: complete MUST be false. After the gate is released the
+     * descendant writes its line and exits — the pipe then reaches EOF and
+     * the drain MUST return complete=true with the LATE line received
+     * EXACTLY once (newline-terminated, not the trailing fragment). Complete
+     * may become true ONLY after real feof. NOTE: this deliberately does NOT
+     * use the waitForConfirmedExit-first order of the other test (that
+     * ordering closes the read end; see round-8 log and report).
+     */
+    public function testDrainAfterGateReleaseCapturesLateLineExactlyOnce(): void
+    {
+        ['workerScript' => $workerScript, 'pidFile' => $pidFile, 'gateFile' => $gateFile] = $this->descendantFixture();
+        $worker = $this->launchWorker($workerScript);
+        $descendantPid = null;
+
+        try {
+            $descendantPid = $this->waitForDescendantPid($pidFile, 10.0);
+            self::assertNotNull($descendantPid, 'the descendant must signal readiness by writing its pid within the bounded window (proxy assertion)');
+
+            $drainBlocked = $worker->drainRemainingLines(2.0);
+            self::assertFalse($drainBlocked['complete'], 'the descendant holds the pipe and is blocked on the gate: EOF must not be observable');
+            self::assertSame([], $drainBlocked['lines'], 'no line may arrive before the gate is released');
+            self::assertNull($drainBlocked['trailing'], 'no trailing bytes may exist without an arrival');
+
+            touch($gateFile);
+
+            $drain = $worker->drainRemainingLines(5.0);
+            self::assertTrue($drain['complete'], 'once the gate is released the descendant writes and exits — the pipe reaches EOF and complete MUST be true');
+            self::assertSame(['LATE:line'], $drain['lines'], 'the late line must be received EXACTLY ONCE');
+            self::assertNull($drain['trailing'], 'a newline-terminated line is not the trailing fragment');
+            self::assertTrue($worker->waitForConfirmedExit(5.0), 'the direct worker exit must be observable afterwards');
+            self::assertSame(0, $worker->waitForExit(1.0), 'the direct worker exits 0 — exit 7 means the STDOUT resource descriptor spec is unsupported on this PHP build');
+            self::assertTrue($this->descendantExited($descendantPid, 5.0), 'the descendant must have exited once its line was written');
+        } finally {
+            if (!is_file($gateFile)) {
+                @touch($gateFile); // let the descendant end even on failure
+            }
+            $this->shutdownDescendant($descendantPid);
             $worker->terminate();
         }
     }
@@ -307,20 +370,48 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
     }
 
     /**
-     * ROUND7 FIX 2(d): the cache-once contract — a decisive running=false
-     * first, then a later raw running=true, must NOT rewrite the cached
-     * final status. (The code already guarantees cache-once; asserted.)
+     * ROUND8 ITEM B (mechanics, matching the real code): the constructor
+     * consumes raw read #1 and caches the first decisive exit (running=false,
+     * exit code 137). Afterwards: isRunning() short-circuits on the cache
+     * WITHOUT another raw read (counter must NOT grow); isConfirmedRunning()
+     * performs a FRESH raw read (no cache short-circuit) — the counter grows
+     * by EXACTLY one and the result reflects the injected raw array; the
+     * cached snapshot NEVER changes.
      */
     public function testCachedExitIsNotOverwrittenByALaterAliveRead(): void
     {
         $worker = $this->launchDoubtWorker('exitThenAlive');
         try {
+            self::assertSame(1, $worker->rawReadCount(), 'the constructor consumes exactly ONE raw read (decisive 137)');
             self::assertFalse($worker->isRunning(), 'a decisive valid exit read caches not-running');
+            self::assertSame(1, $worker->rawReadCount(), 'isRunning() short-circuits on the cached final status — the raw counter must NOT grow');
             $snapshot = $worker->finalStatus();
             self::assertIsArray($snapshot);
             self::assertSame(137, $snapshot['exitCode']);
-            $worker->isConfirmedRunning(); // raw read #2 claims alive; the cache may not change
+            self::assertTrue($worker->isConfirmedRunning(), 'isConfirmedRunning() performs a FRESH raw read (no cache short-circuit) — the injected running=true satisfies the strict check');
+            self::assertSame(2, $worker->rawReadCount(), 'isConfirmedRunning() grew the raw counter by EXACTLY one');
             self::assertSame($snapshot, $worker->finalStatus(), 'a later alive raw read must NOT rewrite the cached final status');
+        } finally {
+            $worker->terminate();
+            self::assertFalse($worker->wasNotReaped());
+        }
+    }
+
+    /**
+     * ROUND8 ITEM B, second case: a LATER raw status running=false with a
+     * DIFFERENT exit code (42) must NOT overwrite the cached exit code (137).
+     */
+    public function testCachedExitIsNotOverwrittenByALaterDifferentExitCode(): void
+    {
+        $worker = $this->launchDoubtWorker('exitThenDifferentExit');
+        try {
+            self::assertSame(1, $worker->rawReadCount(), 'the constructor consumes exactly ONE raw read (decisive 137)');
+            $snapshot = $worker->finalStatus();
+            self::assertIsArray($snapshot);
+            self::assertSame(137, $snapshot['exitCode'], 'the first decisive read is cached — 137');
+            self::assertFalse($worker->isConfirmedRunning(), 'the second raw read reports a valid exit (42); the strict alive check is false');
+            self::assertSame(2, $worker->rawReadCount(), 'the raw counter grew by EXACTLY one');
+            self::assertSame(137, $worker->finalStatus()['exitCode'], 'the DIFFERENT later exit code (42) must NOT overwrite the cached exit code (137)');
         } finally {
             $worker->terminate();
             self::assertFalse($worker->wasNotReaped());
@@ -334,6 +425,115 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
         $this->workers[] = $worker;
 
         return $worker;
+    }
+
+    /**
+     * Descendant fixture (ROUND8 ITEM A): the worker script spawns a
+     * bounded descendant that INHERITS the worker's STDOUT (proc_open with
+     * the STDOUT resource as descriptor spec), then exits 0. The descendant
+     * signals readiness by writing its pid to a pid file and refuses to write
+     * its late line until a gate file exists — no fixed sleep as
+     * synchronization. BOTH paths are pre-registered in temporaryFiles (the
+     * tearDown unlinks them; the gate may legitimately not exist yet), and
+     * the scripts are bounded (pid self-timeout 30s).
+     *
+     * @return array{workerScript: string, pidFile: string, gateFile: string}
+     */
+    private function descendantFixture(): array
+    {
+        $rand = bin2hex(random_bytes(8));
+        $pidFile = sys_get_temp_dir() . '/cpms-ext-worker-' . $rand . '.pid';
+        $gateFile = sys_get_temp_dir() . '/cpms-ext-worker-' . $rand . '.gate';
+        $this->temporaryFiles[] = $pidFile;
+        $this->temporaryFiles[] = $gateFile;
+
+        $grandchild = $this->temporaryScript(
+            "<?php\n" .
+            "\$pidFile = " . var_export($pidFile, true) . ";\n" .
+            "\$gateFile = " . var_export($gateFile, true) . ";\n" .
+            "file_put_contents(\$pidFile, (string) getmypid());\n" .
+            "\$deadline = microtime(true) + 30.0; // bounded self-timeout: never lives forever\n" .
+            "while (!is_file(\$gateFile) && microtime(true) < \$deadline) {\n" .
+            "    usleep(20000);\n" .
+            "}\n" .
+            "if (!is_file(\$gateFile)) {\n" .
+            "    exit(8);\n" .
+            "}\n" .
+            "fwrite(STDOUT, \"LATE:line\n\");\n" .
+            "exit(0);\n"
+        );
+        $workerScript = $this->temporaryScript(
+            "<?php\n" .
+            "\$descriptors = [0 => ['pipe', 'r'], 1 => STDOUT, 2 => STDOUT];\n" .
+            "\$process = @proc_open([PHP_BINARY, " . var_export($grandchild, true) . "], \$descriptors, \$pipes);\n" .
+            "exit(is_resource(\$process) ? 0 : 7);\n"
+        );
+
+        return ['workerScript' => $workerScript, 'pidFile' => $pidFile, 'gateFile' => $gateFile];
+    }
+
+    /**
+     * Bounded poll for the descendant's readiness signal (the pid file).
+     * Proxy assertion (subject to runner load); the descendant itself is
+     * bounded by its own 30s self-timeout.
+     */
+    private function waitForDescendantPid(string $pidFile, float $timeoutSeconds): ?int
+    {
+        $deadline = microtime(true) + $timeoutSeconds;
+        while (microtime(true) < $deadline) {
+            if (is_file($pidFile)) {
+                $raw = trim((string) file_get_contents($pidFile));
+                if (ctype_digit($raw) && (int) $raw > 0) {
+                    return (int) $raw;
+                }
+            }
+            usleep(10000);
+        }
+
+        return null;
+    }
+
+    /**
+     * Bounded poll until the descendant pid is gone. On Linux, a missing
+     * posix_kill turns into a loud false (the assert fails), never a skip.
+     */
+    private function descendantExited(int $pid, float $timeoutSeconds): bool
+    {
+        if (!function_exists('posix_kill')) {
+            return false;
+        }
+        $deadline = microtime(true) + $timeoutSeconds;
+        while (microtime(true) < $deadline) {
+            if (!@posix_kill($pid, 0)) {
+                return true;
+            }
+            usleep(20000);
+        }
+
+        return false;
+    }
+
+    /**
+     * Best-effort descendant cleanup: TERM, bounded poll, then KILL. Always
+     * bounded; never throws (cleanup must not mask a test failure).
+     */
+    private function shutdownDescendant(?int $pid): void
+    {
+        if ($pid === null || !function_exists('posix_kill')) {
+            return;
+        }
+        if (!@posix_kill($pid, 0)) {
+            return; // already gone
+        }
+        @posix_kill($pid, 15); // SIGTERM — numeric POSIX constant, stable on Linux
+        $deadline = microtime(true) + 2.0;
+        while (microtime(true) < $deadline) {
+            if (!@posix_kill($pid, 0)) {
+                return;
+            }
+            usleep(20000);
+        }
+        @posix_kill($pid, 9); // SIGKILL — numeric POSIX constant, stable on Linux
     }
 
     /**
@@ -409,9 +609,17 @@ final class MissingRunningWorker extends ExternalRaceWorker
 
     public const SHAPE_EXIT_THEN_ALIVE = 'exitThenAlive';
 
+    public const SHAPE_EXIT_THEN_DIFFERENT_EXIT = 'exitThenDifferentExit';
+
     private string $shape;
 
     private int $rawReads = 0;
+
+    /** Raw-read counter for assertions on the real read-path mechanics. */
+    public function rawReadCount(): int
+    {
+        return $this->rawReads;
+    }
 
     public function __construct(string $script, string $shape)
     {
@@ -443,11 +651,20 @@ final class MissingRunningWorker extends ExternalRaceWorker
 
             return ['pid' => 4242, 'running' => false, 'signaled' => false, 'stopped' => false, 'exitcode' => 0]; // valid exit
         }
-        // SHAPE_EXIT_THEN_ALIVE: decisive first read, then a later alive claim.
+        if ($this->shape === self::SHAPE_EXIT_THEN_ALIVE) {
+            // SHAPE_EXIT_THEN_ALIVE: decisive first read, then a later alive claim.
+            if ($this->rawReads === 1) {
+                return ['pid' => 4242, 'running' => false, 'signaled' => false, 'stopped' => false, 'exitcode' => 137];
+            }
+
+            return ['pid' => 4242, 'running' => true, 'signaled' => false, 'stopped' => false, 'exitcode' => 0];
+        }
+        // SHAPE_EXIT_THEN_DIFFERENT_EXIT: decisive first read (137), then a
+        // later VALID exit with a DIFFERENT code (42) — must not overwrite.
         if ($this->rawReads === 1) {
             return ['pid' => 4242, 'running' => false, 'signaled' => false, 'stopped' => false, 'exitcode' => 137];
         }
 
-        return ['pid' => 4242, 'running' => true, 'signaled' => false, 'stopped' => false, 'exitcode' => 0];
+        return ['pid' => 4242, 'running' => false, 'signaled' => false, 'stopped' => false, 'exitcode' => 42];
     }
 }
