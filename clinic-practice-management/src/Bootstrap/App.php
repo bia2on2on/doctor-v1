@@ -2044,7 +2044,8 @@ final class App
                 self::op(),
                 self::smsService(),
                 self::jobs(),
-                self::patient_session_scope()
+                self::patient_session_scope(),
+                new PatientNidHmac()
             );
             $deps = $current_deps;
         }

@@ -9,6 +9,7 @@ use ClinicCore\Application\Clinical\ClinicalException;
 use ClinicCore\Application\Clinical\MedicalFileService;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use WP_Error;
 use WP_REST_Request;
@@ -141,7 +142,7 @@ final class FilesController extends RestBase
         } catch (ClinicalException $e) {
             return $this->error($e->errorCode, $e->httpStatus, $e->getMessage(), $e->data);
         } catch (\Throwable $e) {
-            error_log('[CPMS][FilesController] unexpected: ' . get_class($e) . ': ' . $e->getMessage());
+            error_log( '[CPMS][FilesController] unexpected: ' . get_class( $e ) . ': ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention; the argument is exception text with the NID digit runs already masked.
 
             return $this->error('CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور — لطفاً دوباره تلاش کنید');
         }
@@ -355,7 +356,7 @@ final class FilesController extends RestBase
         } catch (ClinicalException $e) {
             return $this->error($e->errorCode, $e->httpStatus, $e->getMessage(), $e->data);
         } catch (\Throwable $e) {
-            error_log('[CPMS][FilesController] unexpected: ' . get_class($e) . ': ' . $e->getMessage());
+            error_log( '[CPMS][FilesController] unexpected: ' . get_class( $e ) . ': ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention; the argument is exception text with the NID digit runs already masked.
 
             return $this->error('CLINIC_INTERNAL_ERROR', 500, 'خطای داخلی سرور — لطفاً دوباره تلاش کنید');
         }
