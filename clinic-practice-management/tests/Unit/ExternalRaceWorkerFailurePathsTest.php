@@ -227,9 +227,10 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
      */
     public function testDrainAfterConfirmedExitDoesNotClaimEofWhileDescendantHoldsStdout(): void
     {
-        ['workerScript' => $workerScript, 'pidFile' => $pidFile, 'gateFile' => $gateFile] = $this->descendantFixture();
+        ['workerScript' => $workerScript, 'pidFile' => $pidFile, 'gateFile' => $gateFile, 'token' => $token] = $this->descendantFixture();
         $worker = $this->launchWorker($workerScript);
         $descendantPid = null;
+        $descendantGone = false;
 
         try {
             $descendantPid = $this->waitForDescendantPid($pidFile, 10.0);
@@ -246,7 +247,7 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             self::assertFalse($drain['complete'], 'the descendant still holds stdout: EOF is not observable — complete must be false');
             self::assertSame([], $drain['lines'], 'no line may arrive while the descendant is blocked on the gate');
             self::assertNull($drain['trailing'], 'no trailing bytes may exist without an arrival');
-            self::assertFalse($this->descendantExited($descendantPid, 0.2), 'the descendant must still be alive while the gate is held');
+            self::assertFalse($this->descendantExited($descendantPid, 0.2, $token), 'the descendant must still be alive while the gate is held');
 
             touch($gateFile);
 
@@ -254,12 +255,15 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             self::assertTrue($drainAfter['complete'], 'once the gate is released the descendant writes and exits — the pipe reaches EOF and complete MUST be true');
             self::assertSame(['LATE:line'], $drainAfter['lines'], 'the late line must be received EXACTLY ONCE');
             self::assertNull($drainAfter['trailing'], 'a newline-terminated line is not the trailing fragment');
-            self::assertTrue($this->descendantExited($descendantPid, 5.0), 'after the gate is released the descendant must exit within the bounded window');
+            self::assertTrue($this->descendantExited($descendantPid, 5.0, $token), 'after the gate is released the descendant must exit within the bounded window');
+            $descendantGone = true; // OBSERVED gone: the PID must never be signalled again
         } finally {
             if (!is_file($gateFile)) {
                 @touch($gateFile); // let the descendant end even on failure
             }
-            $this->shutdownDescendant($descendantPid);
+            if (!$descendantGone) {
+                $this->shutdownDescendant($descendantPid, $token);
+            }
             $worker->terminate();
         }
     }
@@ -282,9 +286,10 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
      */
     public function testDrainAfterGateReleaseCapturesLateLineExactlyOnce(): void
     {
-        ['workerScript' => $workerScript, 'pidFile' => $pidFile, 'gateFile' => $gateFile] = $this->descendantFixture();
+        ['workerScript' => $workerScript, 'pidFile' => $pidFile, 'gateFile' => $gateFile, 'token' => $token] = $this->descendantFixture();
         $worker = $this->launchWorker($workerScript);
         $descendantPid = null;
+        $descendantGone = false;
 
         try {
             $descendantPid = $this->waitForDescendantPid($pidFile, 10.0);
@@ -303,14 +308,120 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             self::assertNull($drain['trailing'], 'a newline-terminated line is not the trailing fragment');
             self::assertTrue($worker->waitForConfirmedExit(5.0), 'the direct worker exit must be observable afterwards');
             self::assertSame(0, $worker->waitForExit(1.0), 'the direct worker exits 0 — exit 7 means the STDOUT resource descriptor spec is unsupported on this PHP build');
-            self::assertTrue($this->descendantExited($descendantPid, 5.0), 'the descendant must have exited once its line was written');
+            self::assertTrue($this->descendantExited($descendantPid, 5.0, $token), 'the descendant must have exited once its line was written');
+            $descendantGone = true; // OBSERVED gone: the PID must never be signalled again
         } finally {
             if (!is_file($gateFile)) {
                 @touch($gateFile); // let the descendant end even on failure
             }
-            $this->shutdownDescendant($descendantPid);
+            if (!$descendantGone) {
+                $this->shutdownDescendant($descendantPid, $token);
+            }
             $worker->terminate();
         }
+    }
+
+    /**
+     * ITEM A (ROUND10-FIX): the PID-reuse guard must REFUSE to signal a
+     * PID whose /proc/<pid>/cmdline does NOT carry this run's unique
+     * token — a plain `php -r 'sleep(30);'` starts without the token; the
+     * guard must refuse both TERM and KILL (returns false, and the child is
+     * still alive afterwards). The same-shaped child started WITH the token
+     * IS signalled (PHP CLI keeps extra arguments in argv verbatim, so the
+     * token appears in /proc/<pid>/cmdline). Each assertion proves which
+     * gate refused/allowed. The PHPUnit process's own PID is never passed to
+     * any signal helper; the children are cleaned up in finally (TERM,
+     * bounded poll, KILL, proc_close).
+     */
+    public function testGuardedDescendantSignalRefusesUnrelatedProcess(): void
+    {
+        if (!function_exists('posix_kill')) {
+            self::fail('ext-posix (posix_kill) is required on Linux CI runners to verify the PID-reuse guard for the descendant fixture.');
+        }
+        if (!is_readable('/proc/self/cmdline')) {
+            self::fail('/proc is unreadable on this Linux CI runner; the PID-reuse guard cannot be verified.');
+        }
+
+        $token = 'cpms-descendant-token=' . bin2hex(random_bytes(8));
+
+        $unrelated = $this->startHarmlessSleepChild([]);
+        $carrier = $this->startHarmlessSleepChild([$token]);
+        /** @var list<array{process: resource, pid: int}> $children */
+        $children = [$unrelated, $carrier];
+
+        try {
+            self::assertNotSame(0, $unrelated['pid'], 'the unrelated child must be a real process');
+            self::assertNotSame(0, $carrier['pid'], 'the token-carrying child must be a real process');
+
+            self::assertFalse($this->signalDescendant($unrelated['pid'], 15, $token), 'the guard must REFUSE to TERM a process without the token');
+            self::assertFalse($this->signalDescendant($unrelated['pid'], 9, $token), 'the guard must REFUSE the KILL step too');
+            self::assertTrue(@posix_kill($unrelated['pid'], 0), 'the unrelated child must STILL be alive — the guard sent nothing (signal 0 probe after refusal)');
+
+            self::assertTrue($this->signalDescendant($carrier['pid'], 15, $token), 'the guard must ALLOW the TERM for a process carrying the token');
+            $deadline = microtime(true) + 5.0;
+            $carrierGone = false;
+            while (microtime(true) < $deadline) {
+                if (!@posix_kill($carrier['pid'], 0)) {
+                    $carrierGone = true;
+                    break;
+                }
+                usleep(20000);
+            }
+            self::assertTrue($carrierGone, 'the token-carrying child must have died after the allowed TERM (bounded poll)');
+        } finally {
+            foreach ($children as $child) {
+                if (!is_resource($child['process'])) {
+                    continue;
+                }
+                if ($child['pid'] > 1 && @posix_kill($child['pid'], 0)) {
+                    @posix_kill($child['pid'], 15); // direct cleanup of our own harmless child: TERM first
+                    $deadline = microtime(true) + 2.0;
+                    while (microtime(true) < $deadline && @posix_kill($child['pid'], 0)) {
+                        usleep(20000);
+                    }
+                    if (@posix_kill($child['pid'], 0)) {
+                        @posix_kill($child['pid'], 9); // then KILL if it ignored TERM
+                        $deadline = microtime(true) + 2.0;
+                        while (microtime(true) < $deadline && @posix_kill($child['pid'], 0)) {
+                            usleep(10000);
+                        }
+                    }
+                }
+                @proc_close($child['process']);
+            }
+        }
+    }
+
+    /**
+     * Start a harmless child for the PID-reuse guard test: a bare
+     * `php -r 'sleep(30);'` that accepts an optional trailing token argument
+     * (PHP CLI keeps extra arguments in argv verbatim, so the token appears
+     * in /proc/<pid>/cmdline when passed). A failed launch fails the test
+     * loudly. Returns the raw process resource and the OS pid (0 when
+     * unreadable).
+     *
+     * @param list<string> $extraArgs
+     * @return array{process: resource, pid: int}
+     */
+    private function startHarmlessSleepChild(array $extraArgs): array
+    {
+        $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        $process = @proc_open(array_merge([PHP_BINARY, '-r', 'sleep(30);'], $extraArgs), $descriptors, $pipes);
+        if (!is_resource($process)) {
+            self::fail('could not launch the harmless sleep fixture for the PID-reuse guard test');
+        }
+        $pid = 0;
+        $status = @proc_get_status($process);
+        if (is_array($status) && isset($status['pid']) && is_int($status['pid']) && $status['pid'] > 0) {
+            $pid = (int) $status['pid'];
+        }
+        foreach ($pipes as $pipe) {
+            if (is_resource($pipe)) {
+                fclose($pipe);
+            }
+        }
+
+        return ['process' => $process, 'pid' => $pid];
     }
 
     /**
@@ -438,22 +549,29 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
     }
 
     /**
-     * Descendant fixture (ROUND8 ITEM A): the worker script spawns a
-     * bounded descendant that INHERITS the worker's STDOUT (proc_open with
-     * the STDOUT resource as descriptor spec), then exits 0. The descendant
-     * signals readiness by writing its pid to a pid file and refuses to write
-     * its late line until a gate file exists — no fixed sleep as
-     * synchronization. BOTH paths are pre-registered in temporaryFiles (the
-     * tearDown unlinks them; the gate may legitimately not exist yet), and
-     * the scripts are bounded (pid self-timeout 30s).
+     * Descendant fixture (ROUND8 ITEM A, token hardened ROUND10 ITEM A): the
+     * worker script spawns a bounded descendant that INHERITS the worker's
+     * STDOUT (proc_open with the STDOUT resource as descriptor spec), then
+     * exits 0. The descendant signals readiness by writing its pid to a pid
+     * file and refuses to write its late line until a gate file exists — no
+     * fixed sleep as synchronization. BOTH paths are pre-registered in
+     * temporaryFiles (the tearDown unlinks them; the gate may legitimately
+     * not exist yet), and the scripts are bounded (pid self-timeout 30s).
      *
-     * @return array{workerScript: string, pidFile: string, gateFile: string}
+     * The descendant is launched with ONE extra argument carrying a unique
+     * identity token (`cpms-descendant-token=<16 hex>`), which therefore
+     * appears in its /proc/<pid>/cmdline on Linux; the token is unique per
+     * test run and is the identity the PID-reuse guard checks before ANY
+     * TERM/KILL. The grandchild script ignores the argument.
+     *
+     * @return array{workerScript: string, pidFile: string, gateFile: string, token: string}
      */
     private function descendantFixture(): array
     {
         $rand = bin2hex(random_bytes(8));
         $pidFile = sys_get_temp_dir() . '/cpms-ext-worker-' . $rand . '.pid';
         $gateFile = sys_get_temp_dir() . '/cpms-ext-worker-' . $rand . '.gate';
+        $token = 'cpms-descendant-token=' . bin2hex(random_bytes(8));
         $this->temporaryFiles[] = $pidFile;
         $this->temporaryFiles[] = $gateFile;
 
@@ -475,11 +593,11 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
         $workerScript = $this->temporaryScript(
             "<?php\n" .
             "\$descriptors = [0 => ['pipe', 'r'], 1 => STDOUT, 2 => STDOUT];\n" .
-            "\$process = @proc_open([PHP_BINARY, " . var_export($grandchild, true) . "], \$descriptors, \$pipes);\n" .
+            "\$process = @proc_open([PHP_BINARY, " . var_export($grandchild, true) . ", " . var_export($token, true) . "], \$descriptors, \$pipes);\n" .
             "exit(is_resource(\$process) ? 0 : 7);\n"
         );
 
-        return ['workerScript' => $workerScript, 'pidFile' => $pidFile, 'gateFile' => $gateFile];
+        return ['workerScript' => $workerScript, 'pidFile' => $pidFile, 'gateFile' => $gateFile, 'token' => $token];
     }
 
     /**
@@ -504,17 +622,60 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
     }
 
     /**
+     * Identity check for a descendant PID (ITEM A, ROUND10-FIX): the pid
+     * must be an integer > 1 and /proc/<pid>/cmdline must be READABLE and
+     * CONTAIN the run-scoped unique token passed to the fixture at launch.
+     * On a missing fd, an unreadable/unavailable /proc, or a token mismatch
+     * (e.g. PID was reused by an unrelated process — including its cmdline
+     * being unreadable or empty, as in a zombie): returns false — the caller
+     * MUST NOT signal the PID in that case. (Linux-only guard; on non-Linux
+     * hosts /proc does not exist and every identity check returns false,
+     * which is the refuse direction.)
+     */
+    private function descendantIdentityMatches(int $pid, string $token): bool
+    {
+        if ($pid <= 1 || $token === '') {
+            return false;
+        }
+        $raw = @file_get_contents('/proc/' . $pid . '/cmdline');
+        if (!is_string($raw)) {
+            return false;
+        }
+
+        return strpos($raw, $token) !== false;
+    }
+
+    /**
+     * Existence probe (signal 0 sends NO signal on any OS) AND identity
+     * match against the run-scoped token. A PID without the token — for
+     * example one reused by an unrelated process — counts as NOT alive.
+     * A missing posix_kill turns into a loud false (the assert fails), never
+     * a silent pass.
+     */
+    private function descendantIsAlive(int $pid, string $token): bool
+    {
+        if (!function_exists('posix_kill')) {
+            return false;
+        }
+        if (!@posix_kill($pid, 0)) {
+            return false; // signal 0 sends nothing
+        }
+
+        return $this->descendantIdentityMatches($pid, $token);
+    }
+
+    /**
      * Bounded poll until the descendant pid is gone. On Linux, a missing
      * posix_kill turns into a loud false (the assert fails), never a skip.
      */
-    private function descendantExited(int $pid, float $timeoutSeconds): bool
+    private function descendantExited(int $pid, float $timeoutSeconds, string $token): bool
     {
         if (!function_exists('posix_kill')) {
             return false;
         }
         $deadline = microtime(true) + $timeoutSeconds;
         while (microtime(true) < $deadline) {
-            if (!@posix_kill($pid, 0)) {
+            if (!$this->descendantIsAlive($pid, $token)) {
                 return true;
             }
             usleep(20000);
@@ -524,26 +685,51 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
     }
 
     /**
-     * Best-effort descendant cleanup: TERM, bounded poll, then KILL. Always
-     * bounded; never throws (cleanup must not mask a test failure).
+     * Identity-guarded signal for the descendant fixture (ITEM A, ROUND10-FIX):
+     * verifies identity (PID integer > 1, /proc/<pid>/cmdline readable and
+     * carrying the run-scoped token) BEFORE any posix_kill. A PID that fails
+     * verification — invalid, /proc unreadable, or a reused PID without the
+     * token — is NEVER signalled; the caller treats refusal as
+     * gone/reused/unverifiable and relies on the gate file plus the
+     * descendant's own 30s self-timeout. Returns true when the signal was
+     * handed to the kernel, false when it was refused.
      */
-    private function shutdownDescendant(?int $pid): void
+    private function signalDescendant(int $pid, int $signal, string $token): bool
     {
-        if ($pid === null || !function_exists('posix_kill')) {
-            return;
+        if (!function_exists('posix_kill')) {
+            return false;
         }
-        if (!@posix_kill($pid, 0)) {
-            return; // already gone
+        if (!$this->descendantIdentityMatches($pid, $token)) {
+            return false; // refused: do NOT signal an unverified PID
         }
-        @posix_kill($pid, 15); // SIGTERM — numeric POSIX constant, stable on Linux
+
+        return @posix_kill($pid, $signal);
+    }
+
+    /**
+     * Best-effort descendant cleanup: TERM, bounded poll, then KILL — both
+     * signals pass the SAME identity guard (ITEM A: PID integer > 1,
+     * /proc/<pid>/cmdline readable and carrying the token). Always bounded;
+     * never throws (cleanup must not mask a test failure). When the PID is
+     * not verified (gone, reused, /proc unreadable) NOTHING is signalled.
+     */
+    private function shutdownDescendant(?int $pid, ?string $token = null): void
+    {
+        if ($pid === null || $token === null || !function_exists('posix_kill')) {
+            return; // no safely-signalable identity — rely on the 30s self-timeout
+        }
+        if (!$this->signalDescendant($pid, 15, $token)) { // SIGTERM — numeric POSIX constant, stable on Linux
+            return; // already gone / invalid / reused / unverifiable: never signal
+        }
         $deadline = microtime(true) + 2.0;
         while (microtime(true) < $deadline) {
-            if (!@posix_kill($pid, 0)) {
+            if (!$this->descendantIsAlive($pid, $token)) {
                 return;
             }
             usleep(20000);
         }
-        @posix_kill($pid, 9); // SIGKILL — numeric POSIX constant, stable on Linux
+        // KILL step: identity is re-verified inside signalDescendant before signalling.
+        $this->signalDescendant($pid, 9, $token); // SIGKILL — numeric POSIX constant, stable on Linux
     }
 
     /**

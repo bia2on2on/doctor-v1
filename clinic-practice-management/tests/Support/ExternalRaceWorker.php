@@ -94,7 +94,7 @@ class ExternalRaceWorker
     /** Sticky: a stdout stream_get_contents() call returned false (never resets). */
     private bool $stdoutReadFailed = false;
 
-    /** Sticky: the stdout read end was observed at EOF (every writer — direct child and any descendant inheriting the pipe — closed). */
+    /** Sticky: the stdout read end was observed at PHP-reported EOF (feof) — PHP may also set EOF after some non-transient read errors; not proof that all writers closed, or that all output was read. */
     private bool $stdoutEofObserved = false;
 
     /** Sticky: any read observed signaled === true (never reset). */
@@ -305,16 +305,26 @@ class ExternalRaceWorker
     /**
      * Bounded drain of everything the worker wrote that has not been
      * consumed yet. Waits (usleep polling, as everywhere in this class) until
-     * the stdout READ END reaches EOF, then returns EVERY line still present —
+     * PHP reports the stdout READ END at EOF (feof — see the note below about
+     * what PHP's feof() does and does not mean), then returns EVERY line still present —
      * including a final line without a trailing newline, which is returned as
      * `trailing` instead of being dropped. There is no line-count cap.
      *
-     * `complete` is true ONLY when stdout really reached EOF before the
-     * deadline — i.e. every writer (the direct child AND any descendant
-     * that inherited the pipe) is closed. A direct worker that exited while
+     * `complete` is true ONLY when PHP reported EOF on the stdout stream
+     * before the deadline — i.e. pump() observed feof() on pipes[1] (sticky
+     * stdoutEofObserved) or the live feof() probe succeeded. PHP's feof()
+     * may ALSO become true after some non-transient read errors: the plain
+     * wrapper's pipe (fd) read path sets stream->eof on a non-transient error
+     * with errno != EBADF (php-8.2.27, main/streams/plain_wrapper.c,
+     * php_stdiop_read fd branch — a read returning 0 bytes sets
+     * stream->eof=1 at :448-450, a non-transient read error errno != EBADF
+     * sets stream->eof=1 at :443-446), and the stdio path sets it via
+     * feof() at :461. `complete` = PHP reported EOF; it is NOT proof that
+     * every writer (the direct child AND any descendant that inherited the
+     * pipe) closed, nor that all output was read. A direct worker that exited while
      * a descendant still holds the pipe open does NOT complete: EOF is not
-     * observable, the deadline keeps polling, and the return is
-     * complete=false. A launcher whose stdout was torn down WITHOUT the EOF
+     * observable while the descendant holds the write end, the deadline keeps polling,
+     * and the return is complete=false. A launcher whose stdout was torn down WITHOUT the EOF
      * ever being observed (pipes closed by close() over an unobserved
      * transport) also returns complete=false — EOF is never inferred from a
      * closed resource or from the worker's exit alone.
@@ -554,9 +564,11 @@ class ExternalRaceWorker
                 continue;
             }
             if ($which === 1 && !$this->stdoutEofObserved && feof($this->pipes[1])) {
-                // Once the read end hits EOF no further bytes can ever
-                // arrive on this pipe (all writers — direct child and any
-                // descendant inheriting it — are closed). Sticky.
+                // Once PHP reports EOF on the read end, no further bytes will
+                // arrive on this pipe in this process — recorded sticky on
+                // PHP-reported EOF. PHP may also set EOF after some
+                // non-transient read errors; this is NOT proof that all
+                // writers closed or that all output was read. Sticky.
                 $this->stdoutEofObserved = true;
             }
             $chunk = (string) $chunk;
@@ -586,13 +598,13 @@ class ExternalRaceWorker
         return $this->stdoutReadFailed;
     }
 
-    /** True when the stdout read end was observed at EOF (all writers closed). Internal poll helper. */
+    /** True when PHP-reported EOF (feof) was observed on the stdout read end; sticky. PHP may also set EOF after some non-transient read errors — not proof all writers closed or that all output was read. Internal poll helper. */
     private function stdoutEofWasSeen(): bool
     {
         return $this->stdoutEofObserved;
     }
 
-    /** Live EOF probe: feof() returns true only after an actual read hit end-of-file. */
+    /** Live probe of PHP-reported EOF: feof() is true after an actual read reached end-of-file, and PHP may ALSO set it after some non-transient read errors (see drainRemainingLines()); this is not proof that all writers closed or that all output was read. */
     private function stdoutReachedEof(): bool
     {
         if (!isset($this->pipes[1]) || !is_resource($this->pipes[1])) {
