@@ -1368,15 +1368,44 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
 
     /**
      * Polls ONLY information_schema.INNODB_TRX for trx_state = 'LOCK WAIT' on
-     * the child's MySQL thread ID with a bounded loop and hard timeout.
-     * Emits strictly value-free diagnostics on premature exit or timeout.
+     * the child's MySQL thread ID with a bounded loop and hard timeout, after
+     * observing the child's pipe stage 'lock_query' (emitted immediately before
+     * the account FOR UPDATE statement) and sleeping >= 120 ms (> MySQL 8.0
+     * InnoDB trx0i_s.cc CACHE_MIN_IDLE_TIME = 100 ms) so trx_i_s_cache never
+     * starves on a pre-lock snapshot. Emits strictly value-free diagnostics on
+     * premature exit or timeout.
      *
      * @param array<string, mixed> $worker
      */
     private function awaitChildAccountLockWait(\mysqli $observer, int $childConnId, array &$worker): void
     {
         $deadline = microtime(true) + self::LOCK_WAIT_TIMEOUT_SEC;
-        $sql      = 'SELECT COUNT(*) FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = '
+        while (microtime(true) < $deadline) {
+            $status    = $this->pumpChildWorker($worker);
+            $lastStage = $this->refreshLastChildStage($worker);
+            if ('lock_query' === $lastStage || 'done' === $lastStage) {
+                break;
+            }
+            if (is_array($status) && false === ($status['running'] ?? true)) {
+                $this->pumpChildWorker($worker);
+                $lastStage = $this->refreshLastChildStage($worker);
+                self::fail(
+                    'child exited prematurely before dispatching account FOR UPDATE'
+                    . '; child_running=false'
+                    . '; child_exit_code=' . (string) (int) ($worker['exit_code'] ?? -1)
+                    . '; last_stage=' . $lastStage
+                );
+            }
+            usleep(10000);
+        }
+
+        // Sleep > 100 ms (InnoDB trx_i_s_cache CACHE_MIN_IDLE_TIME = 100000 us)
+        // before the first INNODB_TRX read and between polls so every read
+        // forces a fresh trx_i_s_cache snapshot instead of resetting last_read
+        // on a stale pre-lock entry.
+        usleep(120000);
+
+        $sql = 'SELECT COUNT(*) FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = '
             . (int) $childConnId . " AND trx_state = 'LOCK WAIT'";
 
         while (microtime(true) < $deadline) {
@@ -1402,9 +1431,10 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
                     . '; last_stage=' . $lastStage
                 );
             }
-            usleep(10000);
+            usleep(120000);
         }
 
+        usleep(120000);
         $finalStatus  = $this->pumpChildWorker($worker);
         $childRunning = is_array($finalStatus) && (bool) ($finalStatus['running'] ?? false);
         $childExit    = $childRunning
@@ -1459,7 +1489,7 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
         if (!$childRunning) {
             self::fail($diagMessage);
         }
-        if ('ready' !== $lastStage) {
+        if ('lock_query' !== $lastStage) {
             self::fail($diagMessage);
         }
         if ('0' === $trxCountDiag && str_starts_with($processlistDiag, 'Sleep:')) {
@@ -1709,6 +1739,22 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
             '        null,',
             '        $sessions,',
             '        $patientAccess',
+            '    );',
+            '    $loginsTableLower = strtolower($db->table("cpms_patient_logins"));',
+            '    $lockQueryEmitted = false;',
+            '    add_filter(',
+            '        "query",',
+            '        static function ($query) use ($emit, $connId, $loginsTableLower, &$lockQueryEmitted) {',
+            '            if (!$lockQueryEmitted && is_string($query)) {',
+            '                $norm = strtolower(trim((string) preg_replace("/\s+/", " ", $query)));',
+            '                if (str_contains($norm, "from " . $loginsTableLower . " ") && str_ends_with($norm, " for update")) {',
+            '                    $lockQueryEmitted = true;',
+            '                    $emit(["stage" => "lock_query", "connection_id" => $connId]);',
+            '                }',
+            '            }',
+            '            return $query;',
+            '        },',
+            '        0',
             '    );',
             '    $emit(["stage" => "ready", "connection_id" => $connId]);',
             '    $result = $service->hold($userId, $clinicianId, $slotDate, $slotTime, $slotId, $patientId);',
