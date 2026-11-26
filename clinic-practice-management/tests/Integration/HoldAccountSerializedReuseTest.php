@@ -586,7 +586,28 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
         // 2) Fixed-instant sub-second boundary rows inside the same UTC second (14:30:10).
         $f2Date   = gmdate('Y-m-d', time() + 8 * 86400);
         $f2SlotId = $this->insertSlot(5, 0, $f2Date);
-        $finder   = new \ReflectionMethod(\ClinicCore\Application\Booking\BookingService::class, 'find_reusable_active_hold_at');
+        $fetcher  = new \ReflectionMethod(\ClinicCore\Application\Booking\BookingService::class, 'fetch_active_hold_candidate');
+        $filter   = new \ReflectionMethod(\ClinicCore\Application\Booking\BookingService::class, 'filter_unexpired_hold_candidate_at');
+        $finder   = new class($fetcher, $filter) {
+            public function __construct(
+                private readonly \ReflectionMethod $fetcher,
+                private readonly \ReflectionMethod $filter
+            ) {
+            }
+
+            public function invoke(
+                object $service,
+                int $wpUserId,
+                int $clinicId,
+                int $slotId,
+                ?int $patientId,
+                \DateTimeImmutable $nowUtc
+            ): ?array {
+                $candidate = $this->fetcher->invoke($service, $wpUserId, $clinicId, $slotId, $patientId);
+
+                return $this->filter->invoke($service, $candidate, $nowUtc);
+            }
+        };
         $fixedNow = new \DateTimeImmutable('2030-05-15 14:30:10.500250', new \DateTimeZone('UTC'));
         $exact500 = new \DateTimeImmutable('2030-05-15 14:30:10.500000', new \DateTimeZone('UTC'));
         $exact501 = new \DateTimeImmutable('2030-05-15 14:30:10.501000', new \DateTimeZone('UTC'));
@@ -688,6 +709,350 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
         $liveNullRow = $finder->invoke($stack['service'], $this->userAId, $this->clinicId, $f2SlotId, null, $fixedNow);
         self::assertIsArray($liveNullRow, 'NULL-subject hold expiring at .800 must be live at .500250');
         self::assertSame($nullFracToken, (string) ($liveNullRow['token'] ?? ''));
+    }
+
+    /**
+     * T-R3 (Round 6, R3 / C1):
+     *  - End-to-end BookingService::hold() proof (zero sleep) that a stored hold
+     *    row whose `expires_at` is empty (''), NULL, omitted, unparseable garbage,
+     *    a relative DateTime expression ('+1 hour'), or an out-of-range calendar
+     *    date ('2030-02-30 12:00:00.000') fails closed (never reused, never turned
+     *    into "now", and never raising an uncaught exception) and mints a fresh
+     *    valid hold instead.
+     *  - Gate-attribution proof: a positive control on the exact persisted row
+     *    without the exact-SQL anchored `query` filter proves every non-expiry
+     *    gate accepts `$seedToken`; `$interceptCount === 2` on each subcase proves
+     *    both the pre-transaction R3 gate and the in-transaction post-account-lock
+     *    R3 gate inspected the row and refused reuse.
+     */
+    public function testTR3MalformedOrMissingHoldExpiryFailsClosedAndMintsFreshHold(): void
+    {
+        $db           = new CpmsDb($this->fixtureWpdb);
+        $holdsTable   = $this->rawTable('cpms_slot_holds');
+        $slotsTable   = $this->rawTable('cpms_schedule_slots');
+        $holderMobile = $this->patientMobile($this->patientAId);
+        $stack        = $this->stackOn($this->fixtureWpdb, true, $this->userAId, $this->capturedSessions[$this->userAId]);
+
+        $r3Date    = gmdate('Y-m-d', time() + 9 * 86400);
+        $r3SlotId  = $this->insertSlot(8, 1, $r3Date);
+        $seedToken = 'tok-r3-seed-' . bin2hex(random_bytes(6));
+        $seedExp   = gmdate('Y-m-d H:i:s', time() + 600) . '.000';
+        $this->insertRow($this->fixtureWpdb, $holdsTable, [
+            'clinic_id'         => $this->clinicId,
+            'slot_id'           => $r3SlotId,
+            'holder_wp_user_id' => $this->userAId,
+            'holder_mobile'     => $holderMobile,
+            'token'             => $seedToken,
+            'expires_at'        => $seedExp,
+            'status'            => 'active',
+            'created_at'        => gmdate('Y-m-d H:i:s') . '.000',
+            'patient_id'        => $this->patientAId,
+        ]);
+
+        // Positive baseline: without projection rewrite, hold() reuses $seedToken.
+        $baseline = $this->transactionalCommit(
+            $this->fixtureWpdb,
+            fn (): array => $stack['service']->hold(
+                $this->userAId,
+                $this->clinicianId,
+                $r3Date,
+                '09:00:00',
+                $r3SlotId,
+                $this->patientAId
+            )
+        );
+        self::assertSame($seedToken, (string) ($baseline['hold_token'] ?? ''), 'positive control must reuse valid seeded hold');
+        self::assertSame(1, (int) $db->fetchValue("SELECT held_count FROM {$slotsTable} WHERE id = %d", [$r3SlotId]));
+
+        $expectedSelectSql = (string) $this->fixtureWpdb->prepare(
+            "SELECT * FROM {$holdsTable} WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND patient_id = %d ORDER BY expires_at DESC, id DESC LIMIT 1",
+            $this->userAId,
+            $this->clinicId,
+            $r3SlotId,
+            'active',
+            $this->patientAId
+        );
+
+        $projections = [
+            'empty_string'     => "SELECT id, clinic_id, slot_id, holder_wp_user_id, holder_mobile, token, '' AS expires_at, status, created_at, patient_id FROM {$holdsTable}",
+            'null_value'       => "SELECT id, clinic_id, slot_id, holder_wp_user_id, holder_mobile, token, NULL AS expires_at, status, created_at, patient_id FROM {$holdsTable}",
+            'omitted_column'   => "SELECT id, clinic_id, slot_id, holder_wp_user_id, holder_mobile, token, status, created_at, patient_id FROM {$holdsTable}",
+            'garbage_text'     => "SELECT id, clinic_id, slot_id, holder_wp_user_id, holder_mobile, token, 'not-a-valid-utc-datetime' AS expires_at, status, created_at, patient_id FROM {$holdsTable}",
+            'relative_expr'    => "SELECT id, clinic_id, slot_id, holder_wp_user_id, holder_mobile, token, '+1 hour' AS expires_at, status, created_at, patient_id FROM {$holdsTable}",
+            'invalid_calendar' => "SELECT id, clinic_id, slot_id, holder_wp_user_id, holder_mobile, token, '2030-02-30 12:00:00.000' AS expires_at, status, created_at, patient_id FROM {$holdsTable}",
+        ];
+
+        $expectedHeldCount = 1;
+        $needlePrefix      = "SELECT * FROM {$holdsTable}";
+        foreach ($projections as $label => $selectPrefix) {
+            $interceptCount = 0;
+            $rewriteFilter  = static function (string $query) use ($expectedSelectSql, $needlePrefix, $selectPrefix, &$interceptCount): string {
+                if ($query === $expectedSelectSql) {
+                    ++$interceptCount;
+
+                    return $selectPrefix . substr($query, strlen($needlePrefix));
+                }
+
+                return $query;
+            };
+
+            add_filter('query', $rewriteFilter, 5);
+            try {
+                $floorBeforeSec = time();
+                $minted         = $this->transactionalCommit(
+                    $this->fixtureWpdb,
+                    fn (): array => $stack['service']->hold(
+                        $this->userAId,
+                        $this->clinicianId,
+                        $r3Date,
+                        '09:00:00',
+                        $r3SlotId,
+                        $this->patientAId
+                    )
+                );
+            } finally {
+                remove_filter('query', $rewriteFilter, 5);
+            }
+
+            ++$expectedHeldCount;
+            $mintedToken = (string) ($minted['hold_token'] ?? '');
+            $mintedExp   = (string) ($minted['expires_at'] ?? '');
+            self::assertSame(
+                2,
+                $interceptCount,
+                "R3 ({$label}): both pre-tx and in-tx candidate reads must execute and refuse malformed expires_at"
+            );
+            self::assertNotSame('', $mintedToken, "R3 ({$label}): fresh hold token must be non-empty");
+            self::assertNotSame($seedToken, $mintedToken, "R3 ({$label}): malformed expires_at row must never be reused");
+            self::assertSame(
+                1,
+                preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.000$/', $mintedExp),
+                "R3 ({$label}): minted hold must carry canonical .000 UTC SQL timestamp"
+            );
+            $parsedMintedExp = \DateTimeImmutable::createFromFormat(
+                '!Y-m-d H:i:s.u',
+                substr($mintedExp, 0, 19) . '.000000',
+                new \DateTimeZone('UTC')
+            );
+            self::assertInstanceOf(\DateTimeImmutable::class, $parsedMintedExp);
+            self::assertGreaterThanOrEqual(
+                $floorBeforeSec + 600,
+                $parsedMintedExp->getTimestamp(),
+                "R3 ({$label}): minted hold must have full future TTL rather than 'now' or raw malformed string"
+            );
+            self::assertSame(
+                $expectedHeldCount,
+                (int) $db->fetchValue("SELECT held_count FROM {$slotsTable} WHERE id = %d", [$r3SlotId]),
+                "R3 ({$label}): refusing malformed hold must allocate fresh slot capacity"
+            );
+
+            // Mark the newly minted hold released so $seedToken stays the sole active row for the next subcase.
+            $this->fixtureWpdb->query(
+                $this->fixtureWpdb->prepare(
+                    "UPDATE {$holdsTable} SET status = %s WHERE token = %s",
+                    'released',
+                    $mintedToken
+                )
+            );
+        }
+
+        // Post-filter positive control: $seedToken is still reused once the R3 projection filter is absent.
+        $afterControl = $this->transactionalCommit(
+            $this->fixtureWpdb,
+            fn (): array => $stack['service']->hold(
+                $this->userAId,
+                $this->clinicianId,
+                $r3Date,
+                '09:00:00',
+                $r3SlotId,
+                $this->patientAId
+            )
+        );
+        self::assertSame($seedToken, (string) ($afterControl['hold_token'] ?? ''));
+    }
+
+    /**
+     * T-R1 (Round 6, R1 / C1):
+     *  - Part 1 (zero-sleep deterministic post-read proof): proves the reuse
+     *    decision evaluates against a fresh instant after the SQL candidate read
+     *    returns (and refuses an expired candidate on both pre-tx and in-tx reads).
+     *  - Part 2 (bounded child-process Account FOR UPDATE lock-holder proof,
+     *    <= 2.25s added wait; child-process lock-wait flake risk): parent holds
+     *    cpms_patient_logins FOR UPDATE until INNODB_TRX confirms child LOCK WAIT,
+     *    inserts an active hold expiring +500ms into the wait (strictly > child's
+     *    pre-tx / pre-lock entry time), waits until >= preWaitEpochSec + 2s and
+     *    past that expiry, then COMMITs; child must (a) NOT reuse the hold that
+     *    expired during the lock wait and (b) compute its new expires_at from a
+     *    fresh post-lock instant (>= commitFloorSec + 600 >= preWaitEpochSec + 602).
+     */
+    public function testTR1FreshPostReadAndPostLockInstantGovernsReuseAndNewExpiry(): void
+    {
+        $db           = new CpmsDb($this->fixtureWpdb);
+        $holdsTable   = $this->rawTable('cpms_slot_holds');
+        $slotsTable   = $this->rawTable('cpms_schedule_slots');
+        $holderMobile = $this->patientMobile($this->patientAId);
+        $stack        = $this->stackOn($this->fixtureWpdb, true, $this->userAId, $this->capturedSessions[$this->userAId]);
+
+        // Part 1: zero-sleep deterministic post-read refusal proof.
+        $part1Date   = gmdate('Y-m-d', time() + 10 * 86400);
+        $part1SlotId = $this->insertSlot(3, 1, $part1Date);
+        $seedToken   = 'tok-r1-postread-' . bin2hex(random_bytes(6));
+        $this->insertRow($this->fixtureWpdb, $holdsTable, [
+            'clinic_id'         => $this->clinicId,
+            'slot_id'           => $part1SlotId,
+            'holder_wp_user_id' => $this->userAId,
+            'holder_mobile'     => $holderMobile,
+            'token'             => $seedToken,
+            'expires_at'        => gmdate('Y-m-d H:i:s', time() + 600) . '.000',
+            'status'            => 'active',
+            'created_at'        => gmdate('Y-m-d H:i:s') . '.000',
+            'patient_id'        => $this->patientAId,
+        ]);
+
+        $control = $this->transactionalCommit(
+            $this->fixtureWpdb,
+            fn (): array => $stack['service']->hold(
+                $this->userAId,
+                $this->clinicianId,
+                $part1Date,
+                '09:00:00',
+                $part1SlotId,
+                $this->patientAId
+            )
+        );
+        self::assertSame($seedToken, (string) ($control['hold_token'] ?? ''));
+
+        $expectedPart1Sql = (string) $this->fixtureWpdb->prepare(
+            "SELECT * FROM {$holdsTable} WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND patient_id = %d ORDER BY expires_at DESC, id DESC LIMIT 1",
+            $this->userAId,
+            $this->clinicId,
+            $part1SlotId,
+            'active',
+            $this->patientAId
+        );
+        $needlePrefix  = "SELECT * FROM {$holdsTable}";
+        $expiredSelect = "SELECT id, clinic_id, slot_id, holder_wp_user_id, holder_mobile, token, '2020-01-01 00:00:00.000' AS expires_at, status, created_at, patient_id FROM {$holdsTable}";
+        $part1Reads    = 0;
+        $part1Filter   = static function (string $query) use ($expectedPart1Sql, $needlePrefix, $expiredSelect, &$part1Reads): string {
+            if ($query === $expectedPart1Sql) {
+                ++$part1Reads;
+
+                return $expiredSelect . substr($query, strlen($needlePrefix));
+            }
+
+            return $query;
+        };
+
+        add_filter('query', $part1Filter, 5);
+        try {
+            $part1Minted = $this->transactionalCommit(
+                $this->fixtureWpdb,
+                fn (): array => $stack['service']->hold(
+                    $this->userAId,
+                    $this->clinicianId,
+                    $part1Date,
+                    '09:00:00',
+                    $part1SlotId,
+                    $this->patientAId
+                )
+            );
+        } finally {
+            remove_filter('query', $part1Filter, 5);
+        }
+        self::assertSame(2, $part1Reads, 'R1 Part 1: both pre-tx and in-tx post-read checks must run and refuse expired candidate');
+        self::assertNotSame($seedToken, (string) ($part1Minted['hold_token'] ?? ''));
+        self::assertSame(2, (int) $db->fetchValue("SELECT held_count FROM {$slotsTable} WHERE id = %d", [$part1SlotId]));
+
+        // Part 2: bounded two-connection child-process Account FOR UPDATE lock-holder proof (<= 2.25s added wait).
+        $this->assertSubprocessBackendAvailable();
+        $contendedDate   = gmdate('Y-m-d', time() + 11 * 86400);
+        $contendedSlotId = $this->insertSlot(2, 0, $contendedDate);
+        $duringWaitToken = 'tok-r1-wait-' . bin2hex(random_bytes(8));
+
+        $parentMysqli   = null;
+        $observerMysqli = null;
+        $worker         = null;
+        try {
+            $parentMysqli   = $this->freshMysqli();
+            $observerMysqli = $this->freshMysqli();
+            self::assertTrue((bool) $parentMysqli->query('SET SESSION innodb_lock_wait_timeout = 20'));
+            self::assertTrue((bool) $parentMysqli->query('BEGIN'));
+            $this->lockAccountRowOnMysqli($parentMysqli, $this->userAId);
+
+            $worker      = $this->spawnChildHoldProcess($this->userAId, $contendedSlotId, $contendedDate, '09:00:00', $this->patientAId);
+            $childConnId = $this->awaitChildReadyConnectionId($worker);
+            $this->awaitChildAccountLockWait($observerMysqli, $childConnId, $worker);
+
+            $lockConfirmedFloat     = microtime(true);
+            $preWaitEpochSec        = (int) floor($lockConfirmedFloat);
+            $expiringDuringWaitFloat = $lockConfirmedFloat + 0.500;
+            $expSec                 = (int) floor($expiringDuringWaitFloat);
+            $expMs                  = (int) floor(($expiringDuringWaitFloat - $expSec) * 1000.0);
+            if ($expMs > 999) {
+                $expMs = 999;
+            }
+            $expiringDuringWaitSql = gmdate('Y-m-d H:i:s', $expSec) . sprintf('.%03d', $expMs);
+
+            $this->insertHoldRowOnMysqli(
+                $parentMysqli,
+                $contendedSlotId,
+                $this->userAId,
+                $this->patientAId,
+                $holderMobile,
+                $duringWaitToken,
+                $expiringDuringWaitSql,
+                gmdate('Y-m-d H:i:s') . '.000'
+            );
+            $this->incrementSlotHeldCountOnceOnMysqli($parentMysqli, $contendedSlotId, gmdate('Y-m-d H:i:s'));
+
+            $waitHardCap = microtime(true) + 2.25;
+            while (microtime(true) < $waitHardCap) {
+                if (microtime(true) >= ($expiringDuringWaitFloat + 0.150) && time() >= ($preWaitEpochSec + 2)) {
+                    break;
+                }
+                usleep(20000);
+            }
+            $commitFloorSec = time();
+            self::assertGreaterThanOrEqual($preWaitEpochSec + 2, $commitFloorSec, 'bounded wait crossed >= 2 UTC seconds within <= 2.25s');
+            self::assertTrue(microtime(true) > $expiringDuringWaitFloat, 'parent COMMIT occurs strictly after during-wait hold expiry');
+            self::assertTrue((bool) $parentMysqli->query('COMMIT'));
+
+            $outcome = $this->reapChildHoldProcess($worker);
+            self::assertFalse($outcome['signaled'], 'child must not terminate by signal');
+            self::assertFalse($outcome['stopped'], 'child must not be stopped');
+            self::assertSame(0, $outcome['exit_code'], 'child must exit strictly with code 0; diag=' . $outcome['stderr']);
+            self::assertTrue((bool) ($outcome['payload']['ok'] ?? false), 'child hold() must succeed with a fresh hold');
+
+            $childHold      = (array) ($outcome['payload']['result'] ?? []);
+            $childToken     = (string) ($childHold['hold_token'] ?? '');
+            $childExpiresAt = (string) ($childHold['expires_at'] ?? '');
+            self::assertNotSame('', $childToken);
+            self::assertNotSame(
+                $duringWaitToken,
+                $childToken,
+                'R1(a): hold whose expires_at elapsed while child waited on account FOR UPDATE must not be reused'
+            );
+            self::assertSame(1, preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.000$/', $childExpiresAt));
+            $parsedChildExp = \DateTimeImmutable::createFromFormat(
+                '!Y-m-d H:i:s.u',
+                substr($childExpiresAt, 0, 19) . '.000000',
+                new \DateTimeZone('UTC')
+            );
+            self::assertInstanceOf(\DateTimeImmutable::class, $parsedChildExp);
+            self::assertGreaterThanOrEqual(
+                $commitFloorSec + 600,
+                $parsedChildExp->getTimestamp(),
+                'R1(b): new hold expires_at must be computed from fresh post-lock instant (>= commitFloorSec + 600 >= preWaitEpochSec + 602), never from pre-lock clock'
+            );
+            self::assertLessThanOrEqual(time() + 660, $parsedChildExp->getTimestamp());
+            self::assertSame(
+                2,
+                (int) $db->fetchValue("SELECT held_count FROM {$slotsTable} WHERE id = %d", [$contendedSlotId]),
+                'R1: refusing expired during-wait hold must allocate second slot unit for fresh hold'
+            );
+        } finally {
+            $this->cleanupRaceResources($worker, $parentMysqli, $observerMysqli);
+        }
     }
 
     // ================= fixture & subprocess helpers =================

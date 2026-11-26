@@ -581,13 +581,13 @@ final class BookingService
         }
 
         // N-4: Hold Active موجود همان بیمار/اسلات → Idempotent (بازگردانی همان Token)
-        $existing = $this->find_reusable_active_hold_at(
+        $existing_candidate = $this->fetch_active_hold_candidate(
             $wp_user_id,
             $trusted_clinic_id,
             (int) $slot['id'],
-            $patient_id_to_persist,
-            $this->now()
+            $patient_id_to_persist
         );
+        $existing           = $this->filter_unexpired_hold_candidate_at( $existing_candidate, $this->now() );
         if ($existing !== null) {
             return [
                 'hold_token' => (string) $existing['token'],
@@ -598,13 +598,13 @@ final class BookingService
 
         $ttl = (int) $settings->get('booking.hold_ttl_sec', 600);
         $token = self::uuid4();
-        $expires_at = ( new \DateTimeImmutable( '+ ' . $ttl . ' seconds', new \DateTimeZone( 'UTC' ) ) )->format( 'Y-m-d H:i:s.000' );
 
         $logins_table_exists = ( new PatientLoginRepository( $this->db ) )->table_exists();
 
         $has_patient_col = $this->holdsHasPatientIdColumn();
         $wp_user_id      = (int) func_get_arg( 0 );
-        $reused_hold     = $this->booking_transaction(
+
+        [ $reused_hold, $expires_at ] = $this->booking_transaction(
             function () use (
                 $slot,
                 $wp_user_id,
@@ -612,29 +612,30 @@ final class BookingService
                 $logins_table_exists,
                 $mobile,
                 $token,
-                $expires_at,
+                $ttl,
                 $patient_id_to_persist,
                 $has_patient_col,
                 $min_lead,
                 $settings,
                 $slot_time,
                 $slot_date
-            ): ?array {
+            ): array {
                 // New demand takes Account -> Organization -> Clinic -> Slot -> Location/capacity.
                 // Slot before Location is the established booking order: the
                 // independent staff-create race test requires the Slot lock to be
                 // held while the actor blocks on the Location row, and every other
                 // booking path follows the same order so no ABBA cycle exists.
                 $this->enforce_account_pending_appointment_cap( $wp_user_id, null, $logins_table_exists );
-                $existing_in_tx = $this->find_reusable_active_hold_at(
+                $in_tx_candidate  = $this->fetch_active_hold_candidate(
                     $wp_user_id,
                     $trusted_clinic_id,
                     (int) $slot['id'],
-                    $patient_id_to_persist,
-                    $this->now()
+                    $patient_id_to_persist
                 );
+                $decision_now_utc = $this->now();
+                $existing_in_tx   = $this->filter_unexpired_hold_candidate_at( $in_tx_candidate, $decision_now_utc );
                 if ( null !== $existing_in_tx ) {
-                    return $existing_in_tx;
+                    return [ $existing_in_tx, '' ];
                 }
                 $this->lock_booking_tenant_prefix( (int) $slot['clinic_id'] );
                 $locked_slot = $this->slots->findForUpdate( (int) $slot['id'] );
@@ -677,6 +678,12 @@ final class BookingService
                         [ 'nearby_slots' => $this->nearbySlotsForLosingSlot( $slot ) ]
                     );
                 }
+                $mint_now_utc = $this->now();
+                $expiry_utc   = $ttl >= 0
+                    ? $mint_now_utc->add( new \DateInterval( 'PT' . $ttl . 'S' ) )
+                    : $mint_now_utc->sub( new \DateInterval( 'PT' . abs( $ttl ) . 'S' ) );
+                $expires_at   = $expiry_utc->format( 'Y-m-d H:i:s.000' );
+
                 $row = [
                     'clinic_id'         => (int) $slot['clinic_id'],
                     'slot_id'           => (int) $locked_slot['id'],
@@ -714,7 +721,7 @@ final class BookingService
                     (int) $slot['clinic_id']
                 );
 
-                return null;
+                return [ null, $expires_at ];
             }
         );
 
@@ -3270,38 +3277,85 @@ final class BookingService
     }
 
     /**
-     * Plain `SELECT` for an unexpired active hold of the resolved subject,
-     * comparing `DATETIME(3)` `expires_at` conservatively at millisecond precision
-     * and rechecking `toDateTime(expires_at) > $now_utc` to match `confirm()`.
+     * Plain `SELECT` for the latest `status = 'active'` hold row of the resolved
+     * `(holder_wp_user_id, clinic_id, slot_id, patient_id)` subject, without
+     * capturing a pre-query clock; the caller takes a fresh UTC instant AFTER
+     * this read returns and passes both to `filter_unexpired_hold_candidate_at()`.
      *
      * @return array<string, mixed>|null
      */
-    private function find_reusable_active_hold_at(
+    private function fetch_active_hold_candidate(
         int $wp_user_id,
         int $trusted_clinic_id,
         int $slot_id,
-        ?int $patient_id_to_persist,
-        \DateTimeImmutable $now_utc
+        ?int $patient_id_to_persist
     ): ?array {
-        $cutoff_utc_sql = $now_utc->format( 'Y-m-d H:i:s.' ) . substr( $now_utc->format( 'u' ), 0, 3 );
         if ( null !== $patient_id_to_persist && $patient_id_to_persist > 0 ) {
-            $candidate = $this->db->fetchRow(
+            return $this->db->fetchRow(
                 'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
-                . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s AND patient_id = %d LIMIT 1',
-                [ $wp_user_id, $trusted_clinic_id, $slot_id, 'active', $cutoff_utc_sql, $patient_id_to_persist ]
-            );
-        } else {
-            $candidate = $this->db->fetchRow(
-                'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
-                . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND expires_at > %s AND patient_id IS NULL LIMIT 1',
-                [ $wp_user_id, $trusted_clinic_id, $slot_id, 'active', $cutoff_utc_sql ]
+                . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND patient_id = %d ORDER BY expires_at DESC, id DESC LIMIT 1',
+                [ $wp_user_id, $trusted_clinic_id, $slot_id, 'active', $patient_id_to_persist ]
             );
         }
-        if ( null === $candidate || $this->toDateTime( (string) ( $candidate['expires_at'] ?? '' ) ) <= $now_utc ) {
+
+        return $this->db->fetchRow(
+            'SELECT * FROM ' . $this->db->table( 'cpms_slot_holds' )
+            . ' WHERE holder_wp_user_id = %d AND clinic_id = %d AND slot_id = %d AND status = %s AND patient_id IS NULL ORDER BY expires_at DESC, id DESC LIMIT 1',
+            [ $wp_user_id, $trusted_clinic_id, $slot_id, 'active' ]
+        );
+    }
+
+    /**
+     * Returns `$candidate` only when its `expires_at` is a strictly valid UTC
+     * SQL `DATETIME` strictly greater than `$decision_now_utc`; fails closed
+     * (`null`) on missing, empty, unparseable, invalid, or `<= $decision_now_utc`.
+     *
+     * @param array<string, mixed>|null $candidate
+     * @return array<string, mixed>|null
+     */
+    private function filter_unexpired_hold_candidate_at(
+        ?array $candidate,
+        \DateTimeImmutable $decision_now_utc
+    ): ?array {
+        if ( null === $candidate ) {
+            return null;
+        }
+        $parsed_expires_at = $this->parse_hold_expires_at_utc( $candidate['expires_at'] ?? null );
+        if ( null === $parsed_expires_at || $parsed_expires_at <= $decision_now_utc ) {
             return null;
         }
 
         return $candidate;
+    }
+
+    /**
+     * Strict fail-closed parser for `cpms_slot_holds.expires_at` (`YYYY-MM-DD HH:MM:SS[.u]` UTC).
+     * Rejects non-strings, empty strings, relative expressions, out-of-range dates, and garbage.
+     */
+    private function parse_hold_expires_at_utc( mixed $raw_expires_at ): ?\DateTimeImmutable {
+        if ( ! is_string( $raw_expires_at ) || '' === $raw_expires_at ) {
+            return null;
+        }
+        if ( 1 !== preg_match( '/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?$/', $raw_expires_at, $parts ) ) {
+            return null;
+        }
+        $year   = (int) $parts[1];
+        $month  = (int) $parts[2];
+        $day    = (int) $parts[3];
+        $hour   = (int) $parts[4];
+        $minute = (int) $parts[5];
+        $second = (int) $parts[6];
+        if ( $year < 1 || ! checkdate( $month, $day, $year ) || $hour > 23 || $minute > 59 || $second > 59 ) {
+            return null;
+        }
+        $micros = str_pad( $parts[7] ?? '0', 6, '0', STR_PAD_RIGHT );
+        $parsed = \DateTimeImmutable::createFromFormat(
+            '!Y-m-d H:i:s.u',
+            sprintf( '%04d-%02d-%02d %02d:%02d:%02d.%s', $year, $month, $day, $hour, $minute, $second, $micros ),
+            new \DateTimeZone( 'UTC' )
+        );
+
+        return false === $parsed ? null : $parsed;
     }
 
     private ?bool $holdsPatientIdColCache = null;
