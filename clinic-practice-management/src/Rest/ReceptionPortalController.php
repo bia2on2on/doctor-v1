@@ -78,6 +78,7 @@ declare(strict_types=1);
 
 namespace ClinicCore\Rest;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
@@ -596,6 +597,11 @@ final class ReceptionPortalController extends RestBase {
 	 * required at the Reception permission boundary.
 	 */
 	private function patient_create( WP_REST_Request $r ): WP_REST_Response|WP_Error {
+		$query = $r->get_query_params();
+		if ( is_array( $query ) && array_key_exists( 'national_id', $query ) ) {
+			return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );
+		}
+
 		$fields = [];
 		foreach ( [ 'first_name', 'last_name', 'mobile', 'national_id', 'birth_date', 'gender' ] as $key ) {
 			$value = $r->get_param( $key );

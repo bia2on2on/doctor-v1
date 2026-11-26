@@ -251,6 +251,12 @@ final class PatientController extends RestBase
         if ($denied instanceof WP_Error) {
             return $denied;
         }
+
+        $query = $request->get_query_params();
+        if ( is_array( $query ) && array_key_exists( 'national_id', $query ) ) {
+            return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );
+        }
+
         $user = wp_get_current_user();
         $fields = $this->body($request);
 
@@ -379,6 +385,12 @@ final class PatientController extends RestBase
         if ($denied instanceof WP_Error) {
             return $denied;
         }
+
+        $query = $request->get_query_params();
+        if ( is_array( $query ) && array_key_exists( 'national_id', $query ) ) {
+            return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );
+        }
+
         $user = wp_get_current_user();
         $fields = $this->body($request);
 
