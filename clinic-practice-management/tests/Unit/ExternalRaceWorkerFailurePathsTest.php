@@ -330,8 +330,9 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
      * IS signalled (PHP CLI keeps extra arguments in argv verbatim, so the
      * token appears in /proc/<pid>/cmdline). Each assertion proves which
      * gate refused/allowed. The PHPUnit process's own PID is never passed to
-     * any signal helper; the children are cleaned up in finally (TERM,
-     * bounded poll, KILL, proc_close).
+     * any signal helper; cleanup uses the children's OWN proc_open handles
+     * (proc_get_status reaping probe, proc_terminate only while still running,
+     * proc_close with ignored return value) — never the guard, never a bare PID.
      */
     public function testGuardedDescendantSignalRefusesUnrelatedProcess(): void
     {
@@ -355,7 +356,9 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
 
             self::assertFalse($this->signalDescendant($unrelated['pid'], 15, $token), 'the guard must REFUSE to TERM a process without the token');
             self::assertFalse($this->signalDescendant($unrelated['pid'], 9, $token), 'the guard must REFUSE the KILL step too');
-            self::assertTrue(@posix_kill($unrelated['pid'], 0), 'the unrelated child must STILL be alive — the guard sent nothing (signal 0 probe after refusal)');
+            $unrelatedStatus = @proc_get_status($unrelated['process']); // owned child: liveness via proc_get_status (reaps via waitpid-WNOHANG; sends no signal), never via a bare-PID probe
+            self::assertIsArray($unrelatedStatus, 'proc_get_status must return a status array for our own child');
+            self::assertTrue($unrelatedStatus['running'] === true, 'the unrelated child must STILL be running — the guard sent nothing (last observed: running=' . var_export(isset($unrelatedStatus['running']) ? $unrelatedStatus['running'] : 'missing', true) . ')');
 
             // A forked child that has not yet exec'd serves the LAUNCHER's
             // argv in /proc/<pid>/cmdline, which lacks the token; gate the
@@ -368,34 +371,48 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             self::assertTrue($this->signalDescendant($carrier['pid'], 15, $token), 'the guard must ALLOW the TERM for a process carrying the token');
             $deadline = microtime(true) + 5.0;
             $carrierGone = false;
+            $lastCarrierObservation = 'none';
             while (microtime(true) < $deadline) {
-                if (!@posix_kill($carrier['pid'], 0)) {
+                // Owned child (this test holds the proc_open handle): liveness
+                // must come from proc_get_status — an exited-but-unreaped child
+                // is a zombie, and kill(pid, 0) on a zombie succeeds.
+                $status = @proc_get_status($carrier['process']);
+                $lastCarrierObservation = is_array($status)
+                    ? ('running=' . var_export(isset($status['running']) ? $status['running'] : 'missing', true) . ', exitcode=' . (isset($status['exitcode']) ? (string) $status['exitcode'] : 'missing') . ', signaled=' . (isset($status['signaled']) ? var_export($status['signaled'], true) : 'missing'))
+                    : 'proc_get_status returned false';
+                if (is_array($status) && isset($status['running']) && $status['running'] === false) {
                     $carrierGone = true;
                     break;
                 }
-                usleep(20000);
+                usleep(20000); // 20 ms poll interval (bound: 5 s total)
             }
-            self::assertTrue($carrierGone, 'the token-carrying child must have died after the allowed TERM (bounded poll)');
+            self::assertTrue($carrierGone, 'the token-carrying child must have died after the allowed TERM (bounded poll via proc_get_status; last observed: ' . $lastCarrierObservation . ')');
         } finally {
             foreach ($children as $child) {
-                if (!is_resource($child['process'])) {
+                $process = $child['process'];
+                if (!is_resource($process)) {
                     continue;
                 }
-                if ($child['pid'] > 1 && @posix_kill($child['pid'], 0)) {
-                    @posix_kill($child['pid'], 15); // direct cleanup of our own harmless child: TERM first
-                    $deadline = microtime(true) + 2.0;
-                    while (microtime(true) < $deadline && @posix_kill($child['pid'], 0)) {
-                        usleep(20000);
-                    }
-                    if (@posix_kill($child['pid'], 0)) {
-                        @posix_kill($child['pid'], 9); // then KILL if it ignored TERM
-                        $deadline = microtime(true) + 2.0;
-                        while (microtime(true) < $deadline && @posix_kill($child['pid'], 0)) {
-                            usleep(10000);
-                        }
-                    }
+                // Cleanup goes through the child's OWN proc_open handle only:
+                // probe first with proc_get_status (reaps a dead child safely,
+                // sends no signal); signal ONLY while the probe still reports
+                // running — never by bare PID (a reaped PID may be recycled),
+                // never through the identity guard, and proc_close's return
+                // value is intentionally ignored (after a proc_get_status
+                // observation of an exit, the exit code is not available again:
+                // php-src proc_open.c — 8.1/8.2: waitpid_cached absent, so the
+                // proc_close waitpid gets ECHILD and yields -1; 8.3+: only
+                // WIFEXITED is cached, so signaled exits still yield -1).
+                $exited = $this->ownedChildExited($process, 0.0, 20000); // single reaping probe
+                if (!$exited) {
+                    @proc_terminate($process, 15); // TERM via our own handle (numeric SIGTERM)
+                    $exited = $this->ownedChildExited($process, 2.0, 20000); // bounded, 20 ms poll
                 }
-                @proc_close($child['process']);
+                if (!$exited) {
+                    @proc_terminate($process, 9); // KILL via our own handle only if TERM failed (numeric SIGKILL)
+                    $this->ownedChildExited($process, 2.0, 10000); // best effort, bounded; ignored when it expires
+                }
+                @proc_close($process); // return value ignored by design (see note above)
             }
         }
     }
