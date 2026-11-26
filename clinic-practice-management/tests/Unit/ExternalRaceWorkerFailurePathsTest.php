@@ -34,6 +34,9 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
         if (!function_exists('proc_open') || !function_exists('proc_terminate')) {
             self::fail('proc_open and proc_terminate are required on Linux CI runners; the external race worker cannot be launched at all.');
         }
+        if (!function_exists('posix_kill')) {
+            self::fail('ext-posix (posix_kill) is required on Linux CI runners for bounded descendant cleanup and readiness probes; without it the descendant fixture cannot be reaped safely.');
+        }
     }
 
     protected function tearDown(): void
@@ -208,18 +211,19 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
     }
 
     /**
-     * ROUND8 ITEM A (requested ORDER): the descendant is alive (pid signal)
-     * and blocked on a gate file. The direct worker has ALREADY exited and
-     * that exit is CONFIRMED via waitForConfirmedExit() BEFORE the drain
-     * runs. The drain must NOT report complete — the pipe is still held
-     * open by the descendant and EOF is unobservable; and on the current
-     * code the read end is torn down at confirmed exit anyway, which makes
-     * completeness unknowable rather than true. These assertions encode the
-     * OBSERVED behavior of the head (LIMITATION, see the round-8 log and
-     * report) — they are NOT the desired end state. Gate release then proves
-     * the descendant ends boundedly (bounded poll). The descendant can never
-     * live forever: pid-signalled readiness, 30s self-timeout in-script,
-     * TERM→KILL cleanup in finally.
+     * ROUND9-FIX ITEM A (the requested ORDER, now with the Step B mechanism):
+     * the descendant is alive (pid signal) and blocked on a gate file. The
+     * direct worker has ALREADY exited and that exit is OBSERVED — the
+     * observation is made WITHOUT closing the stdout read end (isConfirmedRunning()
+     * -> readStatus() and the final-status cache only; nothing in that path
+     * tears a pipe down), BEFORE the drain runs. While the descendant holds
+     * the pipe: the drain MUST report complete=false with no lines and a
+     * null trailing fragment. After the gate is released the descendant
+     * writes its late line and exits; the pipe then reaches EOF and the
+     * drain MUST return complete=true with LATE:line received EXACTLY ONCE
+     * (newline-terminated, never the trailing fragment). The descendant can
+     * never live forever: pid-signalled readiness, 30s self-timeout
+     * in-script, TERM then KILL via posix_kill in finally (bounded).
      */
     public function testDrainAfterConfirmedExitDoesNotClaimEofWhileDescendantHoldsStdout(): void
     {
@@ -230,7 +234,13 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
         try {
             $descendantPid = $this->waitForDescendantPid($pidFile, 10.0);
             self::assertNotNull($descendantPid, 'the descendant must signal readiness by writing its pid within the bounded window (proxy assertion)');
-            self::assertTrue($worker->waitForConfirmedExit(5.0), 'the direct worker exit must be CONFIRMED before the drain runs');
+            self::assertTrue(
+                $this->waitForDirectWorkerExitObserved($worker, 5.0),
+                'the direct worker exit must be OBSERVED (final-status cache filled) before the drain runs — without closing the stdout read end'
+            );
+            $finalStatus = $worker->finalStatus();
+            self::assertIsArray($finalStatus, 'the decisive exit observation must be cached and readable');
+            self::assertSame(0, $finalStatus['exitCode'], 'the direct worker exits 0 — exit 7 means the STDOUT resource descriptor spec is unsupported on this PHP build');
 
             $drain = $worker->drainRemainingLines(0.5);
             self::assertFalse($drain['complete'], 'the descendant still holds stdout: EOF is not observable — complete must be false');
@@ -241,13 +251,9 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             touch($gateFile);
 
             $drainAfter = $worker->drainRemainingLines(5.0);
-            // LIMITATION (see round-8 log): waitForConfirmedExit() closes the
-            // stdout read end, so no later drain can EVER observe EOF or
-            // receive the late line on the current code. This assertion
-            // encodes exactly that — it will become assertTrue + received
-            // once the owner decides how the read end survives confirmed exit.
-            self::assertFalse($drainAfter['complete'], 'LIMITATION: pipes torn down at confirmed exit — completeness is unknowable afterwards (false by design today)');
-            self::assertNotContains('LATE:line', $drainAfter['lines'], 'LIMITATION: the late line is unreceivable after the read end is torn down — asserts the observed limitation, not the desired contract');
+            self::assertTrue($drainAfter['complete'], 'once the gate is released the descendant writes and exits — the pipe reaches EOF and complete MUST be true');
+            self::assertSame(['LATE:line'], $drainAfter['lines'], 'the late line must be received EXACTLY ONCE');
+            self::assertNull($drainAfter['trailing'], 'a newline-terminated line is not the trailing fragment');
             self::assertTrue($this->descendantExited($descendantPid, 5.0), 'after the gate is released the descendant must exit within the bounded window');
         } finally {
             if (!is_file($gateFile)) {
@@ -259,16 +265,20 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
     }
 
     /**
-     * ROUND8 ITEM A (the OTHER order — EOF semantics proof): the drain runs
-     * WITHOUT calling waitForConfirmedExit() first, so the stdout read end
-     * stays OPEN and EOF is observable. While the descendant is blocked on
-     * the gate: complete MUST be false. After the gate is released the
-     * descendant writes its line and exits — the pipe then reaches EOF and
-     * the drain MUST return complete=true with the LATE line received
-     * EXACTLY once (newline-terminated, not the trailing fragment). Complete
-     * may become true ONLY after real feof. NOTE: this deliberately does NOT
-     * use the waitForConfirmedExit-first order of the other test (that
-     * ordering closes the read end; see round-8 log and report).
+     * ROUND8 ITEM A (the OTHER order — EOF semantics proof), unchanged in
+     * substance: the drain runs WITHOUT calling waitForConfirmedExit()
+     * first, so the stdout read end stays OPEN and EOF is observable.
+     * While the descendant is blocked on the gate: complete MUST be false.
+     * After the gate is released the descendant writes its line and exits —
+     * the pipe then reaches EOF and the drain MUST return complete=true with
+     * the LATE line received EXACTLY once (newline-terminated, not the
+     * trailing fragment). Complete may become true ONLY after real feof.
+     * NOTE: this deliberately does NOT use the confirmed-exit-first order
+     * of the other test; that order now relies on waitForDirectWorkerExitObserved()
+     * — the Step B mechanism of the ROUND9-FIX round (see the round-9 log
+     * entry) — so this test's contrast is the OPEN-from-the-start read end,
+     * and neither order may depend on waitForConfirmedExit() (it closes the
+     * read end on the observed exit).
      */
     public function testDrainAfterGateReleaseCapturesLateLineExactlyOnce(): void
     {
@@ -534,6 +544,31 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             usleep(20000);
         }
         @posix_kill($pid, 9); // SIGKILL — numeric POSIX constant, stable on Linux
+    }
+
+    /**
+     * STEP B mechanism (ROUND9-FIX): bounded observation of the direct
+     * worker's exit WITHOUT closing the stdout read end. Each poll routes a
+     * fresh proc_get_status() read through readStatus() (via
+     * isConfirmedRunning()), which fills the one-shot final-status cache on
+     * the FIRST not-running observation; NOTHING in that path tears a pipe
+     * down (verified at the code paths: isConfirmedRunning() -> readStatus()
+     * -> readRawStatus(); neither calls pump(), close(), nor terminate()).
+     * Returns true once the cache is filled. Bounded by the deadline; no
+     * wall-clock assertion is added.
+     */
+    private function waitForDirectWorkerExitObserved(ExternalRaceWorker $worker, float $timeoutSeconds): bool
+    {
+        $deadline = microtime(true) + $timeoutSeconds;
+        while (microtime(true) < $deadline) {
+            $worker->isConfirmedRunning();
+            if ($worker->finalStatus() !== null) {
+                return true;
+            }
+            usleep(2000);
+        }
+
+        return false;
     }
 
     /**
