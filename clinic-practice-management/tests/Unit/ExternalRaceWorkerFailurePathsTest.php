@@ -418,6 +418,30 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
     }
 
     /**
+     * Single reaping probe / bounded wait for a child THIS TEST OWNS (it
+     * holds the proc_open handle). Uses proc_get_status, whose waitpid
+     * (WNOHANG|WUNTRACED) reaps a finished child; never sends a signal.
+     * Returns true once the child reports running === false (the pid has
+     * then been reaped by PHP — and no possibly-recycled PID is consulted).
+     *
+     * @param resource $process the proc_open handle of our own child
+     */
+    private function ownedChildExited($process, float $timeoutSeconds, int $sleepMicros): bool
+    {
+        $deadline = microtime(true) + $timeoutSeconds;
+        do {
+            $status = @proc_get_status($process);
+            if (is_array($status) && isset($status['running']) && $status['running'] === false) {
+                return true;
+            }
+            if (microtime(true) >= $deadline) {
+                return false;
+            }
+            usleep($sleepMicros); // poll interval at the 50 ms bound by call sites
+        } while (true);
+    }
+
+    /**
      * Start a harmless child for the PID-reuse guard test: a bare
      * `php -r 'sleep(30);'` that accepts an optional trailing token argument
      * (PHP CLI keeps extra arguments in argv verbatim, so the token appears
