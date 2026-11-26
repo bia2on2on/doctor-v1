@@ -85,6 +85,20 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             $ready = $worker->readLineWait(10.0);
             self::assertSame('READY:stdin-blocked', $ready, 'the child must print its readiness line before blocking');
 
+            // ROUND14-FIX: the child MUST still be observing as running before
+            // terminate() — otherwise a positive-exit observation afterwards
+            // could come from a child that died on its own BEFORE terminate()
+            // (e.g. a fatal for a disabled function), and the end-of-test
+            // status assertions would then pass without any blocked child ever
+            // being terminated. The confirmed-running probe is the worker's
+            // own strict liveness API (isConfirmedRunning() — running
+            // === true AND signaled === false AND stopped === false); INFERENCE
+            // (nothing executed in this sandbox).
+            self::assertTrue(
+                $worker->isConfirmedRunning(),
+                'the stdin-blocked child must be observed RUNNING between its READY line and terminate() (final status cache: ' . var_export($worker->finalStatus(), true) . ') — a child dead before terminate() must FAIL here, not via the status checks below'
+            );
+
             $started = microtime(true);
             $worker->terminate();
             $elapsed = microtime(true) - $started;
@@ -98,6 +112,17 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             self::assertTrue(
                 $status['signaled'] === true || (is_int($status['exitCode']) && $status['exitCode'] > 0),
                 'a blocked child must be observed as signaled or as a POSITIVE non-zero exit — a clean exit 0, or exit -1 with signaled=false, means the child was NOT blocked or was never signaled'
+            );
+            // ROUND14-FIX (strict): for THIS fixture there is no legitimate
+            // path for a correctly-terminated child to report a positive exit
+            // code — the child is blocked in fgets(STDIN), the parent never
+            // writes to or closes the STDIN pipe before cleanup, and no signal
+            // handler is installed by the script, so SIGTERM must terminate it
+            // (signaled=true, termsig=15). Any positive-exit (or zero-exit)
+            // observation means the child died on its own before terminate().
+            self::assertTrue(
+                $status['signaled'] === true,
+                'a correctly-terminated stdin-blocked child must be observed as SIGNAL termination (signaled=true); signaled=false means it died on its own before terminate() (final status: ' . var_export($status, true) . ')'
             );
         } finally {
             $worker->terminate();
@@ -332,7 +357,7 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
      * gate refused/allowed. The PHPUnit process's own PID is never passed to
      * any signal helper; cleanup uses the children's OWN proc_open handles
      * (proc_get_status reaping probe, proc_terminate only while still running,
-     * proc_close with ignored return value) — never the guard, never a bare PID.
+     * proc_close — called ONLY after a confirmed exit — with ignored return value) — never the guard, never a bare PID.
      * Both handles are null-initialised and BOTH launches happen inside the
      * try, so the finally can terminate an already-launched child even when
      * the SECOND launch (or a launch-time assertion) fails.
@@ -403,7 +428,8 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             }
             self::assertTrue($carrierGone, 'the token-carrying child must have died after the allowed TERM (bounded poll via proc_get_status; last observed: ' . $lastCarrierObservation . ')');
         } finally {
-            foreach ([$unrelated, $carrier] as $child) {
+            $unconfirmed = [];
+            foreach (['unrelated' => $unrelated, 'carrier' => $carrier] as $label => $child) {
                 if ($child === null) {
                     continue; // never launched — or the launch failed before this handle existed; nothing to clean up
                 }
@@ -428,9 +454,26 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
                 }
                 if (!$exited) {
                     @proc_terminate($process, 9); // KILL via our own handle only if TERM failed (numeric SIGKILL)
-                    $this->ownedChildExited($process, 2.0, 10000); // best effort, bounded; ignored when it expires
+                    $exited = $this->ownedChildExited($process, 2.0, 10000); // bounded, 10 ms poll
                 }
-                @proc_close($process); // return value ignored by design (see note above)
+                if (!$exited) {
+                    // Exit was NEVER confirmed through proc_get_status (TERM and
+                    // KILL both timed out): do NOT call proc_close — it sets
+                    // FG(pclose_wait)=1 and the proc_open destructor then runs a
+                    // BLOCKING waitpid(2) (php-src tag php-8.2.36, ext/standard/proc_open.c:
+                    // proc_close `:332-350`, dtor `proc_open_rsrc_dtor` `:232-293` —
+                    // the `!FG(pclose_wait)` WNOHANG branch `:269-274` applies only
+                    // to the GC path, NOT to proc_close). Record the child as
+                    // unconfirmed and keep cleaning the OTHER child through its
+                    // own handle; the fail verdict is raised AFTER the loop so
+                    // one unconfirmable child can never strand the other.
+                    $unconfirmed[] = $label;
+                    continue;
+                }
+                @proc_close($process); // return value ignored by design (see note above); reached ONLY after a confirmed exit
+            }
+            if ($unconfirmed !== []) {
+                self::fail('the ' . implode(' and ', $unconfirmed) . ' child exit was never confirmed via proc_get_status after TERM and KILL; proc_close was withheld to keep it from blocking the suite');
             }
         }
     }
