@@ -4,10 +4,15 @@ declare(strict_types=1);
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Scope\ClinicScope;
+use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Sms\SmsEvents;
 use ClinicCore\Domain\Sms\SmsMessageStatus;
+use ClinicCore\Domain\Validators\MobileValidator;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Settings\Settings;
+use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\RecordingSmsProvider;
 use WP_UnitTestCase;
 
@@ -249,6 +254,136 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
         self::assertStringContainsString('بیمار تست', (string) $row['vars_json']);
     }
 
+    /**
+     * B0-PR3 follow-up — `vars_json` is a stored copy of the caller's
+     * variables (and the template-variable source on a later dispatch). It
+     * used to be persisted verbatim, so a caller passing a national ID left a
+     * raw NID at rest in cpms_sms_messages.
+     *
+     * Contract asserted here: the stored copy masks NID-shaped digit runs
+     * while keeping ordinary values for retries, AND delivery is unchanged —
+     * the provider still receives the legitimate rendered text.
+     */
+    public function testStoredVarsMaskNidWhileDeliveredTextKeepsOrdinaryContent(): void
+    {
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+
+        $result = App::smsService()->sendEvent(
+            self::CLINIC_ID,
+            SmsEvents::APPT_REMINDER,
+            self::MOBILE,
+            [
+                'patient_name' => 'بیمار تست',
+                'doctor_name' => 'دکتر تست',
+                'appointment_date' => '1405/06/10',
+                'appointment_time' => '09:30',
+                'clinic_name' => 'مطب تست',
+                'national_id' => $nid,
+            ],
+            'appointment',
+            $this->uniqueContext(),
+            inline: true
+        );
+        self::assertSame(SmsMessageStatus::SENT, $result['status']);
+
+        $row = $this->fetchRow((int) $result['message_id']);
+        // Stored vars copy: NID masked, ordinary values kept for retries.
+        self::assertNotNull($row['vars_json']);
+        self::assertStringNotContainsString($nid, (string) $row['vars_json']);
+        self::assertStringContainsString('[nid-redacted]', (string) $row['vars_json']);
+        $storedVars = json_decode((string) $row['vars_json'], true);
+        self::assertIsArray($storedVars);
+        self::assertArrayHasKey('patient_name', $storedVars);
+        self::assertSame('بیمار تست', $storedVars['patient_name']);
+        self::assertArrayHasKey('appointment_date', $storedVars);
+        self::assertSame('1405/06/10', $storedVars['appointment_date']);
+
+        // Delivery witness: the provider still receives the legitimate text.
+        self::assertCount(1, $this->recording->textSends);
+        self::assertSame((string) $row['message'], $this->recording->textSends[0]['message']);
+        self::assertStringContainsString('بیمار تست', $this->recording->textSends[0]['message']);
+        self::assertStringContainsString('1405/06/10', $this->recording->textSends[0]['message']);
+        self::assertStringNotContainsString($nid, $this->recording->textSends[0]['message']);
+    }
+
+    /**
+     * B0-PR3 follow-up, template path — the stored `vars_json` is exactly the
+     * variable map handed to a template provider on a later dispatch, so the
+     * masked copy must still carry every ordinary variable while no NID digit
+     * run reaches the provider payload.
+     */
+    public function testTemplateDispatchUsesMaskedStoredVarsButDeliversOrdinaryOnes(): void
+    {
+        App::settings()->set('sms.templates', ['appointment_reminder' => ['template_id' => 'TPL-NID-1', 'updated_at' => gmdate('c')]]);
+        Settings::flushCache();
+
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+        $result = App::smsService()->sendEvent(
+            self::CLINIC_ID,
+            SmsEvents::APPT_REMINDER,
+            self::MOBILE,
+            [
+                'patient_name' => 'بیمار تست',
+                'appointment_date' => '1405/06/10',
+                'appointment_time' => '09:30',
+                'national_id' => $nid,
+            ],
+            'appointment',
+            $this->uniqueContext(),
+            inline: true
+        );
+        self::assertSame(SmsMessageStatus::SENT, $result['status']);
+
+        self::assertSame([], $this->recording->textSends);
+        self::assertCount(1, $this->recording->templateSends);
+        $variables = $this->recording->templateSends[0]['variables'];
+        self::assertIsArray($variables);
+        self::assertArrayHasKey('patient_name', $variables);
+        self::assertSame('بیمار تست', $variables['patient_name']);
+        self::assertArrayHasKey('national_id', $variables);
+        self::assertSame('[nid-redacted]', $variables['national_id']);
+        self::assertArrayHasKey('appointment_date', $variables);
+        self::assertSame('1405/06/10', $variables['appointment_date']);
+    }
+
+    /**
+     * F2 closure - :302 above is vacuous alone: there the NID lives only in
+     * `national_id`, which APPT_REMINDER (SmsEvents.php:58-63) never renders.
+     * Here the NID sits in `patient_name`, which it does render, so
+     * SmsTemplateRenderer.php:62 (redact_digits) is the line under test.
+     */
+    public function testRenderedTextMasksNidPlacedInAVariableTheTemplateRenders(): void
+    {
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+
+        $result = App::smsService()->sendEvent(
+            self::CLINIC_ID,
+            SmsEvents::APPT_REMINDER,
+            self::MOBILE,
+            [
+                'patient_name' => 'بیمار ' . $nid,
+                'doctor_name' => 'دکتر تست',
+                'appointment_date' => '1405/06/10',
+                'appointment_time' => '09:30',
+            ],
+            'appointment',
+            $this->uniqueContext(),
+            inline: true
+        );
+        self::assertSame(SmsMessageStatus::SENT, $result['status']);
+
+        self::assertCount(1, $this->recording->textSends);
+        $delivered = (string) $this->recording->textSends[0]['message'];
+        // (a) the redaction marker reaches the delivered text, because the
+        // rendered variable really carried the digits.
+        self::assertStringContainsString('[nid-redacted]', $delivered);
+        // (b) the raw NID never does.
+        self::assertStringNotContainsString($nid, $delivered);
+        // (c) positive witness: ordinary rendered values survive unmasked.
+        self::assertStringContainsString('دکتر تست', $delivered);
+        self::assertStringContainsString('1405/06/10', $delivered);
+    }
+
     // ------------------------------------------------------------------
 
     /**
@@ -316,6 +451,468 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
     }
 
     /**
+     * Item 1 (independent reader BLOCKER) - a privileged test-send carries STAFF
+     * free text, so a NID can be pasted into `cpms_sms_messages.message`.
+     * VERIFIED before the fix: SmsService.php:253-254 put the override text into
+     * $text untouched and :305 persisted it raw. The contract pinned here: the
+     * PERSISTED copy is masked exactly like every other stored text, while the
+     * text handed to the provider is deliberately NOT changed (open product
+     * question for the owner, not a regression): the service passes it to
+     * dispatchMessage() as a live in-memory override (the same transient
+     * mechanism an OTP code uses), so the provider still receives the raw text
+     * and the row never does.
+     */
+    public function testTestSendMasksNidInPersistedMessageButDeliversStaffTextUnchanged(): void
+    {
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+        self::assertTrue(NationalIdValidator::isValid($nid), 'precondition: the helper returns a checksum-valid NID');
+        // Unique per run: the lookup below keys on the recipient, and a rerun in
+        // the same process must never see an earlier row.
+        $mobile = '0912' . sprintf('%07d', (int) (microtime(true) * 1000) % 10000000);
+        $typed = 'تست ارسال؛ کد ملی ' . $nid . ' را بررسی کنید';
+
+        // testSend() resolves the Clinic from the live operation scope, so bind
+        // it explicitly and restore whatever was there before (try/finally), the
+        // same way the other integration suites do via App::replaceExplicitScope.
+        $lastId = $this->storedMessageIdFor($mobile);
+        $previous = ScopeContext::tryGet();
+        try {
+            App::replaceExplicitScope(ClinicScope::forClinic(self::CLINIC_ID));
+            $result = App::smsService()->testSend($mobile, $typed, 1);
+        } finally {
+            App::replaceExplicitScope($previous);
+        }
+        self::assertSame(SmsMessageStatus::SENT, $result['status']);
+
+        // (1) the real stored row: the raw NID is absent and the marker is there.
+        $messageId = $this->storedMessageIdFor($mobile);
+        self::assertGreaterThan($lastId, $messageId, 'precondition: the call inserted exactly the new row we read');
+        $row = $this->fetchRow($messageId);
+        $stored = (string) $row['message'];
+        self::assertStringNotContainsString($nid, $stored, 'the persisted test-send text must not keep the raw NID');
+        self::assertStringContainsString('[nid-redacted]', $stored, 'the persisted copy must carry the redaction marker');
+        // (2) positive witness: ordinary words of the same fixture survive.
+        self::assertStringContainsString('تست ارسال', $stored);
+        self::assertStringContainsString('را بررسی کنید', $stored);
+        self::assertSame('test', (string) $row['event']);
+
+        // (3) no other persisted column of that row keeps the digits.
+        self::assertStringNotContainsString($nid, (string) json_encode($row, JSON_UNESCAPED_UNICODE));
+        self::assertSame(0, $this->queueRowsContaining($nid), 'no queue payload may carry the test text');
+
+        // (4) the provider still gets exactly the staff text. PENDING OWNER
+        // DECISION: whether delivery itself should be masked is an open product
+        // question (reported), so this assertion pins the CURRENT behaviour only
+        // and must be revisited if the owner chooses to mask delivery too.
+        self::assertCount(1, $this->recording->textSends);
+        self::assertSame($typed, (string) $this->recording->textSends[0]['message'], 'delivered text is a product decision and is unchanged by this fix');
+    }
+
+    /**
+     * Task D (b) - the live override is bound to ONE row and cleared afterwards.
+     * The binding is private, so this pins the observable contract: after
+     * sendEvent() returns, a later dispatch of a DIFFERENT row must deliver that
+     * row's own stored text and never the bound staff text. Dropping the
+     * finally-clear in SmsService::sendEvent() (or making
+     * live_text_applies_to() always true) would let the staff text leak onto the
+     * next dispatched row and fail the assertions below.
+     */
+    public function testLiveTextOverrideIsBoundToOneRowAndNeverLeaksToAnother(): void
+    {
+        $nid = PatientTwoProofTestHelper::next_valid_national_id();
+        $typed = 'تست ارسال؛ کد ملی ' . $nid . ' را بررسی کنید';
+
+        // A second message sent inline (the established successful non-OTP
+        // path), then put back into a non-terminal state so it can be
+        // dispatched once more AFTER the test-send.
+        $other = App::smsService()->sendEvent(
+            self::CLINIC_ID,
+            SmsEvents::APPT_REMINDER,
+            self::MOBILE,
+            [
+                'patient_name' => 'بیمار تست',
+                'doctor_name' => 'دکتر تست',
+                'appointment_date' => '1405/06/10',
+                'appointment_time' => '09:30',
+            ],
+            'appointment',
+            $this->uniqueContext(),
+            inline: true
+        );
+        self::assertSame(SmsMessageStatus::SENT, $other['status'], 'precondition: the other row sent inline');
+        $otherId = (int) $other['message_id'];
+        $otherStored = (string) $this->fetchRow($otherId)['message'];
+
+        $before = count($this->recording->textSends);
+        $previous = ScopeContext::tryGet();
+        try {
+            App::replaceExplicitScope(ClinicScope::forClinic(self::CLINIC_ID));
+            App::smsService()->testSend('0912' . sprintf('%07d', 7_000_001), $typed, 1);
+            // Re-drive the OTHER row after the test-send finished.
+            App::db()->update('cpms_sms_messages', ['status' => SmsMessageStatus::QUEUED], ['id' => $otherId]);
+            App::smsService()->dispatchMessage($otherId);
+        } finally {
+            App::replaceExplicitScope($previous);
+        }
+
+        $sent = array_slice($this->recording->textSends, $before);
+        self::assertCount(2, $sent, 'both messages must reach the provider');
+        self::assertSame($typed, (string) $sent[0]['message'], 'the test-send delivers its own live text verbatim');
+        $deliveredOther = (string) $sent[1]['message'];
+        self::assertSame($otherStored, $deliveredOther, 'the later row delivers exactly its own stored text');
+        self::assertStringNotContainsString($typed, $deliveredOther, 'the later row must never receive the bound staff text');
+        self::assertStringContainsString('بیمار تست', $deliveredOther, 'witness: the later row really rendered its own content');
+    }
+
+    /**
+     * Task D (b) BLOCKER-2 isolation, half 2 of 2: the ROW-ID CHECK ALONE.
+     *
+     * The combined test above cannot fail on the id check alone: the finally
+     * clears the slot before the next dispatch, so no stale binding ever exists
+     * to be mis-delivered. This test supplies the pathological state directly —
+     * the slot holds row A's text bound to row A's id (both obtained from the
+     * real table) while row B is dispatched — so it depends on NOTHING but the
+     * id check in live_text_applies_to() (SmsService.php:371-372, read at
+     * :490-492). Removing that check (always true) delivers A's marker to B.
+     */
+    public function testLiveTextBindingIsIgnoredForADifferentRowWithoutRelyingOnTheClear(): void
+    {
+        $service = App::smsService();
+        $slot = new \ReflectionProperty($service, 'live_text');
+
+        // Row A: a real inserted row (unique event/recipient keeps rows apart).
+        $markerA = 'CPMS-ROWA-MARKER-' . random_int(100000, 999999);
+        $markerB = 'CPMS-ROWB-MARKER-' . random_int(100000, 999999);
+
+        $rowA = App::smsService()->sendEvent(
+            self::CLINIC_ID,
+            SmsEvents::APPT_REMINDER,
+            '0912' . sprintf('%07d', 8_200_001),
+            [
+                'patient_name' => $markerA,
+                'doctor_name' => 'دکتر تست',
+                'appointment_date' => '1405/06/11',
+                'appointment_time' => '10:15',
+            ],
+            'appointment',
+            $this->uniqueContext(),
+            inline: true
+        );
+        self::assertSame(SmsMessageStatus::SENT, $rowA['status'], 'precondition: row A sent inline');
+        $idA = (int) $rowA['message_id'];
+
+        // Row B: a second real row; re-queued so it can be dispatched again.
+        $rowB = App::smsService()->sendEvent(
+            self::CLINIC_ID,
+            SmsEvents::APPT_REMINDER,
+            '0912' . sprintf('%07d', 8_200_002),
+            [
+                'patient_name' => $markerB,
+                'doctor_name' => 'دکتر تست',
+                'appointment_date' => '1405/06/12',
+                'appointment_time' => '11:45',
+            ],
+            'appointment',
+            $this->uniqueContext(),
+            inline: true
+        );
+        self::assertSame(SmsMessageStatus::SENT, $rowB['status'], 'precondition: row B sent inline');
+        $idB = (int) $rowB['message_id'];
+        self::assertNotSame($idA, $idB);
+        $bStored = (string) $this->fetchRow($idB)['message'];
+        self::assertStringContainsString($markerB, $bStored, 'witness: row B renders its own content');
+        self::assertStringNotContainsString($markerA, $bStored);
+
+        // The pathological state, set directly: A's text bound to A's id, then B
+        // dispatched. Nothing clears the slot here, so only the id check stands
+        // between A's marker and B's provider call.
+        $slot->setValue($service, ['LIVE-TEXT-OF-' . $markerA, $idA]);
+        self::assertSame(['LIVE-TEXT-OF-' . $markerA, $idA], $slot->getValue($service), 'precondition: the stale binding is in place');
+
+        $before = count($this->recording->textSends);
+        $previous = ScopeContext::tryGet();
+        try {
+            App::replaceExplicitScope(ClinicScope::forClinic(self::CLINIC_ID));
+            App::db()->update('cpms_sms_messages', ['status' => SmsMessageStatus::QUEUED], ['id' => $idB]);
+            $service->dispatchMessage($idB);
+        } finally {
+            $slot->setValue($service, null); // leave the singleton clean for later tests
+            App::replaceExplicitScope($previous);
+        }
+
+        $sent = array_slice($this->recording->textSends, $before);
+        self::assertCount(1, $sent, 'row B must reach the provider exactly once');
+        $delivered = (string) $sent[0]['message'];
+        self::assertStringNotContainsString($markerA, $delivered, 'the stale binding must never be delivered on behalf of another row');
+        self::assertStringNotContainsString('LIVE-TEXT-OF-', $delivered, 'no live text at all may reach this row');
+        self::assertStringContainsString($markerB, $delivered, 'witness: the delivered text is row B own rendered content');
+    }
+
+    /**
+     * Task D (b) BLOCKER-2 isolation, 1 of 2: the finally-clear on the NORMAL
+     * inline path. A successful inline dispatch must leave the private slot
+     * empty, so no staff text stays bound for the next row.
+     *
+     * Reads the private single slot by reflection (the established in-repo
+     * pattern, e.g. BookingFlowTest.php:824) after a REAL sendEvent() ->
+     * dispatchMessage() call, and asserts on both the delivered text and the
+     * slot. Depends on nothing but the clear: it passes whether or not the
+     * row-id check exists.
+     *
+     * Scope and slot are both restored in OUTER finally blocks (the mechanism
+     * the combined test used at its :686-688 / :752-754), so a failing
+     * assertion or an unexpected throw cannot leak either into the next test.
+     *
+     * Mutation note (INFERENCE — no PHP in this sandbox), for this test run
+     * ALONE: delete `$this->live_text = null;` in the finally at
+     * SmsService.php:352 and this method fails on the assertNull below,
+     * because the slot keeps the `[ text, message_id ]` pair after the send
+     * returned. Run in a combined run it is also independent of any later
+     * test, because the slot cleanup below runs either way.
+     */
+    public function testLiveTextSlotIsClearedAfterASuccessfulInlineDispatch(): void
+    {
+        $service = App::smsService();
+        $slot = new \ReflectionProperty($service, 'live_text');
+        $marker = 'CPMS-SLOT-OK-' . random_int(100000, 999999);
+
+        // R6-01: the scoped window starts BEFORE the first precondition
+        // assertion and the finally below closes it, so the slot cleanup and the
+        // scope restore each run even when EVERY assertion — including the
+        // precondition — fails. Each of the two cleanups has its own try, so a
+        // throw in one cannot skip the other.
+        $previous = ScopeContext::tryGet();
+        App::replaceExplicitScope(ClinicScope::forClinic(self::CLINIC_ID));
+        try {
+            // Precondition: the slot starts empty, so anything found later was
+            // written by the call under test.
+            self::assertNull($slot->getValue($service), 'precondition: the live-text slot is empty before the call');
+
+            // setUp() installs a fresh RecordingSmsProvider, so the WHOLE list can be
+            // asserted — the same mechanism the combined test relied on when it
+            // asserted count() over the whole list (c46e6c66 :693). Asserted rather
+            // than assumed, so a leaked provider can never make the count below pass.
+            self::assertSame(0, count($this->recording->textSends), 'precondition: a fresh recording list, as setUp() installs');
+
+            $ok = $service->testSend('0912' . sprintf('%07d', 8_100_001), 'marker ' . $marker, 1);
+
+            self::assertSame(SmsMessageStatus::SENT, $ok['status'], 'precondition: the normal path really dispatched inline');
+            self::assertSame(1, count($this->recording->textSends), 'the normal path delivered exactly once (whole list)');
+            self::assertStringContainsString($marker, (string) $this->recording->textSends[0]['message'], 'witness: the normal path delivered its bound text');
+            self::assertNull(
+                $slot->getValue($service),
+                'after a NORMAL inline dispatch the slot must be empty — otherwise the staff text stays bound for the next row'
+            );
+        } finally {
+            // Cleanup only — every assertion sits above this point. Each step is
+            // guarded on its own: a throw in one must not skip the other.
+            try {
+                $slot->setValue($service, null);
+            } finally {
+                App::replaceExplicitScope($previous);
+            }
+        }
+    }
+
+    /**
+     * Task D (b) BLOCKER-2 isolation, 2 of 2: the finally-clear on the
+     * EXCEPTION path. The dispatch must throw out of sendEvent() and still
+     * leave the slot empty — the finally, not the happy path, clears it.
+     *
+     * A provider throw cannot produce this: dispatchMessage() catches every
+     * \Throwable from the send (SmsService.php:512) and records FAILED, so it
+     * never escapes. The honest escaping failure is a database error AFTER the
+     * slot is bound (:348) and BEFORE dispatchMessage()'s own try (:465): the
+     * status->SENDING update at :457-463. With CpmsDb in strict mode
+     * (SettingsAuditAtomicityTest.php:181 does the same) CpmsDb::ensureNoSqlError()
+     * throws a RuntimeException (CpmsDb.php:64-69) that leaves sendEvent()
+     * through the finally at :351-353.
+     *
+     * That failure also escapes BEFORE dispatchMessage()'s own restoring
+     * finally at :566-570 (which is inside the try that starts at :465, while
+     * the scope is bound at :448), so the Clinic scope is left CHANGED by the
+     * failed call. The outer finally therefore restores it explicitly.
+     *
+     * Mutation note (INFERENCE — no PHP in this sandbox), for this test run
+     * ALONE: delete `$this->live_text = null;` in the finally at
+     * SmsService.php:352 and this method fails on the assertNull below; it is
+     * independent of the row-id check, because a non-null slot fails on its
+     * own. Run in a combined run it is also independent of any later test,
+     * because the slot cleanup below runs either way.
+     */
+    public function testLiveTextSlotIsClearedWhenAnInlineDispatchEscapes(): void
+    {
+        $service = App::smsService();
+        $slot = new \ReflectionProperty($service, 'live_text');
+        $marker = 'CPMS-SLOT-THROW-' . random_int(100000, 999999);
+
+        // R6-01: the scoped window starts BEFORE the first precondition
+        // assertion and the outer finally closes it, so the slot cleanup and the
+        // scope restore each run even when EVERY assertion — including the
+        // preconditions and the post-call ones — fails.
+        $previous = ScopeContext::tryGet();
+        App::replaceExplicitScope(ClinicScope::forClinic(self::CLINIC_ID));
+        try {
+            self::assertNull($slot->getValue($service), 'precondition: the live-text slot is empty before the call');
+
+            // R6-02: the WHOLE recording list's total, recorded before the call.
+            // The post-call assertion compares this total, so a send appended
+            // anywhere in the list is caught — not just inside a suffix slice.
+            $sentBeforeFault = count($this->recording->textSends);
+
+            // Highest durable id BEFORE the call: row identity is then checked
+            // independently of the mutable last-insert id below.
+            $highestBefore = (int) App::db()->fetchValue(
+                'SELECT COALESCE(MAX(id), 0) FROM ' . App::db()->table('cpms_sms_messages')
+            );
+
+            // The statement-SHAPE match. Anchored \A..\z, the real table (with
+            // $wpdb->prefix), the exact SET list in order, and THIS row's id.
+            // `attempts` and the fraction digits are matched BY PATTERN ('\d+',
+            // '\.\d{3}'), so this is a complete statement shape, not one frozen
+            // literal string. No "contains" on the table token, no prefix-only
+            // match.
+            //
+            // Shape produced by SmsService::updateMessage() (:1265-1269) and rendered
+            // by wpdb::prepare (WP 7.1.3 src/wp-includes/class-wpdb.php:1458-1760):
+            //   UPDATE <$wpdb->prefix>cpms_sms_messages SET `status` = 'SENDING',
+            //   `attempts` = '1', updated_at = '2026-11-24 14:41:55.000' WHERE id = 42
+            // Every SET value is a %s placeholder, and prepare() quotes an
+            // unformatted %s unless the character before it is '%'
+            // (class-wpdb.php:1602-1611; allow_unsafe_unquoted_parameters defaults to
+            // true at :690) — so the attempts int renders QUOTED. `id` is the only
+            // %d and renders bare. updateMessage() writes the table name WITHOUT
+            // backticks, unlike wpdb::insert's "INSERT INTO `table`"
+            // (class-wpdb.php:2613).
+            //
+            // The candidate id for the shape is read at UPDATE time on purpose: the
+            // 'query' filter runs BEFORE execution (class-wpdb.php:2230) and
+            // insert_id is only assigned after the insert executes (:2315), so at
+            // this point it holds the row this call inserted. That value is a HINT
+            // only; the durable proof is the one-new-row check below. A filter at
+            // priority 5 sees unescaped text, because wpdb registers
+            // remove_placeholder_escape at priority 0 (:2427-2428).
+            $table = App::db()->table('cpms_sms_messages');
+            $faultHits = 0;
+            $matchedId = 0;
+            $absentTable = 'cpms_r5_absent_' . random_int(1000000, 9999999);
+            $fault = static function ($query) use ($table, $absentTable, &$faultHits, &$matchedId) {
+                $candidate = App::db()->wpdb_last_insert_id();
+                if ($candidate <= 0) {
+                    return $query;
+                }
+
+                $pattern = '/\AUPDATE ' . preg_quote($table, '/')
+                    . ' SET `status` = \'SENDING\', `attempts` = \'\d+\', '
+                    . 'updated_at = \'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\' '
+                    . 'WHERE id = ' . $candidate . '\z/';
+
+                if (preg_match($pattern, (string) $query) !== 1) {
+                    return $query;
+                }
+
+                $faultHits++;
+                $matchedId = $candidate;
+
+                // Same statement, ONE token changed: the table name. The real table
+                // name appears nowhere in the rewritten text.
+                return (string) preg_replace(
+                    '/\AUPDATE ' . preg_quote($table, '/') . '/',
+                    'UPDATE ' . $absentTable,
+                    (string) $query,
+                    1
+                );
+            };
+
+            $wasStrict = App::db()->is_strict();
+            global $wpdb;
+            $suppressed = (bool) $wpdb->suppress_errors(true);
+            App::db()->setStrict(true);
+            add_filter('query', $fault, 5);
+            $threw = null;
+            // The scope is already bound by the outer try; this inner block only
+            // has to make sure the call's own finally (filters, strict mode,
+            // error suppression) is undone whatever happens.
+            try {
+                $service->testSend('0912' . sprintf('%07d', 8_100_002), 'marker ' . $marker, 1);
+            } catch (\Throwable $error) {
+                $threw = $error;
+            } finally {
+                remove_filter('query', $fault, 5);
+                App::db()->setStrict($wasStrict);
+                $wpdb->suppress_errors($suppressed);
+            }
+
+            self::assertSame(1, $faultHits, 'the fault must fire exactly once, on the one SENDING update of this row');
+            self::assertNotNull($threw, 'precondition: the database failure must escape sendEvent() — that is what exercises the finally');
+            self::assertNull(
+                $slot->getValue($service),
+                'after a THROWING inline dispatch the slot must still be empty — the finally is what clears it'
+            );
+            // R6-02: the WHOLE list's total, not only a suffix. A send appended
+            // anywhere in the list is caught; the slice assertion below stays so
+            // a send that lacked the marker is still attributed to this call.
+            self::assertSame($sentBeforeFault, count($this->recording->textSends), 'the faulted dispatch never reached the provider (whole-list total)');
+            $sent = array_slice($this->recording->textSends, $sentBeforeFault);
+            self::assertSame(0, count($sent), 'the faulted dispatch appended no send to the recording list');
+            $markerDeliveries = 0;
+            foreach ($this->recording->textSends as $send) {
+                if (str_contains((string) $send['message'], $marker)) {
+                    $markerDeliveries++;
+                }
+            }
+            self::assertSame(0, $markerDeliveries, 'no recorded send anywhere in the list may carry the faulted text');
+
+            // Row identity, independent of the mutable last-insert id: exactly one
+            // new row exists, and it is the row the filter matched.
+            $newRows = App::db()->fetchAll(
+                'SELECT id FROM ' . $table . ' WHERE id > %d ORDER BY id ASC',
+                [$highestBefore]
+            );
+            self::assertSame(1, count($newRows), 'the call must insert exactly one new row');
+            $newId = (int) $newRows[0]['id'];
+            self::assertSame($newId, $matchedId, 'the id the statement-shape filter matched is the row this call inserted');
+
+            // R6-02: the new row belongs to THIS call's recipient. The stored
+            // form is what sendEvent() writes: `recipient` is
+            // MobileValidator::normalize($mobile) (SmsService.php:252, inserted at
+            // :331), which returns an 11-digit `09…` input unchanged
+            // (MobileValidator.php:30-31). Not true by construction: it fails if
+            // the row is another mobile's, or if the column holds a different
+            // spelling than normalize() produces.
+            $storedRecipient = (string) $this->fetchRow($newId)['recipient'];
+            self::assertSame('0912' . sprintf('%07d', 8_100_002), $storedRecipient, 'the new row carries the normalized recipient of this call');
+            self::assertSame(MobileValidator::normalize($storedRecipient), $storedRecipient, 'the stored recipient is exactly the normalized form');
+
+            // Persisted-state evidence. `attempts` stays 0 and the provider count
+            // stays unchanged TOGETHER; `attempts === 0` alone does NOT prove no
+            // UPDATE was attempted — the rewritten UPDATE IS attempted, against a
+            // table that does not exist, and fails.
+            //
+            // What the stored `message` column holds depends on which path wrote the
+            // row, and this is a test-send row:
+            //  - test-send (this row): `$text` is replaced by
+            //    NationalIdValidator::redact_digits($text) before the insert
+            //    (SmsService.php:298-302), and that helper only masks runs of 10+
+            //    digits (NationalIdValidator.php:124-128), so a short marker survives;
+            //  - a non-template OTP row: the code becomes `***` (SmsService.php:286-288);
+            //  - an ordinary business event: the rendered text is stored unmasked.
+            $failedRow = $this->fetchRow($newId);
+            self::assertSame(0, (int) $failedRow['attempts'], 'with the provider count unchanged, persisted state shows no send was recorded');
+            self::assertNotSame(SmsMessageStatus::SENT, (string) $failedRow['status'], 'a faulted dispatch never reports the row as sent');
+        } finally {
+            // Cleanup only — every assertion sits above this point, inside the
+            // outer try. Each step is guarded on its own: a throw in one must not
+            // skip the other.
+            try {
+                $slot->setValue($service, null);
+            } finally {
+                App::replaceExplicitScope($previous);
+            }
+        }
+    }
+
+    /**
      * @return array<string, mixed>
      */
     private function fetchRow(int $messageId): array
@@ -334,6 +931,20 @@ final class SmsOtpDispatchTest extends WP_UnitTestCase
         return (int) App::db()->fetchValue(
             'SELECT COUNT(*) FROM ' . App::db()->table('cpms_jobs') . ' WHERE payload_json LIKE %s',
             ['%' . $needle . '%']
+        );
+    }
+
+    /**
+     * Highest durable message id for a recipient (0 when the recipient has no
+     * row yet). Reading it before and after the call proves the row asserted on
+     * is the row that call inserted — from the real table, not from an
+     * in-memory return value.
+     */
+    private function storedMessageIdFor(string $recipient): int
+    {
+        return (int) App::db()->fetchValue(
+            'SELECT MAX(id) FROM ' . App::db()->table('cpms_sms_messages') . ' WHERE recipient = %s',
+            [$recipient]
         );
     }
 

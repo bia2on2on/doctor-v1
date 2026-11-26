@@ -10,6 +10,7 @@ use ClinicCore\Domain\Sms\SmsMessageStatus;
 use ClinicCore\Domain\Sms\SmsTemplateException;
 use ClinicCore\Domain\Sms\SmsTemplateRenderer;
 use ClinicCore\Domain\Validators\MobileValidator;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Application\Scope\ClinicScope;
 use ClinicCore\Application\Scope\ScopeContext;
 use ClinicCore\Infrastructure\Audit\AuditLogger;
@@ -67,6 +68,22 @@ final class SmsService
     public const OTP_NO_RETRY_CODE = 'CLINIC_SMS_OTP_NO_RETRY';
 
     private const UPDATE_COLUMNS = ['status', 'attempts', 'failure_code', 'provider_msg_id', 'provider'];
+
+    /**
+     * In-memory text to hand to the provider instead of the stored copy, for
+     * ONE message row: `[ text, message_id ]`.
+     *
+     * Why a bound field instead of a dispatchMessage() parameter: the stored
+     * copy of a test-send is masked, the provider must still receive the staff
+     * text, and dispatchMessage()'s signature stays exactly as it was so no
+     * exemption is needed on a public method name or an existing parameter.
+     * The binding carries the row id, so the override can never be delivered
+     * on behalf of a different message; sendEvent() always clears it in a
+     * finally block, and a stale value is ignored anyway by the id check.
+     *
+     * @var array{0: string, 1: int}|null
+     */
+    private array|null $live_text = null;
 
     /**
      * @param \Closure(): int $currentClinicResolver Clinicِ فعالِ عملیاتِ جاری
@@ -269,7 +286,20 @@ final class SmsService
         if ($isOtp && !$useTemplate) {
             $text = str_replace((string) ($vars['otp_code'] ?? ''), '***', $text);
         }
-        $storedVars = ($isOtp || $isTest) ? null : (string) json_encode($vars, JSON_UNESCAPED_UNICODE);
+        // B0-PR3 follow-up: vars_json is a stored copy AND the template-variable
+        // source on a later dispatch; NID-shaped runs are masked, content is not.
+        $storedVars = ( $isOtp || $isTest ) ? null : (string) json_encode( $this->redact_vars( $vars ), JSON_UNESCAPED_UNICODE ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase,WordPress.WP.AlternativeFunctions.json_encode_json_encode -- pre-existing $storedVars/$isOtp/$isTest locals; the existing json_encode contract is unchanged.
+
+        // Test-send free text is staff-typed: a NID may be pasted into it, so the
+        // stored copy is masked exactly like every other persisted text. The text
+        // handed to the provider is NOT changed (product decision, owner question):
+        // dispatchMessage() receives it as a live override, the same transient
+        // mechanism an OTP code uses, and never reads it back from the row.
+        $live_test_text = null;
+        if ( $isTest ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $isTest local.
+            $live_test_text = $text;
+            $text           = NationalIdValidator::redact_digits( $text );
+        }
 
         // Dedupe (الزام §20): رویدادهای وابسته به Context — بدون ارسال تکراری
         $dedupeKey = null;
@@ -315,7 +345,12 @@ final class SmsService
 
         // OTP: همیشه Inline + بدون Queue-Retry (کد ذخیره نشده — Retry = ارسال کد جدید توسط کاربر)
         if ($inline || $isOtp) {
-            $this->dispatchMessage($messageId, $isOtp ? $vars : null);
+            $this->live_text = $live_test_text !== null ? [ $live_test_text, $messageId ] : null; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $messageId local.
+            try {
+                $this->dispatchMessage( $messageId, $isOtp ? $vars : null ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.VariableNotSnakeCase -- pre-existing $messageId/$isOtp locals.
+            } finally {
+                $this->live_text = null;
+            }
         } else {
             $this->jobs->enqueue('sms.send', ['message_id' => $messageId], priority: $priority, maxAttempts: $maxAttempts);
         }
@@ -329,12 +364,21 @@ final class SmsService
     }
 
     /**
+     * Whether a bound in-memory text belongs to this exact row. A null binding,
+     * or one created for another row, yields false: the caller then falls back
+     * to the row's own stored text.
+     */
+    private function live_text_applies_to( int $message_id ): bool {
+        return $this->live_text !== null && $this->live_text[1] === $message_id;
+    }
+
+    /**
      * تلاش برای ارسال یک Message (idempotent — برای Job + Fast-path).
      * شکست Retryable با Attempts باقی‌مانده → RETRYING (Job Queue تکرار می‌کند).
      *
      * @param array<string, string>|null $live_vars متغیرهای زنده (OTP — کد هرگز ذخیره نمی‌شود)
      */
-    // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy method name; cross-file API rename.
+    // phpcs:disable WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- legacy public method name; renaming it is a cross-file API change outside this scope.
     public function dispatchMessage( int $message_id, ?array $live_vars = null ): void
     {
         $row = $this->fetchMessage( $message_id );
@@ -443,6 +487,8 @@ final class SmsService
                 $outbound_text = (string) $row['message'];
                 if ( $is_otp_event ) {
                     $outbound_text = $this->render_live_otp_text( $variables );
+                } elseif ( $this->live_text_applies_to( $message_id ) && null !== $this->live_text ) {
+                    $outbound_text = $this->live_text[0];
                 }
                 $result = $provider->sendText( $creds, (string) $row['recipient'], $outbound_text, $opts );
             }
@@ -1221,6 +1267,20 @@ final class SmsService
             ' SET ' . implode(', ', $sets) . ", updated_at = %s WHERE id = %d",
             $params
         );
+    }
+
+    /**
+     * Mask NID-shaped digit runs in SMS variables before they are persisted.
+     * @param array<string, string> $vars
+     * @return array<string, string>
+     */
+    private function redact_vars( array $vars ): array {
+        $safe = [];
+        foreach ( $vars as $key => $value ) {
+            $safe[ NationalIdValidator::redact_digits( (string) $key ) ] = NationalIdValidator::redact_digits( (string) $value );
+        }
+
+        return $safe;
     }
 
     /**

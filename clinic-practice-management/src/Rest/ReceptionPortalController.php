@@ -78,11 +78,13 @@ declare(strict_types=1);
 
 namespace ClinicCore\Rest;
 
+use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
 use ClinicCore\Domain\Booking\BookingException;
 use ClinicCore\Domain\Booking\BookingWindow;
 use ClinicCore\Domain\Time\Jalali;
+use ClinicCore\Domain\Validators\NationalIdValidator;
 use ClinicCore\Domain\Visits\VisitException;
 use ClinicCore\Infrastructure\Repository\AppointmentRepository;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
@@ -595,6 +597,11 @@ final class ReceptionPortalController extends RestBase {
 	 * required at the Reception permission boundary.
 	 */
 	private function patient_create( WP_REST_Request $r ): WP_REST_Response|WP_Error {
+		$query = $r->get_query_params();
+		if ( is_array( $query ) && array_key_exists( 'national_id', $query ) ) {
+			return $this->error( PatientAccess::PROOF_FAILED_CODE, 403, PatientAccess::PROOF_FAILED_MESSAGE );
+		}
+
 		$fields = [];
 		foreach ( [ 'first_name', 'last_name', 'mobile', 'national_id', 'birth_date', 'gender' ] as $key ) {
 			$value = $r->get_param( $key );
@@ -870,7 +877,7 @@ final class ReceptionPortalController extends RestBase {
 			try {
 				$visit = App::visitService()->transition( $user_id, (int) $active['id'], 'enqueue' );
 			} catch ( \Throwable $e ) {
-				error_log( '[CPMS][ReceptionPortalController] recovery enqueue: ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
+				error_log( '[CPMS][ReceptionPortalController] recovery enqueue: ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
 				$code    = $e instanceof VisitException ? $e->errorCode : 'CLINIC_INTERNAL_ERROR'; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- established VisitException contract
 				$message = $e instanceof VisitException ? $e->getMessage() : 'افزودن به صف انجام نشد';
 				return $this->arrival_incomplete( 'existing', (int) $active['id'], 'checked_in', $code, $message );
@@ -949,7 +956,7 @@ final class ReceptionPortalController extends RestBase {
 			// Honest partial: check-in committed, enqueue did not — the
 			// response is a real failure that preserves the partial checked_in
 			// outcome; it is never silently turned into generic success.
-			error_log( '[CPMS][ReceptionPortalController] enqueue stage: ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
+			error_log( '[CPMS][ReceptionPortalController] enqueue stage: ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
 			$code    = $e instanceof VisitException ? $e->errorCode : 'CLINIC_INTERNAL_ERROR'; // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- established VisitException contract
 			$message = $e instanceof VisitException ? $e->getMessage() : 'افزودن به صف انجام نشد';
 			$fresh   = $this->fresh_visit( $user_id, (int) ( $visit['id'] ?? 0 ) );
@@ -1109,7 +1116,7 @@ final class ReceptionPortalController extends RestBase {
 		try {
 			App::visitService()->transition( $user_id, $visit_id, 'enqueue' );
 		} catch ( \Throwable $e ) {
-			error_log( '[CPMS][ReceptionPortalController] walk-in enqueue: ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
+			error_log( '[CPMS][ReceptionPortalController] walk-in enqueue: ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
 			$fresh = $this->fresh_visit( $user_id, $visit_id );
 			if ( 'waiting' === (string) ( $fresh['status'] ?? '' ) ) {
 				// Durable truth: a concurrent request already completed it.
@@ -1401,7 +1408,7 @@ final class ReceptionPortalController extends RestBase {
 			return $this->error( $e->errorCode, $e->httpStatus, $e->getMessage(), $e->data ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- established BookingException contract
 		} catch ( \Throwable $e ) {
 			// Never a fake success and never a raw stack in the response.
-			error_log( '[CPMS][ReceptionPortalController] appointment create: ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
+			error_log( '[CPMS][ReceptionPortalController] appointment create: ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
 
 			return $this->error( 'CLINIC_INTERNAL_ERROR', 500, 'ثبت نوبت انجام نشد' );
 		}
@@ -1574,7 +1581,7 @@ final class ReceptionPortalController extends RestBase {
 			return $this->error( $e->errorCode, $e->httpStatus, $e->getMessage(), $e->data ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- established BookingException contract
 		} catch ( \Throwable $e ) {
 			// Never a fake success and never a raw stack in the response.
-			error_log( '[CPMS][ReceptionPortalController] appointment cancel: ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
+			error_log( '[CPMS][ReceptionPortalController] appointment cancel: ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
 
 			return $this->error( 'CLINIC_INTERNAL_ERROR', 500, 'لغو نوبت انجام نشد' );
 		}
@@ -1651,7 +1658,7 @@ final class ReceptionPortalController extends RestBase {
 		} catch ( BookingException $e ) {
 			return $this->error( $e->errorCode, $e->httpStatus, $e->getMessage(), $e->data ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- established BookingException contract
 		} catch ( \Throwable $e ) {
-			error_log( '[CPMS][ReceptionPortalController] appointment no-show: ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
+			error_log( '[CPMS][ReceptionPortalController] appointment no-show: ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
 
 			return $this->error( 'CLINIC_INTERNAL_ERROR', 500, 'ثبت عدم حضور انجام نشد' );
 		}
@@ -1796,7 +1803,7 @@ final class ReceptionPortalController extends RestBase {
 			return $this->error( $e->errorCode, $e->httpStatus, $e->getMessage(), $e->data ); // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- established BookingException contract
 		} catch ( \Throwable $e ) {
 			// Never a fake success and never a raw stack in the response.
-			error_log( '[CPMS][ReceptionPortalController] appointment reschedule: ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
+			error_log( '[CPMS][ReceptionPortalController] appointment reschedule: ' . NationalIdValidator::redact_digits( $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- established controller convention
 
 			return $this->error( 'CLINIC_INTERNAL_ERROR', 500, 'جابه‌جایی نوبت انجام نشد' );
 		}
