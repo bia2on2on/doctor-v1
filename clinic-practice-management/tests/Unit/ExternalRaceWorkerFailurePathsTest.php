@@ -333,6 +333,9 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
      * any signal helper; cleanup uses the children's OWN proc_open handles
      * (proc_get_status reaping probe, proc_terminate only while still running,
      * proc_close with ignored return value) — never the guard, never a bare PID.
+     * Both handles are null-initialised and BOTH launches happen inside the
+     * try, so the finally can terminate an already-launched child even when
+     * the SECOND launch (or a launch-time assertion) fails.
      */
     public function testGuardedDescendantSignalRefusesUnrelatedProcess(): void
     {
@@ -345,12 +348,24 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
 
         $token = 'cpms-descendant-token=' . bin2hex(random_bytes(8));
 
-        $unrelated = $this->startHarmlessSleepChild([]);
-        $carrier = $this->startHarmlessSleepChild([$token]);
-        /** @var list<array{process: resource, pid: int}> $children */
-        $children = [$unrelated, $carrier];
+        // Cleanup must exist BEFORE the first launch: both handles start at
+        // null, BOTH launches happen INSIDE the try, and the finally below
+        // cleans each child only when its handle is non-null — through that
+        // child's OWN proc_open handle, never by bare PID. If a launch fails,
+        // self::fail() unwinds through the finally and every already-launched
+        // child is still terminated; the helper's post-launch steps are all
+        // failure-safe, so a child created inside it cannot be stranded
+        // outside the finally either.
+        /** @var ?array{process: resource, pid: int} $unrelated */
+        $unrelated = null;
+        /** @var ?array{process: resource, pid: int} $carrier */
+        $carrier = null;
 
         try {
+            $unrelated = $this->startHarmlessSleepChild([]);
+            $carrier = $this->startHarmlessSleepChild([$token]);
+            self::assertNotNull($unrelated, 'the unrelated child handle must be registered before assertions run');
+            self::assertNotNull($carrier, 'the token-carrying child handle must be registered before assertions run');
             self::assertNotSame(0, $unrelated['pid'], 'the unrelated child must be a real process');
             self::assertNotSame(0, $carrier['pid'], 'the token-carrying child must be a real process');
 
@@ -388,7 +403,10 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             }
             self::assertTrue($carrierGone, 'the token-carrying child must have died after the allowed TERM (bounded poll via proc_get_status; last observed: ' . $lastCarrierObservation . ')');
         } finally {
-            foreach ($children as $child) {
+            foreach ([$unrelated, $carrier] as $child) {
+                if ($child === null) {
+                    continue; // never launched — or the launch failed before this handle existed; nothing to clean up
+                }
                 $process = $child['process'];
                 if (!is_resource($process)) {
                     continue;
@@ -466,7 +484,7 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
         }
         foreach ($pipes as $pipe) {
             if (is_resource($pipe)) {
-                fclose($pipe);
+                @fclose($pipe); // post-launch step: a warning must never strand the child without a handle
             }
         }
 
@@ -919,6 +937,9 @@ final class MissingRunningWorker extends ExternalRaceWorker
         // drive every read through the injected arrays.
         $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
         $process = @proc_open([PHP_BINARY, $script], $descriptors, $pipes, dirname($script, 3), []);
+        if (!is_resource($process)) {
+            self::fail('could not launch the doubt-injection child for this test'); // fail-closed: never inject doubt for a child that does not exist
+        }
         parent::__construct($process, is_array($pipes) ? $pipes : []);
     }
 
