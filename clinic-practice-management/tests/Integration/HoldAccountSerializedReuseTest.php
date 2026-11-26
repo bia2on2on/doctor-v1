@@ -59,7 +59,17 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
     protected function setUp(): void
     {
         parent::setUp();
-        $this->createDisposableSchema('hsr');
+        try {
+            $this->createDisposableSchema('hsr');
+        } catch (\PHPUnit\Framework\SkippedTest $skip) {
+            if ('Linux' === PHP_OS_FAMILY) {
+                self::fail(
+                    'Linux runtime must create disposable schema without skipping: ' . $skip->getMessage()
+                );
+            }
+
+            throw $skip;
+        }
         $this->migrateDisposableSchema();
         $this->seedWpUsers();
         $this->seedOrganizationGraph();
