@@ -1055,6 +1055,101 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
         }
     }
 
+    /**
+     * T-R3P (Round 7 ITEM B): Direct ReflectionMethod unit-level verification of
+     * BookingService::parse_hold_expires_at_utc(mixed $raw_expires_at): ?DateTimeImmutable.
+     *
+     * Executes zero SQL queries and zero sleeps. Verifies valid MySQL DATETIME /
+     * DATETIME(3) / DATETIME(6) UTC strings parse to UTC DateTimeImmutable with exact
+     * microsecond formatting, and every malformed shape (including trailing "\n" that
+     * PCRE '$' without 'D' or '\z' would otherwise accept) fails closed to null.
+     */
+    public function testTR3PParserFailsClosedOnEveryMalformedExpiryShape(): void
+    {
+        $stack         = $this->stackOn($this->fixtureWpdb, true, $this->userAId, $this->capturedSessions[$this->userAId]);
+        $service       = $stack['service'];
+        $queriesBefore = (int) $this->fixtureWpdb->num_queries;
+
+        $parser = new \ReflectionMethod(\ClinicCore\Application\Booking\BookingService::class, 'parse_hold_expires_at_utc');
+        self::assertTrue($parser->isPrivate(), 'T-R3P: parse_hold_expires_at_utc must remain private');
+        self::assertFalse($parser->isStatic(), 'T-R3P: parse_hold_expires_at_utc must be an instance method');
+        self::assertSame(1, $parser->getNumberOfRequiredParameters(), 'T-R3P: parse_hold_expires_at_utc must require 1 parameter');
+
+        $validCases = [
+            'valid_ms_zero'           => ['2030-01-01 12:00:00.000', '2030-01-01 12:00:00.000000'],
+            'valid_1_frac_digit'      => ['2030-01-01 12:00:00.5', '2030-01-01 12:00:00.500000'],
+            'valid_2_frac_digits'     => ['2030-01-01 12:00:00.25', '2030-01-01 12:00:00.250000'],
+            'valid_3_frac_digits'     => ['2030-01-01 12:00:00.250', '2030-01-01 12:00:00.250000'],
+            'valid_6_frac_digits_max' => ['2030-01-01 12:00:00.123456', '2030-01-01 12:00:00.123456'],
+            'valid_no_fraction'       => ['2030-01-01 12:00:00', '2030-01-01 12:00:00.000000'],
+            'valid_leap_day'          => ['2028-02-29 23:59:59.999', '2028-02-29 23:59:59.999000'],
+        ];
+
+        foreach ($validCases as $caseName => $pair) {
+            $rawInput          = $pair[0];
+            $expectedFormatted = $pair[1];
+            $actual            = $parser->invoke($service, $rawInput);
+
+            self::assertInstanceOf(
+                \DateTimeImmutable::class,
+                $actual,
+                'T-R3P valid case must return DateTimeImmutable: ' . $caseName
+            );
+            self::assertSame(
+                $expectedFormatted,
+                $actual->format('Y-m-d H:i:s.u'),
+                'T-R3P formatted UTC timestamp mismatch for case: ' . $caseName
+            );
+            self::assertSame(
+                'UTC',
+                $actual->getTimezone()->getName(),
+                'T-R3P timezone name must be UTC for case: ' . $caseName
+            );
+        }
+
+        $malformedCases = [
+            'empty_string'                 => '',
+            'null_value'                   => null,
+            'int_value'                    => 1893499200,
+            'array_value'                  => ['2030-01-01 12:00:00.000'],
+            'bool_false'                   => false,
+            'relative_now'                 => 'now',
+            'relative_plus_one_hour'       => '+1 hour',
+            'impossible_date_feb_30'       => '2030-02-30 12:00:00.000',
+            'year_0000'                    => '0000-01-01 00:00:00.000',
+            'hour_24'                      => '2030-01-01 24:00:00.000',
+            'minute_60'                    => '2030-01-01 12:60:00.000',
+            'second_60'                    => '2030-01-01 12:00:60.000',
+            'trailing_lf_with_fraction'    => "2030-01-01 12:00:00.000\n",
+            'trailing_lf_without_fraction' => "2030-01-01 12:00:00\n",
+            'trailing_space'               => '2030-01-01 12:00:00.000 ',
+            'trailing_crlf'                => "2030-01-01 12:00:00.000\r\n",
+            'leading_space'                => ' 2030-01-01 12:00:00.000',
+            'leading_lf'                   => "\n2030-01-01 12:00:00.000",
+            'iso_t_separator'              => '2030-01-01T12:00:00.000',
+            'trailing_letters'             => '2030-01-01 12:00:00.000UTC',
+            'embedded_nul_trailing'        => "2030-01-01 12:00:00.000\0",
+            'embedded_nul_middle'          => "2030-01-01\0 12:00:00.000",
+            'trailing_dot_without_digits'  => '2030-01-01 12:00:00.',
+            'seven_frac_digits_overflow'   => '2030-01-01 12:00:00.1234567',
+            'non_ascii_persian_digits'     => '۲۰۳۰-۰۱-۰۱ ۱۲:۰۰:۰۰.۰۰۰',
+        ];
+
+        foreach ($malformedCases as $caseName => $rawInput) {
+            $actual = $parser->invoke($service, $rawInput);
+            self::assertNull(
+                $actual,
+                'T-R3P malformed case must fail closed to null: ' . $caseName
+            );
+        }
+
+        self::assertSame(
+            $queriesBefore,
+            (int) $this->fixtureWpdb->num_queries,
+            'T-R3P direct parser test must execute zero SQL queries'
+        );
+    }
+
     // ================= fixture & subprocess helpers =================
 
     private function seedSecondLinkedPatientOnAccount(int $userId, string $mrn): int
@@ -1111,11 +1206,18 @@ final class HoldAccountSerializedReuseTest extends WP_UnitTestCase
     private function assertSubprocessBackendAvailable(): void
     {
         $ok = function_exists('proc_open') && defined('PHP_BINARY') && '' !== PHP_BINARY;
-        if ('true' === (string) getenv('GITHUB_ACTIONS')) {
-            self::assertTrue($ok, 'CI integration job must provide proc_open + PHP_BINARY');
+        if ('Linux' === PHP_OS_FAMILY) {
+            self::assertTrue(
+                $ok,
+                'Linux runtime must provide proc_open and non-empty PHP_BINARY regardless of environment'
+            );
+
+            return;
         }
         if (!$ok) {
-            self::markTestSkipped('proc_open / PHP_BINARY unavailable in this local runtime');
+            self::markTestSkipped(
+                'Subprocess backend requires proc_open and PHP_BINARY; unavailable on non-Linux OS family: ' . PHP_OS_FAMILY
+            );
         }
     }
 

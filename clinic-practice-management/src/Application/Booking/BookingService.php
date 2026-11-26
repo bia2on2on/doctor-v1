@@ -3336,7 +3336,7 @@ final class BookingService
         if ( ! is_string( $raw_expires_at ) || '' === $raw_expires_at ) {
             return null;
         }
-        if ( 1 !== preg_match( '/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?$/', $raw_expires_at, $parts ) ) {
+        if ( 1 !== preg_match( '/\A(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?\z/', $raw_expires_at, $parts ) ) {
             return null;
         }
         $year   = (int) $parts[1];
