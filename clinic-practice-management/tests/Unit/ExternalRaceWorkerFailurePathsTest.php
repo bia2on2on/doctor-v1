@@ -357,6 +357,14 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             self::assertFalse($this->signalDescendant($unrelated['pid'], 9, $token), 'the guard must REFUSE the KILL step too');
             self::assertTrue(@posix_kill($unrelated['pid'], 0), 'the unrelated child must STILL be alive — the guard sent nothing (signal 0 probe after refusal)');
 
+            // A forked child that has not yet exec'd serves the LAUNCHER's
+            // argv in /proc/<pid>/cmdline, which lacks the token; gate the
+            // allow-branch assertions on the carrier actually exec'ing (bounded
+            // poll — not a fixed sleep).
+            self::assertTrue(
+                $this->waitForDescendantToken($carrier['pid'], $token, 5.0),
+                'the carrier child must exec and show the token in /proc/<pid>/cmdline within the bounded window (bounded poll, not a fixed sleep)'
+            );
             self::assertTrue($this->signalDescendant($carrier['pid'], 15, $token), 'the guard must ALLOW the TERM for a process carrying the token');
             $deadline = microtime(true) + 5.0;
             $carrierGone = false;
@@ -619,6 +627,27 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
         }
 
         return null;
+    }
+
+    /**
+     * Bounded wait until the child's /proc/<pid>/cmdline is READABLE and
+     * carries the run-scoped token — i.e. until the child has exec'd and
+     * its own argv is visible. A forked-but-not-yet-exec'd child shows the
+     * launcher's argv instead (no token), which is why the allow-branch
+     * assertions must be gated on this handshake; bounded poll, never a
+     * fixed sleep.
+     */
+    private function waitForDescendantToken(int $pid, string $token, float $timeoutSeconds): bool
+    {
+        $deadline = microtime(true) + $timeoutSeconds;
+        while (microtime(true) < $deadline) {
+            if ($this->descendantIdentityMatches($pid, $token)) {
+                return true;
+            }
+            usleep(20000);
+        }
+
+        return false;
     }
 
     /**
