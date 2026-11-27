@@ -356,7 +356,8 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
      * token appears in /proc/<pid>/cmdline). Each assertion proves which
      * gate refused/allowed. The PHPUnit process's own PID is never passed to
      * any signal helper; cleanup uses the children's OWN proc_open handles
-     * (proc_get_status reaping probe, proc_terminate only while still running,
+     * (proc_get_status reaping probe, proc_terminate whenever a probe has not confirmed exit —
+     * doubt/unreadable included, never gated on running===true,
      * proc_close — called ONLY after a confirmed exit — with ignored return value) — never the guard, never a bare PID.
      * Both handles are null-initialised and BOTH launches happen inside the
      * try, so the finally can terminate an already-launched child even when
@@ -429,7 +430,9 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
             self::assertTrue($carrierGone, 'the token-carrying child must have died after the allowed TERM (bounded poll via proc_get_status; last observed: ' . $lastCarrierObservation . ')');
         } finally {
             $unconfirmed = [];
+            $cleanupErrors = [];
             foreach (['unrelated' => $unrelated, 'carrier' => $carrier] as $label => $child) {
+                try {
                 if ($child === null) {
                     continue; // never launched — or the launch failed before this handle existed; nothing to clean up
                 }
@@ -439,8 +442,9 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
                 }
                 // Cleanup goes through the child's OWN proc_open handle only:
                 // probe first with proc_get_status (reaps a dead child safely,
-                // sends no signal); signal ONLY while the probe still reports
-                // running — never by bare PID (a reaped PID may be recycled),
+                // sends no signal); TERM/KILL are sent whenever a probe has not
+                // CONFIRMED exit (a doubtful/unreadable probe included — the code
+                // never gates signalling on running===true) — never by bare PID (a reaped PID may be recycled),
                 // never through the identity guard, and proc_close's return
                 // value is intentionally ignored (after a proc_get_status
                 // observation of an exit, the exit code is not available again:
@@ -471,9 +475,24 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
                     continue;
                 }
                 @proc_close($process); // return value ignored by design (see note above); reached ONLY after a confirmed exit
+                } catch (\Throwable $e) {
+                    // ROUND15-FIX (G1): a failing step for THIS child must not
+                    // skip the OTHER child. Record class+message; do NOT call
+                    // proc_close, do NOT call self::fail() in the catch path -
+                    // the one verdict is raised AFTER the loop instead.
+                    $cleanupErrors[] = $label . ': ' . get_class($e) . ': ' . $e->getMessage();
+                    continue;
+                }
             }
+            $problems = [];
             if ($unconfirmed !== []) {
-                self::fail('the ' . implode(' and ', $unconfirmed) . ' child exit was never confirmed via proc_get_status after TERM and KILL; proc_close was withheld to keep it from blocking the suite');
+                $problems[] = 'the ' . implode(' and ', $unconfirmed) . ' child exit was never confirmed via proc_get_status after TERM and KILL; proc_close was withheld to keep it from blocking the suite';
+            }
+            if ($cleanupErrors !== []) {
+                $problems[] = 'cleanup threw (' . implode('; ', $cleanupErrors) . ')';
+            }
+            if ($problems !== []) {
+                self::fail(implode(' | ', $problems));
             }
         }
     }
