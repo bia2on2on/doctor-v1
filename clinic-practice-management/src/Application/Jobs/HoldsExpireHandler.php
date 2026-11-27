@@ -31,7 +31,11 @@ final class HoldsExpireHandler
      */
     public function __invoke(array $payload): int
     {
-        $now = $this->db->nowUtcSql();
+        // PR25-ROUND12: read the clock fractionally (.v, DATETIME(3)-aligned), not via
+        // the whole-second nowUtcSql(). Recognition (SELECT) and the guarded transition
+        // (UPDATE) share this one value, so both agree with the real clock at sub-second
+        // precision and a hold expiring mid-second is swept in the same second.
+        $now = $this->db->nowUtc();
 
         $expired = $this->db->fetchAll(
             'SELECT id, slot_id FROM ' . $this->db->table('cpms_slot_holds') .

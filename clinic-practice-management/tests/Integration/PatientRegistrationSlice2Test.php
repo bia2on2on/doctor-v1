@@ -2891,6 +2891,151 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
     }
 
     /**
+     * PR25-ROUND12 (C4): a hold whose DATETIME(3) fractional expires_at falls inside the
+     * current whole second (e.g. ':10.001' with decision now ':10.437') must be recognized
+     * as expired AND have its held capacity released in the same second:
+     *  - Sub-case 1: BookingService::confirm() lazy expiry transition (guarded UPDATE);
+     *  - Sub-case 2: HoldsExpireHandler sweeper (SELECT + guarded UPDATE).
+     * Pre-fix, confirm() recognized expiry with a microsecond clock but transitioned with
+     * the whole-second nowUtcSql() ('.000'), so the guarded UPDATE matched zero rows and
+     * held_count stayed allocated; the sweeper also compared against the whole-second .000.
+     * The backdate is bound to the CURRENT whole second with '.001' and the wait is bounded
+     * (<= 20 ms busy-wait), so the test is deterministic with no wall-clock TTL sleeps.
+     */
+    public function testRound2T1FractionalHoldExpiryBoundaryReleasesHeldCapacityInSameSecond(): void {
+        $db         = App::db();
+        $holdsTable = $db->table( 'cpms_slot_holds' );
+        $slotsTable = $db->table( 'cpms_schedule_slots' );
+        $apptsTable = $db->table( 'cpms_appointments' );
+        $booking    = App::bookingService();
+
+        $mobileA  = '09125550241';
+        $nidA     = PatientTwoProofTestHelper::next_valid_national_id();
+        $patientA = $this->insertPatient( $this->clinicListed, $mobileA, 'کسر', 'انقضا', $nidA, '1991-03-15' );
+        self::assertGreaterThan( 0, $patientA );
+        $userA = (int) self::factory()->user->create( [ 'role' => RolesAndCapabilities::ROLE_PATIENT ] );
+        PatientTwoProofTestHelper::seed_patient_proof(
+            $userA,
+            $this->clinicListed,
+            $patientA,
+            [
+                'mobile'             => $mobileA,
+                'seed_session_scope' => true,
+                'set_current_user'   => false,
+            ]
+        );
+
+        $dateFracLazy  = gmdate( 'Y-m-d', time() + 18 * 86400 );
+        $dateFracSweep = gmdate( 'Y-m-d', time() + 19 * 86400 );
+        $slotFracLazy  = $this->insertSlotWithCapacity( $this->clinicListed, $this->locationListed, $this->clinicianListed, $dateFracLazy, '11:00:00', 1 );
+        $slotFracSweep = $this->insertSlotWithCapacity( $this->clinicListed, $this->locationListed, $this->clinicianListed, $dateFracSweep, '12:00:00', 1 );
+        self::assertGreaterThan( 0, $slotFracLazy );
+        self::assertGreaterThan( 0, $slotFracSweep );
+
+        // --- Sub-case 1: lazy expiry release inside BookingService::confirm() (same whole second) ---
+        PatientTwoProofTestHelper::acting_as( $userA );
+        $holdLazy = $booking->hold( $userA, $this->clinicianListed, $dateFracLazy, '11:00:00', $slotFracLazy, $patientA, $this->locationListed );
+        self::assertArrayHasKey( 'hold_token', $holdLazy );
+        $tokenLazy = (string) $holdLazy['hold_token'];
+
+        $holdRowBefore = $db->fetchRow(
+            'SELECT id, status FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
+            [ $tokenLazy ]
+        );
+        self::assertIsArray( $holdRowBefore );
+        self::assertSame( 'active', (string) $holdRowBefore['status'] );
+        $holdIdLazy = (int) $holdRowBefore['id'];
+
+        $fracExpiresLazy = $this->fractionalExpiryWithinCurrentSecondForTest( $holdIdLazy );
+
+        $denyExpiredFrac = null;
+        try {
+            $booking->confirm( $tokenLazy, $userA, 'کسر پس از انقضا', wp_generate_uuid4() );
+        } catch ( BookingException $e ) {
+            $denyExpiredFrac = $e;
+        }
+        self::assertInstanceOf( BookingException::class, $denyExpiredFrac );
+        self::assertSame( 'CLINIC_HOLD_EXPIRED', $denyExpiredFrac->errorCode );
+        self::assertSame( 422, $denyExpiredFrac->httpStatus );
+
+        $holdRowLazyExpired = $db->fetchRow(
+            'SELECT status, expires_at FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1',
+            [ $holdIdLazy ]
+        );
+        self::assertIsArray( $holdRowLazyExpired );
+        self::assertSame( 'expired', (string) $holdRowLazyExpired['status'] );
+        self::assertSame( $fracExpiresLazy, (string) $holdRowLazyExpired['expires_at'] );
+
+        $slotFracLazyFreed = $db->fetchRow(
+            'SELECT held_count, booked_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slotFracLazy ]
+        );
+        self::assertIsArray( $slotFracLazyFreed );
+        self::assertSame( 0, (int) $slotFracLazyFreed['held_count'] );
+        self::assertSame( 0, (int) $slotFracLazyFreed['booked_count'] );
+        self::assertSame(
+            0,
+            (int) $db->fetchValue( 'SELECT COUNT(*) FROM ' . $apptsTable . ' WHERE slot_id = %d', [ $slotFracLazy ] )
+        );
+
+        // --- Sub-case 2: sweeper releases the same fractional boundary in the same second ---
+        $holdSweep = $booking->hold( $userA, $this->clinicianListed, $dateFracSweep, '12:00:00', $slotFracSweep, $patientA, $this->locationListed );
+        self::assertArrayHasKey( 'hold_token', $holdSweep );
+        $tokenSweep = (string) $holdSweep['hold_token'];
+
+        $holdSweepBefore = $db->fetchRow(
+            'SELECT id, status FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
+            [ $tokenSweep ]
+        );
+        self::assertIsArray( $holdSweepBefore );
+        self::assertSame( 'active', (string) $holdSweepBefore['status'] );
+        $holdIdSweep = (int) $holdSweepBefore['id'];
+
+        $fracExpiresSweep = $this->fractionalExpiryWithinCurrentSecondForTest( $holdIdSweep );
+
+        $sweeper = new \ClinicCore\Application\Jobs\HoldsExpireHandler( $db );
+        $freed   = $sweeper( [] );
+        self::assertGreaterThanOrEqual( 1, $freed );
+
+        $holdSweepExpired = $db->fetchRow(
+            'SELECT status, expires_at FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1',
+            [ $holdIdSweep ]
+        );
+        self::assertIsArray( $holdSweepExpired );
+        self::assertSame( 'expired', (string) $holdSweepExpired['status'] );
+        self::assertSame( $fracExpiresSweep, (string) $holdSweepExpired['expires_at'] );
+
+        $slotFracSweepFreed = $db->fetchRow(
+            'SELECT held_count, booked_count FROM ' . $slotsTable . ' WHERE id = %d LIMIT 1',
+            [ $slotFracSweep ]
+        );
+        self::assertIsArray( $slotFracSweepFreed );
+        self::assertSame( 0, (int) $slotFracSweepFreed['held_count'] );
+        self::assertSame( 0, (int) $slotFracSweepFreed['booked_count'] );
+    }
+
+    /**
+     * Bind an active hold's expires_at to a fractional DATETIME(3) value ('.001') that sits
+     * INSIDE the current whole second — i.e. in the past by the decision clock, yet sharing
+     * its whole-second prefix with a whole-second nowUtcSql() ('.000'). Pre-fix, the
+     * whole-second guarded UPDATE could never match this row. A bounded busy-wait
+     * (<= 20 ms) makes the binding deterministic with no wall-clock TTL sleep.
+     */
+    private function fractionalExpiryWithinCurrentSecondForTest( int $holdId ): string {
+        while ( fmod( microtime( true ), 1.0 ) < 0.020 ) {
+            usleep( 1000 );
+        }
+        $expiresAt = gmdate( 'Y-m-d H:i:s', time() ) . '.001';
+        $affected  = App::db()->execute(
+            'UPDATE ' . App::db()->table( 'cpms_slot_holds' ) . " SET expires_at = %s WHERE id = %d AND status = 'active'",
+            [ $expiresAt, $holdId ]
+        );
+        self::assertSame( 1, $affected );
+
+        return $expiresAt;
+    }
+
+    /**
      * Round 2 T2 (no capture): on a capacity=1 slot, after Patient A's hold is preserved
      * across a profile-incomplete confirm() denial, proved Patient B cannot hold
      * (409 CLINIC_SLOT_TAKEN) or confirm (403 CLINIC_PERMISSION_DENIED) that slot,

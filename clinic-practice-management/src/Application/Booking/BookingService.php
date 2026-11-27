@@ -870,7 +870,14 @@ final class BookingService
         $holdPatientId = $hasPatientCol && array_key_exists('patient_id', $hold) && $hold['patient_id'] !== null && (string) $hold['patient_id'] !== '' ? (int) $hold['patient_id'] : null;
 
         $now = $this->now();
-        $now_sql = $this->db->nowUtcSql();
+        // PR25-ROUND12: the expiry transition must be driven by the same precise
+        // decision instant used for recognition ($now, microsecond DateTimeImmutable),
+        // not by the whole-second nowUtcSql() ('.000'). Otherwise a hold that expired
+        // within the current whole second is recognized as expired here yet the guarded
+        // UPDATE (expires_at <= %s) matches zero rows and held capacity stays allocated.
+        // '.v' truncates microseconds to milliseconds, matching the DATETIME(3) column;
+        // floor() is monotonic, so whenever recognition is true the transition matches too.
+        $now_sql = $now->format( 'Y-m-d H:i:s.v' );
         if ((int) $hold['holder_wp_user_id'] !== $wpUserId) {
             // phpcs:disable PEAR.Functions.FunctionCallSignature.MultipleArguments,PEAR.Functions.FunctionCallSignature.CloseBracketLine -- PSR compact multi-line call, established file style; security, SQL, i18n and escaping sniffs stay active.
             $this->audit('FORBIDDEN_ACCESS_ATTEMPT', $wpUserId, 'patient', 'slot_hold', (int) $hold['id'], null, null, null, [
