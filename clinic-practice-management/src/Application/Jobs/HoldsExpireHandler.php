@@ -31,11 +31,14 @@ final class HoldsExpireHandler
      */
     public function __invoke(array $payload): int
     {
-        // PR25-ROUND12: read the clock fractionally (.v, DATETIME(3)-aligned), not via
-        // the whole-second nowUtcSql(). Recognition (SELECT) and the guarded transition
-        // (UPDATE) share this one value, so both agree with the real clock at sub-second
-        // precision and a hold expiring mid-second is swept in the same second.
-        $now = $this->db->nowUtc();
+        // PR25-ROUND14: read ONE UTC instant and format it with truncating '.v'
+        // (milliseconds), matching the DATETIME(3) column precision. Recognition
+        // (SELECT) and the guarded transition (UPDATE) share this single value, so
+        // both agree with the real clock at sub-second precision and a hold expiring
+        // mid-second is swept in the same second. (CpmsDb::nowUtc() is deliberately
+        // NOT used: it builds its milliseconds with round() from a SECOND microtime()
+        // call, which can round up into the next second and is not truncation.)
+        $now = ( new \DateTimeImmutable( 'now', new \DateTimeZone( 'UTC' ) ) )->format( 'Y-m-d H:i:s.v' );
 
         $expired = $this->db->fetchAll(
             'SELECT id, slot_id FROM ' . $this->db->table('cpms_slot_holds') .

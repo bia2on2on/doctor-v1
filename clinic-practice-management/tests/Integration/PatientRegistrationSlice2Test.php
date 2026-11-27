@@ -2891,16 +2891,17 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
     }
 
     /**
-     * PR25-ROUND12 (C4): a hold whose DATETIME(3) fractional expires_at falls inside the
-     * current whole second (e.g. ':10.001' with decision now ':10.437') must be recognized
-     * as expired AND have its held capacity released in the same second:
-     *  - Sub-case 1: BookingService::confirm() lazy expiry transition (guarded UPDATE);
-     *  - Sub-case 2: HoldsExpireHandler sweeper (SELECT + guarded UPDATE).
-     * Pre-fix, confirm() recognized expiry with a microsecond clock but transitioned with
-     * the whole-second nowUtcSql() ('.000'), so the guarded UPDATE matched zero rows and
-     * held_count stayed allocated; the sweeper also compared against the whole-second .000.
-     * The backdate is bound to the CURRENT whole second with '.001' and the wait is bounded
-     * (<= 20 ms busy-wait), so the test is deterministic with no wall-clock TTL sleeps.
+     * PR25-ROUND12/ROUND14 (C4, same whole second): expires_at falls INSIDE the current
+     * whole second ('.001', decision now in the same second) — the same-second boundary.
+     * Discrimination is bounded per attempt: the fixture waits (2 s deadline) for the
+     * phase of the second to enter [0.050, 0.700), and floor(t_after) == S proves the
+     * decision instant was inside second S (S.001 <= fixture write <= decision <=
+     * t_after < S+1). A crossing attempt is discarded and retried with a FRESH hold
+     * (max 3 attempts, then the test FAILS — never a skip, never a silent pass).
+     *  - Sub-case 1: confirm() throws 422 CLINIC_HOLD_EXPIRED, row expired, held_count 0,
+     *    expires_at unchanged;
+     *  - Sub-case 2: HoldsExpireHandler expires the row identically.
+     * Deterministic against pre-fix whole-second clocks ONLY on non-crossing attempts.
      */
     public function testRound2T1FractionalHoldExpiryBoundaryReleasesHeldCapacityInSameSecond(): void {
         $db         = App::db();
@@ -2933,30 +2934,39 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertGreaterThan( 0, $slotFracSweep );
 
         // --- Sub-case 1: lazy expiry release inside BookingService::confirm() (same whole second) ---
-        PatientTwoProofTestHelper::acting_as( $userA );
-        $holdLazy = $booking->hold( $userA, $this->clinicianListed, $dateFracLazy, '11:00:00', $slotFracLazy, $patientA, $this->locationListed );
-        self::assertArrayHasKey( 'hold_token', $holdLazy );
-        $tokenLazy = (string) $holdLazy['hold_token'];
+        $lazyAttempt = function () use ( $booking, $userA, $patientA, $dateFracLazy, $slotFracLazy, $holdsTable, $db ): array {
+            PatientTwoProofTestHelper::acting_as( $userA );
+            $hold = $booking->hold( $userA, $this->clinicianListed, $dateFracLazy, '11:00:00', $slotFracLazy, $patientA, $this->locationListed );
+            self::assertArrayHasKey( 'hold_token', $hold );
+            $rowBefore = $db->fetchRow(
+                'SELECT id, status FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
+                [ (string) $hold['hold_token'] ]
+            );
+            self::assertIsArray( $rowBefore );
+            self::assertSame( 'active', (string) $rowBefore['status'] );
+            $holdId  = (int) $rowBefore['id'];
+            $fixture = $this->sameSecondExpiryFixtureForTest( $holdId, false );
 
-        $holdRowBefore = $db->fetchRow(
-            'SELECT id, status FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
-            [ $tokenLazy ]
-        );
-        self::assertIsArray( $holdRowBefore );
-        self::assertSame( 'active', (string) $holdRowBefore['status'] );
-        $holdIdLazy = (int) $holdRowBefore['id'];
+            $deny = null;
+            try {
+                $booking->confirm( (string) $hold['hold_token'], $userA, 'کسر پس از انقضا', wp_generate_uuid4() );
+            } catch ( BookingException $e ) {
+                $deny = $e;
+            }
+            $tAfter = microtime( true );
+            // floor(t_after) == s proves the decision instant was inside second S
+            // (S.001 <= fixture write <= decision <= t_after < S+1).
+            return [ 's' => $fixture['s'], 'expires' => $fixture['expires'], 't_after' => $tAfter, 'hold_id' => $holdId, 'deny' => $deny ];
+        };
+        $lazy = $this->runSameSecondExpiryAttemptForTest( $lazyAttempt );
 
-        $fracExpiresLazy = $this->fractionalExpiryWithinCurrentSecondForTest( $holdIdLazy );
-
-        $denyExpiredFrac = null;
-        try {
-            $booking->confirm( $tokenLazy, $userA, 'کسر پس از انقضا', wp_generate_uuid4() );
-        } catch ( BookingException $e ) {
-            $denyExpiredFrac = $e;
-        }
+        $denyExpiredFrac = $lazy['deny'];
         self::assertInstanceOf( BookingException::class, $denyExpiredFrac );
         self::assertSame( 'CLINIC_HOLD_EXPIRED', $denyExpiredFrac->errorCode );
         self::assertSame( 422, $denyExpiredFrac->httpStatus );
+
+        $holdIdLazy = $lazy['hold_id'];
+        $fracExpiresLazy = $lazy['expires'];
 
         $holdRowLazyExpired = $db->fetchRow(
             'SELECT status, expires_at FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1',
@@ -2979,23 +2989,32 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         );
 
         // --- Sub-case 2: sweeper releases the same fractional boundary in the same second ---
-        $holdSweep = $booking->hold( $userA, $this->clinicianListed, $dateFracSweep, '12:00:00', $slotFracSweep, $patientA, $this->locationListed );
-        self::assertArrayHasKey( 'hold_token', $holdSweep );
-        $tokenSweep = (string) $holdSweep['hold_token'];
+        $sweepAttempt = function () use ( $booking, $userA, $patientA, $dateFracSweep, $slotFracSweep, $holdsTable, $db ): array {
+            PatientTwoProofTestHelper::acting_as( $userA );
+            $hold = $booking->hold( $userA, $this->clinicianListed, $dateFracSweep, '12:00:00', $slotFracSweep, $patientA, $this->locationListed );
+            self::assertArrayHasKey( 'hold_token', $hold );
+            $rowBefore = $db->fetchRow(
+                'SELECT id, status FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
+                [ (string) $hold['hold_token'] ]
+            );
+            self::assertIsArray( $rowBefore );
+            self::assertSame( 'active', (string) $rowBefore['status'] );
+            $holdId  = (int) $rowBefore['id'];
+            $fixture = $this->sameSecondExpiryFixtureForTest( $holdId, false );
 
-        $holdSweepBefore = $db->fetchRow(
-            'SELECT id, status FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
-            [ $tokenSweep ]
-        );
-        self::assertIsArray( $holdSweepBefore );
-        self::assertSame( 'active', (string) $holdSweepBefore['status'] );
-        $holdIdSweep = (int) $holdSweepBefore['id'];
+            $sweeper = new \ClinicCore\Application\Jobs\HoldsExpireHandler( $db );
+            $freed   = $sweeper( [] );
+            $tAfter  = microtime( true );
+            // floor(t_after) == s proves the decision instant was inside second S
+            // (S.001 <= fixture write <= decision <= t_after < S+1).
+            return [ 's' => $fixture['s'], 'expires' => $fixture['expires'], 't_after' => $tAfter, 'hold_id' => $holdId, 'freed' => $freed ];
+        };
+        $sweep = $this->runSameSecondExpiryAttemptForTest( $sweepAttempt );
 
-        $fracExpiresSweep = $this->fractionalExpiryWithinCurrentSecondForTest( $holdIdSweep );
+        self::assertGreaterThanOrEqual( 1, $sweep['freed'] );
 
-        $sweeper = new \ClinicCore\Application\Jobs\HoldsExpireHandler( $db );
-        $freed   = $sweeper( [] );
-        self::assertGreaterThanOrEqual( 1, $freed );
+        $holdIdSweep = $sweep['hold_id'];
+        $fracExpiresSweep = $sweep['expires'];
 
         $holdSweepExpired = $db->fetchRow(
             'SELECT status, expires_at FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1',
@@ -3015,24 +3034,73 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
     }
 
     /**
-     * Bind an active hold's expires_at to a fractional DATETIME(3) value ('.001') that sits
-     * INSIDE the current whole second — i.e. in the past by the decision clock, yet sharing
-     * its whole-second prefix with a whole-second nowUtcSql() ('.000'). Pre-fix, the
-     * whole-second guarded UPDATE could never match this row. A bounded busy-wait
-     * (<= 20 ms) makes the binding deterministic with no wall-clock TTL sleep.
+     * PR25-ROUND14: wait (hard elapsed-time deadline of 2 s) until the phase of the
+     * current second is inside [0.050, 0.700); on deadline the test FAILS with a clear
+     * message — never a silent loop.
      */
-    private function fractionalExpiryWithinCurrentSecondForTest( int $holdId ): string {
-        while ( fmod( microtime( true ), 1.0 ) < 0.020 ) {
-            usleep( 1000 );
+    private function waitForSafeSecondPhaseForTest(): void {
+        $deadline = microtime( true ) + 2.0;
+        while ( true ) {
+            $phase = fmod( microtime( true ), 1.0 );
+            if ( $phase >= 0.050 && $phase < 0.700 ) {
+                return;
+            }
+            if ( microtime( true ) >= $deadline ) {
+                self::fail( 'PR25-ROUND14: second phase did not enter [0.050, 0.700) within 2 s' );
+            }
+            usleep( 500 );
         }
-        $expiresAt = gmdate( 'Y-m-d H:i:s', time() ) . '.001';
+    }
+
+    /**
+     * PR25-ROUND14: bind an active hold's expires_at INSIDE the current whole second
+     * (after a safe-phase wait). $minusOneMillisecond selects between '.001' of the
+     * current second (round-12 fixture) and floor(now-1ms) in milliseconds (round-13
+     * fixture). Returns ['s' => whole second S, 'expires' => expires_at string].
+     *
+     * @return array{s: int, expires: string}
+     */
+    private function sameSecondExpiryFixtureForTest( int $holdId, bool $minusOneMillisecond ): array {
+        $this->waitForSafeSecondPhaseForTest();
+        $s = (int) floor( microtime( true ) );
+        if ( $minusOneMillisecond ) {
+            $micros    = (int) round( microtime( true ) * 1_000_000 ) - 1000;
+            $expiresAt = gmdate( 'Y-m-d H:i:s', intdiv( $micros, 1_000_000 ) )
+                . '.' . sprintf( '%03d', intdiv( $micros % 1_000_000, 1000 ) );
+        } else {
+            $expiresAt = gmdate( 'Y-m-d H:i:s', $s ) . '.001';
+        }
         $affected  = App::db()->execute(
             'UPDATE ' . App::db()->table( 'cpms_slot_holds' ) . " SET expires_at = %s WHERE id = %d AND status = 'active'",
             [ $expiresAt, $holdId ]
         );
         self::assertSame( 1, $affected );
 
-        return $expiresAt;
+        return [ 's' => $s, 'expires' => $expiresAt ];
+    }
+
+    /**
+     * PR25-ROUND14: run one same-second expiry attempt up to 3 times. $attemptFn creates
+     * a FRESH active hold (the previous attempt may already have expired it), backdates
+     * expires_at via sameSecondExpiryFixtureForTest(), performs the operation under test
+     * and returns ['s','expires','t_after', ...payload]. floor(t_after) == s proves the
+     * decision instant was inside second S (S.mmm <= fixture write <= decision <=
+     * t_after < S+1). A non-crossing attempt is discriminating; if all 3 attempts cross,
+     * the test FAILS — never a skip, never a silent pass.
+     *
+     * @param callable(): array<string, mixed> $attemptFn
+     * @return array<string, mixed>
+     */
+    private function runSameSecondExpiryAttemptForTest( callable $attemptFn ): array {
+        for ( $attempt = 1; $attempt <= 3; $attempt++ ) {
+            $r = $attemptFn();
+            // floor(t_after) == s proves the decision instant was inside second S
+            // (S.mmm <= fixture write <= decision <= t_after < S+1).
+            if ( (int) floor( (float) $r['t_after'] ) === (int) $r['s'] ) {
+                return $r;
+            }
+        }
+        self::fail( 'PR25-ROUND14: 3 attempts crossed the second boundary; refusing to pass on a non-discriminating attempt' );
     }
 
     /**
@@ -3140,16 +3208,17 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
     }
 
     /**
-     * PR25-ROUND13 (C4, 1 ms BEFORE the exact instant, SAME whole second — tightest
+     * PR25-ROUND13/ROUND14 (C4, 1 ms BEFORE the exact instant, SAME whole second — tightest
      * deterministic neighbour; equality itself is not deterministically testable without
      * clock injection, so this bounds the boundary from below): expires_at is bound to
-     * floor((now - 1 ms) to milliseconds), always inside the same whole second (guarded
-     * by fmod >= 0.002, <= 2 ms busy-wait):
+     * floor(now-1ms) in milliseconds, inside the current whole second (phase wait to
+     * [0.050, 0.700) with a 2 s deadline; retry up to 3 attempts on second-crossing, then
+     * FAIL — floor(t_after) == S proves the decision instant was inside second S):
      *  - Sub-case 1 (lazy): confirm() throws 422 CLINIC_HOLD_EXPIRED, the row becomes
      *    `expired`, held_count returns to 0, expires_at unchanged;
      *  - Sub-case 2 (sweeper): HoldsExpireHandler expires the row identically.
-     * Round 12's test covers the same-second boundary with a >= 19 ms margin; this adds
-     * the 1 ms adjacency only.
+     * Round 12's same-second test covers '.001' with the same machinery; this adds only
+     * the 1 ms adjacency.
      */
     public function testRound2T1OneMillisecondBeforeInstantSameSecondConfirmAndSweeperRelease(): void {
         $db         = App::db();
@@ -3182,30 +3251,39 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertGreaterThan( 0, $slotTightSweep );
 
         // --- Sub-case 1: lazy expiry release inside confirm() (1 ms before, same whole second) ---
-        PatientTwoProofTestHelper::acting_as( $userA );
-        $holdLazy = $booking->hold( $userA, $this->clinicianListed, $dateTightLazy, '15:00:00', $slotTightLazy, $patientA, $this->locationListed );
-        self::assertArrayHasKey( 'hold_token', $holdLazy );
-        $tokenLazy = (string) $holdLazy['hold_token'];
+        $lazyAttempt = function () use ( $booking, $userA, $patientA, $dateTightLazy, $slotTightLazy, $holdsTable, $db ): array {
+            PatientTwoProofTestHelper::acting_as( $userA );
+            $hold = $booking->hold( $userA, $this->clinicianListed, $dateTightLazy, '15:00:00', $slotTightLazy, $patientA, $this->locationListed );
+            self::assertArrayHasKey( 'hold_token', $hold );
+            $rowBefore = $db->fetchRow(
+                'SELECT id, status FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
+                [ (string) $hold['hold_token'] ]
+            );
+            self::assertIsArray( $rowBefore );
+            self::assertSame( 'active', (string) $rowBefore['status'] );
+            $holdId  = (int) $rowBefore['id'];
+            $fixture = $this->sameSecondExpiryFixtureForTest( $holdId, true );
 
-        $holdRowBefore = $db->fetchRow(
-            'SELECT id, status FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
-            [ $tokenLazy ]
-        );
-        self::assertIsArray( $holdRowBefore );
-        self::assertSame( 'active', (string) $holdRowBefore['status'] );
-        $holdIdLazy = (int) $holdRowBefore['id'];
+            $deny = null;
+            try {
+                $booking->confirm( (string) $hold['hold_token'], $userA, 'کسر پس از انقضا', wp_generate_uuid4() );
+            } catch ( BookingException $e ) {
+                $deny = $e;
+            }
+            $tAfter = microtime( true );
+            // floor(t_after) == s proves the decision instant was inside second S
+            // (fixture stays inside second S: S.001 or floor(now-1ms), both >= S.000).
+            return [ 's' => $fixture['s'], 'expires' => $fixture['expires'], 't_after' => $tAfter, 'hold_id' => $holdId, 'deny' => $deny ];
+        };
+        $lazy = $this->runSameSecondExpiryAttemptForTest( $lazyAttempt );
 
-        $fracExpiresLazy = $this->fractionalExpiryOneMillisecondBeforeNowForTest( $holdIdLazy );
-
-        $denyExpiredTight = null;
-        try {
-            $booking->confirm( $tokenLazy, $userA, 'کسر پس از انقضا', wp_generate_uuid4() );
-        } catch ( BookingException $e ) {
-            $denyExpiredTight = $e;
-        }
+        $denyExpiredTight = $lazy['deny'];
         self::assertInstanceOf( BookingException::class, $denyExpiredTight );
         self::assertSame( 'CLINIC_HOLD_EXPIRED', $denyExpiredTight->errorCode );
         self::assertSame( 422, $denyExpiredTight->httpStatus );
+
+        $holdIdLazy = $lazy['hold_id'];
+        $fracExpiresLazy = $lazy['expires'];
 
         $holdRowLazyExpired = $db->fetchRow(
             'SELECT status, expires_at FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1',
@@ -3228,23 +3306,32 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         );
 
         // --- Sub-case 2: sweeper releases the same 1 ms-tight boundary ---
-        $holdSweep = $booking->hold( $userA, $this->clinicianListed, $dateTightSweep, '16:00:00', $slotTightSweep, $patientA, $this->locationListed );
-        self::assertArrayHasKey( 'hold_token', $holdSweep );
-        $tokenSweep = (string) $holdSweep['hold_token'];
+        $sweepAttempt = function () use ( $booking, $userA, $patientA, $dateTightSweep, $slotTightSweep, $holdsTable, $db ): array {
+            PatientTwoProofTestHelper::acting_as( $userA );
+            $hold = $booking->hold( $userA, $this->clinicianListed, $dateTightSweep, '16:00:00', $slotTightSweep, $patientA, $this->locationListed );
+            self::assertArrayHasKey( 'hold_token', $hold );
+            $rowBefore = $db->fetchRow(
+                'SELECT id, status FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
+                [ (string) $hold['hold_token'] ]
+            );
+            self::assertIsArray( $rowBefore );
+            self::assertSame( 'active', (string) $rowBefore['status'] );
+            $holdId  = (int) $rowBefore['id'];
+            $fixture = $this->sameSecondExpiryFixtureForTest( $holdId, true );
 
-        $holdSweepBefore = $db->fetchRow(
-            'SELECT id, status FROM ' . $holdsTable . ' WHERE token = %s LIMIT 1',
-            [ $tokenSweep ]
-        );
-        self::assertIsArray( $holdSweepBefore );
-        self::assertSame( 'active', (string) $holdSweepBefore['status'] );
-        $holdIdSweep = (int) $holdSweepBefore['id'];
+            $sweeper = new \ClinicCore\Application\Jobs\HoldsExpireHandler( $db );
+            $freed   = $sweeper( [] );
+            $tAfter  = microtime( true );
+            // floor(t_after) == s proves the decision instant was inside second S
+            // (fixture stays inside second S: S.001 or floor(now-1ms), both >= S.000).
+            return [ 's' => $fixture['s'], 'expires' => $fixture['expires'], 't_after' => $tAfter, 'hold_id' => $holdId, 'freed' => $freed ];
+        };
+        $sweep = $this->runSameSecondExpiryAttemptForTest( $sweepAttempt );
 
-        $fracExpiresSweep = $this->fractionalExpiryOneMillisecondBeforeNowForTest( $holdIdSweep );
+        self::assertGreaterThanOrEqual( 1, $sweep['freed'] );
 
-        $sweeper = new \ClinicCore\Application\Jobs\HoldsExpireHandler( $db );
-        $freed   = $sweeper( [] );
-        self::assertGreaterThanOrEqual( 1, $freed );
+        $holdIdSweep = $sweep['hold_id'];
+        $fracExpiresSweep = $sweep['expires'];
 
         $holdSweepExpired = $db->fetchRow(
             'SELECT status, expires_at FROM ' . $holdsTable . ' WHERE id = %d LIMIT 1',
@@ -3270,8 +3357,8 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
      *    `expired`, held_count returns to 0, expires_at unchanged;
      *  - Sub-case 2 (sweeper): HoldsExpireHandler expires the row identically;
      *  - Sub-case 3 (no revival/extension): a fresh hold() by the same subject mints a
-     *    NEW token and leaves the expired row untouched (status `expired`, expires_at
-     *    byte-identical) — it is not reused as an active row.
+     *    NEW token; the expired row keeps its `status` and `expires_at` unchanged — the
+     *    only two fields this test compares.
      */
     public function testRound2T1PreviousWholeSecondFractionalExpiryConfirmAndSweeperRelease(): void {
         $db         = App::db();
@@ -3396,27 +3483,6 @@ final class PatientRegistrationSlice2Test extends WP_UnitTestCase {
         self::assertIsArray( $holdSweepAfterRehold );
         self::assertSame( 'expired', (string) $holdSweepAfterRehold['status'] );
         self::assertSame( $fracExpiresSweep, (string) $holdSweepAfterRehold['expires_at'] );
-    }
-
-    /**
-     * Bind an active hold's expires_at to the millisecond instant 1 ms BEFORE the current
-     * instant (floored to ms), guaranteed to stay inside the same whole second by the
-     * <= 2 ms busy-wait guard. Deterministic; no wall-clock TTL sleep.
-     */
-    private function fractionalExpiryOneMillisecondBeforeNowForTest( int $holdId ): string {
-        while ( fmod( microtime( true ), 1.0 ) < 0.002 ) {
-            usleep( 500 );
-        }
-        $expiresAt = ( new \DateTimeImmutable( 'now', new \DateTimeZone( 'UTC' ) ) )
-            ->modify( '-1 millisecond' )
-            ->format( 'Y-m-d H:i:s.v' );
-        $affected  = App::db()->execute(
-            'UPDATE ' . App::db()->table( 'cpms_slot_holds' ) . " SET expires_at = %s WHERE id = %d AND status = 'active'",
-            [ $expiresAt, $holdId ]
-        );
-        self::assertSame( 1, $affected );
-
-        return $expiresAt;
     }
 
     /**
