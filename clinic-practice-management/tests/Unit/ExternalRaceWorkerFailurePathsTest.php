@@ -356,8 +356,8 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
      * token appears in /proc/<pid>/cmdline). Each assertion proves which
      * gate refused/allowed. The PHPUnit process's own PID is never passed to
      * any signal helper; cleanup uses the children's OWN proc_open handles
-     * (proc_get_status reaping probe, proc_terminate whenever a probe has not confirmed exit —
-     * doubt/unreadable included, never gated on running===true,
+     * (proc_get_status reaping probe. A probe that RETURNS without confirming exit: TERM is sent and polled; if exit is still unconfirmed after polling, KILL is sent and polled; if still unconfirmed, the child is recorded and proc_close is NOT called.
+     * A probe/signal/poll that THROWS: the catch records it (class+message) and cleanup of THAT child STOPS — no further signal, no proc_close for it; the single aggregate self::fail after the loop names it (documented limitation, record-only). A doubtful/unreadable probe is a RETURNING probe with an unconfirmed result, not a throwing probe;
      * proc_close — called ONLY after a confirmed exit — with ignored return value) — never the guard, never a bare PID.
      * Both handles are null-initialised and BOTH launches happen inside the
      * try, so the finally can terminate an already-launched child even when
@@ -442,22 +442,22 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
                 }
                 // Cleanup goes through the child's OWN proc_open handle only:
                 // probe first with proc_get_status (reaps a dead child safely,
-                // sends no signal); TERM/KILL are sent whenever a probe has not
-                // CONFIRMED exit (a doubtful/unreadable probe included — the code
-                // never gates signalling on running===true) — never by bare PID (a reaped PID may be recycled),
-                // never through the identity guard, and proc_close's return
-                // value is intentionally ignored (after a proc_get_status
-                // observation of an exit, the exit code is not available again:
-                // php-src proc_open.c — 8.1/8.2: waitpid_cached absent, so the
-                // proc_close waitpid gets ECHILD and yields -1; 8.3+: only
-                // WIFEXITED is cached, so signaled exits still yield -1).
+                // sends no signal). A probe that RETURNS without confirming exit ⇒ TERM is sent and polled;
+                // still unconfirmed after polling ⇒ KILL is sent and polled; still unconfirmed ⇒ the child is
+                // recorded and proc_close is NOT called. A probe/signal/poll that THROWS ⇒ the catch records
+                // it (class+message) and cleanup of THAT child STOPS — no further signal, no proc_close for it;
+                // the aggregate self::fail after the loop names it (record-only limitation). A doubtful/unreadable
+                // probe is a RETURNING probe with an unconfirmed result, not a throwing probe — signalling is
+                // never gated on running===true; never by bare PID (a reaped PID may be recycled), never through
+                // the identity guard, and proc_close's return value is intentionally ignored (after a reaping
+                // observation the exit code is unavailable: php-src proc_open.c — 8.1/8.2 waitpid_cached absent ⇒ ECHILD ⇒ -1; 8.3+ caches only WIFEXITED).
                 $exited = $this->ownedChildExited($process, 0.0, 20000); // single reaping probe
                 if (!$exited) {
                     @proc_terminate($process, 15); // TERM via our own handle (numeric SIGTERM)
                     $exited = $this->ownedChildExited($process, 2.0, 20000); // bounded, 20 ms poll
                 }
                 if (!$exited) {
-                    @proc_terminate($process, 9); // KILL via our own handle only if TERM failed (numeric SIGKILL)
+                    @proc_terminate($process, 9); // KILL via our own handle only if exit is still unconfirmed after the TERM poll (numeric SIGKILL)
                     $exited = $this->ownedChildExited($process, 2.0, 10000); // bounded, 10 ms poll
                 }
                 if (!$exited) {
@@ -476,10 +476,10 @@ final class ExternalRaceWorkerFailurePathsTest extends TestCase
                 }
                 @proc_close($process); // return value ignored by design (see note above); reached ONLY after a confirmed exit
                 } catch (\Throwable $e) {
-                    // ROUND15-FIX (G1): a failing step for THIS child must not
-                    // skip the OTHER child. Record class+message; do NOT call
-                    // proc_close, do NOT call self::fail() in the catch path -
-                    // the one verdict is raised AFTER the loop instead.
+                    // ROUND15-FIX (G1): a failing step for THIS child stops cleanup of THAT child here —
+                    // the OTHER child is still cleaned via its own handle. Record class+message only: do NOT
+                    // call proc_close, no further signal for this child, do NOT self::fail() in the catch path —
+                    // the single aggregate self::fail after the loop names it (record-only limitation).
                     $cleanupErrors[] = $label . ': ' . get_class($e) . ': ' . $e->getMessage();
                     continue;
                 }
