@@ -4,11 +4,14 @@ declare( strict_types=1 );
 
 namespace ClinicCore\Tests\Integration;
 
+use ClinicCore\Application\Auth\OtpService;
 use ClinicCore\Application\Auth\PatientAccess;
 use ClinicCore\Application\Auth\PatientSessionProofStore;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
+use ClinicCore\Infrastructure\Repository\PatientIdentityRepository;
 use ClinicCore\Infrastructure\Repository\PatientLoginRepository;
+use ClinicCore\Infrastructure\Repository\PatientRepository;
 use ClinicCore\Tests\Support\PatientTwoProofTestHelper;
 use ClinicCore\Tests\Support\SignedExpirationFixture;
 use WP_REST_Request;
@@ -17,26 +20,30 @@ use WP_UnitTestCase;
 
 /**
  * Gaps for T-L29 and T-L31 of docs/architecture/patient-identity-login-design.md
- * (patient-identity family; rows near :417 and :419).
+ * (patient-identity family; the rows in the §9 table that describe the 14-day sweep's
+ * neighbours, not the license-activation family).
  *
- * Only the legs that are BOTH uncovered and deterministic are tested here. Legs that
- * document a WordPress limitation (the destroy-vs-update race) or that an existing test
- * already asserts (the 60-minute absolute window, post-destroy reads, cross-token reads)
- * are recorded in the agent log instead of being re-asserted as if they were new.
+ * Only the legs that are BOTH uncovered and deterministic are tested here. The
+ * destroy-versus-update race is a WordPress limitation the design records rather than fixes,
+ * so it has no test; the 60-minute absolute window and post-destroy READS are already
+ * asserted elsewhere and are not re-asserted as if they were new.
+ *
+ * No PHP runs in the authoring sandbox: every behavioural statement below is either read
+ * from the cited production source or observed in CI. Nothing here is claimed as executed
+ * locally.
  */
 final class PatientTwoProofGapsTest extends WP_UnitTestCase {
     use SignedExpirationFixture;
 
-    private const MOBILE_SHARED = '09128881001';
-    private const MOBILE_SH2    = '09128881003';
-    private const MOBILE_A      = '09128881002';
-    private const NID_SHARED_1  = '0010000107';
-    private const NID_SHARED_2  = '0010000115';
-    private const NID_A         = '0010000123';
+    private const MOBILE_A     = '09128881002';
+    private const MOBILE_SH1   = '09128881001';
+    private const MOBILE_SH2   = '09128881003';
+    private const NID_A        = '0010000123';
+    private const NID_SH1      = '0010000107';
+    private const NID_SH2      = '0010000115';
 
     private int $orgId;
     private int $clinicA;
-    private int $clinicB;
     private int $patientA;
     private int $patientShared1;
     private int $patientShared2;
@@ -58,25 +65,11 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
         );
         self::assertGreaterThan( 0, $this->orgId );
 
-        $db->insert(
-            'cpms_clinics',
-            [
-                'organization_id' => $this->orgId,
-                'name'            => 'TwoProof Gaps Clinic B',
-                'slug'            => 'twoproof-gaps-b-' . uniqid(),
-                'timezone'        => 'UTC',
-                'status'          => 'active',
-                'created_at'      => $now,
-                'updated_at'      => $now,
-            ]
-        );
-        $this->clinicB = $db->wpdb_last_insert_id();
+        $this->patientA       = $this->insertPatient( 'MR-GAP-A-' . uniqid(), self::MOBILE_A, self::NID_A );
+        $this->patientShared1 = $this->insertPatient( 'MR-GAP-S1-' . uniqid(), self::MOBILE_SH1, self::NID_SH1 );
+        $this->patientShared2 = $this->insertPatient( 'MR-GAP-S2-' . uniqid(), self::MOBILE_SH2, self::NID_SH2 );
 
-        $this->patientA       = $this->insertPatient( $this->clinicA, 'MR-GAP-A-' . uniqid(), self::MOBILE_A, self::NID_A );
-        $this->patientShared1 = $this->insertPatient( $this->clinicA, 'MR-GAP-S1-' . uniqid(), self::MOBILE_SHARED, self::NID_SHARED_1 );
-        $this->patientShared2 = $this->insertPatient( $this->clinicA, 'MR-GAP-S2-' . uniqid(), self::MOBILE_SH2, self::NID_SHARED_2 );
-
-        $this->patientUserA = $this->makeUser( 'gap_pat_a_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
+        $this->patientUserA = $this->makeUser( 'gap_pat_a_' . uniqid() );
 
         $logins = new PatientLoginRepository( $db );
         $logins->insert_pending_account( $this->patientUserA, self::MOBILE_A, 'GapA', 'Test' );
@@ -94,21 +87,30 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
     }
 
     /**
-     * T-L31 (uncovered leg): a proof WRITE must fail closed once the token is gone.
+     * T-L31 (uncovered leg): a proof WRITE refuses once the token is gone, and the refused
+     * write leaves no session behind.
      *
-     * §2.7 requires that "before writing, the store re-reads the session and must find the
-     * same token still present; if it is gone the write fails closed (no proof)". The existing
-     * unit test destroys the session and then asserts a READ (`has_valid_binding_proof`)
-     * returns false, which is a different branch: the read fails at `get_live_session()` before
-     * the write path is ever entered. This test drives the WRITE path itself.
+     * WHAT THIS TEST ACTUALLY EXERCISES (OBSERVED by reading the store): both writers hit the
+     * INITIAL live-session guard, `PatientSessionProofStore::get_live_session()`, which returns
+     * null for a missing token — `record_mobile_proof()` at :77-80 and `record_binding_proof()`
+     * at :128-131. The SECOND, pre-mutation re-read (:92-95 / :146-148) is NOT reached here and
+     * is not deterministically testable without an injection seam, so this test makes no claim
+     * about it. The design's "re-reads before writing" sentence describes that second branch,
+     * not this one.
+     *
+     * The `level()` call at the end uses a fixture with an ACTIVE account and an ACTIVE durable
+     * binding, so it really does reach the proof store (:443) and return LEVEL_NONE at :458 —
+     * see the separate test below, where the same fixture also proves LEVEL_FULL positively.
      */
     public function testProofWriteFailsClosedOnceTheSessionTokenIsGone(): void {
         $store = new PatientSessionProofStore();
         $now   = time();
 
-        // POSITIVE CONTROL: with a live session the write succeeds and the proof reads back.
-        // It is asserted BEFORE any destruction: `destroy_all_sessions()` below ends every
-        // session of this user, so a control placed after it could only ever see refusals.
+        // A real durable account + binding + identity edge, so the gate can reach the store.
+        $seeded = $this->seedActiveAccountAndBinding();
+
+        // POSITIVE CONTROLS, asserted BEFORE any destruction: `destroy_all_sessions()` below
+        // ends every session of this user, so a control after it could only see refusals.
         $liveToken = $store->issue_non_persistent_auth_cookie( $this->patientUserA );
         self::assertNotSame( '', $liveToken, 'a live session token was issued' );
         self::assertTrue(
@@ -116,11 +118,19 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
             'control: a live session accepts the mobile proof write'
         );
         self::assertTrue(
-            $store->has_valid_mobile_proof( $this->patientUserA, self::MOBILE_A, $now + 1, $liveToken ),
-            'control: the written mobile proof reads back inside the window'
+            $store->record_binding_proof( $this->patientUserA, $this->clinicA, $this->patientA, (int) $seeded['binding_id'], (string) $seeded['verified_at'], $now, $liveToken ),
+            'control: a live session accepts the binding proof write'
+        );
+        self::assertSame(
+            PatientAccess::LEVEL_FULL,
+            App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 1, $liveToken ),
+            'control: the proved live session really reaches the proof store and returns LEVEL_FULL'
         );
 
-        // Second session: destroy it, then attempt the same writes through it.
+        $liveSessionsBefore = array_keys( WP_Session_Tokens::get_instance( $this->patientUserA )->get_all() );
+        self::assertContains( $liveToken, $liveSessionsBefore, 'precondition: the live token is in the store' );
+
+        // Second session, destroyed, then the same writes are attempted through it.
         $deadToken = $store->issue_non_persistent_auth_cookie( $this->patientUserA );
         self::assertNotSame( '', $deadToken, 'the second session token was issued' );
         self::assertNotSame( $liveToken, $deadToken, 'the two sessions have distinct tokens' );
@@ -133,75 +143,108 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
         );
         self::assertFalse(
             $store->record_mobile_proof( $this->patientUserA, self::MOBILE_A, $now, $deadToken ),
-            'T-L31: the write fails closed when the token is gone (no proof is created)'
+            'T-L31: the mobile-proof write fails closed when the token is gone'
         );
         self::assertFalse(
-            $store->record_binding_proof( $this->patientUserA, $this->clinicA, $this->patientA, 1, '2026-11-28 00:00:00.000', $now, $deadToken ),
-            'T-L31: the binding-proof write fails closed too'
+            $store->record_binding_proof( $this->patientUserA, $this->clinicA, $this->patientA, (int) $seeded['binding_id'], (string) $seeded['verified_at'], $now, $deadToken ),
+            'T-L31: the binding-proof write fails closed when the token is gone'
         );
 
-        // No proof survived the refused writes, so the gate stays at `none` for that session.
+        // The refused writes must not have RESURRECTED the session or stored a proof in it.
+        self::assertNull(
+            WP_Session_Tokens::get_instance( $this->patientUserA )->get( $deadToken ),
+            'after the refused writes the destroyed token is still absent'
+        );
+        self::assertSame(
+            [],
+            WP_Session_Tokens::get_instance( $this->patientUserA )->get_all(),
+            'after destroy_all_sessions and two refused writes, the user has no sessions at all'
+        );
+
+        // ... and the gate gives that session nothing.
         self::assertSame(
             PatientAccess::LEVEL_NONE,
             App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 2, $deadToken ),
-            'T-L31: no level is granted on the destroyed session after the refused write'
+            'T-L31: no level is granted on the destroyed session'
         );
     }
 
     /**
-     * T-L29 (uncovered leg): two records of ONE clinic sharing one identity, only record A bound.
+     * T-L31 (the leg the shallow version could not reach): `level()` on a LIVE session with
+     * NO proofs written on it is LEVEL_NONE, and the SAME fixture becomes LEVEL_FULL once the
+     * real store writes both proofs on that same token.
      *
-     * Record B must stay unproved even though it carries the SAME `identity_id` as record A.
-     * This is the P3 claim: an identity edge grants nothing by itself; the binding is decisive.
-     * The existing shared-mobile test uses two DIFFERENT clinics and two different identities,
-     * so it never exercises a shared identity inside one clinic.
+     * This is the leg that actually exercises the proof store through the gate: the fixture has
+     * an ACTIVE account and an ACTIVE two_factor binding, so `level()` passes the early
+     * `[] === $bindings` return (`PatientAccess.php:429-430`) and calls
+     * `has_valid_binding_proof()` at :443. Without that durable binding the gate would return
+     * LEVEL_NONE at :430 for ANY token, live or dead — which is exactly the short-circuit the
+     * earlier version of this file suffered from.
+     */
+    public function testLiveSessionWithoutProofsIsNoneAndWithProofsIsFull(): void {
+        $store  = new PatientSessionProofStore();
+        $now    = time();
+        $seeded = $this->seedActiveAccountAndBinding();
+
+        // A brand-new live session: durable binding exists, but no proof has been written.
+        $token = $store->issue_non_persistent_auth_cookie( $this->patientUserA );
+        self::assertNotSame( '', $token, 'a live session token was issued' );
+        self::assertSame(
+            0,
+            $this->proofCount( $token ),
+            'precondition: the fresh session carries no proof entries'
+        );
+
+        // Denial class (a): the proof gate, reached because the binding exists.
+        self::assertSame(
+            PatientAccess::LEVEL_NONE,
+            App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 1, $token ),
+            'T-L31: a live session with no proofs gets LEVEL_NONE although the binding is durable'
+        );
+
+        // POSITIVE CONTROL on the SAME fixture and the SAME token: write both proofs, get FULL.
+        self::assertTrue(
+            $store->record_mobile_proof( $this->patientUserA, self::MOBILE_A, $now + 2, $token ),
+            'control: the mobile proof is written on this live session'
+        );
+        self::assertSame(
+            PatientAccess::LEVEL_NONE,
+            App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 3, $token ),
+            'control: a mobile proof alone is still not enough for LEVEL_FULL'
+        );
+        self::assertTrue(
+            $store->record_binding_proof( $this->patientUserA, $this->clinicA, $this->patientA, (int) $seeded['binding_id'], (string) $seeded['verified_at'], $now + 2, $token ),
+            'control: the binding proof is written on this live session'
+        );
+        self::assertSame(
+            PatientAccess::LEVEL_FULL,
+            App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 3, $token ),
+            'control: both proofs on the same token give LEVEL_FULL'
+        );
+    }
+
+    /**
+     * T-L29 at the gate: record B of the SAME clinic shares record A's Organization identity
+     * but has no binding of its own, so a session that proved A proves nothing about B.
      */
     public function testSharedIdentityGrantsNoAccessToTheOtherRecord(): void {
-        $db = App::db();
+        $db  = App::db();
+        $now = time();
 
-        // Record A is proved; record B is a second record of the SAME clinic that will share
-        // record A's Organization identity without any binding of its own.
-        $proof = PatientTwoProofTestHelper::seed_patient_proof(
-            $this->patientUserA,
-            $this->clinicA,
-            $this->patientA,
-            [ 'mobile' => self::MOBILE_A ]
-        );
-        $token   = (string) $proof['token'];
-        $now     = time();
-        $identId = (int) $db->fetchValue(
-            'SELECT identity_id FROM ' . $db->table( 'cpms_patients' ) . ' WHERE id = %d LIMIT 1',
-            [ $this->patientA ]
-        );
-        self::assertGreaterThan( 0, $identId, 'record A carries an Organization identity' );
+        // Record A proved through the REAL promoter (matching NID + OTP), not a helper shortcut.
+        $token      = $this->promoteRecord( $this->patientA, self::MOBILE_A, self::NID_A );
+        $identA     = $this->identityIdOf( $this->patientA );
+        self::assertGreaterThan( 0, $identA, 'record A carries an Organization identity' );
 
-        // `activate_for_new_patient()` reuses the caller's single Organization identity
-        // (`resolve_verified_identity()`, exactly-one rule), so record B legitimately ends up
-        // pointing at the SAME identity as record A — the condition T-L29 names.
-        $identB = (int) App::patient_identity_activator()->activate_for_new_patient(
-            $this->clinicA,
-            $this->patientShared1,
-            self::MOBILE_SHARED,
-            $this->patientUserA
-        );
-        self::assertSame( $identId, $identB, 'fixture: both records share ONE Organization identity' );
+        // Record B must really SHARE that identity for this test to be about shared identity.
+        $this->shareIdentity( $this->patientShared1, $identA );
         self::assertSame(
-            $identId,
-            (int) $db->fetchValue(
-                'SELECT identity_id FROM ' . $db->table( 'cpms_patients' ) . ' WHERE id = %d LIMIT 1',
-                [ $this->patientShared1 ]
-            ),
-            'fixture: record B persisted the shared identity'
-        );
-        self::assertNull(
-            $db->fetchValue(
-                'SELECT identity_id FROM ' . $db->table( 'cpms_patients' ) . ' WHERE id = %d LIMIT 1',
-                [ $this->patientShared2 ]
-            ),
-            'the untouched third record carries no identity at all'
+            $identA,
+            $this->identityIdOf( $this->patientShared1 ),
+            'fixture: record B shares record A identity in the same Organization'
         );
 
-        // POSITIVE CONTROL: record A is fully proved at the gate.
+        // POSITIVE CONTROL: record A is fully proved at the gate on this very token.
         self::assertSame(
             PatientAccess::LEVEL_FULL,
             App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 5, $token ),
@@ -213,16 +256,11 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
             'control: exactly the bound record is proved'
         );
 
-        // T-L29: neither unbound record is proved, and the shared identity changes nothing.
+        // T-L29: the shared identity grants nothing on record B.
         self::assertSame(
             PatientAccess::LEVEL_NONE,
             App::patient_access()->level( $this->patientUserA, $this->patientShared1, $this->clinicA, $now + 5, $token ),
-            'T-L29: sharing record A identity grants no level on the unbound record'
-        );
-        self::assertSame(
-            PatientAccess::LEVEL_NONE,
-            App::patient_access()->level( $this->patientUserA, $this->patientShared2, $this->clinicA, $now + 5, $token ),
-            'T-L29: the second unbound record stays none too'
+            'T-L29: sharing record A identity grants no level on record B'
         );
         self::assertNotContains(
             $this->patientShared1,
@@ -230,129 +268,375 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
             'T-L29: the proved set never widens to the shared-identity record'
         );
 
-        // Record B becomes proved only by its OWN two proofs (matching NID), never by identity.
-        $proofB = PatientTwoProofTestHelper::seed_patient_proof(
-            $this->patientUserA,
-            $this->clinicA,
-            $this->patientShared2,
-            [ 'mobile' => self::MOBILE_SH2 ]
+        // P3 ASSERTED DIRECTLY on the predicate-backed repository method.
+        $repo = new PatientRepository( $db );
+        $linkA = $db->fetchValue(
+            'SELECT id FROM ' . $db->table( 'cpms_patient_user_links' )
+            . ' WHERE wp_user_id = %d AND patient_id = %d LIMIT 1',
+            [ $this->patientUserA, $this->patientA ]
         );
+        self::assertNotNull( $linkA, 'fixture: record A has a user link row' );
+        $resolvedA = $repo->find_active_linked_patient_by_link( $this->patientUserA, (int) $linkA );
+        self::assertNotNull( $resolvedA, 'P3: the predicate-backed resolver resolves the PROVED record' );
+        self::assertSame( $this->patientA, (int) $resolvedA['id'], 'P3: it resolves the expected record' );
+
+        $db->insert(
+            'cpms_patient_user_links',
+            [
+                'clinic_id'      => $this->clinicA,
+                'patient_id'     => $this->patientShared1,
+                'wp_user_id'     => $this->patientUserA,
+                'mobile_at_link' => self::MOBILE_SH1,
+                'is_primary'     => 0,
+                'linked_at'      => $db->nowUtcSql(),
+            ]
+        );
+        $linkB = (int) $db->wpdb_last_insert_id();
+        self::assertGreaterThan( 0, $linkB, 'fixture: record B has a user link row' );
+        self::assertNull(
+            $repo->find_active_linked_patient_by_link( $this->patientUserA, $linkB ),
+            'P3: the predicate-backed resolver does NOT resolve the shared-identity record without its own binding'
+        );
+
+        // Record B becomes reachable only after ITS OWN two proofs, through the real promoter.
+        $tokenB = $this->promoteRecord( $this->patientShared1, self::MOBILE_SH1, self::NID_SH1 );
         self::assertSame(
             PatientAccess::LEVEL_FULL,
-            App::patient_access()->level( $this->patientUserA, $this->patientShared2, $this->clinicA, $now + 6, (string) $proofB['token'] ),
-            'T-L29: the second record is reachable only after its own proof'
+            App::patient_access()->level( $this->patientUserA, $this->patientShared1, $this->clinicA, $now + 6, $tokenB ),
+            'T-L29: record B is reachable only after its own proofs'
+        );
+        self::assertSame(
+            $identA,
+            $this->identityIdOf( $this->patientShared1 ),
+            'T-L29: proving record B did not change the shared identity'
         );
     }
 
     /**
-     * T-L29 at the HTTP boundary: `GET /patient/me?link_id=<record B>` must be refused,
-     * and the refusal must carry no NID.
+     * T-L29 at the REST boundary. TWO labelled sub-cases, because the HTTP status and error
+     * code are IDENTICAL for both gates (403 + PROOF_FAILED_CODE) and only the observer
+     * reason distinguishes them:
      *
-     * The safeguard is the same proof check reached through the REST layer; the existing
-     * shared-mobile test never dispatches a request at the second record's link.
+     *   CASE R - the link RESOLVES through the P3 predicate, but the session holds no proof
+     *            for that record, so the LEVEL check refuses ('two_proof_required',
+     *            PatientAccess.php:696).
+     *   CASE U - the shared-identity record has NO active two_factor binding of its own, so
+     *            the P3 predicate's binding term (PatientRepository.php:422-438) makes the link
+     *            UNRESOLVABLE and the LINK RESOLVER refuses ('link_not_found',
+     *            PatientAccess.php:629). Note the identity term is USER-scoped
+     *            (PatientRepository.php:453: `pil.wp_user_id = l.wp_user_id`), so record B
+     *            INHERITS A's identity link - which is precisely the safeguard under test:
+     *            sharing identity_id still makes a record unreachable until that record has its
+     *            own verification.
+     *
+     * The reason is captured through the `decision_observer` constructor seam of
+     * `PatientAccess` (:159, consumed by `observe_decision()`), and each sub-case first
+     * asserts the precondition on `find_active_linked_patient_by_link()` directly, so the
+     * denial class is PROVEN rather than inferred from the shared 403.
      */
-    public function testHttpRequestForTheOtherRecordIsRefusedWithoutIdentityData(): void {
+    public function testHttpRefusalNamesTheGateForResolvableAndUnresolvableRecords(): void {
         $db  = App::db();
         $now = time();
 
-        $proof = PatientTwoProofTestHelper::seed_patient_proof(
-            $this->patientUserA,
+        $token  = $this->promoteRecord( $this->patientA, self::MOBILE_A, self::NID_A );
+        $identA = $this->identityIdOf( $this->patientA );
+        $this->shareIdentity( $this->patientShared1, $identA );
+
+        $repo = new PatientRepository( $db );
+
+        // ---- CASE R: resolvable link, refusal must come from the LEVEL check ----
+        // Give record B the two durable edges the P3 predicate needs (identity-user link +
+        // active binding) but NOT a session proof, so resolution succeeds and the gate can
+        // only refuse at the level check.
+        $this->makeRecordResolvableWithoutSessionProof( $this->patientShared1, self::MOBILE_SH1 );
+
+        $linkR = (int) $db->fetchValue(
+            'SELECT id FROM ' . $db->table( 'cpms_patient_user_links' )
+            . ' WHERE wp_user_id = %d AND patient_id = %d LIMIT 1',
+            [ $this->patientUserA, $this->patientShared1 ]
+        );
+        self::assertGreaterThan( 0, $linkR, 'CASE R fixture: record B has a link row' );
+        self::assertNotNull(
+            $repo->find_active_linked_patient_by_link( $this->patientUserA, $linkR ),
+            'CASE R precondition: the link really RESOLVES through the P3 predicate'
+        );
+
+        $reasonsR = [];
+        $gateR    = new PatientAccess(
+            $db,
+            new PatientRepository( $db ),
+            logins: new PatientLoginRepository( $db ),
+            proofs: new PatientSessionProofStore(),
+            decision_observer: static function ( array $d ) use ( &$reasonsR ): void {
+                $reasonsR[] = (string) $d['reason'];
+            }
+        );
+
+        $decisionR = $gateR->authorize_two_proof_request( $this->patientUserA, null, null, $linkR, PatientAccess::MODE_CLINICAL, false, $now + 5, $token );
+
+        self::assertFalse( $decisionR['allowed'], 'CASE R: the request is refused' );
+        self::assertSame( 403, $decisionR['http_status'], 'CASE R: refusal is 403' );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $decisionR['code'], 'CASE R: refusal carries the proof code' );
+        self::assertSame(
+            'two_proof_required',
+            (string) $decisionR['reason'],
+            'CASE R: the LEVEL check refuses (PatientAccess.php:696), not the link resolver'
+        );
+        self::assertSame( [ 'two_proof_required' ], $reasonsR, 'CASE R: the observer saw exactly that one reason' );
+        self::assertNotSame(
+            'link_not_found',
+            (string) $decisionR['reason'],
+            'CASE R: the resolver did NOT refuse - this is what separates it from CASE U'
+        );
+
+        // Positive control for CASE R on the SAME resolvable link: a session holding that
+        // record's own proofs is allowed.
+        $tokenB = $this->promoteRecord( $this->patientShared1, self::MOBILE_SH1, self::NID_SH1 );
+        $allowedR = $gateR->authorize_two_proof_request( $this->patientUserA, null, null, $linkR, PatientAccess::MODE_CLINICAL, false, $now + 6, $tokenB );
+        self::assertTrue( $allowedR['allowed'], 'CASE R control: same link is allowed once that record is proved in the session' );
+
+        // ---- CASE U: unresolvable link, refusal must come from the LINK RESOLVER ----
+        $identU = $this->identityIdOf( $this->patientA );
+        $this->shareIdentity( $this->patientShared2, $identU );
+        $db->insert(
+            'cpms_patient_user_links',
+            [
+                'clinic_id'      => $this->clinicA,
+                'patient_id'     => $this->patientShared2,
+                'wp_user_id'     => $this->patientUserA,
+                'mobile_at_link' => self::MOBILE_SH2,
+                'is_primary'     => 0,
+                'linked_at'      => $db->nowUtcSql(),
+            ]
+        );
+        $linkU = (int) $db->wpdb_last_insert_id();
+        self::assertGreaterThan( 0, $linkU, 'CASE U fixture: record has a link row' );
+        self::assertNull(
+            $repo->find_active_linked_patient_by_link( $this->patientUserA, $linkU ),
+            'CASE U precondition: the P3 predicate does NOT resolve the shared-identity record'
+        );
+
+        $reasonsU = [];
+        $gateU    = new PatientAccess(
+            $db,
+            new PatientRepository( $db ),
+            logins: new PatientLoginRepository( $db ),
+            proofs: new PatientSessionProofStore(),
+            decision_observer: static function ( array $d ) use ( &$reasonsU ): void {
+                $reasonsU[] = (string) $d['reason'];
+            }
+        );
+
+        $decisionU = $gateU->authorize_two_proof_request( $this->patientUserA, null, null, $linkU, PatientAccess::MODE_CLINICAL, false, $now + 5, $token );
+
+        self::assertFalse( $decisionU['allowed'], 'CASE U: the request is refused' );
+        self::assertSame( 403, $decisionU['http_status'], 'CASE U: refusal is 403, same as CASE R' );
+        self::assertSame( PatientAccess::PROOF_FAILED_CODE, $decisionU['code'], 'CASE U: same code as CASE R' );
+        self::assertSame(
+            'link_not_found',
+            (string) $decisionU['reason'],
+            'CASE U: the LINK RESOLVER refuses (PatientAccess.php:629), not the level check'
+        );
+        self::assertSame( [ 'link_not_found' ], $reasonsU, 'CASE U: the observer saw exactly that one reason' );
+
+        // Positive control on the SAME gate and token: record A's own link resolves and is
+        // served, so the refusal above is about that record, not a broken gate.
+        $linkA = (int) $db->fetchValue(
+            'SELECT id FROM ' . $db->table( 'cpms_patient_user_links' )
+            . ' WHERE wp_user_id = %d AND patient_id = %d LIMIT 1',
+            [ $this->patientUserA, $this->patientA ]
+        );
+        $okU = $gateU->authorize_two_proof_request( $this->patientUserA, null, null, $linkA, PatientAccess::MODE_CLINICAL, false, $now + 5, $token );
+        self::assertTrue( $okU['allowed'], 'CASE U control: record A link is allowed on the same gate and token' );
+    }
+
+    // ---------------------------------------------------------------- fixtures
+
+    /**
+     * Activates the account and creates a real ACTIVE durable binding for record A, so the
+     * gate cannot short-circuit at the `[] === $bindings` return.
+     *
+     * @return array{binding_id: int, verified_at: string}
+     */
+    private function seedActiveAccountAndBinding(): array {
+        $logins = new PatientLoginRepository( App::db() );
+        $account = $logins->find_account_by_user_id( $this->patientUserA );
+        if ( null !== $account && PatientLoginRepository::STATE_PENDING === (string) ( $account['state'] ?? '' ) ) {
+            $logins->activate_account_from_pending( (int) $account['id'], $this->patientUserA );
+        }
+        $account = $logins->find_account_by_user_id( $this->patientUserA );
+        self::assertNotNull( $account, 'fixture: the account exists' );
+        self::assertSame(
+            PatientLoginRepository::STATE_ACTIVE,
+            (string) $account['state'],
+            'fixture: the account is ACTIVE so level() does not stop at the state check'
+        );
+
+        $db          = App::db();
+        $verified_at = $db->nowUtcSql();
+        $binding     = $logins->upsert_active_binding( $this->patientUserA, $this->clinicA, $this->patientA, $verified_at );
+        self::assertGreaterThan( 0, (int) $binding['id'], 'fixture: an active binding exists' );
+
+        // Identity edges: without them level() would return LEVEL_BOOKING, not LEVEL_FULL.
+        $identity = App::patient_identity_activator()->activate_for_new_patient(
             $this->clinicA,
             $this->patientA,
-            [ 'mobile' => self::MOBILE_A ]
+            self::MOBILE_A,
+            $this->patientUserA
         );
-        $token = (string) $proof['token'];
-
-        // A link row exists for record B (so a refusal cannot be "link not found" noise).
+        self::assertGreaterThan( 0, $identity, 'fixture: record A has an Organization identity' );
+        if ( ! ( new PatientIdentityRepository( $db ) )->user_link_exists( $identity, $this->patientUserA ) ) {
+            App::patient_identity_service()->link_user( $this->orgId, $identity, $this->patientUserA, self::MOBILE_A );
+        }
         self::assertTrue(
+            ( new PatientIdentityRepository( $db ) )->user_link_exists( $identity, $this->patientUserA ),
+            'fixture: the identity <-> user edge exists, so LEVEL_FULL is reachable'
+        );
+
+        return [
+            'binding_id'  => (int) $binding['id'],
+            'verified_at' => (string) $binding['verified_at'],
+        ];
+    }
+
+    /**
+     * Drives the REAL promoter (OTP + matching NID) for a record and returns its live token.
+     */
+    private function promoteRecord( int $patientId, string $mobile, string $nid ): string {
+        $store = new PatientSessionProofStore();
+        $token = $store->issue_non_persistent_auth_cookie( $this->patientUserA );
+        self::assertNotSame( '', $token, 'fixture: a live session token was issued for the promotion' );
+
+        $this->seedOtp( $mobile, '424242' );
+
+        $promoted = App::patient_binding_promoter()->promote(
+            $this->patientUserA,
+            $this->clinicA,
+            $mobile,
+            $nid,
+            '424242',
+            '198.51.100.90',
+            time(),
+            $token
+        );
+        self::assertSame( $patientId, (int) $promoted['patient_id'], 'fixture: the promoter bound the intended record' );
+
+        return $token;
+    }
+
+    /**
+     * Gives record B the durable edges the P3 predicate needs, WITHOUT a session proof, so a
+     * request for it reaches the LEVEL check (Case R).
+     */
+    private function makeRecordResolvableWithoutSessionProof( int $patientId, string $mobile ): void {
+        $db  = App::db();
+        $logins = new PatientLoginRepository( $db );
+        $now = $db->nowUtcSql();
+
+        $logins->upsert_active_binding( $this->patientUserA, $this->clinicA, $patientId, $now );
+
+        $identity = App::patient_identity_activator()->activate_for_new_patient(
+            $this->clinicA,
+            $patientId,
+            $mobile,
+            $this->patientUserA
+        );
+        self::assertGreaterThan( 0, $identity, 'fixture: record B has an Organization identity' );
+        if ( ! ( new PatientIdentityRepository( $db ) )->user_link_exists( $identity, $this->patientUserA ) ) {
+            App::patient_identity_service()->link_user( $this->orgId, $identity, $this->patientUserA, $mobile );
+        }
+
+        if ( 0 === (int) $db->fetchValue(
+            'SELECT id FROM ' . $db->table( 'cpms_patient_user_links' )
+            . ' WHERE wp_user_id = %d AND patient_id = %d LIMIT 1',
+            [ $this->patientUserA, $patientId ]
+        ) ) {
             $db->insert(
                 'cpms_patient_user_links',
                 [
                     'clinic_id'      => $this->clinicA,
-                    'patient_id'     => $this->patientShared1,
+                    'patient_id'     => $patientId,
                     'wp_user_id'     => $this->patientUserA,
-                    'mobile_at_link' => self::MOBILE_SHARED,
+                    'mobile_at_link' => $mobile,
                     'is_primary'     => 0,
-                    'linked_at'      => $db->nowUtcSql(),
+                    'linked_at'      => $now,
                 ]
-            ),
-            'fixture: a link row exists for the unproved record'
-        );
-        $linkB = (int) $db->wpdb_last_insert_id();
-        self::assertGreaterThan( 0, $linkB, 'fixture: the link row id is readable' );
-
-        // POSITIVE CONTROL: the proved record answers with a body and no NID, on its own token
-        // (the one that carries record A's binding proof and nothing else).
-        $okResponse = $this->dispatchMe( 0, (string) $proof['token'], $now + 5 );
-        $okStatus   = $okResponse->get_status();
-        $okBody     = (string) wp_json_encode( $okResponse->get_data() );
-        self::assertContains( $okStatus, [ 200 ], 'control: the proved record is served' );
-        $this->assertNoNationalId( $okBody, 'the served body' );
-
-        // T-L29/T-L30 boundary: the unproved record is refused.
-        $denied = $this->dispatchMe( (int) $linkB, $token, $now + 5 );
-        $status = $denied->get_status();
-        $data   = $denied->get_data();
-        $code   = is_array( $data ) && isset( $data['code'] ) ? (string) $data['code'] : '';
-        $body   = (string) wp_json_encode( $data );
-
-        // DENIAL CLASS (a) — the target proof gate. `resolve_link_target()` resolves the link
-        // (it exists, same clinic) and `authorize_two_proof_request()` then refuses at the level
-        // check with `proof_failed_decision()`, which is always 403 + PROOF_FAILED_CODE.
-        // The nonce is valid, so the nonce gate cannot be the cause.
-        self::assertSame( 403, $status, 'the unproved record is refused by the proof gate' );
-        self::assertSame(
-            PatientAccess::PROOF_FAILED_CODE,
-            $code,
-            'the refusal is the two-proof gate, not the link resolver'
-        );
-        self::assertStringNotContainsString( self::NID_SHARED_1, $body, 'no national ID leaks in the refusal' );
-        self::assertStringNotContainsString( self::NID_A, $body, 'no other national ID leaks either' );
-        foreach ( [ $this->patientShared1, $this->patientA ] as $recordId ) {
-            self::assertStringNotContainsString(
-                'MR-GAP-',
-                $body,
-                'the refusal carries no MRN of record ' . $recordId
             );
         }
     }
 
-    // ---------------------------------------------------------------- helpers
-
-    private function dispatchMe( int $linkId, string $token, int $now ): \WP_REST_Response {
-        PatientTwoProofTestHelper::acting_as( $this->patientUserA );
-        $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie(
-            $this->patientUserA,
-            $now + PatientSessionProofStore::SESSION_TTL_SECONDS,
-            'logged_in',
-            $token
+    /**
+     * Makes a record share another record's Organization identity through the REAL production
+     * edge writer - `PatientIdentityService::link_clinical_record()`, the single audited
+     * identity boundary - never a raw UPDATE. The resulting equality is then ASSERTED as a
+     * fixture precondition, so "shared identity" below is a measured fact, not an assumption.
+     */
+    private function shareIdentity( int $patientId, int $identityId ): void {
+        App::patient_identity_service()->link_clinical_record( $this->orgId, $identityId, $this->clinicA, $patientId );
+        self::assertSame(
+            $identityId,
+            $this->identityIdOf( $patientId ),
+            'fixture precondition: the record really carries the shared identity_id'
         );
-        App::patient_session_scope()->set_in_process_session_token( $this->patientUserA, $token );
-
-        $request = new WP_REST_Request( 'GET', '/clinic/v1/patient/me' );
-        $request->set_header( 'X-WP-Nonce', wp_create_nonce( 'wp_rest' ) );
-        if ( $linkId > 0 ) {
-            $request->set_param( 'link_id', $linkId );
-        }
-
-        return rest_do_request( $request );
     }
 
-    private function assertNoNationalId( string $body, string $where ): void {
-        foreach ( [ self::NID_A, self::NID_SHARED_1, self::NID_SHARED_2 ] as $nid ) {
-            self::assertStringNotContainsString( $nid, $body, $where . ' carries no national ID' );
-            self::assertStringNotContainsString( 'national_id', $body, $where . ' exposes no national_id field' );
-        }
+    private function identityIdOf( int $patientId ): int {
+        return (int) App::db()->fetchValue(
+            'SELECT identity_id FROM ' . App::db()->table( 'cpms_patients' ) . ' WHERE id = %d LIMIT 1',
+            [ $patientId ]
+        );
     }
 
-    private function insertPatient( int $clinicId, string $mrn, string $mobile, ?string $nationalId ): int {
+    /** Counts the proof entries stored in a session, so "no proof" is asserted, not assumed. */
+    private function proofCount( string $token ): int {
+        $session = WP_Session_Tokens::get_instance( $this->patientUserA )->get( $token );
+        if ( ! is_array( $session ) ) {
+            return -1;
+        }
+        $count = 0;
+        foreach ( [ PatientSessionProofStore::KEY_MOBILE_PROOFS, PatientSessionProofStore::KEY_BINDING_PROOFS ] as $key ) {
+            if ( isset( $session[ $key ] ) && is_array( $session[ $key ] ) ) {
+                $count += count( $session[ $key ] );
+            }
+        }
+
+        return $count;
+    }
+
+    private function seedOtp( string $mobile, string $code ): void {
+        $pepper = defined( 'CPMS_PEPPER' ) && '' !== (string) CPMS_PEPPER
+            ? (string) CPMS_PEPPER
+            : (string) get_option( 'cpms_otp_pepper', '' );
+        if ( '' === $pepper ) {
+            $pepper = bin2hex( random_bytes( 32 ) );
+            update_option( 'cpms_otp_pepper', $pepper, 'no' );
+        }
+
+        self::assertTrue(
+            App::db()->insert(
+                'cpms_otp_tokens',
+                [
+                    'clinic_id'  => $this->clinicA,
+                    'mobile'     => $mobile,
+                    'purpose'    => OtpService::PURPOSE_VERIFY_MOBILE,
+                    'code_hash'  => \ClinicCore\Domain\Otp\OtpPolicy::hashCode( $code, $pepper ),
+                    'expires_at' => gmdate( 'Y-m-d H:i:s', time() + 180 ) . '.000',
+                    'attempts'   => 0,
+                    'created_at' => App::db()->nowUtcSql(),
+                ]
+            ),
+            'fixture: OTP row seeded for ' . $mobile
+        );
+    }
+
+    private function insertPatient( string $mrn, string $mobile, string $nationalId ): int {
         $db  = App::db();
         $now = $db->nowUtcSql();
         self::assertTrue(
             $db->insert(
                 'cpms_patients',
                 [
-                    'clinic_id'   => $clinicId,
+                    'clinic_id'   => $this->clinicA,
                     'mrn'         => $mrn,
                     'first_name'  => 'Gap',
                     'last_name'   => 'Proof',
@@ -371,15 +655,13 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
         return $id;
     }
 
-    /**
-     * @param list<string> $capabilities
-     */
-    private function makeUser( string $login, string $role ): int {
-        return (int) self::factory()->user->create(
-            [
-                'role'       => $role,
-                'user_login' => $login,
-            ]
-        );
+    private function makeUser( string $login ): int {
+        $userId = (int) wp_create_user( $login, 'pass-12345', $login . '@test.local' );
+        self::assertGreaterThan( 0, $userId, 'fixture: the patient user was created' );
+        $user = get_userdata( $userId );
+        self::assertNotFalse( $user, 'fixture: the user object is readable' );
+        $user->set_role( RolesAndCapabilities::ROLE_PATIENT );
+
+        return $userId;
     }
 }
