@@ -101,6 +101,7 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
         $own = $this->dispatch('GET', self::NS . '/patients/' . $this->patient_a, $this->clinic_a);
         self::assertSame(200, $own->get_status(), 'positive control: own-clinic patient is readable');
         self::assertIsArray($own->get_data());
+        self::assertStringContainsString($this->own_name, wp_json_encode($own->get_data()));
 
         $foreign = $this->dispatch('GET', self::NS . '/patients/' . $this->patient_b, $this->clinic_a);
         self::assertSame(404, $foreign->get_status(), 'foreign patient is indistinguishable from not found');
