@@ -919,7 +919,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
             $userA,
             $tokenA
         );
-        $this->assertProofFailedResponse( $wrongNidResp, 'link-record with valid OTP + wrong NID' );
+        $this->assertProofFailedResponse( $wrongNidResp, 'link-record with seeded code and wrong NID' );
         self::assertNull( $logins->find_binding( $userA, $this->clinicA, $patientA, true ) );
 
         // Immediate replay of the same code with matching NID -> response status 403, code CLINIC_PATIENT_PROOF_FAILED, and find_binding(user, clinic, patient, true) returns null (the stored consumed state of the OTP row is not asserted by this test).
@@ -957,7 +957,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         $this->assertProofFailedResponse( $qsResp, 'link-record with query-string national_id' );
         self::assertNull( $logins->find_binding( $userA, $this->clinicA, $patientA, true ) );
 
-        // 5) Positive Path A: fresh valid OTP + matching NID in request body -> 200, find_binding(user, clinic, patient, true) returns array with expected live_key, and GET /patient/me returns 200 with assertNoNationalIdLeak().
+        // 5) Positive Path A: seeded code '223344' (seedOtp at :942) + matching NID in request body -> 200, find_binding(user, clinic, patient, true) returns array with expected live_key, and GET /patient/me returns 200 with assertNoNationalIdLeak().
         $promoteOtpOk = $this->dispatchRestWithSessionToken(
             'POST',
             self::NS . '/patient/link-record',
@@ -1083,7 +1083,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
             0,
             true
         );
-        $this->assertProofFailedResponse( $anonReg, 'register without Step-1 OTP proof' );
+        $this->assertProofFailedResponse( $anonReg, 'register as user id 0 with no prior otp/verify' );
 
         // 2) Step 1: verify_mobile OTP with clinic_id -> 200, pending account created, find_active_bindings_for_user returns an empty array, and GET /patient/me returns 403 + CLINIC_PATIENT_PROOF_FAILED.
         $this->seedOtp( $this->clinicA, $mob, '654321', OtpService::PURPOSE_VERIFY_MOBILE );
