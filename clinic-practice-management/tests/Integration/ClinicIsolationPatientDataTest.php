@@ -162,6 +162,7 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
         $clinician_a = $this->visitClinicianId($visit_a);
         $visit_b = $this->insertVisitForClinic($this->clinic_b, $doctor, 'note-foreign', $clinician_a);
         $before = $this->countNotesForVisit($this->clinic_b, $visit_b);
+        $before_own = $this->countNotesForVisit($this->clinic_a, $visit_a);
         $body = [
             'category' => 'clinical_note',
             'content_text' => 'isolation-note-' . bin2hex(random_bytes(8)),
@@ -169,6 +170,7 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
 
         $own = $this->dispatch('POST', self::NS . '/visits/' . $visit_a . '/notes', $this->clinic_a, $body, $doctor);
         self::assertSame(200, $own->get_status(), 'registered note route wraps successful write with status 200');
+        self::assertSame($before_own + 1, $this->countNotesForVisit($this->clinic_a, $visit_a), 'own-clinic note count increases by one');
 
         $foreign = $this->dispatch('POST', self::NS . '/visits/' . $visit_b . '/notes', $this->clinic_a, $body, $doctor);
         self::assertSame(404, $foreign->get_status());
@@ -435,11 +437,11 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
         $org_id = (int) $this->organization_id;
         $wpdb->query('DELETE p FROM ' . $wpdb->prefix . 'cpms_handwriting_pages p INNER JOIN ' . $wpdb->prefix . 'cpms_handwriting_documents d ON d.id = p.document_id INNER JOIN ' . $wpdb->prefix . 'cpms_clinics c ON c.id = d.clinic_id WHERE c.organization_id = ' . $org_id); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         $wpdb->query('DELETE d FROM ' . $wpdb->prefix . 'cpms_handwriting_documents d INNER JOIN ' . $wpdb->prefix . 'cpms_clinics c ON c.id = d.clinic_id WHERE c.organization_id = ' . $org_id); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_clinical_notes WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_visits WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_clinicians WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_locations WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_audit_logs WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_clinical_notes WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id . ')'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_visits WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id . ')'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_clinicians WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id . ')'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_audit_logs WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id . ')'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_locations WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id . ')'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_clinic_memberships WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id . ')'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_patients WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id . ')'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
