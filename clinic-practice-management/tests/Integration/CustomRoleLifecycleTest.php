@@ -11,18 +11,13 @@ use ClinicCore\Application\Roles\CustomRoleManagementService;
 use ClinicCore\Application\Roles\CustomRoleAssignmentService;
 use ClinicCore\Application\Roles\CustomRoleAssignmentException;
 use ClinicCore\Application\Scope\ScopeRequiredException;
-use ClinicCore\Application\Scope\TrustedClinicEstablisher;
-use ClinicCore\Application\Authorization\AuthorizationService;
 use ClinicCore\Auth\RolesAndCapabilities;
 use ClinicCore\Bootstrap\App;
-use ClinicCore\Infrastructure\Audit\AuditLogger;
-use ClinicCore\Infrastructure\Db\CpmsDb;
-use ClinicCore\Infrastructure\Logging\OpLogger;
 use ClinicCore\Infrastructure\Repository\CustomRoleRepository;
 use ClinicCore\Infrastructure\Repository\MembershipRepository;
 use RuntimeException;
 use Throwable;
-use ClinicCore\Tests\Support\ForkChildExit;
+use ClinicCore\Tests\Support\ExternalRaceWorker;
 use WP_UnitTestCase;
 use ClinicCore\Tests\Support\CustomRoleLockWaitFixture;
 
@@ -278,8 +273,15 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
 
     public function testAssignmentWaitsForLockedDefinitionAndRevalidatesAfterDeactivation(): void
     {
-        if (!function_exists('pcntl_fork') || !function_exists('stream_socket_pair') || !class_exists('mysqli')) {
-            self::markTestSkipped('Requires pcntl, stream_socket_pair, and MySQLi for independent MySQL connections.');
+        if (PHP_OS_FAMILY !== 'Linux') {
+            // Descriptor isolation is only established through /proc/self/fd,
+            // which Linux provides. Non-Linux hosts skip explicitly.
+            self::markTestSkipped('External race workers require Linux (/proc/self/fd descriptor isolation).');
+        }
+        if (!function_exists('proc_open') || !class_exists('mysqli')) {
+            // Fail-closed on Linux (ROUND7): a missing prerequisite FAILS the
+            // test — only the non-Linux host may skip.
+            self::fail('proc_open and MySQLi are required on Linux CI runners for the independent MySQL connections; skipping is not allowed.');
         }
 
         // Keep the repository-seeded definition free of a create-audit row. The
@@ -299,21 +301,20 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
         self::assertInstanceOf(\WP_User::class, $targetWpUserBefore);
         $targetWpRolesBefore = (array) $targetWpUserBefore->roles;
 
-        // A forked connection cannot observe the WP test transaction's uncommitted
+        // An independent session cannot observe the WP test transaction's uncommitted
         // fixtures. Commit them explicitly and clean only these fixture rows below.
         global $wpdb;
         $wpdb->query('COMMIT'); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
         $parentConnectionId = (int) App::db()->wpdb()->get_var('SELECT CONNECTION_ID()'); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
         self::assertGreaterThan(0, $parentConnectionId);
 
-        $childPid = 0;
+        $worker = null;
         $childReaped = false;
-        $childStatus = 0;
+        $childStatus = null;
         $childConnectionId = 0;
         $childOutcome = '';
         $childQueryFingerprint = '';
         $childLockQuery = '';
-        $parentPipe = null;
         $observer = null;
         $mysqlVersion = '';
         $isMariaDb = false;
@@ -345,13 +346,11 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                 $targetUser,
                 $raceRoleKey,
                 $parentConnectionId,
-                &$childPid,
+                &$worker,
                 &$childReaped,
-                &$childStatus,
                 &$childConnectionId,
                 &$childQueryFingerprint,
                 &$childLockQuery,
-                &$parentPipe,
                 &$observer,
                 &$mysqlVersion,
                 &$isMariaDb,
@@ -376,7 +375,7 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                 self::assertSame('active', $lockedDefinition['status']);
 
                 // Observe from a third, independent connection. This proves A
-                // already owns the exact primary-key record before B is forked.
+                // already owns the exact primary-key record before B is launched.
                 $observer = $this->freshMysqli();
                 $versionResult = $observer->query('SELECT VERSION()');
                 if ($versionResult === false) {
@@ -395,235 +394,34 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                     'Parent A must hold a granted X record lock on the exact custom-role definition row before child B starts.'
                 );
 
-                // MariaDB cannot report this forked waiter through its InnoDB
-                // views, so the child is told to prove the block with the exact
+                // MariaDB cannot report this waiter through its InnoDB
+                // views, so the worker is told to prove the block with the exact
                 // production statement's own ER_LOCK_WAIT_TIMEOUT and to retry
                 // only after an explicit RELEASE. MySQL 8 is unchanged: the
-                // variable is never set for it.
+                // flag is never set for it.
                 $isMariaDb = stripos($mysqlVersion, 'mariadb') !== false;
-                if ($isMariaDb) {
-                    putenv('CPMS_RACE_AWAIT_RELEASE=1');
-                }
 
-                $pipes = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
-                if ($pipes === false) {
-                    throw new RuntimeException('Could not create the parent/child synchronization pipe.');
-                }
+                $worker = ExternalRaceWorker::launch(
+                    dirname(__DIR__) . '/bin/fork-race-wp-worker.php',
+                    [
+                        'mode' => 'custom_role_assignment',
+                        'manager_id' => $managerId,
+                        'clinic_id' => $clinicId,
+                        'target_user_id' => $targetUser,
+                        'race_role_key' => $raceRoleKey,
+                        'definition_id' => $definitionId,
+                        'await_release' => $isMariaDb,
+                        'lock_wait_sec' => self::RACE_CHILD_LOCK_WAIT_TIMEOUT_SECONDS,
+                    ]
+                );
 
-                $childPid = pcntl_fork();
-                if ($childPid === -1) {
-                    fclose($pipes[0]);
-                    fclose($pipes[1]);
-                    throw new RuntimeException('Could not fork the independent MySQL assignment connection.');
-                }
-
-                if ($childPid === 0) {
-                    fclose($pipes[0]);
-                    $childPipe = $pipes[1];
-                    $wpdb2 = null;
-                    try {
-                        $wpdb2 = $this->freshWpdb();
-                        $connectionId = (int) $wpdb2->get_var('SELECT CONNECTION_ID()'); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-                        if ($connectionId <= 0) {
-                            throw new RuntimeException('Child B did not receive a valid MySQL connection id.');
-                        }
-
-                        // B is a separate WPDB/MySQL session; remove inherited test
-                        // query shims, but keep the production locking query intact.
-                        remove_all_filters('query');
-                        if ($wpdb2->query('SET SESSION innodb_lock_wait_timeout = ' . self::RACE_CHILD_LOCK_WAIT_TIMEOUT_SECONDS) === false) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-                            throw new RuntimeException('Could not bound child B\'s InnoDB row-lock wait: ' . $wpdb2->last_error);
-                        }
-                        $db2 = new CpmsDb($wpdb2);
-                        $memberships2 = new MembershipRepository($db2);
-                        $roles2 = new CustomRoleRepository($db2);
-                        $authorization2 = new AuthorizationService($memberships2, $roles2);
-                        $assignmentService = new CustomRoleAssignmentService(
-                            new TrustedClinicEstablisher($db2, $memberships2),
-                            $authorization2,
-                            $memberships2,
-                            $roles2,
-                            new AuditLogger($db2, new OpLogger($db2)),
-                            $db2
-                        );
-                        $roleDefinitionsTable = strtolower($db2->table('cpms_custom_role_defs'));
-                        $lockQuerySent = false;
-                        $lockFingerprint = '';
-
-                        // Signal only when B is about to execute the production
-                        // target-row SELECT ... FOR UPDATE, not merely before assign().
-                        add_filter(
-                            'query',
-                            static function ($query) use (
-                                $childPipe,
-                                $connectionId,
-                                $roleDefinitionsTable,
-                                $definitionId,
-                                $clinicId,
-                                &$lockQuerySent,
-                                &$lockFingerprint
-                            ) {
-                                $sql = strtolower(trim((string) preg_replace('/\s+/', ' ', trim((string) $query))));
-                                $expectedPredicate = 'where id = ' . $definitionId . ' and clinic_id = ' . $clinicId;
-                                if (
-                                    !$lockQuerySent
-                                    && str_contains($sql, 'from ' . $roleDefinitionsTable . ' ')
-                                    && str_contains($sql, $expectedPredicate)
-                                    && preg_match('/\bfor\s+update\s*$/', $sql) === 1
-                                ) {
-                                    $lockQuerySent = true;
-                                    $fingerprint = hash('sha256', $sql);
-                                    $lockFingerprint = $fingerprint;
-                                    $queryBase64 = base64_encode($sql);
-                                    fwrite($childPipe, 'LOCK_QUERY:' . $connectionId . ':' . $fingerprint . ':' . $queryBase64 . "\n");
-                                    fflush($childPipe);
-                                }
-
-                                return $query;
-                            },
-                            0
-                        );
-
-                        $readySent = false;
-                        // Strict driver reporting: a failed production statement then
-                        // raises mysqli_sql_exception carrying the server error code
-                        // (1205 ER_LOCK_WAIT_TIMEOUT on MariaDB), which is the exact
-                        // statement-level evidence; wpdb's bookkeeping alone reset to 0.
-                        if (function_exists('mysqli_report')) {
-                            mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
-                        }
-                        // One production assignment attempt. Any driver error is
-                        // captured as lockerr:<errno> inside the callback, before
-                        // the transaction wrapper's ROLLBACK resets wpdb state.
-                        $attempt = function () use (
-                            $db2,
-                            $assignmentService,
-                            $managerId,
-                            $clinicId,
-                            $targetUser,
-                            $raceRoleKey,
-                            $childPipe,
-                            $connectionId,
-                            &$readySent
-                        ): string {
-                            $result = 'assigned';
-                            try {
-                                // Keep an unexpected success reversible; the production
-                                // service itself still owns its atomic savepoint/audit path.
-                                $db2->transactional(function () use (
-                                    $db2,
-                                    $assignmentService,
-                                    $managerId,
-                                    $clinicId,
-                                    $targetUser,
-                                    $raceRoleKey,
-                                    $childPipe,
-                                    $connectionId,
-                                    &$result,
-                                    &$readySent
-                                ): void {
-                                    if (!$readySent) {
-                                        $readySent = true;
-                                        fwrite($childPipe, 'READY:' . $connectionId . "\n");
-                                        fflush($childPipe);
-                                    }
-                                    try {
-                                        $assignmentService->assign($managerId, $clinicId, $targetUser, $raceRoleKey);
-                                        $result = 'assigned';
-                                    } catch (CustomRoleAssignmentException $exception) {
-                                        $result = 'denied:' . $exception->reason_code();
-                                    } catch (Throwable $exception) {
-                                        // The failing production statement's own
-                                        // driver error code, read before any ROLLBACK.
-                                        $driverErrno = (int) $exception->getCode();
-                                        $handle = $db2->wpdb()->dbh;
-                                        if ($driverErrno === 0 && $handle instanceof \mysqli) {
-                                            $driverErrno = (int) $handle->errno;
-                                        }
-                                        if ($driverErrno === 0 && stripos((string) $db2->wpdb()->last_error, 'lock wait timeout') !== false) {
-                                            $driverErrno = 1205;
-                                        }
-                                        $result = 'lockerr:' . $driverErrno;
-                                        throw $exception;
-                                    }
-
-                                    throw new RuntimeException('intentional race-fixture rollback');
-                                });
-                            } catch (RuntimeException $exception) {
-                                if ($exception->getMessage() === 'intentional race-fixture rollback') {
-                                    return $result;
-                                }
-                                if (str_starts_with($result, 'lockerr:')) {
-                                    // A lock-wait timeout is the evidence this attempt
-                                    // exists to produce on MariaDB; report it, do not
-                                    // turn it into an infrastructure error.
-                                    return $result;
-                                }
-                                throw $exception;
-                            }
-
-                            return $result;
-                        };
-
-                        $outcome = $attempt();
-
-                        // MariaDB 10.11 does not expose this forked, still-blocked
-                        // waiter in INNODB_TRX/INNODB_LOCK_WAITS (measured runs
-                        // 39041714039 and 39045431008). The authoritative evidence
-                        // is the production statement's own ER_LOCK_WAIT_TIMEOUT,
-                        // naming the exact statement by its SHA-256. B then waits
-                        // for A's explicit RELEASE before retrying, so the retry can
-                        // only happen after A committed the deactivation.
-                        if (getenv('CPMS_RACE_AWAIT_RELEASE') === '1' && $lockQuerySent && str_starts_with($outcome, 'lockerr:')) {
-                            fwrite($childPipe, 'RESULT:blocked:' . (int) substr($outcome, strlen('lockerr:')) . ':' . $lockFingerprint . "\n");
-                            fflush($childPipe);
-                            stream_set_timeout($childPipe, 5);
-                            $released = false;
-                            $releaseDeadline = microtime(true) + 90;
-                            while (microtime(true) < $releaseDeadline) {
-                                $releaseLine = fgets($childPipe);
-                                if (is_string($releaseLine) && trim($releaseLine) === 'RELEASE') {
-                                    $released = true;
-                                    break;
-                                }
-                            }
-                            if (!$released) {
-                                throw new RuntimeException('Parent A never released child B for the post-commit retry.');
-                            }
-                            $outcome = $attempt();
-                        }
-
-                        if (!$lockQuerySent) {
-                            $outcome = 'missing-target-lock-query:' . $outcome;
-                        }
-                        fwrite($childPipe, 'RESULT:' . $outcome . "\n");
-                        fflush($childPipe);
-                        if ($wpdb2 instanceof \wpdb) {
-                            $wpdb2->close();
-                        }
-                        fclose($childPipe);
-                        ForkChildExit::terminate(0);
-                    } catch (Throwable $exception) {
-                        fwrite($childPipe, 'ERROR:' . get_class($exception) . "\n");
-                        fflush($childPipe);
-                        if ($wpdb2 instanceof \wpdb) {
-                            $wpdb2->close();
-                        }
-                        fclose($childPipe);
-                        ForkChildExit::terminate(1);
-                    }
-                }
-
-                fclose($pipes[1]);
-                $parentPipe = $pipes[0];
-
-                $readyLine = $this->readRaceLine($parentPipe, self::RACE_SIGNAL_TIMEOUT_SECONDS);
+                $readyLine = $worker->readLineWait((float) self::RACE_SIGNAL_TIMEOUT_SECONDS);
                 self::assertIsString($readyLine, 'Child B did not report its independent connection as ready within the bounded timeout.');
                 self::assertMatchesRegularExpression('/^READY:[1-9][0-9]*$/', $readyLine);
                 $childConnectionId = (int) substr($readyLine, strlen('READY:'));
                 self::assertNotSame($parentConnectionId, $childConnectionId, 'A and B must use genuinely independent MySQL connections.');
 
-                $queryLine = $this->readRaceLine($parentPipe, self::RACE_SIGNAL_TIMEOUT_SECONDS);
+                $queryLine = $worker->readLineWait((float) self::RACE_SIGNAL_TIMEOUT_SECONDS);
                 if (!is_string($queryLine)) {
                     // Bounded diagnostics on FAIL paths only: engine transaction ids,
                     // lock ids and lock_data (the fixture primary key) are NOT printed.
@@ -665,7 +463,7 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                     // Authoritative MariaDB evidence, statement-specific: the child
                     // reports ER_LOCK_WAIT_TIMEOUT for the production statement it
                     // signalled above, named by that statement's own SHA-256.
-                    $blockedLine = $this->readRaceLine($parentPipe, 75);
+                    $blockedLine = $worker->readLineWait(75.0);
                     if (!is_string($blockedLine)) {
                         self::fail(
                             'B produced no statement-level evidence within the bounded window. RDIAG='
@@ -712,7 +510,7 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                     );
                     self::assertIsArray($parentLockWhileChildBlocked, 'A must still hold the exact definition row lock when B times out.');
                     self::assertSame($parentLockBefore['lock_id'], $parentLockWhileChildBlocked['lock_id']);
-                    self::assertSame(0, pcntl_waitpid($childPid, $childStatus, WNOHANG), 'B must still be alive and awaiting release, not exited.');
+                    self::assertTrue($worker->isConfirmedRunning(), 'B must be observably alive and awaiting release, not exited.');
                 }
 
                 // Poll current Performance Schema state. The interval only
@@ -734,13 +532,9 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                         break;
                     }
 
-                    $waited = pcntl_waitpid($childPid, $childStatus, WNOHANG);
-                    if ($waited === $childPid) {
+                    if (!$worker->isRunning()) {
                         $childReaped = true;
                         break;
-                    }
-                    if ($waited === -1) {
-                        throw new RuntimeException('Could not inspect the child process while awaiting the MySQL lock edge.');
                     }
 
                     usleep(self::RACE_POLL_INTERVAL_MICROSECONDS);
@@ -772,7 +566,7 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                     // most one allowlisted late token from the child. It separates
                     // "child blocked by MariaDB but unobservable" from "child
                     // acquired or failed past the lock". Only exact tokens pass.
-                    $lateLine = $this->readRaceLine($parentPipe, 25);
+                    $lateLine = $worker->readLineWait(25.0);
                     if (!is_string($lateLine)) {
                         $late = 'none';
                     } elseif (preg_match('/^RESULT:(assigned|denied:[A-Z_]+)$/', $lateLine, $match) === 1) {
@@ -851,7 +645,7 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                 if ($isMariaDb) {
                     // B already proved it cannot complete while A holds the row; it
                     // is now deterministically parked awaiting A's RELEASE.
-                    self::assertSame(0, pcntl_waitpid($childPid, $childStatus, WNOHANG), 'B must still be awaiting release after A deactivated the role.');
+                    self::assertTrue($worker->isConfirmedRunning(), 'B must be observably awaiting release after A deactivated the role.');
                 } else {
                     self::assertIsArray($waitEvidenceAfterTransition, 'B must remain blocked by A until A commits the deactivation.');
                 }
@@ -877,28 +671,52 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
             // proved the block with its own statement-level timeout and is parked
             // awaiting this explicit release; it then retries the same production
             // assignment and must validate the current, inactive row state.
-            if ($isMariaDb && is_resource($parentPipe)) {
-                fwrite($parentPipe, "RELEASE\n");
-                fflush($parentPipe);
+            if ($isMariaDb && $worker instanceof ExternalRaceWorker) {
+                self::assertGreaterThan(0, $worker->writeCommand('RELEASE'), 'A must release B after committing the deactivation.');
             }
-            if (!$childReaped && $childPid > 0) {
-                $waited = pcntl_waitpid($childPid, $childStatus);
-                if ($waited !== $childPid) {
-                    throw new RuntimeException('Could not reap child B after parent A committed.');
-                }
-                $childReaped = true;
-            }
+            $childRc = $worker instanceof ExternalRaceWorker
+                ? $worker->waitForExit((float) self::RACE_SIGNAL_TIMEOUT_SECONDS)
+                : -1;
+            $childStatus = $worker instanceof ExternalRaceWorker ? $worker->finalStatus() : null;
+            $childReaped = true;
 
-            $resultLines = [];
-            if (is_resource($parentPipe)) {
-                stream_set_timeout($parentPipe, self::RACE_SIGNAL_TIMEOUT_SECONDS);
-                while (($line = fgets($parentPipe)) !== false) {
-                    $resultLines[] = rtrim($line, "\r\n");
+            // The worker emits exactly one terminal line ('RESULT:*' or
+            // 'ERROR:*') after the retry. Drain the remaining output until
+            // EOF (waitForExit already returned, so the worker is gone), then
+            // require EXACTLY ONE terminal line — even an identical duplicate
+            // is a failure. Unknown non-terminal lines are ignored as before.
+            $finalLine = $worker instanceof ExternalRaceWorker ? $worker->readLineWait((float) self::RACE_SIGNAL_TIMEOUT_SECONDS) : null;
+            $terminalLines = [];
+            $collectTerminalLine = static function (string $line) use (&$terminalLines): void {
+                if (str_starts_with($line, 'RESULT:') || str_starts_with($line, 'ERROR:')) {
+                    $terminalLines[] = $line;
                 }
-                fclose($parentPipe);
-                $parentPipe = null;
+            };
+            if (is_string($finalLine) && $finalLine !== '') {
+                $collectTerminalLine($finalLine);
             }
-            foreach ($resultLines as $line) {
+            if ($worker instanceof ExternalRaceWorker) {
+                $drain = $worker->drainRemainingLines((float) self::RACE_SIGNAL_TIMEOUT_SECONDS);
+                foreach ($drain['lines'] as $drainedLine) {
+                    $collectTerminalLine($drainedLine);
+                }
+                if (is_string($drain['trailing']) && $drain['trailing'] !== '') {
+                    $collectTerminalLine($drain['trailing']);
+                }
+                self::assertTrue(
+                    $drain['complete'],
+                    'The worker did not reach EOF within the bounded drain window; a later terminal line cannot be ruled out.'
+                );
+                self::assertFalse(
+                    $worker->outputTruncated(),
+                    'Worker stdout exceeded the bounded rolling buffer and bytes were discarded; output integrity cannot be proven.'
+                );
+                self::assertFalse(
+                    $worker->outputReadFailed(),
+                    'A stdout read failure invalidates the drained-output accounting.'
+                );
+            }
+            foreach ($terminalLines as $line) {
                 if (str_starts_with($line, 'RESULT:')) {
                     $childOutcome = substr($line, strlen('RESULT:'));
                 } elseif (str_starts_with($line, 'ERROR:')) {
@@ -906,11 +724,23 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                     $childOutcome = 'ERROR:' . (preg_match('/\A[A-Za-z0-9_\\]{1,128}\z/D', $class) === 1 ? $class : 'unknown');
                 }
             }
+            self::assertCount(
+                1,
+                $terminalLines,
+                'The worker must emit exactly one terminal line (RESULT:/ERROR:). A duplicate or a missing terminal line is a failure.'
+            );
 
-            // Child hygiene: B either exits 0 or ends via the fork-child lifetime guard
-            // (SIGKILL) — both skip inherited-socket teardown. The RESULT/ERROR pipe line
-            // asserted below carries the authoritative verdict, including infra failure.
-            self::assertTrue(ForkChildExit::childTerminatedCleanly($childStatus), 'Child B must terminate cleanly after A commits (exit 0 or lifetime-guard hard exit). Child result: ' . $childOutcome);
+            // Worker hygiene: B ends with a plain, graceful exit(0); it holds no
+            // descriptor of this process, so its shutdown path cannot tear down the
+            // harness session. The RESULT/ERROR line asserted below carries the
+            // authoritative verdict, including infra failure. The final status was
+            // read once (at the observation that first saw the worker gone) and is
+            // served from the cache: exit code 0, not signaled, not stopped.
+            self::assertSame(0, $childRc, 'Child B must exit with a plain, graceful exit(0) after A commits. Child result: ' . $childOutcome);
+            self::assertIsArray($childStatus, 'Child B final status must be readable from the cached single status read.');
+            self::assertSame(0, (int) $childStatus['exitCode'], 'Child B exit code must be exactly 0 (strict).');
+            self::assertFalse($childStatus['signaled'], 'Child B must not be terminated by a signal (strict).');
+            self::assertFalse($childStatus['stopped'], 'Child B must not be stopped (strict).');
             self::assertSame(
                 'denied:' . CustomRoleAssignmentException::CODE_DEFINITION_NOT_ACTIVE,
                 $childOutcome,
@@ -990,32 +820,40 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
                 . PHP_EOL
             );
         } finally {
-            if ($observer instanceof \mysqli) {
-                $observer->close();
+            // Nested try/finally: observer close, termination, query-hook
+            // restore and committed-fixture cleanup for both clinics ALWAYS
+            // run even if termination throws. The unreaped-worker verdict is
+            // reported only AFTER all of that has run, as a hard test failure.
+            try {
+                if ($observer instanceof \mysqli) {
+                    $observer->close();
+                }
+                if ($worker instanceof ExternalRaceWorker) {
+                    $worker->terminate();
+                }
+            } finally {
+                try {
+                    // Restore WordPress' integration bootstrap query handlers before
+                    // fixture cleanup and PHPUnit tearDown rollback.
+                    if ($queryHooks !== null) {
+                        $GLOBALS['wp_filter']['query'] = $queryHooks;
+                    } else {
+                        unset($GLOBALS['wp_filter']['query']);
+                    }
+                } finally {
+                    try {
+                        $this->cleanupCommittedRaceFixtures(
+                            [$this->clinicA, $this->clinicB],
+                            [$managerId, $this->managerB, $this->suspendedManager, $this->member, $this->nonMember, $targetUser],
+                            $definitionId
+                        );
+                    } finally {
+                        if ($worker instanceof ExternalRaceWorker && $worker->wasNotReaped()) {
+                            self::fail('External race worker B could not be reaped after SIGTERM and SIGKILL; refusing to leave an unreaped child behind a green run.');
+                        }
+                    }
+                }
             }
-
-            if ($childPid > 0 && !$childReaped) {
-                pcntl_waitpid($childPid, $childStatus);
-                $childReaped = true;
-            }
-
-            if (is_resource($parentPipe)) {
-                fclose($parentPipe);
-            }
-
-            // Restore WordPress' integration bootstrap query handlers before
-            // fixture cleanup and PHPUnit tearDown rollback.
-            if ($queryHooks !== null) {
-                $GLOBALS['wp_filter']['query'] = $queryHooks;
-            } else {
-                unset($GLOBALS['wp_filter']['query']);
-            }
-
-            $this->cleanupCommittedRaceFixtures(
-                [$this->clinicA, $this->clinicB],
-                [$managerId, $this->managerB, $this->suspendedManager, $this->member, $this->nonMember, $targetUser],
-                $definitionId
-            );
         }
     }
 
@@ -1253,22 +1091,6 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
     /**
      * @param resource $pipe
      */
-    private function readRaceLine($pipe, int $timeoutSeconds): ?string
-    {
-        if (!is_resource($pipe)) {
-            return null;
-        }
-
-        stream_set_timeout($pipe, $timeoutSeconds);
-        $line = fgets($pipe);
-        $metadata = stream_get_meta_data($pipe);
-        if ($line === false || ($metadata['timed_out'] ?? false)) {
-            return null;
-        }
-
-        return rtrim($line, "\r\n");
-    }
-
     private function customRoleAssignmentAuditCount(int $clinicId, int $membershipId): int
     {
         return (int) App::db()->fetchValue(
@@ -1283,15 +1105,6 @@ final class CustomRoleLifecycleTest extends WP_UnitTestCase
         );
     }
 
-    private function freshWpdb(): \wpdb
-    {
-        global $wpdb;
-        $connection = new \wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
-        $connection->set_prefix($wpdb->prefix);
-        $connection->show_errors(false);
-
-        return $connection;
-    }
 
     /**
      * Test-only teardown for the committed two-connection fixture. The test
