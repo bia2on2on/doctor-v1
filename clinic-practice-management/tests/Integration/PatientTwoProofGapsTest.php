@@ -28,6 +28,7 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
     use SignedExpirationFixture;
 
     private const MOBILE_SHARED = '09128881001';
+    private const MOBILE_SH2    = '09128881003';
     private const MOBILE_A      = '09128881002';
     private const NID_SHARED_1  = '0010000107';
     private const NID_SHARED_2  = '0010000115';
@@ -73,7 +74,7 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
 
         $this->patientA       = $this->insertPatient( $this->clinicA, 'MR-GAP-A-' . uniqid(), self::MOBILE_A, self::NID_A );
         $this->patientShared1 = $this->insertPatient( $this->clinicA, 'MR-GAP-S1-' . uniqid(), self::MOBILE_SHARED, self::NID_SHARED_1 );
-        $this->patientShared2 = $this->insertPatient( $this->clinicA, 'MR-GAP-S2-' . uniqid(), self::MOBILE_SHARED, self::NID_SHARED_2 );
+        $this->patientShared2 = $this->insertPatient( $this->clinicA, 'MR-GAP-S2-' . uniqid(), self::MOBILE_SH2, self::NID_SHARED_2 );
 
         $this->patientUserA = $this->makeUser( 'gap_pat_a_' . uniqid(), RolesAndCapabilities::ROLE_PATIENT );
 
@@ -234,7 +235,7 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
             $this->patientUserA,
             $this->clinicA,
             $this->patientShared2,
-            [ 'mobile' => self::MOBILE_SHARED ]
+            [ 'mobile' => self::MOBILE_SH2 ]
         );
         self::assertSame(
             PatientAccess::LEVEL_FULL,
@@ -295,11 +296,15 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
         $code   = is_array( $data ) && isset( $data['code'] ) ? (string) $data['code'] : '';
         $body   = (string) wp_json_encode( $data );
 
-        self::assertContains( $status, [ 403, 404 ], 'the unproved record is refused, not served' );
-        self::assertContains(
+        // DENIAL CLASS (a) — the target proof gate. `resolve_link_target()` resolves the link
+        // (it exists, same clinic) and `authorize_two_proof_request()` then refuses at the level
+        // check with `proof_failed_decision()`, which is always 403 + PROOF_FAILED_CODE.
+        // The nonce is valid, so the nonce gate cannot be the cause.
+        self::assertSame( 403, $status, 'the unproved record is refused by the proof gate' );
+        self::assertSame(
+            PatientAccess::PROOF_FAILED_CODE,
             $code,
-            [ PatientAccess::PROOF_FAILED_CODE, PatientAccess::NOT_FOUND_CODE ],
-            'the refusal is the proof gate or the not-found guard, never a data response'
+            'the refusal is the two-proof gate, not the link resolver'
         );
         self::assertStringNotContainsString( self::NID_SHARED_1, $body, 'no national ID leaks in the refusal' );
         self::assertStringNotContainsString( self::NID_A, $body, 'no other national ID leaks either' );
@@ -343,22 +348,27 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
     private function insertPatient( int $clinicId, string $mrn, string $mobile, ?string $nationalId ): int {
         $db  = App::db();
         $now = $db->nowUtcSql();
-        $db->insert(
-            'cpms_patients',
-            [
-                'clinic_id'   => $clinicId,
-                'mrn'         => $mrn,
-                'first_name'  => 'Gap',
-                'last_name'   => 'Proof',
-                'mobile'      => $mobile,
-                'national_id' => $nationalId,
-                'status'      => 'active',
-                'created_at'  => $now,
-                'updated_at'  => $now,
-            ]
+        self::assertTrue(
+            $db->insert(
+                'cpms_patients',
+                [
+                    'clinic_id'   => $clinicId,
+                    'mrn'         => $mrn,
+                    'first_name'  => 'Gap',
+                    'last_name'   => 'Proof',
+                    'mobile'      => $mobile,
+                    'national_id' => $nationalId,
+                    'status'      => 'active',
+                    'created_at'  => $now,
+                    'updated_at'  => $now,
+                ]
+            ),
+            'fixture: patient row inserted (' . $mrn . ')'
         );
+        $id = (int) $db->wpdb_last_insert_id();
+        self::assertGreaterThan( 0, $id, 'fixture: patient id readable (' . $mrn . ')' );
 
-        return $db->wpdb_last_insert_id();
+        return $id;
     }
 
     /**
