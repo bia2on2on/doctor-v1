@@ -162,10 +162,12 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
 
         ( new RestoreIdentityCleanup( App::db() ) )->revoke();
         self::assertFalse( WP_Session_Tokens::get_instance( $userC )->verify( $oldTokenC ) );
+        self::assertFalse( WP_Session_Tokens::get_instance( $userB )->verify( $tokenB ) );
         $freshTokenC = WP_Session_Tokens::get_instance( $userC )->create( time() + 3600 );
         $this->assertNoPatientAccess( $access, $userC, $this->clinicA, $patientC, $linkC, $this->clinicB, $now, $freshTokenC );
 
-        // Positive control (non-tautological): same legacy-edges fixture (userB) after real OTP + NID promotion via /patient/link-record.
+        // Positive control (non-tautological): same legacy-edges fixture (userB) in a fresh post-restore session after real OTP + NID promotion via /patient/link-record.
+        $freshTokenB = WP_Session_Tokens::get_instance( $userB )->create( time() + 3600 );
         $logins->insert_pending_account( $userB, $mobB, 'LegacyEdges', 'PatientB' );
         $this->seedOtp( $this->clinicA, $mobB, '415263', OtpService::PURPOSE_VERIFY_MOBILE );
         $promoteResp = $this->dispatchRestWithSessionToken(
@@ -178,15 +180,15 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
                 'national_id' => $nidB,
             ],
             $userB,
-            $tokenB
+            $freshTokenB
         );
         self::assertSame( 200, $promoteResp->get_status() );
-        self::assertSame( PatientAccess::LEVEL_FULL, $access->level( $userB, $patientB, $this->clinicA, $now, $tokenB ) );
-        self::assertSame( [ $patientB ], $access->proved_patient_ids( $userB, $this->clinicA, $now, $tokenB ) );
+        self::assertSame( PatientAccess::LEVEL_FULL, $access->level( $userB, $patientB, $this->clinicA, $now, $freshTokenB ) );
+        self::assertSame( [ $patientB ], $access->proved_patient_ids( $userB, $this->clinicA, $now, $freshTokenB ) );
 
         $this->withSessionCookie(
             $userB,
-            $tokenB,
+            $freshTokenB,
             function () use ( $access, $userB, $patientB, $linkB ): void {
                 self::assertTrue( $access->can_access_patient( $userB, $this->clinicA, $patientB ) );
                 self::assertTrue( $access->can_access_clinic( $userB, $this->clinicA ) );
@@ -1061,7 +1063,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
                 'birth_date'  => '1991-03-15',
             ],
             0,
-            false
+            true
         );
         $this->assertProofFailedResponse( $anonReg, 'register without Step-1 OTP proof' );
 
