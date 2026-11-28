@@ -493,6 +493,31 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
             'fixture: the identity <-> user edge exists, so LEVEL_FULL is reachable'
         );
 
+        // Clinic patient <-> WP user edge. `has_full_identity_edges()` (PatientAccess.php:1060-1081)
+        // INNER JOINs `cpms_patient_user_links`, so without this row `level()` proves the binding
+        // but stops at LEVEL_BOOKING (:474) and never returns LEVEL_FULL (:470). Same shape the
+        // production promoter writes (PatientBindingPromoter::ensure_patient_user_link()).
+        if ( 0 === (int) $db->fetchValue(
+            'SELECT id FROM ' . $db->table( 'cpms_patient_user_links' )
+            . ' WHERE wp_user_id = %d AND patient_id = %d LIMIT 1',
+            [ $this->patientUserA, $this->patientA ]
+        ) ) {
+            self::assertTrue(
+                $db->insert(
+                    'cpms_patient_user_links',
+                    [
+                        'clinic_id'      => $this->clinicA,
+                        'patient_id'     => $this->patientA,
+                        'wp_user_id'     => $this->patientUserA,
+                        'mobile_at_link' => self::MOBILE_A,
+                        'is_primary'     => 0,
+                        'linked_at'      => $db->nowUtcSql(),
+                    ]
+                ),
+                'fixture: the clinic patient <-> user link was inserted'
+            );
+        }
+
         return [
             'binding_id'  => (int) $binding['id'],
             'verified_at' => (string) $binding['verified_at'],
