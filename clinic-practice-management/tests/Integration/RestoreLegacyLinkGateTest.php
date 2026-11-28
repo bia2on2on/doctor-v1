@@ -24,11 +24,13 @@ use WP_UnitTestCase;
 
 /**
  * Integration tests for RESTORE-SLICE1: legacy-link gate enforcement and
- * two-factor re-verification contracts (`T1`-`T8` with positive controls).
+ * two-factor re-verification contracts for the finite PatientAccess primitives,
+ * REST routes, portal/shortcode views, and fixtures listed in `T1`-`T8` below
+ * (not an exhaustive sweep of all patient surfaces).
  *
- * Verifies that durable legacy edges (`cpms_patient_user_links`, `patients.identity_id`,
- * `cpms_patient_identity_links`) and restored/unproved bindings grant zero patient
- * access without both a live `cpms_patient_logins` two-factor binding and valid
+ * Verifies for those tested surfaces that durable legacy edges (`cpms_patient_user_links`,
+ * `patients.identity_id`, `cpms_patient_identity_links`) and restored/unproved bindings
+ * receive `LEVEL_NONE` / `403` without a `cpms_patient_logins` active binding and valid
  * current-session proofs (`cpms_mobile_proofs` + `cpms_binding_proofs`).
  */
 final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
@@ -146,7 +148,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
 
         $this->assertNoPatientAccess( $access, $userB, $this->clinicA, $patientB, $linkB, $this->clinicB, $now, $tokenB );
 
-        // Case 1c: Previously active user revoked by RestoreIdentityCleanup -> closed bindings + destroyed sessions.
+        // Case 1c: Previously active user revoked by RestoreIdentityCleanup::revoke() (updates state='closed', live_key=NULL on every patient_logins row where state<>'closed', including kind='account' as well as kind='binding', then destroys WP sessions).
         $mobC     = $this->nextUniqueMobile();
         $nidC     = $this->nextUniqueValidNationalId();
         $patientC = $this->insertPatient( $this->clinicA, 'MR-RLG-T1C-' . $this->nextUniqueToken(), 'Restored', 'PatientC', $mobC, $nidC, '1992-03-03' );
@@ -244,7 +246,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         );
         self::assertSame( $firstName, $storedFirst );
 
-        // Positive control: promote legacy link via fresh OTP + matching NID, then verify all read routes succeed without NID leak.
+        // Positive control: promote legacy link via fresh OTP + matching NID, then verify GET /patient/me succeeds with expected first_name and assertNoNationalIdLeak(), while GET /patient/my-records, GET /visits, GET /visits/{id}, and GET /prescriptions return 200 with expected counts or seeded text.
         ( new PatientLoginRepository( App::db() ) )->insert_pending_account( $userId, $mob, $firstName, $lastName );
         $this->seedOtp( $this->clinicA, $mob, '516273', OtpService::PURPOSE_VERIFY_MOBILE );
         $linkResp = $this->dispatchRestWithSessionToken(
@@ -440,7 +442,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
             }
         );
 
-        // 2) Notifications REST endpoints (inbox, rt with/without ETag, mark read) must deny with 403 and leak nothing.
+        // 2) Notifications REST endpoints (inbox, rt with/without ETag, mark read) return 403 + CLINIC_PATIENT_PROOF_FAILED; inbox and unconditioned rt exclude $name1/$notifDocSecret, and read_at remains NULL.
         $inboxResp = $this->dispatchRestWithSessionToken( 'GET', self::NS . '/notifications', [], $userId, $token );
         $this->assertProofFailedResponse( $inboxResp, 'GET /notifications' );
         $this->assertResponseExcludesStrings( $inboxResp->get_data(), [ $name1, $notifDocSecret ], 'GET /notifications' );
@@ -762,7 +764,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         self::assertTrue( $otherProofStore->record_binding_proof( $userId, $this->clinicA, $patientId, (int) $binding['id'], (string) $binding['verified_at'], $now, $otherToken ) );
         self::assertSame( PatientAccess::LEVEL_NONE, $access->level( $userId, $patientId, $this->clinicA, $now, $plainToken ) );
 
-        // Sub-case C: Real OTP login (PURPOSE_LOGIN) creates session with mobile proof ONLY and NO binding proof.
+        // Sub-case C: Real OTP login (PURPOSE_LOGIN) creates session with mobile proof and LEVEL_NONE / [] proved IDs.
         $this->seedOtp( $this->clinicA, $mob, '456789', OtpService::PURPOSE_LOGIN );
         $otpLoginToken = '';
         $capture       = static function ( string $cookie, int $expire, int $expiration, int $uid, string $scheme, string $tok ) use ( $userId, &$otpLoginToken ): void {
@@ -810,7 +812,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
             }
         }
 
-        // Positive control: complete two-factor proof in the OTP-login session via matching NID -> full access granted.
+        // Positive control: complete two-factor proof in the OTP-login session via matching NID -> LEVEL_FULL and 200 on /patient/me, /visits, and /booking/hold.
         $linkOk = $this->dispatchRestWithSessionToken(
             'POST',
             self::NS . '/patient/link-record',
@@ -856,7 +858,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         $logins->insert_pending_account( $userA, $mobA, 'PromoteOtp', 'UserA' );
         $tokenA = WP_Session_Tokens::get_instance( $userA )->create( time() + 3600 );
 
-        // 1) No OTP code and no same-session mobile proof -> 403, no binding.
+        // 1) No OTP code and no same-session mobile proof -> 403, no active binding.
         $noProofResp = $this->dispatchRestWithSessionToken(
             'POST',
             self::NS . '/patient/link-record',
@@ -871,7 +873,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         $this->assertProofFailedResponse( $noProofResp, 'link-record without OTP or mobile proof' );
         self::assertNull( $logins->find_binding( $userA, $this->clinicA, $patientA, true ) );
 
-        // 2) Wrong OTP code -> 403, no binding.
+        // 2) Wrong OTP code -> 403, no active binding.
         $this->seedOtp( $this->clinicA, $mobA, '112233', OtpService::PURPOSE_VERIFY_MOBILE );
         $wrongOtpResp = $this->dispatchRestWithSessionToken(
             'POST',
@@ -888,7 +890,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         $this->assertProofFailedResponse( $wrongOtpResp, 'link-record with wrong OTP' );
         self::assertNull( $logins->find_binding( $userA, $this->clinicA, $patientA, true ) );
 
-        // 3) Valid fresh OTP + wrong NID -> 403, no binding, and OTP is consumed (cannot be replayed).
+        // 3) Valid fresh OTP + wrong NID -> 403 and no active binding; an immediate replay of the same code with the matching NID is also denied (403) and creates no active binding (the stored consumed state of the OTP row is not asserted by this test).
         $wrongNidResp = $this->dispatchRestWithSessionToken(
             'POST',
             self::NS . '/patient/link-record',
@@ -904,7 +906,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         $this->assertProofFailedResponse( $wrongNidResp, 'link-record with valid OTP + wrong NID' );
         self::assertNull( $logins->find_binding( $userA, $this->clinicA, $patientA, true ) );
 
-        // Replay consumed OTP with matching NID -> still 403.
+        // Immediate replay of the same code with matching NID -> still 403 and no active binding (OTP row consumed state is not asserted).
         $replayResp = $this->dispatchRestWithSessionToken(
             'POST',
             self::NS . '/patient/link-record',
@@ -917,10 +919,10 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
             $userA,
             $tokenA
         );
-        $this->assertProofFailedResponse( $replayResp, 'link-record replaying consumed OTP' );
+        $this->assertProofFailedResponse( $replayResp, 'link-record immediate replay of prior OTP' );
         self::assertNull( $logins->find_binding( $userA, $this->clinicA, $patientA, true ) );
 
-        // 4) Query-string national_id rejected -> 403, no binding.
+        // 4) Query-string national_id rejected -> 403, no active binding.
         $this->seedOtp( $this->clinicA, $mobA, '223344', OtpService::PURPOSE_VERIFY_MOBILE );
         $qsResp = $this->dispatchRestWithSessionToken(
             'POST',
@@ -939,7 +941,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         $this->assertProofFailedResponse( $qsResp, 'link-record with query-string national_id' );
         self::assertNull( $logins->find_binding( $userA, $this->clinicA, $patientA, true ) );
 
-        // 5) Positive Path A: fresh valid OTP + matching NID in request body -> 200 + active binding + full access.
+        // 5) Positive Path A: fresh valid OTP + matching NID in request body -> 200, active binding with expected live_key, and GET /patient/me 200 without national_id.
         $promoteOtpOk = $this->dispatchRestWithSessionToken(
             'POST',
             self::NS . '/patient/link-record',
@@ -996,7 +998,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         self::assertSame( 200, $otpVerifyB->get_status() );
         self::assertNotSame( '', $tokenB );
 
-        // Wrong NID in same-session mobile-proof flow -> 403, no binding.
+        // Wrong NID in same-session mobile-proof flow -> 403, no active binding.
         $wrongSameSession = $this->dispatchRestWithSessionToken(
             'POST',
             self::NS . '/patient/link-record',
@@ -1050,7 +1052,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
             )
         );
 
-        // 1) Direct registration without Step-1 OTP proof -> 403, zero links/bindings.
+        // 1) Direct registration without Step-1 OTP proof -> 403 CLINIC_PATIENT_PROOF_FAILED.
         $anonReg = $this->dispatchRest(
             'POST',
             self::NS . '/patient/register',
@@ -1067,7 +1069,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         );
         $this->assertProofFailedResponse( $anonReg, 'register without Step-1 OTP proof' );
 
-        // 2) Step 1: verify_mobile OTP with clinic_id issues pending account + cpms_reg_proofs, still zero patient access.
+        // 2) Step 1: verify_mobile OTP with clinic_id issues pending account (no active bindings), and GET /patient/me returns 403.
         $this->seedOtp( $this->clinicA, $mob, '654321', OtpService::PURPOSE_VERIFY_MOBILE );
         $step1UserId = 0;
         $step1Token  = '';
@@ -1103,7 +1105,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         $meAfterStep1 = $this->dispatchRestWithSessionToken( 'GET', self::NS . '/patient/me', [], $step1UserId, $step1Token );
         $this->assertProofFailedResponse( $meAfterStep1, 'GET /patient/me after Step 1 only' );
 
-        // 3) Step 2 with wrong national_id -> 403, legacy row untouched, zero links/bindings.
+        // 3) Step 2 with wrong national_id -> 403 without NID leak, no active bindings, and birth_date/identity_id remain NULL.
         $wrongNidReg = $this->dispatchRestWithSessionToken(
             'POST',
             self::NS . '/patient/register',
@@ -1145,7 +1147,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         );
         $this->assertProofFailedResponse( $qsReg, 'register Step 2 with query-string NID' );
 
-        // 5) Positive control: Step 2 with matching national_id links existing legacy row, activates account, creates binding + session proof.
+        // 5) Positive control: Step 2 with matching national_id links existing legacy row, activates account, creates active binding, and allows GET /patient/me without NID leak.
         $okReg = $this->dispatchRestWithSessionToken(
             'POST',
             self::NS . '/patient/register',
