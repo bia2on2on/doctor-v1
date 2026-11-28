@@ -116,7 +116,7 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
     }
 
     /**
-     * Clinic B staff update must be rejected at the patient ownership check and
+     * Clinic A secretary updating a Clinic B patient must be rejected at the ownership check and
      * leave the persisted foreign profile unchanged.
      */
     public function testStaffPatientUpdateCannotCrossClinicByObjectId(): void
@@ -161,6 +161,11 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
         $visit_a = $this->insertVisitForClinic($this->clinic_a, $doctor, 'note-own');
         $clinician_a = $this->visitClinicianId($visit_a);
         $visit_b = $this->insertVisitForClinic($this->clinic_b, $doctor, 'note-foreign', $clinician_a);
+        global $wpdb;
+        self::assertGreaterThan(0, $visit_b);
+        $foreign_visit = $wpdb->get_row($wpdb->prepare('SELECT clinic_id, clinician_id FROM ' . $wpdb->prefix . 'cpms_visits WHERE id = %d', $visit_b), ARRAY_A);
+        self::assertIsArray($foreign_visit);
+        self::assertSame([(int) $this->clinic_b, (int) $clinician_a], [(int) $foreign_visit['clinic_id'], (int) $foreign_visit['clinician_id']]);
         $before = $this->countNotesForVisit($this->clinic_b, $visit_b);
         $before_own = $this->countNotesForVisit($this->clinic_a, $visit_a);
         $body = [
@@ -188,6 +193,14 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
         $marker_b = 'isolation-page-foreign-' . bin2hex(random_bytes(8));
         $page_a = $this->insertHandwritingPage($visit_a, $this->clinic_a, $marker_a);
         $page_b = $this->insertHandwritingPage($visit_b, $this->clinic_b, $marker_b);
+        global $wpdb;
+        self::assertGreaterThan(0, $page_b);
+        $foreign_page = $wpdb->get_row($wpdb->prepare('SELECT d.id AS document_id, d.clinic_id, d.visit_id, p.document_id AS page_document_id FROM ' . $wpdb->prefix . 'cpms_handwriting_pages p INNER JOIN ' . $wpdb->prefix . 'cpms_handwriting_documents d ON d.id = p.document_id WHERE p.id = %d', $page_b), ARRAY_A);
+        self::assertIsArray($foreign_page);
+        self::assertGreaterThan(0, (int) $foreign_page['document_id']);
+        self::assertSame($this->clinic_b, (int) $foreign_page['clinic_id']);
+        self::assertSame($visit_b, (int) $foreign_page['visit_id']);
+        self::assertSame((int) $foreign_page['document_id'], (int) $foreign_page['page_document_id']);
 
         $own = $this->dispatch('GET', self::NS . '/handwriting/pages/' . $page_a, $this->clinic_a, [], $doctor);
         self::assertSame(200, $own->get_status());
