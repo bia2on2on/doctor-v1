@@ -12,12 +12,12 @@ use WP_REST_Response;
 use WP_UnitTestCase;
 
 /**
- * Focused cross-clinic object-ID check for staff patient health-data reads.
+ * Focused cross-clinic object-ID checks for staff patient health-data reads
+ * and profile updates.
  *
  * Uses a secretary with active membership in Clinic A, real PatientController
- * REST dispatch, and a foreign patient row in Clinic B. This documents only the
- * staff GET /patients/{id} path; other health-data routes are inventoried but
- * remain outside this test's coverage.
+ * REST dispatch, and foreign patient rows in Clinic B. Other health-data routes
+ * are inventoried but remain outside this test's coverage.
  */
 final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
 {
@@ -41,6 +41,8 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
 
     private string $foreign_mobile = '';
 
+    private string $own_name = '';
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -59,9 +61,18 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
             RolesAndCapabilities::ROLE_SECRETARY
         );
         self::assertGreaterThan(0, (int) $membership_id, 'actor has active secretary membership in Clinic A');
+        self::assertTrue(user_can($this->actor_id, RolesAndCapabilities::PATIENT_UPDATE));
+        self::assertSame(
+            'active',
+            (string) App::db()->fetchValue(
+                'SELECT status FROM ' . App::db()->table('cpms_clinic_memberships') . ' WHERE id = %d',
+                [(int) $membership_id]
+            )
+        );
 
         $this->patient_a = $this->insertPatient($this->clinic_a, 'OwnPatient');
         $this->patient_b = $this->insertPatient($this->clinic_b, 'ForeignPatient');
+        $this->own_name = $this->patient_last_name($this->patient_a);
         $this->foreign_name = $this->patient_last_name($this->patient_b);
         $this->foreign_mrn = $this->patient_mrn($this->patient_b);
         $this->foreign_mobile = $this->patient_mobile($this->patient_b);
@@ -75,6 +86,9 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
         \ClinicCore\Application\Scope\SystemClinicResolver::flush();
         \ClinicCore\Settings\Settings::flushCache();
         $this->purgeOrganizationRows();
+        if ($this->actor_id > 0) {
+            wp_delete_user($this->actor_id);
+        }
         parent::tearDown();
     }
 
@@ -97,6 +111,54 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
         self::assertStringNotContainsString($this->foreign_name, $body);
         self::assertStringNotContainsString($this->foreign_mrn, $body);
         self::assertStringNotContainsString($this->foreign_mobile, $body);
+    }
+
+    /**
+     * Clinic B staff update must be rejected at the patient ownership check and
+     * leave the persisted foreign profile unchanged.
+     */
+    public function testStaffPatientUpdateCannotCrossClinicByObjectId(): void
+    {
+        $own_phone = '02188888888';
+        $own = $this->dispatch(
+            'PATCH',
+            self::NS . '/patients/' . $this->patient_a,
+            $this->clinic_a,
+            ['phone' => $own_phone]
+        );
+        self::assertSame(200, $own->get_status(), 'positive control: same actor updates own-clinic patient');
+        self::assertIsArray($own->get_data());
+        self::assertStringContainsString($this->own_name, wp_json_encode($own->get_data()));
+        self::assertStringContainsString($own_phone, wp_json_encode($own->get_data()));
+
+        $before = $this->patient_state($this->patient_b);
+        $attempted_phone = '02177776666';
+        $foreign = $this->dispatch(
+            'PATCH',
+            self::NS . '/patients/' . $this->patient_b,
+            $this->clinic_a,
+            ['phone' => $attempted_phone]
+        );
+        self::assertSame(404, $foreign->get_status(), 'foreign update is reported as missing');
+        self::assertIsArray($foreign->get_data());
+        self::assertSame('CLINIC_NOT_FOUND', (string) $foreign->get_data()['code']);
+        $body = wp_json_encode($foreign->get_data());
+        self::assertIsString($body);
+        $foreign_tokens = [$this->foreign_name, $this->foreign_mrn, $this->foreign_mobile, $attempted_phone];
+        self::assertNotEmpty($foreign_tokens);
+        foreach ($foreign_tokens as $token) {
+            self::assertNotSame('', $token);
+            self::assertStringNotContainsString($token, $body);
+        }
+        self::assertSame($before, $this->patient_state($this->patient_b), 'Clinic B patient row is unchanged');
+    }
+
+    private function patient_state(int $patient_id): array
+    {
+        return (array) App::db()->fetchRow(
+            'SELECT first_name, last_name, mrn, mobile, phone, status FROM ' . App::db()->table('cpms_patients') . ' WHERE id = %d',
+            [$patient_id]
+        );
     }
 
     private function createOrganization(): int
@@ -198,10 +260,13 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
         );
     }
 
-    private function dispatch(string $method, string $route, int $clinic_id): WP_REST_Response
+    private function dispatch(string $method, string $route, int $clinic_id, array $params = []): WP_REST_Response
     {
         wp_set_current_user($this->actor_id);
         $request = new WP_REST_Request($method, $route);
+        foreach ($params as $key => $value) {
+            $request->set_param($key, $value);
+        }
         $request->set_header('X-WP-Nonce', wp_create_nonce('wp_rest'));
         $request->set_header('X-CPMS-Clinic-Id', (string) $clinic_id);
 
@@ -215,6 +280,7 @@ final class ClinicIsolationPatientDataTest extends WP_UnitTestCase
         }
         global $wpdb;
         $org_id = (int) $this->organization_id;
+        $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_audit_logs WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_clinic_memberships WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id . ')'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_patients WHERE clinic_id IN (SELECT id FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id . ')'); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
         $wpdb->query('DELETE FROM ' . $wpdb->prefix . 'cpms_clinics WHERE organization_id = ' . $org_id); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
