@@ -99,8 +99,7 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
      * not this one.
      *
      * The `level()` call at the end uses a fixture with an ACTIVE account and an ACTIVE durable
-     * binding, so it really does reach the proof store (:443) and return LEVEL_NONE at :458 —
-     * see the separate test below, where the same fixture also proves LEVEL_FULL positively.
+     * binding, so it reaches the proof store (:443) and returns LEVEL_NONE at :458.
      */
     public function testProofWriteFailsClosedOnceTheSessionTokenIsGone(): void {
         $store = new PatientSessionProofStore();
@@ -109,8 +108,8 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
         // A real durable account + binding + identity edge, so the gate can reach the store.
         $seeded = $this->seedActiveAccountAndBinding();
 
-        // POSITIVE CONTROLS, asserted BEFORE any destruction: `destroy_all_sessions()` below
-        // ends every session of this user, so a control after it could only see refusals.
+        // POSITIVE CONTROLS before destruction: `destroy_all_sessions()` below ends every session
+        // of this user, so a control after it could only ever see refusals.
         $liveToken = $store->issue_non_persistent_auth_cookie( $this->patientUserA );
         self::assertNotSame( '', $liveToken, 'a live session token was issued' );
         self::assertTrue(
@@ -126,9 +125,18 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
             App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 1, $liveToken ),
             'control: the proved live session really reaches the proof store and returns LEVEL_FULL'
         );
-
-        $liveSessionsBefore = array_keys( WP_Session_Tokens::get_instance( $this->patientUserA )->get_all() );
-        self::assertContains( $liveToken, $liveSessionsBefore, 'precondition: the live token is in the store' );
+        // PRECONDITION: the token is LIVE before any destruction, so the "token gone"
+        // assertions cannot be vacuous. Uses the SAME accessor they use: `get( $token )` returns
+        // the session array or null (WP 7.1.3 class-wp-session-tokens.php:82-85). `get_all()` is
+        // deliberately not used - it returns a LIST (`array_values`, :233-235), never keyed by token.
+        $liveSessionBefore = WP_Session_Tokens::get_instance( $this->patientUserA )->get( $liveToken );
+        self::assertIsArray( $liveSessionBefore, 'precondition: the live token resolves to a session before destruction' );
+        // Expiry in the future (`is_still_valid()`, :203-205), so it is live, not merely present.
+        self::assertGreaterThan(
+            time(),
+            (int) $liveSessionBefore['expiration'],
+            'precondition: that session expires in the future, so it is live now'
+        );
 
         // Second session, destroyed, then the same writes are attempted through it.
         $deadToken = $store->issue_non_persistent_auth_cookie( $this->patientUserA );
@@ -150,7 +158,7 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
             'T-L31: the binding-proof write fails closed when the token is gone'
         );
 
-        // The refused writes must not have RESURRECTED the session or stored a proof in it.
+        // The refused writes must not RESURRECT the session or store a proof in it.
         self::assertNull(
             WP_Session_Tokens::get_instance( $this->patientUserA )->get( $deadToken ),
             'after the refused writes the destroyed token is still absent'
@@ -165,7 +173,7 @@ final class PatientTwoProofGapsTest extends WP_UnitTestCase {
         self::assertSame(
             PatientAccess::LEVEL_NONE,
             App::patient_access()->level( $this->patientUserA, $this->patientA, $this->clinicA, $now + 2, $deadToken ),
-            'T-L31: no level is granted on the destroyed session'
+            'T-L31: the destroyed session gets no level either'
         );
     }
 
