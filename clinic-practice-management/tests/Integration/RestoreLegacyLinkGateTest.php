@@ -28,9 +28,9 @@ use WP_UnitTestCase;
  * REST routes, portal/shortcode views, and fixtures listed in `T1`-`T8` below.
  *
  * Scope mapped to assertions:
- * - PatientAccess `LEVEL_NONE` and `proved_patient_ids() === []` (plus `false`
- *   on `can_access_*`/`can_enroll_in_clinic` and `allowed === false` on
- *   `authorize_request`): `T1` and `T6`.
+ * - PatientAccess `LEVEL_NONE` and `proved_patient_ids() === []`: `T1` and `T6`.
+ *   In `T1`, `can_access_*` and `can_enroll_in_clinic` also return `false`, and
+ *   `authorize_request` returns `allowed === false`.
  * - HTTP `403` with `CLINIC_PATIENT_PROOF_FAILED` on tested REST routes: `T2`
  *   (`/patient/me`, `/patient/my-records`, `/patient/enroll`, `/visits`,
  *   `/visits/{id}`, `/prescriptions`), `T3` (`/patients/{id}/files`,
@@ -142,7 +142,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
     public function testLegacyLinkAloneHasNoPatientAccessLevelOrProvedIds(): void {
         $access = App::patient_access();
 
-        // Case 1a: cpms_patient_user_links fixture without insertLegacyIdentityEdges() or cpms_patient_logins rows.
+        // Case 1a: cpms_patient_user_links fixture without calling insertLegacyIdentityEdges() or inserting a cpms_patient_logins row in this fixture.
         $mobA     = $this->nextUniqueMobile();
         $nidA     = $this->nextUniqueValidNationalId();
         $patientA = $this->insertPatient( $this->clinicA, 'MR-RLG-T1A-' . $this->nextUniqueToken(), 'LegacyOnly', 'PatientA', $mobA, $nidA, '1990-01-01' );
@@ -458,7 +458,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
             }
         );
 
-        // 2) Notifications REST endpoints (inbox, rt with/without ETag, mark read) return 403 + CLINIC_PATIENT_PROOF_FAILED; inbox and unconditioned rt exclude $name1/$notifDocSecret, and read_at remains NULL.
+        // 2) Notifications REST endpoints return 403 + CLINIC_PATIENT_PROOF_FAILED; inbox and unconditioned rt exclude $name1/$notifDocSecret, and the post-request fetchValue for read_at returns null.
         $inboxResp = $this->dispatchRestWithSessionToken( 'GET', self::NS . '/notifications', [], $userId, $token );
         $this->assertProofFailedResponse( $inboxResp, 'GET /notifications' );
         $this->assertResponseExcludesStrings( $inboxResp->get_data(), [ $name1, $notifDocSecret ], 'GET /notifications' );
@@ -773,7 +773,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         self::assertSame( PatientAccess::LEVEL_NONE, $access->level( $userId, $patientId, $this->clinicA, $now, $plainToken ) );
         self::assertSame( [], $access->proved_patient_ids( $userId, $this->clinicA, $now, $plainToken ) );
 
-        // Sub-case B: Proof stamped on a DIFFERENT session token cannot authorize plainToken.
+        // Sub-case B: after proofs are stamped on a different token, level(..., plainToken) returns LEVEL_NONE.
         $otherProofStore = new PatientSessionProofStore();
         $otherToken      = $otherProofStore->issue_non_persistent_auth_cookie( $userId );
         self::assertTrue( $otherProofStore->record_mobile_proof( $userId, $mob, $now, $otherToken ) );
@@ -874,7 +874,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         $logins->insert_pending_account( $userA, $mobA, 'PromoteOtp', 'UserA' );
         $tokenA = WP_Session_Tokens::get_instance( $userA )->create( time() + 3600 );
 
-        // 1) Request without OTP code and without same-session mobile proof -> response status 403, code CLINIC_PATIENT_PROOF_FAILED, and find_binding(user, clinic, patient, true) returns null.
+        // 1) Request without an OTP code in a plain WP session with no prior record_mobile_proof call returns 403, code CLINIC_PATIENT_PROOF_FAILED, and find_binding(user, clinic, patient, true) returns null.
         $noProofResp = $this->dispatchRestWithSessionToken(
             'POST',
             self::NS . '/patient/link-record',
@@ -886,7 +886,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
             $userA,
             $tokenA
         );
-        $this->assertProofFailedResponse( $noProofResp, 'link-record without OTP or mobile proof' );
+        $this->assertProofFailedResponse( $noProofResp, 'link-record without OTP code in plain session' );
         self::assertNull( $logins->find_binding( $userA, $this->clinicA, $patientA, true ) );
 
         // 2) Wrong OTP code -> response status 403, code CLINIC_PATIENT_PROOF_FAILED, and find_binding(user, clinic, patient, true) returns null.
@@ -978,7 +978,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         self::assertSame( 200, $meA->get_status() );
         $this->assertNoNationalIdLeak( $meA->get_data(), $nidA, 'T7 Path A GET /patient/me' );
 
-        // Path B: Legacy-linked active account (without a binding row inserted yet) uses valid same-session mobile proof from OTP login.
+        // Path B: a legacy-linked active account, without a binding row inserted by this fixture, receives a 200 OTP-login response and a non-empty session token.
         $mobB      = $this->nextUniqueMobile();
         $nidB      = $this->nextUniqueValidNationalId();
         $wrongNidB = $this->nextUniqueValidNationalId();
@@ -1121,7 +1121,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         $meAfterStep1 = $this->dispatchRestWithSessionToken( 'GET', self::NS . '/patient/me', [], $step1UserId, $step1Token );
         $this->assertProofFailedResponse( $meAfterStep1, 'GET /patient/me after Step 1 only' );
 
-        // 3) Step 2 with wrong national_id -> 403 + CLINIC_PATIENT_PROOF_FAILED with assertNoNationalIdLeak(), find_active_bindings_for_user returns an empty array, and birth_date/identity_id remain NULL.
+        // 3) Step 2 with wrong national_id -> 403 + CLINIC_PATIENT_PROOF_FAILED with assertNoNationalIdLeak(), find_active_bindings_for_user returns an empty array, and post-request fetchRow returns null for birth_date and identity_id.
         $wrongNidReg = $this->dispatchRestWithSessionToken(
             'POST',
             self::NS . '/patient/register',
