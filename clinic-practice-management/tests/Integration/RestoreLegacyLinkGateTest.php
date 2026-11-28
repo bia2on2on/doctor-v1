@@ -164,7 +164,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
 
         $this->assertNoPatientAccess( $access, $userB, $this->clinicA, $patientB, $linkB, $this->clinicB, $now, $tokenB );
 
-        // Case 1c: Previously active user revoked by RestoreIdentityCleanup::revoke() (updates state='closed', live_key=NULL on every patient_logins row where state<>'closed', including kind='account' as well as kind='binding', then destroys WP sessions).
+        // Case 1c: Previously active user revoked by RestoreIdentityCleanup::revoke() (src/Application/Backup/RestoreIdentityCleanup.php:21-28 updates patient_logins rows to state='closed', live_key=NULL and destroys WP sessions); this test asserts only WP_Session_Tokens::verify(...) === false and assertNoPatientAccess().
         $mobC     = $this->nextUniqueMobile();
         $nidC     = $this->nextUniqueValidNationalId();
         $patientC = $this->insertPatient( $this->clinicA, 'MR-RLG-T1C-' . $this->nextUniqueToken(), 'Restored', 'PatientC', $mobC, $nidC, '1992-03-03' );
@@ -201,8 +201,8 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
             $freshTokenB
         );
         self::assertSame( 200, $promoteResp->get_status() );
-        self::assertSame( PatientAccess::LEVEL_FULL, $access->level( $userB, $patientB, $this->clinicA, $now, $freshTokenB ) );
-        self::assertSame( [ $patientB ], $access->proved_patient_ids( $userB, $this->clinicA, $now, $freshTokenB ) );
+        self::assertSame( PatientAccess::LEVEL_FULL, $access->level( $userB, $patientB, $this->clinicA, time(), $freshTokenB ) );
+        self::assertSame( [ $patientB ], $access->proved_patient_ids( $userB, $this->clinicA, time(), $freshTokenB ) );
 
         $this->withSessionCookie(
             $userB,
@@ -806,9 +806,9 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         }
         self::assertSame( 200, $loginResp->get_status() );
         self::assertNotSame( '', $otpLoginToken );
-        self::assertTrue( $otherProofStore->has_valid_mobile_proof( $userId, $mob, $now, $otpLoginToken ) );
-        self::assertSame( PatientAccess::LEVEL_NONE, $access->level( $userId, $patientId, $this->clinicA, $now, $otpLoginToken ) );
-        self::assertSame( [], $access->proved_patient_ids( $userId, $this->clinicA, $now, $otpLoginToken ) );
+        self::assertTrue( $otherProofStore->has_valid_mobile_proof( $userId, $mob, time(), $otpLoginToken ) );
+        self::assertSame( PatientAccess::LEVEL_NONE, $access->level( $userId, $patientId, $this->clinicA, time(), $otpLoginToken ) );
+        self::assertSame( [], $access->proved_patient_ids( $userId, $this->clinicA, time(), $otpLoginToken ) );
 
         $protectedRoutes = [
             [ 'GET', self::NS . '/patient/me', [] ],
@@ -906,7 +906,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
         $this->assertProofFailedResponse( $wrongOtpResp, 'link-record with wrong OTP' );
         self::assertNull( $logins->find_binding( $userA, $this->clinicA, $patientA, true ) );
 
-        // 3) Valid fresh OTP + wrong NID -> response status 403, code CLINIC_PATIENT_PROOF_FAILED, and find_binding(user, clinic, patient, true) returns null; an immediate replay of the same code with the matching NID also returns 403 + CLINIC_PATIENT_PROOF_FAILED and find_binding(user, clinic, patient, true) returns null (the stored consumed state of the OTP row is not asserted by this test).
+        // 3) Request using the seeded code '112233' (seedOtp at :893 with default +180s expiry offset at :1622) + wrong NID -> response status 403, code CLINIC_PATIENT_PROOF_FAILED, and find_binding(user, clinic, patient, true) returns null; an immediate replay of '112233' with the matching NID also returns 403 + CLINIC_PATIENT_PROOF_FAILED and find_binding(user, clinic, patient, true) returns null (the stored consumed state of the OTP row is not asserted by this test).
         $wrongNidResp = $this->dispatchRestWithSessionToken(
             'POST',
             self::NS . '/patient/link-record',
@@ -1068,7 +1068,7 @@ final class RestoreLegacyLinkGateTest extends WP_UnitTestCase {
             )
         );
 
-        // 1) Direct registration without Step-1 OTP proof -> 403 CLINIC_PATIENT_PROOF_FAILED.
+        // 1) Direct registration dispatched as user id 0 with no prior /otp/verify call in this test -> returns 403 and code CLINIC_PATIENT_PROOF_FAILED.
         $anonReg = $this->dispatchRest(
             'POST',
             self::NS . '/patient/register',
